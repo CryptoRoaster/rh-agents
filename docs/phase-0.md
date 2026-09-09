@@ -8,7 +8,7 @@
 - SQLAlchemy 2 PostgreSQL tables, initial Alembic migration, one fictitious paper account, atomic accounting, persistent idempotency, and portfolio row locking.
 - Weighted-average long-only spot positions and fee-aware realized/unrealized PnL.
 - Next.js, strict TypeScript, Tailwind CSS, Recharts, responsive off-white dashboard, all requested sections, agent filters, and read-only policy placeholders.
-- Root contributor/architecture/setup documentation, local Compose PostgreSQL, secret-free environment example, ignore rules, and dependency locks.
+- Root contributor/architecture/setup documentation, native external PostgreSQL setup for macOS and Linux, secret-free environment example, ignore rules, and dependency locks.
 
 ## Verification
 
@@ -33,7 +33,9 @@ Validated locally on Python 3.13.2, Node 22.22.2, Next.js 16.3.4, and PostgreSQL
 
 PostgreSQL concurrency tests verify that simultaneous identical intents produce one fill, and different concurrent intents cannot exceed the portfolio exposure limit. Persistence tests also cover replay after service restart, conflicting IDs, durable rejection, a latched pause, transactional rollback with correlated error logs, and missing portfolio marks.
 
-Docker is not installed in the verification environment. Compose targets PostgreSQL 17; the actual migration and database tests used an isolated local PostgreSQL 16.14 instance instead. Docker startup and PostgreSQL 17 specifically remain unverified. Initial dependency downloads, PostgreSQL access, and Turbopack workers required permission beyond the sandbox; reruns completed successfully.
+The migration and database tests used an isolated native PostgreSQL 16.14 instance. The macOS setup guide provides a Homebrew PostgreSQL 17 example; that version specifically remains unverified. The Linux VPS target uses native PostgreSQL, Python backend, and Next.js frontend services, with systemd supervision deferred.
+
+After the native-service setup correction on 2026-09-09, verification was rerun: PostgreSQL pytest (68 passed), SQLite pytest (66 passed, 2 skipped), Ruff lint/format, strict mypy, Alembic upgrade/schema drift/offline SQL, frontend typecheck/ESLint/Prettier, and the Next.js production build all passed. Locked dependency installation also succeeded; npm reported zero vulnerabilities. The disposable native PostgreSQL instance was stopped and removed afterward. Browser checks and coverage measurement in the table above are from the initial Phase 0 verification.
 
 The browser CLI's semantic pointer clicks did not reliably activate off-screen controls. DOM activation and keyboard events verified the React behavior; a complete manual pointer-interaction/accessibility audit is not claimed.
 

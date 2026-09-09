@@ -21,9 +21,11 @@ CryptoRoaster/rh-agents is a new autonomous trading project. Work only here; nev
 
 ## Build, Test, and Development Commands
 
-From the root, `docker compose up -d` starts local PostgreSQL. In `backend/`, run `uv sync --locked`, `uv run alembic upgrade head`, and `uv run uvicorn src.api.main:app --reload`. Validate with `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`, and `uv run mypy`.
+Use native Python, Node.js, and an independently managed native PostgreSQL service. On macOS, an example setup is `brew install postgresql@17` followed by `brew services start postgresql@17`; see README.md for role/database creation. Homebrew paths belong only in documentation, never application code. Copy `.env.example` to the root `.env` and configure `DATABASE_URL` for the local instance. In `backend/`, run `uv sync --locked`, `uv run alembic upgrade head`, and `uv run uvicorn src.api.main:app --reload`. These commands load the root `.env`. Validate with `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`, and `uv run mypy`.
 
 In `frontend/`, run `npm ci`, `npm run dev`, `npm run typecheck`, `npm run lint`, and `npm run build`. Use `npm run format:check` to verify formatting.
+
+Development and deployment must use native host processes exclusively. The production target is a Linux VPS with native PostgreSQL, Python backend, and Next.js frontend services; later systemd units may supervise them. PostgreSQL remains authoritative in production. SQLite is optional for lightweight tests only.
 
 ## Coding Style & Naming Conventions
 

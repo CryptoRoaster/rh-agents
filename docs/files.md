@@ -1,6 +1,6 @@
 # Phase 0 file inventory
 
-59 authored source, configuration, lock, and documentation files. `AGENTS.md` existed before this phase and was updated as requested; the other files are new.
+58 authored source, configuration, lock, and documentation files. `AGENTS.md` existed before this phase and was updated as requested; the other files are new.
 
 ```text
 rh-agents/
@@ -79,8 +79,7 @@ rh-agents/
 ├── .gitignore
 ├── AGENTS.md
 ├── ARCHITECTURE.md
-├── README.md
-└── docker-compose.yml
+└── README.md
 ```
 
-Generated local artifacts are ignored: `backend/.venv/`, Python bytecode, pytest/Ruff/mypy caches, `backend/.coverage`, `frontend/node_modules/`, `frontend/.next/`, and TypeScript build metadata. Temporary verification databases, browser captures, and download caches live outside the repository.
+Generated local artifacts are ignored: `backend/.venv/`, Python bytecode, pytest/Ruff/mypy caches, `backend/.coverage`, `frontend/node_modules/`, `frontend/.next/`, and TypeScript build metadata. Temporary verification databases may use the ignored `.local/` directory and are removed after verification; browser captures and download caches live outside the repository.
