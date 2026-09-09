@@ -1,7 +1,7 @@
 """SENTINEL: deterministic, fail-closed policy. This module has no LLM dependencies."""
 
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal, localcontext
 
 from src.core.models import (
     MarketSnapshot,
@@ -18,6 +18,40 @@ from src.core.models import (
 from src.core.numbers import quantize
 
 BPS = Decimal("10000")
+
+
+def _additional_buy_notional(
+    context: RiskContext,
+    market: MarketSnapshot,
+    limits: RiskLimits,
+    permitted_slippage: Decimal,
+) -> Decimal:
+    if (
+        context.cash_usd is None
+        or context.exposure_usd is None
+        or context.position_quantity is None
+        or market.fee_bps is None
+    ):
+        return Decimal("0")
+    with localcontext() as arithmetic:
+        arithmetic.prec = 78
+        budget = max(
+            Decimal("0"),
+            min(
+                context.cash_usd,
+                limits.max_exposure_usd - context.exposure_usd,
+                limits.max_position_size_usd - context.position_quantity * market.price_usd,
+            ),
+        )
+        slippage_factor = 1 + permitted_slippage / BPS
+        fee_factor = 1 + market.fee_bps / BPS
+        quantum = Decimal("0.000000000000000001")
+        capacity = (budget / (slippage_factor * fee_factor)).quantize(quantum, rounding=ROUND_DOWN)
+        # Final validation rounds slippage and total cost separately. Keep the
+        # guidance conservative even when those intermediate roundings round up.
+        while capacity > 0 and quantize(quantize(capacity * slippage_factor) * fee_factor) > budget:
+            capacity -= quantum
+        return capacity
 
 
 def evaluate(
@@ -125,6 +159,10 @@ def evaluate(
         if pause
         else (RiskOutcome.REJECT if reasons else RiskOutcome.APPROVE)
     )
+    capacity = Decimal("0")
+    sizing_reasons = {"INSUFFICIENT_CASH", "MAX_EXPOSURE", "MAX_POSITION_SIZE"}
+    if intent.side == Side.BUY and not (set(reasons) - sizing_reasons):
+        capacity = _additional_buy_notional(context, market, limits, permitted_slippage)
     return RiskDecision(
         source="SENTINEL",
         correlation_id=intent.correlation_id,
@@ -136,7 +174,8 @@ def evaluate(
         market_fingerprint=market.fingerprint(),
         outcome=outcome,
         reason_codes=tuple(reasons) or ("WITHIN_LIMITS",),
-        max_allowed_position_size_usd=limits.max_position_size_usd,
+        position_size_limit_usd=limits.max_position_size_usd,
+        max_additional_notional_usd=capacity,
         max_slippage_bps=permitted_slippage,
         metrics=RiskMetrics(
             requested_notional_usd=notional,

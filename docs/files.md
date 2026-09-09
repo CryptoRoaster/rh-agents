@@ -1,9 +1,12 @@
 # Phase 0 file inventory
 
-58 authored source, configuration, lock, and documentation files. `AGENTS.md` existed before this phase and was updated as requested; the other files are new.
+62 authored source, configuration, lock, and documentation files, including Phase 0 hardening.
 
 ```text
 rh-agents/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
 ├── backend/
 │   ├── migrations/
 │   │   ├── versions/
@@ -19,6 +22,7 @@ rh-agents/
 │   │   │   └── main.py
 │   │   ├── core/
 │   │   │   ├── __init__.py
+│   │   │   ├── clock.py
 │   │   │   ├── config.py
 │   │   │   ├── models.py
 │   │   │   └── numbers.py
@@ -45,6 +49,8 @@ rh-agents/
 │   ├── tests/
 │   │   ├── __init__.py
 │   │   ├── conftest.py
+│   │   ├── test_clock.py
+│   │   ├── test_config.py
 │   │   ├── test_contracts.py
 │   │   ├── test_execution.py
 │   │   ├── test_ledger.py

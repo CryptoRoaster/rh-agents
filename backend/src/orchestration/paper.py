@@ -1,12 +1,13 @@
 """Trusted internal entry point: serialize risk + fill + ledger in one DB transaction."""
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC
 from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from src.core.clock import Clock, SystemClock
 from src.core.models import (
     ExecutionResult,
     MarketSnapshot,
@@ -35,22 +36,25 @@ class PaperTradingService:
         sessions: async_sessionmaker[AsyncSession],
         limits: RiskLimits,
         mode: TradingMode = TradingMode.OBSERVE,
+        *,
+        clock: Clock | None = None,
     ) -> None:
         if mode == TradingMode.LIVE_AUTONOMOUS:
             raise ValueError("Live execution is unavailable")
         self.sessions, self.limits, self.mode = sessions, limits, mode
         self.executor = PaperExecutor()
+        # Only trusted bootstrap/test infrastructure constructs this service.
+        self._clock = clock if clock is not None else SystemClock()
 
     async def process(
         self,
         intent: TradeIntent,
         market: MarketSnapshot,
         *,
-        now: datetime,
         marks: dict[str, MarketSnapshot] | None = None,
     ) -> ExecutionResult | RiskDecision:
         try:
-            return await self._process(intent, market, now=now, marks=marks)
+            return await self._process(intent, market, marks=marks)
         except Exception:
             logger.exception(
                 "paper_processing_failed",
@@ -63,7 +67,6 @@ class PaperTradingService:
         intent: TradeIntent,
         market: MarketSnapshot,
         *,
-        now: datetime,
         marks: dict[str, MarketSnapshot] | None = None,
     ) -> ExecutionResult | RiskDecision:
         if self.mode != TradingMode.PAPER:
@@ -93,6 +96,9 @@ class PaperTradingService:
             positions = [
                 read_position(row) for row in (await session.scalars(select(PositionRow))).all()
             ]
+            # Read time after acquiring the lock and loading the portfolio: time
+            # spent waiting must count toward freshness and the UTC loss day.
+            now = self._clock.now()
             prices = {market.asset_id: market.price_usd}
             valid_marks = True
             for holding in positions:
@@ -155,14 +161,15 @@ class PaperTradingService:
                 if risk.outcome == RiskOutcome.PAUSE_SYSTEM:
                     account.paused = True
                 return risk
+            execution_requested_at = self._clock.now()
             order = OrderIntent(
                 source="COMMANDER",
                 correlation_id=intent.correlation_id,
-                created_at=now,
-                updated_at=now,
+                created_at=execution_requested_at,
+                updated_at=execution_requested_at,
                 intent=intent,
                 risk=risk,
-                execution_requested_at=now,
+                execution_requested_at=execution_requested_at,
             )
             await append(session, order)
             fill = await self.executor.execute(order, market)

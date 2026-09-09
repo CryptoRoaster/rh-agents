@@ -5,7 +5,6 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
-from src.api.main import create_app
 from src.core.config import Settings
 from src.core.models import AgentDecision, AgentRole, IntentProposal, Observation, TradingMode
 from src.orchestration.bus import DecisionBus
@@ -65,10 +64,18 @@ def test_trade_proposal_requires_correct_role_and_trace(intent, now, trace):
 
 def test_live_configuration_refused():
     with pytest.raises(ValidationError):
-        Settings(trading_mode=TradingMode.LIVE_AUTONOMOUS)
+        Settings(
+            _env_file=None,
+            database_url="postgresql+asyncpg://test_user@localhost/test_database",
+            trading_mode=TradingMode.LIVE_AUTONOMOUS,
+        )
 
 
-async def test_api_is_read_only_and_observe_by_default():
+async def test_api_is_read_only_and_observe_by_default(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test_user@localhost/test_database")
+    monkeypatch.delenv("TRADING_MODE", raising=False)
+    from src.api.main import create_app
+
     app = create_app(Settings(_env_file=None))
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         assert (await client.get("/health")).json()["mode"] == "OBSERVE"

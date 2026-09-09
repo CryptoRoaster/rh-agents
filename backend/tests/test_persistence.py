@@ -2,14 +2,16 @@
 
 import asyncio
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from src.core.clock import FixedClock, SystemClock
 from src.core.models import (
     ExecutionResult,
     RiskDecision,
@@ -75,10 +77,12 @@ async def sessions():
 
 
 async def test_durable_idempotency_survives_service_restart(sessions, intent, market, now):
-    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER)
-    first = await service.process(intent, market, now=now)
-    restarted = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER)
-    second = await restarted.process(intent, market, now=now)
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=FixedClock(now))
+    first = await service.process(intent, market)
+    restarted = PaperTradingService(
+        sessions, RiskLimits(), TradingMode.PAPER, clock=FixedClock(now)
+    )
+    second = await restarted.process(intent, market)
     assert isinstance(first, ExecutionResult)
     assert second == first
     async with sessions() as session:
@@ -91,21 +95,24 @@ async def test_durable_idempotency_survives_service_restart(sessions, intent, ma
 
 
 async def test_conflicting_idempotency_key_is_rejected(sessions, intent, market, now):
-    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER)
-    await service.process(intent, market, now=now)
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=FixedClock(now))
+    await service.process(intent, market)
     changed = intent.model_copy(update={"quantity": Decimal("3")})
     with pytest.raises(ValueError, match="Idempotency conflict"):
-        await service.process(changed, market, now=now)
+        await service.process(changed, market)
 
 
 async def test_rejection_is_durable_without_execution(sessions, intent, market, now):
     service = PaperTradingService(
-        sessions, RiskLimits(max_exposure_usd=Decimal("100")), TradingMode.PAPER
+        sessions,
+        RiskLimits(max_exposure_usd=Decimal("100")),
+        TradingMode.PAPER,
+        clock=FixedClock(now),
     )
-    risk = await service.process(intent, market, now=now)
+    risk = await service.process(intent, market)
     assert isinstance(risk, RiskDecision)
     assert risk.outcome == RiskOutcome.REJECT
-    assert await service.process(intent, market, now=now) == risk
+    assert await service.process(intent, market) == risk
     async with sessions() as session:
         assert await session.scalar(select(func.count()).select_from(RiskRow)) == 1
         assert await session.scalar(select(func.count()).select_from(ExecutionRow)) == 0
@@ -114,14 +121,14 @@ async def test_rejection_is_durable_without_execution(sessions, intent, market, 
 async def test_fill_and_accounting_commit_atomically(
     sessions, intent, market, now, monkeypatch, caplog
 ):
-    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER)
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=FixedClock(now))
 
     async def fail(*args):
         raise ValueError("Simulated execution failure")
 
     monkeypatch.setattr(service.executor, "execute", fail)
     with pytest.raises(ValueError, match="execution failure"):
-        await service.process(intent, market, now=now)
+        await service.process(intent, market)
     assert caplog.records[-1].correlation_id == str(intent.correlation_id)
     assert caplog.records[-1].intent_id == str(intent.id)
     async with sessions() as session:
@@ -131,18 +138,22 @@ async def test_fill_and_accounting_commit_atomically(
 
 
 async def test_pause_is_latched_across_service_instances(sessions, intent, market, now):
-    service = PaperTradingService(sessions, RiskLimits(kill_switch=True), TradingMode.PAPER)
-    assert (await service.process(intent, market, now=now)).outcome == RiskOutcome.PAUSE_SYSTEM
-    restarted = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER)
+    service = PaperTradingService(
+        sessions, RiskLimits(kill_switch=True), TradingMode.PAPER, clock=FixedClock(now)
+    )
+    assert (await service.process(intent, market)).outcome == RiskOutcome.PAUSE_SYSTEM
+    restarted = PaperTradingService(
+        sessions, RiskLimits(), TradingMode.PAPER, clock=FixedClock(now)
+    )
     intent = intent.model_copy(update={"id": uuid4()})
-    assert (await restarted.process(intent, market, now=now)).outcome == RiskOutcome.PAUSE_SYSTEM
+    assert (await restarted.process(intent, market)).outcome == RiskOutcome.PAUSE_SYSTEM
 
 
 async def test_persisted_buy_sell_and_pnl(sessions, intent, market, now):
-    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER)
-    await service.process(intent, market, now=now)
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=FixedClock(now))
+    await service.process(intent, market)
     sell = intent.model_copy(update={"id": uuid4(), "side": Side.SELL})
-    fill = await service.process(sell, market, now=now)
+    fill = await service.process(sell, market)
     assert isinstance(fill, ExecutionResult)
     async with sessions() as session:
         position = await session.scalar(select(PositionRow))
@@ -157,8 +168,8 @@ async def test_persisted_buy_sell_and_pnl(sessions, intent, market, now):
 
 
 async def test_missing_portfolio_mark_fails_closed(sessions, intent, market, now):
-    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER)
-    await service.process(intent, market, now=now)
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=FixedClock(now))
+    await service.process(intent, market)
     new_asset = "paper:SECOND"
     data = market.model_dump()
     data.update(id=uuid4(), asset_id=new_asset)
@@ -166,15 +177,15 @@ async def test_missing_portfolio_mark_fails_closed(sessions, intent, market, now
         data[key].update(id=uuid4(), asset_id=new_asset)
     new_market = type(market).model_validate(data)
     new_intent = intent.model_copy(update={"id": uuid4(), "asset_id": new_asset})
-    risk = await service.process(new_intent, new_market, now=now)
+    risk = await service.process(new_intent, new_market)
     assert risk.outcome == RiskOutcome.REJECT
     assert "ACCOUNTING_UNKNOWN" in risk.reason_codes
 
 
 @pytest.mark.skipif(not os.environ.get("TEST_DATABASE_URL"), reason="PostgreSQL row locks required")
 async def test_concurrent_duplicates_have_one_fill(sessions, intent, market, now):
-    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER)
-    results = await asyncio.gather(*(service.process(intent, market, now=now) for _ in range(4)))
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=FixedClock(now))
+    results = await asyncio.gather(*(service.process(intent, market) for _ in range(4)))
     assert all(result == results[0] for result in results)
     async with sessions() as session:
         assert await session.scalar(select(func.count()).select_from(TradeRow)) == 1
@@ -183,12 +194,13 @@ async def test_concurrent_duplicates_have_one_fill(sessions, intent, market, now
 @pytest.mark.skipif(not os.environ.get("TEST_DATABASE_URL"), reason="PostgreSQL row locks required")
 async def test_concurrent_intents_cannot_overspend_exposure(sessions, intent, market, now):
     service = PaperTradingService(
-        sessions, RiskLimits(max_exposure_usd=Decimal("300")), TradingMode.PAPER
+        sessions,
+        RiskLimits(max_exposure_usd=Decimal("300")),
+        TradingMode.PAPER,
+        clock=FixedClock(now),
     )
     second = intent.model_copy(update={"id": uuid4()})
-    results = await asyncio.gather(
-        service.process(intent, market, now=now), service.process(second, market, now=now)
-    )
+    results = await asyncio.gather(service.process(intent, market), service.process(second, market))
     assert sum(isinstance(result, ExecutionResult) for result in results) == 1
     assert (
         sum(
@@ -197,3 +209,108 @@ async def test_concurrent_intents_cannot_overspend_exposure(sessions, intent, ma
         )
         == 1
     )
+
+
+async def test_service_uses_injected_clock_for_freshness(sessions, intent, market, now):
+    later = now + timedelta(seconds=31)
+    service = PaperTradingService(
+        sessions, RiskLimits(), TradingMode.PAPER, clock=FixedClock(later)
+    )
+    risk = await service.process(intent, market)
+    assert risk.outcome == RiskOutcome.REJECT
+    assert risk.evaluated_at == later
+    assert "STALE_OR_FUTURE_MARKET" in risk.reason_codes
+    assert risk.max_additional_notional_usd == 0
+
+
+async def test_service_defaults_to_system_clock(sessions, intent, market, now, monkeypatch):
+    monkeypatch.setattr(SystemClock, "now", lambda self: now + timedelta(seconds=31))
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER)
+    risk = await service.process(intent, market)
+    assert "STALE_OR_FUTURE_MARKET" in risk.reason_codes
+
+
+async def test_trading_caller_cannot_supply_now(sessions, intent, market, now):
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=FixedClock(now))
+    with pytest.raises(TypeError, match="now"):
+        await service.process(intent, market, now=now)
+
+
+async def test_execution_rechecks_clock_for_approval_expiry(sessions, intent, market, now):
+    class AdvancingClock:
+        def __init__(self):
+            self.instants = iter([now, now + timedelta(seconds=6)])
+
+        def now(self):
+            return next(self.instants)
+
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=AdvancingClock())
+    with pytest.raises(ValidationError, match="expired"):
+        await service.process(intent, market)
+    async with sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(ExecutionRow)) == 0
+        assert await session.scalar(select(func.count()).select_from(IntentRow)) == 0
+        assert (await session.get(AccountRow, 1)).cash_usd == 10000
+
+
+async def test_legacy_rejection_replays_without_rewriting_history(sessions, intent, market, now):
+    service = PaperTradingService(
+        sessions,
+        RiskLimits(max_exposure_usd=Decimal("100")),
+        TradingMode.PAPER,
+        clock=FixedClock(now),
+    )
+    first = await service.process(intent, market)
+    async with sessions.begin() as session:
+        row = await session.scalar(select(RiskRow))
+        legacy = dict(row.payload)
+        legacy["max_allowed_position_size_usd"] = legacy.pop("position_size_limit_usd")
+        del legacy["max_additional_notional_usd"]
+        row.payload = legacy
+    restarted = PaperTradingService(
+        sessions, RiskLimits(), TradingMode.PAPER, clock=FixedClock(now + timedelta(days=1))
+    )
+    replay = await restarted.process(intent, market)
+    assert replay.id == first.id
+    assert replay.outcome == first.outcome == RiskOutcome.REJECT
+    assert replay.position_size_limit_usd == first.position_size_limit_usd
+    assert replay.max_additional_notional_usd == 0
+    async with sessions() as session:
+        assert (await session.scalar(select(RiskRow))).payload == legacy
+
+
+@pytest.mark.skipif(not os.environ.get("TEST_DATABASE_URL"), reason="PostgreSQL row locks required")
+async def test_trusted_time_is_read_after_waiting_for_portfolio_lock(sessions, intent, market, now):
+    attempted = asyncio.Event()
+    clock_allowed = asyncio.Event()
+    engine = sessions.kw["bind"]
+
+    class AfterLockClock:
+        def now(self):
+            assert clock_allowed.is_set(), "Clock was sampled before waiting for the lock"
+            return now + timedelta(seconds=31)
+
+    def lock_attempt(connection, cursor, statement, parameters, execution_context, executemany):
+        if "FOR UPDATE" in statement:
+            attempted.set()
+
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=AfterLockClock())
+    task = None
+    event.listen(engine.sync_engine, "before_cursor_execute", lock_attempt)
+    try:
+        async with sessions.begin() as session:
+            await session.scalar(select(AccountRow).where(AccountRow.id == 1).with_for_update())
+            attempted.clear()
+            task = asyncio.create_task(service.process(intent, market))
+            await asyncio.wait_for(attempted.wait(), timeout=5)
+            assert not task.done()
+            clock_allowed.set()
+        risk = await asyncio.wait_for(task, timeout=5)
+        assert risk.outcome == RiskOutcome.REJECT
+        assert "STALE_OR_FUTURE_MARKET" in risk.reason_codes
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", lock_attempt)
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

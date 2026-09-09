@@ -216,11 +216,33 @@ class RiskDecision(Record):
     market_fingerprint: str
     outcome: RiskOutcome
     reason_codes: tuple[str, ...] = Field(min_length=1)
-    max_allowed_position_size_usd: Amount
+    position_size_limit_usd: Amount = Field(
+        description="Absolute configured per-position USD limit"
+    )
+    max_additional_notional_usd: Amount = Field(
+        description="Additional BUY quote notional before costs; zero for SELL or unsafe context. "
+        "Sizing guidance only, never an execution authorization."
+    )
     max_slippage_bps: Amount
     metrics: RiskMetrics
     evaluated_at: AwareDatetime
     expires_at: AwareDatetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def read_legacy_sizing(cls, value: object) -> object:
+        # Historical records lacked incremental capacity. Preserve replay without
+        # inventing it or rewriting immutable events; all new records use both fields.
+        if (
+            isinstance(value, dict)
+            and "max_allowed_position_size_usd" in value
+            and "position_size_limit_usd" not in value
+            and "max_additional_notional_usd" not in value
+        ):
+            value = dict(value)
+            value["position_size_limit_usd"] = value.pop("max_allowed_position_size_usd")
+            value["max_additional_notional_usd"] = Decimal("0")
+        return value
 
 
 class OrderIntent(Record):

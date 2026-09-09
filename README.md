@@ -34,7 +34,7 @@ uv run alembic upgrade head
 uv run uvicorn src.api.main:app --reload --host 127.0.0.1
 ```
 
-The backend and Alembic load the root `.env` when launched from `backend/`; exported environment variables take precedence. `uv sync --locked` creates a native Python virtual environment in `backend/.venv/`. Alembic connects normally to the external PostgreSQL instance using `DATABASE_URL` and seeds $10,000 of fictitious paper cash. The backend defaults to OBSERVE; set `TRADING_MODE=PAPER` in the root `.env` only for future internal runner use. LIVE_AUTONOMOUS fails configuration validation.
+The backend and Alembic load the root `.env` when launched from `backend/`; exported environment variables take precedence. `DATABASE_URL` is required and accepts only `postgresql+asyncpg://` URLs with a database name. Missing, blank, malformed, SQLite, and unsupported-driver URLs fail settings validation; application code has no fallback URL. Native Unix-socket URLs such as `postgresql+asyncpg://runner@/rh_agents_test?host=/var/run/postgresql` are supported. SQLite is available only to tests that construct their database engine directly. `uv sync --locked` creates a native Python virtual environment in `backend/.venv/`. Alembic connects normally to the external PostgreSQL instance using `DATABASE_URL` and seeds $10,000 of fictitious paper cash. The backend defaults to OBSERVE; set `TRADING_MODE=PAPER` in the root `.env` only for future internal runner use. LIVE_AUTONOMOUS fails configuration validation.
 
 In another terminal:
 
@@ -103,7 +103,7 @@ uv run mypy
 uv run alembic upgrade head --sql
 ```
 
-The normal suite uses SQLite in memory for fast persistence checks and skips two concurrency tests. To validate PostgreSQL row locks, create a separate disposable database once using the local PostgreSQL administrator, then run from `backend/`:
+The normal suite uses SQLite in memory for fast persistence checks and skips three PostgreSQL locking tests. To validate PostgreSQL row locks, create a separate disposable database once using the local PostgreSQL administrator, then run from `backend/`:
 
 ```sh
 createdb -h localhost -p 5432 --owner=rh_agents rh_agents_test
@@ -122,8 +122,14 @@ npm run build
 
 Dependencies are locked in `backend/uv.lock` and `frontend/package-lock.json`. No coverage percentage gate is set; safety and accounting behavior must be covered explicitly. Use `uv run pytest --cov=src --cov-report=term-missing` for a coverage report.
 
+`.github/workflows/ci.yml` runs the backend and frontend checks on pushes and pull requests using native Ubuntu runner processes, Python 3.12, and Node.js 22. The backend job installs and starts native PostgreSQL, creates a disposable database owned by the runner's login, and uses local Unix-socket peer authentication. It verifies Alembic upgrades/schema drift, the full PostgreSQL suite, and the optional SQLite suite. The frontend job installs locked dependencies and runs typecheck, lint, formatting, and the production build.
+
 ## Paper execution integration
 
-`PaperTradingService(session_factory, RiskLimits(), TradingMode.PAPER).process(intent, market, now=...)` is the internal testable entry point. It derives portfolio context from the database, validates every final intent, simulates a fill, and records accounting atomically. Pass fresh `marks` for other open assets. Missing safety data rejects execution. Identical intent IDs replay stored results; changed content with the same ID is rejected. It is not exposed to LLM code or public HTTP callers.
+`PaperTradingService(session_factory, RiskLimits(), TradingMode.PAPER).process(intent, market)` is the internal testable entry point. It derives portfolio context from the database, validates every final intent, simulates a fill, and records accounting atomically. The service defaults to `SystemClock`; trusted test setup may inject `clock=FixedClock(aware_datetime)` at construction. Trading callers cannot supply `now` or choose the clock. Time is read after the portfolio lock is acquired and read again when requesting execution to enforce approval expiry. Agents must never construct or mutate the service or its clock.
+
+Pass fresh `marks` for other open assets. Missing safety data rejects execution. Identical intent IDs replay stored results; changed content with the same ID is rejected. The service is not exposed to LLM code or public HTTP callers.
+
+`RiskDecision.position_size_limit_usd` is the absolute configured position limit. `max_additional_notional_usd` is conservative additional BUY notional at the snapshot quote price, before fees and slippage. It uses the smallest of cash, remaining total exposure, and remaining position capacity, divided by the worst permitted slippage and known fee factors. It is nonnegative and rounded down to 18 decimal places, with an additional check for intermediate cost rounding. SELL decisions and decisions with non-sizing safety blockers report zero. A BUY rejected solely for sizing can still report a smaller usable capacity. This guidance never authorizes a trade: the final intent must independently pass every SENTINEL check. Historical risk payloads with the old field remain readable and replay with zero incremental guidance; immutable stored events are preserved.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the ten invariants, approval binding, accounting semantics, and future boundaries. See [docs/phase-0.md](docs/phase-0.md) for delivery verification and Phase 1 work. No commit or push is performed by setup or development commands.

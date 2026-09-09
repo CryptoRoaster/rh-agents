@@ -25,7 +25,7 @@ Use native Python, Node.js, and an independently managed native PostgreSQL servi
 
 In `frontend/`, run `npm ci`, `npm run dev`, `npm run typecheck`, `npm run lint`, and `npm run build`. Use `npm run format:check` to verify formatting.
 
-Development and deployment must use native host processes exclusively. The production target is a Linux VPS with native PostgreSQL, Python backend, and Next.js frontend services; later systemd units may supervise them. PostgreSQL remains authoritative in production. SQLite is optional for lightweight tests only.
+Development and deployment must use native host processes exclusively. The production target is a Linux VPS with native PostgreSQL, Python backend, and Next.js frontend services; later systemd units may supervise them. PostgreSQL is authoritative for all runtime modes. Runtime Settings require `DATABASE_URL` with the `postgresql+asyncpg://` driver and a database name; native Unix-socket URLs are valid. SQLite, unsupported drivers, malformed URLs, and missing/blank values must fail validation. SQLite is optional for lightweight tests that construct their engine directly, never through runtime Settings.
 
 ## Coding Style & Naming Conventions
 
