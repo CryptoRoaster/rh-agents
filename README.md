@@ -1,8 +1,8 @@
 # rh-agents
 
-Phase 0 foundation for CryptoRoaster's autonomous multi-agent on-chain trading system. Agents will autonomously request trades; deterministic risk controls are mandatory and cannot be overridden. Individual trades do not require human approval.
+Phase 1A market recording foundation for CryptoRoaster's autonomous multi-agent on-chain trading system, built on the Phase 0 paper executor. Agents will autonomously request trades; deterministic risk controls are mandatory and cannot be overridden. Individual trades do not require human approval.
 
-**Paper only. No wallets, signing, blockchain calls, credentials, live trading, or running LLM agents.** This repository is independent of ClawfredAI/polma-db.
+**Paper only. No wallets, signing, blockchain calls, live trading, external market feed, or running LLM agents.** This repository is independent of ClawfredAI/polma-db.
 
 ## Local setup (macOS)
 
@@ -77,14 +77,15 @@ backend/
   src/
     core/           Pydantic domain contracts, configuration, numeric precision
     data/           SQLAlchemy tables, sessions, typed persistence
-    agents/         Agent and infrastructure role registry
+    agents/         Agent roles and read-only ORBIT market input port
+    markets/        Normalized market contracts, provider ports, recorder and reader
     risk/           SENTINEL deterministic policy
     execution/      Abstract Executor and deterministic PaperExecutor
     ledger/         Weighted-average spot accounting and PnL
     orchestration/  Typed asyncio bus and transactional paper coordinator
     api/            Read-only FastAPI foundation
   tests/            Contract, safety, executor, accounting, persistence tests
-  migrations/       Alembic initial PostgreSQL schema
+  migrations/       Alembic PostgreSQL foundation and append-only market observations
 frontend/
   app/              Next.js App Router and light dashboard theme
   components/       Dashboard shell and Recharts equity chart
@@ -103,7 +104,7 @@ uv run mypy
 uv run alembic upgrade head --sql
 ```
 
-The normal suite uses SQLite in memory for fast persistence checks and skips three PostgreSQL locking tests. To validate PostgreSQL row locks, create a separate disposable database once using the local PostgreSQL administrator, then run from `backend/`:
+The normal suite uses SQLite in memory for fast persistence checks and skips eight PostgreSQL locking/concurrency/trigger checks. To validate PostgreSQL row locks, create a separate disposable database once using the local PostgreSQL administrator, then run from `backend/`:
 
 ```sh
 createdb -h localhost -p 5432 --owner=rh_agents rh_agents_test
@@ -123,6 +124,14 @@ npm run build
 Dependencies are locked in `backend/uv.lock` and `frontend/package-lock.json`. No coverage percentage gate is set; safety and accounting behavior must be covered explicitly. Use `uv run pytest --cov=src --cov-report=term-missing` for a coverage report.
 
 `.github/workflows/ci.yml` runs the backend and frontend checks on pushes and pull requests using native Ubuntu runner processes, Python 3.12, and Node.js 22. The backend job installs and starts native PostgreSQL, creates a disposable database owned by the runner's login, and uses local Unix-socket peer authentication. It verifies Alembic upgrades/schema drift, the full PostgreSQL suite, and the optional SQLite suite. The frontend job installs locked dependencies and runs typecheck, lint, formatting, and the production build.
+
+## Recorded market data (Phase 1A)
+
+`Market Provider -> normalization -> MarketRecorder -> PostgreSQL -> ORBIT input` is the new ingestion path. Immutable, versioned observations preserve exact Decimal values, provider provenance, chain/network identity, observation time and explicit UNKNOWN/unavailable values. The recorder deduplicates replay and rejects conflicting event identities; revision `0002` makes stored observations append-only.
+
+Read-only endpoints: `/api/markets`, `/api/markets/{chain-qualified-asset-or-pair}`, and `/api/market-candidates`. Results must be fresh and have known price/liquidity; fixtures are excluded unless `include_fixtures=true`. Configure API freshness through `MARKET_MAX_AGE_SECONDS` (default 60). No mutation or trading endpoint is added. The bundled provider supplies labeled deterministic fixtures only; no external feed or LLM is connected. PAPER remains the only trading-capable mode, with no live-money execution.
+
+See [docs/phase-1.md](docs/phase-1.md) for interfaces, semantics, security boundaries, limitations and a runnable fixture-recording example. The dashboard remains a fixture preview.
 
 ## Paper execution integration
 
