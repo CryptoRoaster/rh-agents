@@ -1,4 +1,4 @@
-name: Phase 0 checks
+name: Repository checks
 
 on:
   push:

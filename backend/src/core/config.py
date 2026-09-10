@@ -12,6 +12,7 @@ from src.core.models import TradingMode
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
     database_url: str = Field(min_length=1)
+    market_max_age_seconds: int = Field(default=60, gt=0, le=3600)
     trading_mode: Literal[TradingMode.OBSERVE, TradingMode.PAPER] = TradingMode.OBSERVE
 
     @field_validator("database_url")

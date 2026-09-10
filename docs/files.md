@@ -1,6 +1,6 @@
-# Phase 0 file inventory
+# Repository file inventory
 
-62 authored source, configuration, lock, and documentation files, including Phase 0 hardening.
+Authored source, configuration, lock, and documentation files through Phase 1A.
 
 ```text
 rh-agents/
@@ -10,16 +10,19 @@ rh-agents/
 ├── backend/
 │   ├── migrations/
 │   │   ├── versions/
-│   │   │   └── 0001_foundation.py
+│   │   │   ├── 0001_foundation.py
+│   │   │   └── 0002_market_observations.py
 │   │   ├── env.py
 │   │   └── script.py.mako
 │   ├── src/
 │   │   ├── agents/
 │   │   │   ├── __init__.py
+│   │   │   ├── orbit.py
 │   │   │   └── registry.py
 │   │   ├── api/
 │   │   │   ├── __init__.py
-│   │   │   └── main.py
+│   │   │   ├── main.py
+│   │   │   └── markets.py
 │   │   ├── core/
 │   │   │   ├── __init__.py
 │   │   │   ├── clock.py
@@ -38,6 +41,13 @@ rh-agents/
 │   │   ├── ledger/
 │   │   │   ├── __init__.py
 │   │   │   └── accounting.py
+│   │   ├── markets/
+│   │   │   ├── __init__.py
+│   │   │   ├── fake.py
+│   │   │   ├── models.py
+│   │   │   ├── providers.py
+│   │   │   ├── reader.py
+│   │   │   └── recorder.py
 │   │   ├── orchestration/
 │   │   │   ├── __init__.py
 │   │   │   ├── bus.py
@@ -47,6 +57,11 @@ rh-agents/
 │   │   │   └── engine.py
 │   │   └── __init__.py
 │   ├── tests/
+│   │   ├── markets/
+│   │   │   ├── conftest.py
+│   │   │   ├── test_api.py
+│   │   │   ├── test_models.py
+│   │   │   └── test_recorder.py
 │   │   ├── __init__.py
 │   │   ├── conftest.py
 │   │   ├── test_clock.py
@@ -61,7 +76,8 @@ rh-agents/
 │   └── uv.lock
 ├── docs/
 │   ├── files.md
-│   └── phase-0.md
+│   ├── phase-0.md
+│   └── phase-1.md
 ├── frontend/
 │   ├── app/
 │   │   ├── globals.css
