@@ -138,7 +138,9 @@ async def test_concurrent_conflict_has_one_winner(recorder, market_sessions, obs
     winner = next(result for result in results if isinstance(result, MarketSnapshot))
     async with market_sessions() as session:
         assert await session.scalar(select(func.count()).select_from(Row)) == 1
-        assert (await session.get(Row, observation.id)).payload == winner.model_dump(mode="json")
+        assert (await session.get(Row, observation.id)).payload == winner.model_dump(
+            mode="json", exclude={"pair": {"pool_locator"}}
+        )
 
 
 @pytest.mark.skipif(
@@ -159,7 +161,7 @@ async def test_database_enforces_append_only(recorder, market_sessions, observat
             await session.execute(text(sql))
     async with market_sessions() as session:
         assert (await session.get(Row, observation.id)).payload == observation.model_dump(
-            mode="json"
+            mode="json", exclude={"pair": {"pool_locator"}}
         )
 
 

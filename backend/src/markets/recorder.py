@@ -28,6 +28,9 @@ class MarketRecorder:
         # Revalidate nested Python models too; model_copy can bypass validation.
         observation = MarketSnapshot.model_validate(observation.model_dump())
         payload = observation.model_dump(mode="json")
+        if observation.pair.pool_locator is None:
+            # Preserve the exact version-1 serialization for legacy replay.
+            payload["pair"].pop("pool_locator", None)
         async with self._sessions.begin() as session:
             dialect = session.get_bind().dialect.name
             insert: PGInsert | SQLiteInsert
@@ -71,15 +74,24 @@ async def record_provider(provider: MarketProvider, recorder: MarketRecorder) ->
     """One explicit ingestion pass. No polling loop, strategy, HTTP or agent code."""
     recorded = 0
     for pair in await provider.discover():
-        pair = MarketPair.model_validate(pair.model_dump())
-        if pair.provider != provider.provider or pair.is_fixture != provider.is_fixture:
-            raise ValueError("Discovery provenance does not match adapter")
-        snapshot = await provider.snapshot(pair)
-        normalized = normalize_snapshot(
-            snapshot.model_dump(), provider=provider.provider, is_fixture=provider.is_fixture
-        )
-        if normalized.pair.market_identity != pair.market_identity:
-            raise ValueError("Provider returned a different market than requested")
-        await recorder.record(normalized)
+        await record_pair(provider, pair, recorder)
         recorded += 1
     return recorded
+
+
+async def record_pair(
+    provider: MarketProvider,
+    pair: MarketPair,
+    recorder: MarketRecorder,
+) -> MarketSnapshot:
+    """Shared immutable discovery binding for one-shot and provider ingestion."""
+    pair = MarketPair.model_validate(pair.model_dump())
+    if pair.provider != provider.provider or pair.is_fixture != provider.is_fixture:
+        raise ValueError("Discovery provenance does not match adapter")
+    snapshot = await provider.snapshot(pair)
+    normalized = normalize_snapshot(
+        snapshot.model_dump(), provider=provider.provider, is_fixture=provider.is_fixture
+    )
+    if normalized.pair.market_identity != pair.market_identity:
+        raise ValueError("Provider returned a different market than requested")
+    return await recorder.record(normalized)

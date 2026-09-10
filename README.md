@@ -1,8 +1,8 @@
 # rh-agents
 
-Phase 1A market recording foundation for CryptoRoaster's autonomous multi-agent on-chain trading system, built on the Phase 0 paper executor. Agents will autonomously request trades; deterministic risk controls are mandatory and cannot be overridden. Individual trades do not require human approval.
+Phase 1B EVM market-data ingestion and recording foundation for CryptoRoaster's autonomous multi-agent on-chain trading system, built on the Phase 0 paper executor. Agents will autonomously request trades; deterministic risk controls are mandatory and cannot be overridden. Individual trades do not require human approval.
 
-**Paper only. No wallets, signing, blockchain calls, live trading, external market feed, or running LLM agents.** This repository is independent of ClawfredAI/polma-db.
+**Paper only. No wallets, signing, blockchain calls, live trading or running LLM agents.** This repository is independent of ClawfredAI/polma-db.
 
 ## Local setup (macOS)
 
@@ -16,7 +16,7 @@ brew services start postgresql@17
 export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
 pg_isready -h localhost -p 5432
 createuser -h localhost -p 5432 --login --no-superuser --no-createdb --no-createrole rh_agents
-createdb -h localhost -p 5432 --owner=rh_agents rh_agents
+createdb -h localhost -p 5432 --template=template0 --encoding=UTF8 --owner=rh_agents rh_agents
 psql -h localhost -p 5432 -U rh_agents -d rh_agents -c 'SELECT current_database(), current_user;'
 ```
 
@@ -107,7 +107,7 @@ uv run alembic upgrade head --sql
 The normal suite uses SQLite in memory for fast persistence checks and skips eight PostgreSQL locking/concurrency/trigger checks. To validate PostgreSQL row locks, create a separate disposable database once using the local PostgreSQL administrator, then run from `backend/`:
 
 ```sh
-createdb -h localhost -p 5432 --owner=rh_agents rh_agents_test
+createdb -h localhost -p 5432 --template=template0 --encoding=UTF8 --owner=rh_agents rh_agents_test
 TEST_DATABASE_URL=postgresql+asyncpg://rh_agents@localhost:5432/rh_agents_test uv run pytest -q
 ```
 
@@ -125,13 +125,36 @@ Dependencies are locked in `backend/uv.lock` and `frontend/package-lock.json`. N
 
 `.github/workflows/ci.yml` runs the backend and frontend checks on pushes and pull requests using native Ubuntu runner processes, Python 3.12, and Node.js 22. The backend job installs and starts native PostgreSQL, creates a disposable database owned by the runner's login, and uses local Unix-socket peer authentication. It verifies Alembic upgrades/schema drift, the full PostgreSQL suite, and the optional SQLite suite. The frontend job installs locked dependencies and runs typecheck, lint, formatting, and the production build.
 
-## Recorded market data (Phase 1A)
+## Recorded market data (Phase 1A/1B)
 
 `Market Provider -> normalization -> MarketRecorder -> PostgreSQL -> ORBIT input` is the new ingestion path. Immutable, versioned observations preserve exact Decimal values, provider provenance, chain/network identity, observation time and explicit UNKNOWN/unavailable values. The recorder deduplicates replay and rejects conflicting event identities; revision `0002` makes stored observations append-only.
 
-Read-only endpoints: `/api/markets`, `/api/markets/{chain-qualified-asset-or-pair}`, and `/api/market-candidates`. Results must be fresh and have known price/liquidity; fixtures are excluded unless `include_fixtures=true`. Configure API freshness through `MARKET_MAX_AGE_SECONDS` (default 60). No mutation or trading endpoint is added. The bundled provider supplies labeled deterministic fixtures only; no external feed or LLM is connected. PAPER remains the only trading-capable mode, with no live-money execution.
+Read-only endpoints: `/api/markets`, `/api/markets/{chain-qualified-asset-or-pair}`, and `/api/market-candidates`. Results must be fresh and have known price/liquidity; fixtures are excluded unless `include_fixtures=true`. Configure API freshness through `MARKET_MAX_AGE_SECONDS` (default 60). No mutation or trading endpoint is added. GeckoTerminal is the first real provider for the configured EVM target chains; deterministic fixtures remain available. No LLM is connected. PAPER remains the only trading-capable mode, with no live-money execution.
 
 See [docs/phase-1.md](docs/phase-1.md) for interfaces, semantics, security boundaries, limitations and a runnable fixture-recording example. The dashboard remains a fixture preview.
+
+## GeckoTerminal EVM ingestion (Phase 1B)
+
+**GeckoTerminal -> EVM chain mapping -> Decimal-safe transport -> provider DTO -> canonical MarketPair/MarketSnapshot -> MarketRecorder -> PostgreSQL -> ORBIT read boundary**.
+
+Targets: **Robinhood Chain mainnet (4663)** and **BNB Smart Chain mainnet (56)**. Internal chains are `robinhood` and `bsc`; provider network IDs are independently configured and verified against the public `/networks` listing each pass. Current provider mappings are `robinhood` and `bsc`, with matching CoinGecko platform identities. A missing network fails explicitly; an incomplete bounded scan reports a budget error. No fallback to another chain.
+
+From `backend/`, with native PostgreSQL and migrations applied:
+
+```sh
+uv sync --locked
+uv run alembic upgrade head
+uv run python -m src.markets.ingest --provider geckoterminal --chain bsc --once
+# Select robinhood or all for another deliberate pass; respect the public rate limit.
+```
+
+Alternatively set `MARKET_PROVIDER=geckoterminal` and `MARKET_CHAINS=robinhood,bsc` in your root `.env`, then use `--once`. Default provider stays `fixture` for normal application startup; the real-ingestion CLI requires GeckoTerminal selection. Existing fixture recording remains described in [docs/phase-1.md](docs/phase-1.md). Public ingestion needs no API key, paid-plan key, RPC URL, LLM key or executor secret. Prepared future environment values are ignored.
+
+The [public API](https://api.geckoterminal.com/docs/index.html) is beta and documents approximately **10 calls/minute**. Requests pin `Accept: application/json;version=20230203`. Defaults: at most 2 chains, 3 inspected pools per chain, 3 network-list pages, 5 logical requests, 8 total HTTP attempts including one retry, concurrency 1. Both chains share network pages. `new_pools?include=base_token,quote_token,dex&page=1` already supplies compatible measurements and explicit token addresses; no pool detail calls are made. Repeated manual passes share the provider's quota; these limits are per process/pass, not a global quota service.
+
+Pool base-token USD price, reserve USD and trailing 24-hour volume USD map directly to canonical measurements. JSON numbers are parsed with Decimal before validation; strings and numeric values retain canonical precision. Missing/null data remains UNKNOWN; explicit zero reserve/volume stays zero. Token identities use lowercase nonzero 20-byte addresses; pools carry an explicit CONTRACT_ADDRESS or BYTES32_POOL_ID locator, bound to venue. Fetch completion uses the trusted Clock; pool creation time is never freshness evidence. Recorder replay, immutable market identity binding and fail-closed latest-event filtering are preserved.
+
+No Docker or container workflows. No wallets, signing, transaction construction/broadcasting or live-money execution. No Solana or Birdeye integration. **Market observation != SENTINEL approval evidence.** Data does not generate a trade, risk PASS or executor action. The dashboard remains a labeled fixture preview.
 
 ## Paper execution integration
 
@@ -142,3 +165,21 @@ Pass fresh `marks` for other open assets. Missing safety data rejects execution.
 `RiskDecision.position_size_limit_usd` is the absolute configured position limit. `max_additional_notional_usd` is conservative additional BUY notional at the snapshot quote price, before fees and slippage. It uses the smallest of cash, remaining total exposure, and remaining position capacity, divided by the worst permitted slippage and known fee factors. It is nonnegative and rounded down to 18 decimal places, with an additional check for intermediate cost rounding. SELL decisions and decisions with non-sizing safety blockers report zero. A BUY rejected solely for sizing can still report a smaller usable capacity. This guidance never authorizes a trade: the final intent must independently pass every SENTINEL check. Historical risk payloads with the old field remain readable and replay with zero incremental guidance; immutable stored events are preserved.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the ten invariants, approval binding, accounting semantics, and future boundaries. See [docs/phase-0.md](docs/phase-0.md) for delivery verification and Phase 1 work. No commit or push is performed by setup or development commands.
+
+## Explicit pool locators and exact market precision
+
+EVM token identity remains a nonzero 20-byte address. A market can instead identify a standalone pool contract or a logical singleton pool. Immutable `PoolLocator` contains `kind` (`CONTRACT_ADDRESS` or `BYTES32_POOL_ID`), lowercase hex `value`, normalized `venue`, optional `pool_manager_address`, and explicit `manager_status` (UNKNOWN by default). Values require exactly 20 or 32 bytes according to kind; malformed hex and zero values reject. A bytes32 pool ID is not a wallet or contract address. JSON:API IDs only cross-check provider bindings; actual locators come from pool attributes.
+
+Canonical contract pool IDs are `<chain>:<network>:contract_address:<value>`. Singleton IDs are `<chain>:<network>:bytes32_pool_id:<venue>:<value>`. MarketIdentity binds only PoolLocatorIdentity (kind, value, venue), provider, chain/network, base/quote assets and fixture marker. Manager address/status are enrichable routing metadata on the observation’s pair.pool_locator, excluded from pair_id and MarketIdentity equality. UNKNOWN to known (AVAILABLE in the existing availability enum) preserves both identities and the same provider/pair/fixture stream. Enrichment is a new append-only event; changing metadata under an existing event UUID still conflicts. Different venues cannot collapse the same bytes32 value. No PoolManager is inferred from a DEX name. Within one canonical chain/network/stable venue namespace, a bytes32 pool ID is the stable logical pool identifier. If independent PoolManagers later prove to have colliding IDs under that namespace, an explicit future deployment namespace/resolution model is required. Manager discovery must never mutate identity. Existing normalized venue identifiers remain stable (for example uniswap-v4-bsc and uniswap-v4-robinhood); manager knowledge never renames their namespace. Later PULSE/ANCHOR/execution would require venue-specific resolution and the relevant PoolManager/router, outside Phase 1B.
+
+Migration `0003` widens indexed pair_id to VARCHAR(512) and permits schema versions 1 and 2. Migration `0002` is unchanged. New provider snapshots use version 2 and require a locator. Legacy version-1 observations remain readable and replayable without adding a locator key to their persisted payload or guessing their type. Downgrade to 0002 preserves compatible history and explicitly refuses incompatible version-2/long-ID rows; it never deletes or rewrites observations. Append-only triggers, concurrent idempotency and observed_at DESC -> recorded_at DESC -> id DESC rank-before-filter semantics remain intact.
+
+Market measurements use PostgreSQL **JSONB containing exact Decimal strings**, not a fixed-scale NUMERIC column. API output also uses strings. Removing the market model's former 18-place restriction therefore requires no numeric column conversion. Accounting NUMERIC(38,18) and SENTINEL contracts remain unchanged. Market bounds allow at most 100 coefficient digits (including trailing zeros), with both Decimal tuple exponent and adjusted exponent within [-1000, 1000]. Finite nonnegative values are preserved without quantization or binary floats; available prices must remain positive.
+
+JSON null and absent measurements both become UNKNOWN with value null. Numeric zero and string "0" become AVAILABLE Decimal("0") for liquidity/volume. Price zero remains UNKNOWN because a usable canonical price must be positive. Tests cover these distinctions and 19-place, 30-plus-place and scientific-notation prices through transport, DTOs, PostgreSQL, MarketReader and API. No observation constitutes SENTINEL approval evidence.
+
+### One-shot operational counters
+
+The summary prints `discovered`, `recorded`, `readable`, `unavailable`, `rejected`, `failed`, sorted safe `reasons`, and an optional pass-level `error`. Discovered counts inspected entries after recognized duplicate removal, within the configured bound. Recorded counts durable accepted writes/replays. After recording, each event is checked through the existing MarketReader boundary: readable counts that exact event still visible; unavailable counts successful writes hidden by availability/freshness/latest-event rules. Unavailable is not a provider or persistence failure. Readback errors leave the write counted as recorded and increment failed with `readback_failed`; they do not claim a successful visibility check.
+
+Rejected counts isolated malformed provider entries. Failed includes rejected entries plus pass-level provider/recording/readback failures; it is not the number of unavailable observations. `reasons` groups fixed safe error codes (for example provider_identity or provider_contract), never payloads or exception text. A provider-wide or persistence failure can abort remaining work, so discovered need not equal recorded + rejected. The CLI returns nonzero for failures, including partial rejected results; successful unavailable observations alone do not cause a failure exit. Public request bounds remain unchanged.

@@ -25,7 +25,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             async with engine.connect() as connection:
                 revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
-                if revision != "0002":
+                if revision != "0003":
                     raise HTTPException(status_code=503, detail="Database migration is not current")
         except (SQLAlchemyError, OSError) as error:
             raise HTTPException(

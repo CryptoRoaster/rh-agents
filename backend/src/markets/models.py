@@ -1,12 +1,20 @@
 """Normalized observations, distinct from SENTINEL's execution evidence contracts."""
 
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from pydantic import AwareDatetime, BeforeValidator, Field, model_validator
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    BeforeValidator,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from src.core.models import Contract
 
@@ -17,10 +25,25 @@ def exact_number(value: object) -> object:
     return value
 
 
+def market_decimal_bounds(value: Decimal) -> Decimal:
+    parts = value.as_tuple()
+    if (
+        not isinstance(parts.exponent, int)
+        or len(parts.digits) > 100
+        or abs(parts.exponent) > 1000
+        or abs(value.adjusted()) > 1000
+    ):
+        raise ValueError(
+            "Market amounts require at most 100 coefficient digits and exponent within ±1000"
+        )
+    return value
+
+
 Amount = Annotated[
     Decimal,
     BeforeValidator(exact_number),
-    Field(ge=0, allow_inf_nan=False, max_digits=38, decimal_places=18),
+    Field(ge=0, allow_inf_nan=False),
+    AfterValidator(market_decimal_bounds),
 ]
 Name = Annotated[str, Field(min_length=1, max_length=200, pattern=r"^\S+$")]
 Namespace = Annotated[str, Field(min_length=1, max_length=60, pattern=r"^[a-zA-Z0-9_-]+$")]
@@ -30,6 +53,70 @@ class Availability(StrEnum):
     AVAILABLE = "AVAILABLE"
     UNKNOWN = "UNKNOWN"
     UNAVAILABLE = "UNAVAILABLE"
+
+
+PairId = Annotated[str, Field(strict=True, min_length=1, max_length=512, pattern=r"^\S+$")]
+Venue = Annotated[str, Field(strict=True, min_length=1, max_length=80, pattern=r"^[a-z0-9_-]+$")]
+
+
+class PoolLocatorKind(StrEnum):
+    CONTRACT_ADDRESS = "CONTRACT_ADDRESS"
+    BYTES32_POOL_ID = "BYTES32_POOL_ID"
+
+
+class PoolLocatorIdentity(Contract):
+    """Stable coordinates only. Manager resolution never participates in identity."""
+
+    kind: PoolLocatorKind
+    value: str = Field(strict=True)
+    venue: Venue
+
+    @field_validator("value")
+    @classmethod
+    def lowercase_hex(cls, value: str) -> str:
+        return value.lower()
+
+    @model_validator(mode="after")
+    def valid_locator(self) -> Self:
+        length = 40 if self.kind == PoolLocatorKind.CONTRACT_ADDRESS else 64
+        if (
+            re.fullmatch(rf"0x[0-9a-f]{{{length}}}", self.value) is None
+            or int(self.value[2:], 16) == 0
+        ):
+            raise ValueError("Invalid nonzero pool locator")
+        return self
+
+    def pair_id(self, chain: str, network: str) -> str:
+        if self.kind == PoolLocatorKind.CONTRACT_ADDRESS:
+            return f"{chain}:{network}:contract_address:{self.value}"
+        return f"{chain}:{network}:bytes32_pool_id:{self.venue}:{self.value}"
+
+
+class PoolLocator(PoolLocatorIdentity):
+    """Locator plus enrichable routing metadata, persisted per observation."""
+
+    pool_manager_address: str | None = Field(default=None, strict=True)
+    manager_status: Availability = Availability.UNKNOWN
+
+    @field_validator("pool_manager_address")
+    @classmethod
+    def lowercase_manager(cls, value: str | None) -> str | None:
+        return value.lower() if value is not None else None
+
+    @model_validator(mode="after")
+    def valid_resolution(self) -> Self:
+        manager = self.pool_manager_address
+        if manager is not None and (
+            re.fullmatch(r"0x[0-9a-f]{40}", manager) is None or int(manager[2:], 16) == 0
+        ):
+            raise ValueError("Invalid pool manager address")
+        if (self.manager_status == Availability.AVAILABLE) != (manager is not None):
+            raise ValueError("Manager availability must match independently known address")
+        return self
+
+    @property
+    def identity(self) -> PoolLocatorIdentity:
+        return PoolLocatorIdentity(kind=self.kind, value=self.value, venue=self.venue)
 
 
 class Observation(Contract):
@@ -69,18 +156,20 @@ class MarketIdentity(Contract):
     provider: Name
     chain: Namespace
     network: Namespace
-    pair_id: Name
+    pair_id: PairId
     base_asset_id: Name
     quote_asset_id: Name
     venue: Name
+    pool_locator: PoolLocatorIdentity | None = None
     is_fixture: bool = Field(strict=True)
 
 
 class MarketPair(Observation):
-    pair_id: Name
+    pair_id: PairId
     base: AssetIdentity
     quote: AssetIdentity
     venue: Name
+    pool_locator: PoolLocator | None = None
 
     @property
     def market_identity(self) -> MarketIdentity:
@@ -92,6 +181,7 @@ class MarketPair(Observation):
             base_asset_id=self.base.asset_id,
             quote_asset_id=self.quote.asset_id,
             venue=self.venue,
+            pool_locator=self.pool_locator.identity if self.pool_locator is not None else None,
             is_fixture=self.is_fixture,
         )
 
@@ -102,6 +192,11 @@ class MarketPair(Observation):
             raise ValueError("pair_id must be chain:network:pair")
         if self.asset_id != self.base.asset_id or self.base.asset_id == self.quote.asset_id:
             raise ValueError("Pair must identify distinct base and quote assets")
+        if self.pool_locator is not None and (
+            self.pool_locator.venue != self.venue
+            or self.pool_locator.pair_id(self.chain, self.network) != self.pair_id
+        ):
+            raise ValueError("Pool locator must bind canonical pair identity and venue")
         for asset in (self.base, self.quote):
             same_provenance(self, asset, same_asset=False)
         return self
@@ -145,7 +240,7 @@ def same_provenance(parent: Observation, child: Observation, *, same_asset: bool
 
 
 class MarketSnapshot(Observation):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     pair: MarketPair
     price: PriceSnapshot
     liquidity: LiquiditySnapshot
@@ -153,6 +248,8 @@ class MarketSnapshot(Observation):
 
     @model_validator(mode="after")
     def consistent_observation(self) -> Self:
+        if self.schema_version == 2 and self.pair.pool_locator is None:
+            raise ValueError("Version 2 requires an explicit pool locator")
         for child in (self.pair, self.price, self.liquidity, self.volume):
             same_provenance(self, child)
         return self
@@ -181,7 +278,7 @@ class MarketSnapshot(Observation):
 
 
 class MarketCandidate(Observation):
-    pair_id: Name
+    pair_id: PairId
     snapshot_id: UUID
 
     # A recorded-data reference, not a recommendation or tradability assertion.

@@ -1,0 +1,65 @@
+{
+  "data": [
+    {
+      "id": "bsc_0xcccccccccccccccccccccccccccccccccccccccc",
+      "type": "pool",
+      "attributes": {
+        "address": "0xcccccccccccccccccccccccccccccccccccccccc",
+        "name": "TEST / QUOTE",
+        "base_token_price_usd": "123.123456789012345678",
+        "reserve_in_usd": "123456.123456789012345678",
+        "volume_usd": {
+          "h24": "654321.987654321098765432"
+        },
+        "pool_created_at": "2024-01-01T00:00:00Z"
+      },
+      "relationships": {
+        "base_token": {
+          "data": {
+            "type": "token",
+            "id": "bsc_0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        },
+        "quote_token": {
+          "data": {
+            "type": "token",
+            "id": "bsc_0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        },
+        "dex": {
+          "data": {
+            "id": "fixture-dex",
+            "type": "dex"
+          }
+        }
+      }
+    }
+  ],
+  "included": [
+    {
+      "id": "bsc_0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "type": "token",
+      "attributes": {
+        "address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "symbol": "TEST",
+        "decimals": 18
+      }
+    },
+    {
+      "id": "bsc_0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "type": "token",
+      "attributes": {
+        "address": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "symbol": "QUOTE",
+        "decimals": 18
+      }
+    },
+    {
+      "type": "dex",
+      "id": "fixture-dex",
+      "attributes": {
+        "name": "Contract Fixture DEX"
+      }
+    }
+  ]
+}
