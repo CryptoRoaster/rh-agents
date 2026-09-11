@@ -100,6 +100,7 @@ def holder_facts(
     observation_basis=HolderObservationBasis.SOURCE_BLOCK,
     snapshot_block=1_000_000,
     holder_block_delta=0,
+    excluded_addresses=(),
 ) -> HolderFacts:
     if status != Availability.AVAILABLE:
         return HolderFacts(status=status, failure=failure, source="test-indexer")
@@ -109,6 +110,7 @@ def holder_facts(
         observed_at=observed_at or now,
         observation_basis=observation_basis,
         completeness=completeness,
+        excluded_addresses=excluded_addresses,
         snapshot_block=snapshot_block,
         holder_block_delta=holder_block_delta,
         holder_count=4200,

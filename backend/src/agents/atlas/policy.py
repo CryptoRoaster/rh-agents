@@ -43,6 +43,11 @@ class AtlasPolicy:
     # None disables the threshold blocker while still measuring the metric. A
     # concentration limit is a product decision with real financial meaning, so
     # an invented number would be worse than an explicit absence.
+    #
+    # Enabling one is not only choosing a number. A threshold must know which
+    # source exclusions the metric carries and whether they were reconciled; it
+    # may never assume the holder set was unfiltered. That is enforced in
+    # ``_data_gaps`` rather than left to whoever sets the field.
     max_top10_concentration: Decimal | None
     block_on_proxy_admin: bool
     # Which holder-coverage proofs are good enough to measure a top-ten share.
@@ -166,6 +171,22 @@ def _data_gaps(
     ):
         # An answer arrived, but not one the metric can be computed from. Policy
         # names the minimum facts explicitly rather than trusting a status flag.
+        gaps.append(AtlasReasonCode.HOLDER_FACTS_UNAVAILABLE)
+    if (
+        policy.max_top10_concentration is not None
+        and snapshot.holders.status == Availability.AVAILABLE
+        and snapshot.holders.excluded_addresses
+    ):
+        # A threshold judges a distribution, so it may only judge one that
+        # actually covers it. Every exclusion a provider applies removes supply
+        # from the numerator while the denominator stays full on-chain supply,
+        # so the metric can only ever *understate* concentration — and an
+        # understated metric silently passing a limit is the one failure mode a
+        # limit exists to prevent. Nothing reconciles an exclusion today, so any
+        # exclusion is an unreconciled one and the case becomes insufficient
+        # rather than clear. A blocker still fires on the same metric, because
+        # exceeding a limit on an understated figure means the true figure
+        # exceeds it too.
         gaps.append(AtlasReasonCode.HOLDER_FACTS_UNAVAILABLE)
     return gaps
 

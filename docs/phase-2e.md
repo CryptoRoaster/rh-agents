@@ -347,6 +347,28 @@ established, fresh and internally consistent, and no configured deterministic
 blocker fired. It is not a claim that the token is economically safe, and a
 switched-off threshold must never be read as a passed one.
 
+### What a future threshold must satisfy
+
+Enabling a limit is not only choosing a number. The metric it judges must declare
+which source exclusions it carries and whether they were reconciled, because
+every provider exclusion removes supply from the numerator while the denominator
+stays full on-chain supply — so an excluded holder set can only ever
+**understate** concentration. An understated figure read as a pass is precisely
+the failure a limit exists to prevent.
+
+This is enforced, not left to whoever sets the field. While
+`max_top10_concentration` is `None` nothing decides on the metric and a filtered
+set is simply measured and recorded. The moment a threshold is configured,
+holder facts carrying any `excluded_addresses` yield
+`HOLDER_FACTS_UNAVAILABLE` — insufficient data rather than a clear verdict —
+because nothing reconciles an exclusion today, so every exclusion is an
+unreconciled one. A blocker still fires on the same metric, since exceeding a
+limit on an understated figure means the true figure exceeds it too.
+
+Reconciling an exclusion — reading `balanceOf(0x0)` at the pinned block and
+adding it back — is deliberately **not** implemented here. Until it is, no
+threshold may assume `excluded_addresses` is empty when it is not.
+
 ## Contract origin
 
 `OriginFacts` now carries the creation transaction, the factory address when the
