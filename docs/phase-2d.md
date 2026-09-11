@@ -88,6 +88,12 @@ function of the stored payload.
 * **OriginFacts** — creator address, creation block and transaction.
 
 Every group carries `status` and, when unavailable, a typed `AtlasSourceFailure`.
+
+The snapshot digest covers the normalized facts and their provenance — including
+block number and block timestamp — but not the moment of collection, so an
+unchanged chain state hashes identically across passes. That is safe precisely
+because freshness is enforced separately from observation time and cannot be
+reset by re-collecting.
 Model validators enforce the pairing: available facts cannot carry a failure, and
 unavailable facts cannot carry observations. Supply is kept as an exact integer
 alongside decimals; no value passes through a float.
@@ -138,6 +144,20 @@ prompt text and never chosen by a model.
   discovery window or from SENTINEL.
 * Maximum source skew: 5 minutes. Facts from different sources are never atomic,
   so the spread is measured rather than assumed away.
+
+### Freshness is anchored to observation, not to collection
+
+Age is measured from `oldest_source_observation` — the earliest moment any
+contributing source actually observed reality — and never from when the
+collector ran. For contract facts that is the **block timestamp**: a block mined
+twenty minutes ago is twenty minutes old however recently it was read. For
+provider facts it is the provider's own observation time.
+
+This matters because the obvious implementation is wrong. If freshness were
+anchored to collection time, a provider that keeps returning its 10:00 snapshot
+would look fresh at 10:20 simply because the collector ran again. Re-fetching is
+not evidence that the world moved. One current source also never rescues a stale
+one: the oldest observation decides.
 * Hard blockers: chain-ID mismatch, absent contract code, an available zero total
   supply, and — when configured — excess holder concentration or a present proxy
   admin.

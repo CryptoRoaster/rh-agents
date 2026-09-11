@@ -74,13 +74,15 @@ def _data_gaps(
     snapshot: AtlasOnchainSnapshot, now: datetime, policy: AtlasPolicy
 ) -> list[AtlasReasonCode]:
     gaps: list[AtlasReasonCode] = []
-    age = now - snapshot.collected_at
+    # Anchored to when the sources observed reality, not to when the collector
+    # ran. Re-fetching an unchanged provider snapshot cannot renew its freshness.
+    age = now - snapshot.oldest_source_observation
     if age < timedelta(0) or age > policy.snapshot_validity:
         gaps.append(AtlasReasonCode.SNAPSHOT_STALE)
     # Facts read from different sources are never atomic. Measure the spread
-    # rather than pretending the snapshot was taken at one instant.
+    # between the observations themselves, again not between fetches.
     if snapshot.holders.observed_at is not None:
-        skew = abs(snapshot.chain.observed_at - snapshot.holders.observed_at)
+        skew = abs(snapshot.chain.block_timestamp - snapshot.holders.observed_at)
         if skew > policy.max_source_skew:
             gaps.append(AtlasReasonCode.SNAPSHOT_SKEW_EXCEEDED)
     for domain in sorted(policy.required_domains, key=lambda item: item.value):

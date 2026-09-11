@@ -180,7 +180,7 @@ def snapshot_document(snapshot: AtlasOnchainSnapshot) -> dict[str, object]:
         "network": snapshot.chain.network,
         "chain_id": snapshot.chain.chain_id,
         "block_number": snapshot.chain.block_number,
-        "block_observed_at": snapshot.chain.observed_at.isoformat(),
+        "block_timestamp": snapshot.chain.block_timestamp.isoformat(),
         "contract": {
             **_measurement(contract.status, contract.failure),
             "source": contract.source,

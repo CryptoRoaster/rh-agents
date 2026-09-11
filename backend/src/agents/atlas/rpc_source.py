@@ -11,7 +11,7 @@ consistent rather than assembled across a moving chain.
 """
 
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 
 from src.agents.atlas.models import (
     AtlasSourceFailure,
@@ -71,6 +71,10 @@ class RpcTokenContractSource:
             chain_id=chain_id,
             block_number=block.number,
             block_hash=block.hash if block.hash.startswith("0x") else None,
+            # Chain time, which is what "how current is this" actually means. A
+            # block mined twenty minutes ago is twenty minutes old however
+            # recently we asked for it.
+            block_timestamp=datetime.fromtimestamp(block.timestamp, UTC),
             observed_at=self.clock.now().astimezone(UTC),
             source=self.source,
         )

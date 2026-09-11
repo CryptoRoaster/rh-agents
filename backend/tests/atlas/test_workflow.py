@@ -18,6 +18,7 @@ from src.agents.atlas.unavailable import UnconfiguredHolderSource, UnconfiguredO
 from src.core.clock import FixedClock
 from src.core.models import AgentRole, RiskDecision, RiskMetrics, RiskOutcome
 from src.markets.models import Availability
+from src.orchestration.worker.capabilities import AtlasCapabilities
 from src.orchestration.worker.models import (
     TaskAttemptOutcome,
     WorkerErrorCode,
@@ -233,9 +234,7 @@ async def test_new_atlas_evidence_invalidates_a_prior_risk_authorization(worker_
     lease = _lease_for(refreshed, later, trace)
     report = await handler.handle(
         lease,
-        __import__(
-            "src.orchestration.worker.capabilities", fromlist=["AtlasCapabilities"]
-        ).AtlasCapabilities(lease=lease, context=_Fixed(refreshed), submit=_NoSubmit()),
+        AtlasCapabilities(lease=lease, context=_Fixed(refreshed), submit=_NoSubmit()),
     )
     await later_runtime.cases.record_evidence(trade_case.id, report.submission)
 
@@ -468,3 +467,46 @@ def _lease_for(task_input: AtlasTaskInput, now, trace):
         renewals=0,
         correlation_id=trace,
     )
+
+
+async def test_atlas_supersession_also_invalidates_a_limited_authorization(worker_db, now, trace):
+    """RISK_LIMITED is an authorization too, and safety evidence changing revokes it."""
+    _, sessions = worker_db
+    runtime, reader = build_stack(sessions, now)
+    trade_case = await open_atlas_case(runtime.cases, now, trace, "atlas-limited")
+    await run_atlas(runtime, reader, "atlas-limited-worker")
+
+    cases = runtime.cases
+    await _complete_remaining_evidence(cases, trade_case, now, trace)
+    ready = await cases.get_trade_case(trade_case.id)
+    assert ready.status == TradeCaseStatus.READY_FOR_RISK
+
+    # A resizable sizing-only rejection with bounded capacity: LIMITED, not APPROVED.
+    limited_decision = _risk_decision(ready, now).model_copy(
+        update={
+            "outcome": RiskOutcome.REJECT,
+            "reason_codes": ("MAX_POSITION_SIZE",),
+            "max_additional_notional_usd": Decimal("137.125"),
+        }
+    )
+    limited = await cases.record_risk_decision(
+        trade_case.id, limited_decision, risk_input_digest=ready.risk_input_digest
+    )
+    assert limited.status == TradeCaseStatus.RISK_LIMITED
+    before_digest = limited.risk_input_digest
+
+    later = now + timedelta(minutes=1)
+    later_runtime, later_reader = build_stack(
+        sessions, later, contract=contract_facts(code_present=False)
+    )
+    refreshed = await later_reader.onchain_context(trade_case.id, uuid4())
+    handler = AtlasWorkerHandler(clock=FixedClock(later))
+    lease = _lease_for(refreshed, later, trace)
+    report = await handler.handle(
+        lease, AtlasCapabilities(lease=lease, context=_Fixed(refreshed), submit=_NoSubmit())
+    )
+    await later_runtime.cases.record_evidence(trade_case.id, report.submission)
+
+    revoked = await later_runtime.cases.get_trade_case(trade_case.id)
+    assert revoked.status == TradeCaseStatus.BLOCKED
+    assert revoked.risk_input_digest != before_digest

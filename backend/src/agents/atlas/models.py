@@ -13,6 +13,7 @@ fact that blocks; an unobtainable fact is insufficient data that also blocks,
 for a different reason and with a different remedy.
 """
 
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal, Self
@@ -127,13 +128,19 @@ RISK_BLOCKER_REASONS = frozenset(
 
 
 class ChainSnapshot(Immutable):
-    """Which chain and block the contract facts were read against."""
+    """Which chain and block the contract facts were read against.
+
+    ``block_timestamp`` is chain time and is what freshness is judged by.
+    ``observed_at`` records when we happened to fetch it, which is useful for
+    audit but must never be mistaken for how current the data is.
+    """
 
     chain: Identifier
     network: Identifier
     chain_id: int = Field(gt=0)
     block_number: int = Field(ge=0)
     block_hash: Hash32 | None = None
+    block_timestamp: AwareDatetime
     observed_at: AwareDatetime
     source: Identifier
 
@@ -268,6 +275,20 @@ class AtlasOnchainSnapshot(Immutable):
         if self.chain.chain != self.market.chain or self.chain.network != self.market.network:
             raise ValueError("Snapshot chain must match the TradeCase market identity")
         return self
+
+    @property
+    def oldest_source_observation(self) -> datetime:
+        """The oldest moment any contributing source actually observed reality.
+
+        Freshness is anchored here, never to ``collected_at``. Re-running the
+        collector against an unchanged provider snapshot must not make old data
+        look new, so the time we fetched something is deliberately not part of
+        this answer.
+        """
+        observations = [self.chain.block_timestamp]
+        if self.holders.observed_at is not None:
+            observations.append(self.holders.observed_at)
+        return min(observations)
 
     def availability(self, domain: AtlasDomain) -> Availability:
         return {

@@ -236,3 +236,83 @@ def test_invalid_policies_are_rejected():
         }
         with pytest.raises(ValueError):
             AtlasPolicy(**{**base, field: value})
+
+
+# ------------------------------------------------- freshness cannot be refetched
+
+
+def test_refetching_an_unchanged_snapshot_does_not_renew_its_freshness(now):
+    """The collector running again is not evidence that the world moved.
+
+    A provider that keeps returning its 10:00 snapshot is still describing 10:00,
+    no matter how recently it was asked.
+    """
+    old_observation = now - timedelta(minutes=30)
+    stale = snapshot(
+        now,
+        chain=chain_snapshot(now, block_timestamp=old_observation, fetched_at=now),
+        holders=holder_facts(now, observed_at=old_observation),
+        # The collector ran just now, which must not matter.
+        collected_at=now,
+    )
+    decision = evaluate_snapshot(stale, now)
+    assert decision.verdict == AtlasVerdict.INSUFFICIENT_DATA
+    assert AtlasReasonCode.SNAPSHOT_STALE in decision.data_gaps
+
+
+def test_freshness_follows_chain_time_not_fetch_time(now):
+    """A block mined long ago is old however recently it was read."""
+    old_block = snapshot(
+        now,
+        chain=chain_snapshot(now, block_timestamp=now - timedelta(minutes=20), fetched_at=now),
+        holders=holder_facts(now, observed_at=now - timedelta(minutes=20)),
+    )
+    assert AtlasReasonCode.SNAPSHOT_STALE in evaluate_snapshot(old_block, now).data_gaps
+
+    fresh_block = snapshot(
+        now,
+        chain=chain_snapshot(now, block_timestamp=now - timedelta(minutes=2)),
+        holders=holder_facts(now, observed_at=now - timedelta(minutes=2)),
+    )
+    assert evaluate_snapshot(fresh_block, now).verdict == AtlasVerdict.CLEAR
+
+
+def test_the_oldest_contributing_source_decides(now):
+    """One current source does not rescue another that is out of date."""
+    mixed = snapshot(
+        now,
+        chain=chain_snapshot(now, block_timestamp=now),
+        holders=holder_facts(now, observed_at=now - timedelta(minutes=30)),
+    )
+    assert mixed.oldest_source_observation == now - timedelta(minutes=30)
+    decision = evaluate_snapshot(mixed, now)
+    assert decision.verdict == AtlasVerdict.INSUFFICIENT_DATA
+
+
+# ----------------------------------------------- factual truth under a blocker
+
+
+def test_a_blocker_never_erases_the_record_of_a_missing_fact(now):
+    """Precedence applies to the decision, not to what the snapshot says happened.
+
+    An operator must still be able to see both that the contract is broken and
+    that holder data was never obtained.
+    """
+    mixed = snapshot(
+        now,
+        contract=contract_facts(code_present=False),
+        holders=holder_facts(
+            now, status=Availability.UNAVAILABLE, failure=AtlasSourceFailure.NOT_CONFIGURED
+        ),
+    )
+    decision = evaluate_snapshot(mixed, now)
+    assert decision.verdict == AtlasVerdict.BLOCKED
+    # The known violation is reported...
+    assert AtlasReasonCode.CONTRACT_CODE_ABSENT in decision.blockers
+    # ...and the unresolved required fact is still recorded, not discarded.
+    assert AtlasReasonCode.HOLDER_SOURCE_NOT_CONFIGURED in decision.data_gaps
+    assert decision.domain_status["HOLDERS"] == Availability.UNAVAILABLE.value
+    assert decision.domain_status["CONTRACT"] == Availability.AVAILABLE.value
+    # Nothing anywhere claims the holder domain was available.
+    assert mixed.holders.top1_share is None
+    assert mixed.holders.failure == AtlasSourceFailure.NOT_CONFIGURED

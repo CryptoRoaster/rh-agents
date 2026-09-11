@@ -350,7 +350,7 @@ def test_the_model_only_ever_sees_bounded_facts(now):
         "network",
         "chain_id",
         "block_number",
-        "block_observed_at",
+        "block_timestamp",
         "contract",
         "holders",
         "origin",

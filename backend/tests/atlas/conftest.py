@@ -40,13 +40,16 @@ def market_identity(chain: str = "robinhood", network: str = "mainnet") -> Marke
     )
 
 
-def chain_snapshot(now, *, chain="robinhood", chain_id=4663, block=1_000_000) -> ChainSnapshot:
+def chain_snapshot(
+    now, *, chain="robinhood", chain_id=4663, block=1_000_000, block_timestamp=None, fetched_at=None
+) -> ChainSnapshot:
     return ChainSnapshot(
         chain=chain,
         network="mainnet",
         chain_id=chain_id,
         block_number=block,
-        observed_at=now,
+        block_timestamp=block_timestamp or now,
+        observed_at=fetched_at or now,
         source="evm-rpc",
     )
 
