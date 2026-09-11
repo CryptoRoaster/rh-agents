@@ -67,6 +67,14 @@ Workers are untrusted for authorization. They receive role-composed capabilities
 
 Evidence recording, task completion and deterministic evaluation commit in one transaction, so a crash leaves neither a successful task without evidence nor evidence without completion. Leases expire, heartbeats extend only their own lease within a budget, bounded sweeps reclaim abandoned work, and typed failure categories drive deterministic bounded retries with durable backoff. Public `/api/workers` routes are GET-only; claim, heartbeat and completion stay internal. The runtime is disabled by default and no reasoning worker exists. See [Phase 2B worker runtime details](docs/phase-2b.md).
 
+## Phase 2C ORBIT specialist worker
+
+ORBIT is the first real specialist and the reference for every later LLM worker. It reasons over one purpose-built market view and produces typed `DISCOVERY_EVIDENCE`; it never says buy, sell, execute or approve, and its output schema cannot express a side, size, route or slippage allowance. A strong ORBIT opinion is not a risk authorization and bypasses nothing.
+
+Reasoning happens behind a narrow provider-neutral port: typed input, typed output, bounded timeout, typed error categories, and no tool, network, filesystem or credential surface. A deterministic scripted provider drives every automated test; the Anthropic adapter is infrastructure, disabled by default, and its key is a `SecretStr` that never reaches a log, an API route or evidence. Phase 2B owns authoritative retries, so the adapter keeps only a single transport retry.
+
+Model output is untrusted. Schema parsing proves the shape, then a semantic validator proves the content agrees with the input: invented observation references, the wrong market or chain, a value claimed for an unobserved measurement, or an absence claimed for an observed one are all invalid results that never become evidence. Instructions and market data travel in separate channels, so hostile token metadata stays quoted data. Zero and UNKNOWN remain different facts end to end, and money never passes through a float. Provenance records the input digest, prompt version and hash, provider and model — never a key, raw vendor response or chain-of-thought. Phase 2C adds no migration. See [Phase 2C ORBIT details](docs/phase-2c.md).
+
 ## Typed asynchronous contracts
 
 Pydantic contracts reject extra fields and nonfinite amounts. Records carry UUIDs, timezone-aware timestamps, source, and correlation IDs. Decisions use discriminated observation/setup/intent payloads. SENTINEL, LEDGER, and EXECUTOR are deliberately excluded from the LLM role enum. FUSE and COMMANDER may propose intents; proposal traces must match.

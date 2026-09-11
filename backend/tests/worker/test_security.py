@@ -189,7 +189,7 @@ def fake_lease(role, now, trace):
 
 
 ROLE_PORT = {
-    AgentRole.ORBIT: ("markets", {"markets", "lease", "submit"}),
+    AgentRole.ORBIT: ("context", {"context", "lease", "submit"}),
     AgentRole.ATLAS: ("onchain", {"onchain", "lease", "submit"}),
     AgentRole.SIGNAL: ("sentiment", {"sentiment", "lease", "submit"}),
     AgentRole.VECTOR: ("history", {"history", "lease", "submit"}),

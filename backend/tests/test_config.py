@@ -66,3 +66,68 @@ def test_invalid_runtime_database_url_is_rejected(url):
 )
 def test_supported_runtime_database_urls_are_preserved(url):
     assert Settings(_env_file=None, database_url=url).database_url == url
+
+
+# ------------------------------------------------- reasoning activation semantics
+
+DATABASE = "postgresql+asyncpg://test_user@localhost/test_database"
+
+
+def settings(monkeypatch, **env: str) -> Settings:
+    monkeypatch.setenv("DATABASE_URL", DATABASE)
+    for name in (
+        "REASONING_PROVIDER",
+        "ANTHROPIC_API_KEY",
+        "ORBIT_WORKER_ENABLED",
+        "REASONING_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    return Settings(_env_file=None)
+
+
+def test_reasoning_and_orbit_are_disabled_by_default(monkeypatch):
+    configured = settings(monkeypatch)
+    assert configured.reasoning_provider == "disabled"
+    assert configured.orbit_worker_enabled is False
+    assert configured.anthropic_api_key.get_secret_value() == ""
+
+
+def test_an_ambient_api_key_alone_activates_nothing(monkeypatch):
+    """A machine may hold ANTHROPIC_API_KEY for entirely unrelated purposes.
+
+    Credential presence is not consent to spend, so it must never be the thing
+    that turns reasoning on.
+    """
+    configured = settings(monkeypatch, ANTHROPIC_API_KEY="sk-ant-unrelated-machine-key")
+    assert configured.reasoning_provider == "disabled"
+    assert configured.orbit_worker_enabled is False
+
+
+def test_a_real_provider_must_be_chosen_and_credentialed(monkeypatch):
+    with pytest.raises(ValidationError):
+        settings(monkeypatch, REASONING_PROVIDER="anthropic")
+    chosen = settings(
+        monkeypatch, REASONING_PROVIDER="anthropic", ANTHROPIC_API_KEY="sk-ant-explicit"
+    )
+    assert chosen.reasoning_provider == "anthropic"
+    # Choosing a provider still does not start ORBIT.
+    assert chosen.orbit_worker_enabled is False
+
+
+def test_enabling_orbit_without_a_provider_fails_loudly(monkeypatch):
+    with pytest.raises(ValidationError):
+        settings(monkeypatch, ORBIT_WORKER_ENABLED="true")
+    enabled = settings(monkeypatch, ORBIT_WORKER_ENABLED="true", REASONING_PROVIDER="fake")
+    assert enabled.orbit_worker_enabled is True
+
+
+def test_the_model_identifier_is_configured_never_latest(monkeypatch):
+    configured = settings(monkeypatch)
+    assert configured.reasoning_model == "claude-opus-5"
+    assert "latest" not in configured.reasoning_model
+    assert settings(monkeypatch, REASONING_MODEL="claude-sonnet-5").reasoning_model == (
+        "claude-sonnet-5"
+    )

@@ -280,8 +280,14 @@ async def test_open_is_idempotent_and_creates_team_tasks(workflow_service, now, 
     assert first.status == TradeCaseStatus.EVIDENCE_PENDING
     tasks = await workflow_service.tasks(first.id)
     assert {task.role for task in tasks} == set(AgentRole)
+    # ORBIT verifies the candidate the case was opened from, so its task is real
+    # claimable work; only COMMANDER's open step is complete on arrival.
     assert (
         next(task for task in tasks if task.role == AgentRole.ORBIT).status
+        == SpecialistTaskStatus.PENDING
+    )
+    assert (
+        next(task for task in tasks if task.role == AgentRole.COMMANDER).status
         == SpecialistTaskStatus.SUCCEEDED
     )
     assert next(task for task in tasks if task.role == AgentRole.FUSE).required is False

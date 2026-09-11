@@ -225,3 +225,28 @@ Read-only observability lives at `/api/worker-runtime`, `/api/workers` and
 `/api/worker-attempts`. There is no public claim, heartbeat or completion route.
 `WORKER_RUNTIME_ENABLED` is `false` by default and no reasoning worker, model
 provider or prompt is included. See [the Phase 2B runtime and capability model](docs/phase-2b.md).
+
+## Phase 2C ORBIT specialist worker
+
+ORBIT is the first real specialist worker and the reference implementation for the
+rest of the team. It claims ORBIT tasks through the Phase 2B runtime, reads one
+purpose-built view of the recorded market candidate, reasons over it behind a
+provider-neutral structured-reasoning port, and submits typed `DISCOVERY_EVIDENCE`.
+It has no session, RPC client, HTTP client, signer, executor, ledger write or
+SENTINEL access, and no generic tool surface.
+
+Discovery is not trade authority: the output schema cannot express a side, size,
+route or approval, and the deterministic workflow alone decides what the evidence
+means. Model output is validated against the input it was given, so invented
+observation references, the wrong market, or a value claimed for an unobserved
+measurement are rejected rather than recorded. Zero and UNKNOWN stay different
+facts, instructions and market data travel in separate channels so hostile token
+metadata stays quoted data, and no API key, raw vendor response or model reasoning
+transcript is ever persisted.
+
+Every automated test uses a deterministic offline provider. `REASONING_PROVIDER` is
+`disabled` and `ORBIT_WORKER_ENABLED` is `false` by default, and an ambient
+`ANTHROPIC_API_KEY` activates nothing on its own. Phase 2C ships no worker
+launcher either, so even a fully configured environment cannot make a paid call
+without new code. Phase 2C adds no migration. See
+[the ORBIT reference implementation](docs/phase-2c.md).

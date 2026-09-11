@@ -16,10 +16,10 @@ from src.orchestration.worker.capabilities import (
     AnchorCapabilities,
     AtlasCapabilities,
     CommanderCapabilities,
+    DiscoveryContextPort,
     EvidenceSubmissionPort,
     ExecutionAssessmentPort,
     FuseCapabilities,
-    MarketDiscoveryPort,
     MarketHistoryPort,
     OnchainIntelligencePort,
     OrbitCapabilities,
@@ -110,7 +110,7 @@ class CapabilityProvider:
     """
 
     service: WorkerRuntimeService
-    markets: MarketDiscoveryPort | None = None
+    context: DiscoveryContextPort | None = None
     onchain: OnchainIntelligencePort | None = None
     sentiment: SentimentPort | None = None
     history: MarketHistoryPort | None = None
@@ -122,8 +122,8 @@ class CapabilityProvider:
     def build(self, lease: TaskLease) -> object:
         submit: EvidenceSubmissionPort = BoundEvidenceSubmission(lease, self.service)
         match lease.role:
-            case AgentRole.ORBIT if self.markets is not None:
-                return OrbitCapabilities(lease=lease, markets=self.markets, submit=submit)
+            case AgentRole.ORBIT if self.context is not None:
+                return OrbitCapabilities(lease=lease, context=self.context, submit=submit)
             case AgentRole.ATLAS if self.onchain is not None:
                 return AtlasCapabilities(lease=lease, onchain=self.onchain, submit=submit)
             case AgentRole.SIGNAL if self.sentiment is not None:
