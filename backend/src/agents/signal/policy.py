@@ -116,12 +116,14 @@ SIGNAL_QUALITY_V1 = SignalQualityPolicy(
     top1_author_share_severe=Decimal("0.50"),
     top5_author_share_elevated=Decimal("0.80"),
     burst_share_elevated=Decimal("0.50"),
-    # A symbol with resolvable context is admissible but weaker, and is counted
-    # separately so a set that rests entirely on it cannot look strongly bound.
+    # An unscoped address and a symbol with resolvable context are both
+    # admissible and both weak, counted separately so a set that rests entirely
+    # on them cannot look strongly bound.
     admissible_bases=frozenset(
         {
             MarketBindingBasis.CONTRACT_ADDRESS_EXACT,
             MarketBindingBasis.VERIFIED_PROJECT_LINK,
+            MarketBindingBasis.CONTRACT_ADDRESS_UNSCOPED,
             MarketBindingBasis.UNIQUE_SYMBOL_WITH_CONTEXT,
         }
     ),

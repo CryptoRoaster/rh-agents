@@ -102,6 +102,17 @@ class Settings(BaseSettings):
     signal_window_seconds: int = Field(default=21600, ge=300, le=604800)
     signal_max_observations: int = Field(default=500, ge=10, le=5000)
     signal_max_model_observations: int = Field(default=25, ge=5, le=100)
+    # Phase 2G SIGNAL social data. "disabled" is the default and a key alone
+    # selects nothing: a credential in the environment is not consent to spend
+    # provider credits, and selecting a provider still starts no worker and makes
+    # no call. There is deliberately no "fake" option — a synthetic feed must not
+    # be reachable from a production configuration at all.
+    signal_social_provider: Literal["disabled", "neynar"] = "disabled"
+    neynar_base_url: str = "https://api.neynar.com"
+    neynar_api_key: SecretStr = SecretStr("")
+    signal_source_timeout_seconds: int = Field(default=10, ge=1, le=60)
+    signal_neynar_page_size: int = Field(default=50, ge=10, le=100)
+    signal_neynar_max_pages: int = Field(default=2, ge=1, le=5)
 
     @model_validator(mode="after")
     def reasoning_configuration(self) -> "Settings":
@@ -198,6 +209,37 @@ class Settings(BaseSettings):
             or any(c.isspace() for c in value)
         ):
             raise ValueError("GeckoTerminal requires an HTTPS /api/v2 URL without credentials")
+        return value.rstrip("/")
+
+    @model_validator(mode="after")
+    def signal_source_configuration(self) -> "Settings":
+        # A selected provider that cannot authenticate would fail on its first
+        # read. Refusing to boot is louder and cheaper than discovering it later.
+        if self.signal_social_provider != "disabled" and not self.neynar_api_key.get_secret_value():
+            raise ValueError("A selected SIGNAL social provider requires its API key")
+        return self
+
+    @field_validator("neynar_base_url")
+    @classmethod
+    def require_neynar_origin(cls, value: str) -> str:
+        """The one host the social adapter can ever reach.
+
+        Pinned by configuration rather than chosen at call time, and checked as a
+        whole host rather than by suffix — "api.neynar.com.evil.example" ends with
+        the right characters and is a different server.
+        """
+        url = urlsplit(value)
+        if (
+            url.scheme != "https"
+            or url.hostname != "api.neynar.com"
+            or url.username
+            or url.password
+            or url.query
+            or url.fragment
+            or (url.port is not None and url.port != 443)
+            or any(character.isspace() for character in value)
+        ):
+            raise ValueError("The Neynar base URL must be the documented HTTPS origin")
         return value.rstrip("/")
 
     @field_validator("blockscout_base_url", "moralis_base_url", "etherscan_base_url")

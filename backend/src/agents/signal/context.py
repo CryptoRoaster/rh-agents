@@ -168,7 +168,10 @@ class SignalContextReader:
         unavailable = False
         try:
             observations = await self.source.observations(
-                chain=market.chain, pair_id=market.pair_id, window=window
+                chain=market.chain,
+                pair_id=market.pair_id,
+                token_address=token_address,
+                window=window,
             )
         except SignalSourceUnavailable:
             # A source that cannot answer is an explicit absence, never an empty

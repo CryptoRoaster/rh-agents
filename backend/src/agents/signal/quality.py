@@ -179,6 +179,13 @@ def _verified_basis(
             # The same hex string on another chain is another contract entirely.
             return MarketBindingBasis.UNRESOLVED
         return MarketBindingBasis.CONTRACT_ADDRESS_EXACT
+    if item.binding_basis == MarketBindingBasis.CONTRACT_ADDRESS_UNSCOPED:
+        # The address still has to be this token's. What is missing is only the
+        # chain, and nothing here invents one from the TradeCase — doing so would
+        # make the binding prove itself.
+        if token_address is None or item.binding_address != token_address:
+            return MarketBindingBasis.UNRESOLVED
+        return MarketBindingBasis.CONTRACT_ADDRESS_UNSCOPED
     if item.binding_basis == MarketBindingBasis.VERIFIED_PROJECT_LINK:
         if item.author_key not in verified_project_authors:
             return MarketBindingBasis.UNRESOLVED

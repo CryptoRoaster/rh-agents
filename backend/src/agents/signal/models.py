@@ -84,7 +84,14 @@ class MarketBindingBasis(StrEnum):
     TradeCase. The bases below are ordered by how much they actually prove:
 
     * ``CONTRACT_ADDRESS_EXACT`` — the text contains this token's contract
-      address on this chain. Deterministically checkable, and checked.
+      address *and* deterministic context naming this chain. Checkable, and
+      checked.
+    * ``CONTRACT_ADDRESS_UNSCOPED`` — the text contains this token's address with
+      no trustworthy chain context. A 20-byte address is chain-scoped: the same
+      deployer and nonce produce the same address on every EVM chain, so a
+      scammer can cheaply occupy it elsewhere. Far stronger evidence than a
+      ticker, and still not proof of *which* contract is meant, so it is
+      admissible and weak rather than strong.
     * ``VERIFIED_PROJECT_LINK`` — the source is an account or domain the project
       itself is recorded as owning.
     * ``UNIQUE_SYMBOL_WITH_CONTEXT`` — the symbol plus corroborating context the
@@ -94,6 +101,7 @@ class MarketBindingBasis(StrEnum):
     """
 
     CONTRACT_ADDRESS_EXACT = "CONTRACT_ADDRESS_EXACT"
+    CONTRACT_ADDRESS_UNSCOPED = "CONTRACT_ADDRESS_UNSCOPED"
     VERIFIED_PROJECT_LINK = "VERIFIED_PROJECT_LINK"
     UNIQUE_SYMBOL_WITH_CONTEXT = "UNIQUE_SYMBOL_WITH_CONTEXT"
     AMBIGUOUS_SYMBOL = "AMBIGUOUS_SYMBOL"
@@ -298,6 +306,12 @@ class SignalObservation(Immutable):
             self.binding_address is None or self.binding_chain is None
         ):
             raise ValueError("An address binding must name the address and its chain")
+        if self.binding_basis == MarketBindingBasis.CONTRACT_ADDRESS_UNSCOPED and (
+            self.binding_address is None or self.binding_chain is not None
+        ):
+            # Unscoped means the address is known and the chain deliberately is
+            # not. Carrying a chain here would be a claim the basis denies.
+            raise ValueError("An unscoped address binding names an address and no chain")
         if self.kind != ObservationKind.ORIGINAL and self.referenced_observation_id is None:
             # A share or a reply that names nothing it responds to cannot be
             # distinguished from an original, which is exactly the confusion the

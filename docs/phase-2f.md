@@ -10,6 +10,11 @@ model. It deliberately integrates **no real social provider**; see
 [Provider research](#provider-research-and-phase-2g) for why, and what Phase 2G
 should evaluate.
 
+> **Superseded in part.** Phase 2G connects Farcaster through Neynar and adds the
+> `CONTRACT_ADDRESS_UNSCOPED` binding for an exact address with no chain context.
+> Everything else here still holds unchanged — see
+> [Phase 2G](phase-2g.md).
+
 ## What changed in one line
 
 SIGNAL can now turn a normalized set of public posts into typed sentiment
@@ -101,6 +106,7 @@ case, so binding strength is explicit:
 | Basis | Strength | Admitted |
 | --- | --- | --- |
 | `CONTRACT_ADDRESS_EXACT` | Strong — the text names this token's address on this chain | Yes |
+| `CONTRACT_ADDRESS_UNSCOPED` | Weak — the exact address with no trustworthy chain context. Added in Phase 2G; counted separately | Yes |
 | `VERIFIED_PROJECT_LINK` | Strong — the source is an account or domain the project owns | Yes |
 | `UNIQUE_SYMBOL_WITH_CONTEXT` | Weak — symbol plus resolvable context; counted separately | Yes |
 | `AMBIGUOUS_SYMBOL` | None — a bare ticker | **No**, counted as a gap |

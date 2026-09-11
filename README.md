@@ -328,13 +328,35 @@ two networks stays two people. Posts reach the model as quoted
 data, and the output schema has no field for a side, a size or an approval, so an
 injected instruction has nothing to aim at.
 
-**SIGNAL is implemented, not operationally data-enabled.** No social provider is
-integrated, no source credential exists in configuration, and the deterministic
-fake source is test-only and reachable from no startup path — nothing can quietly
-carry a real case forward on synthetic sentiment. The realistic candidates are
-researched against current official documentation in the phase document, data
-enablement is Phase 2G, and scraping around an access control is explicitly not a
-fallback. SIGNAL stays required and not
+The deterministic fake source is test-only and reachable from no startup path —
+nothing can quietly carry a real case forward on synthetic sentiment. Phase 2G
+below connects the first real source. SIGNAL stays required and not
 safety-critical: unusable social data leaves the requirement pending rather than
 blocking a case, and a negative reading stops nothing. No migration, no worker
 started. See [the Phase 2F SIGNAL design and provider research](docs/phase-2f.md).
+
+## Phase 2G SIGNAL data enablement
+
+Phase 2G gives SIGNAL real public Farcaster posts through Neynar. Nothing about
+SIGNAL changed: the adapter supplies observations, and every judgement about what
+they mean stays where Phase 2F put it.
+
+Three provider options are deliberately left off. Search is literal and
+chronological rather than relevance-ranked, because a ranked set is a sample
+someone else chose. No viewer is supplied, because one account's mutes would
+decide what SIGNAL sees. No provider-side spam filtering is requested and the
+provider's own user score is used for nothing, because SIGNAL exists to measure
+campaigns and a provider that removes them first removes the evidence.
+
+The hard part was chain identity. The same contract address can exist on two
+chains, and Farcaster search is not chain-aware, so "we searched for our address,
+therefore this post is about our token" is circular. Chain context comes only
+from the post itself — an allowlisted explorer link or an explicit chain name —
+and an exact address without it is recorded as a weak, unscoped reference rather
+than attributed to our chain. Anyone can register a domain that spells a chain's
+name, so links only count through the allowlist.
+
+The provider is disabled by default and a key alone selects nothing. There is no
+synthetic fallback: if the provider cannot answer, SIGNAL is unavailable and the
+case waits. No scraping, no wallet or payment path, no migration, no worker
+started. See [the Phase 2G provider contract and chain-identity design](docs/phase-2g.md).

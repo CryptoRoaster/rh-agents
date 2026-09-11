@@ -100,7 +100,12 @@ class DeterministicSignalSource:
         return cls(failure=reason_code)
 
     async def observations(
-        self, *, chain: str, pair_id: str, window: SignalWindow
+        self,
+        *,
+        chain: str,
+        pair_id: str,
+        token_address: str | None,
+        window: SignalWindow,
     ) -> tuple[SignalObservation, ...]:
         self.calls.append((chain, pair_id, window))
         if self.failure is not None:
