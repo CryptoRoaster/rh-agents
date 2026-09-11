@@ -303,3 +303,31 @@ prerequisite was met, never that the distribution was judged safe. Every provide
 defaults to `disabled`, a credential alone activates nothing, no worker is
 started and no migration is added. See
 [the Phase 2E provider research and support matrix](docs/phase-2e.md).
+
+## Phase 2F SIGNAL social attention
+
+SIGNAL reads what people publicly said about a candidate and reports it on six
+separate axes — sentiment direction and strength, attention, organic breadth,
+manipulation concern and social demand indication — rather than as one score,
+because collapsing them is exactly how a promotional campaign passes for a
+community.
+
+The counts are not the model's to decide. How many distinct people wrote
+something, how much of the text was the same sentence repeated, how concentrated
+authorship was and whether it all landed inside one minute are computed in code,
+and a model may explain them but never contradict them: a claim of broad interest
+is capped by the measured breadth of who actually spoke. Reposts are counted as
+attention rather than as opinions, so one amplified voice cannot read as a crowd.
+
+Freshness anchors to when a post was written, never to when it was fetched, and a
+bare ticker can never bind a post to a market — an exact contract address is
+re-checked against this token and this chain. Posts reach the model as quoted
+data, and the output schema has no field for a side, a size or an approval, so an
+injected instruction has nothing to aim at.
+
+No social provider is integrated yet. The realistic candidates are researched
+against current official documentation in the phase document, and scraping around
+an access control is explicitly not a fallback. SIGNAL stays required and not
+safety-critical: unusable social data leaves the requirement pending rather than
+blocking a case, and a negative reading stops nothing. No migration, no worker
+started. See [the Phase 2F SIGNAL design and provider research](docs/phase-2f.md).

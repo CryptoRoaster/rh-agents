@@ -127,7 +127,7 @@ class CapabilityProvider:
             case AgentRole.ATLAS if self.onchain is not None:
                 return AtlasCapabilities(lease=lease, context=self.onchain, submit=submit)
             case AgentRole.SIGNAL if self.sentiment is not None:
-                return SignalCapabilities(lease=lease, sentiment=self.sentiment, submit=submit)
+                return SignalCapabilities(lease=lease, context=self.sentiment, submit=submit)
             case AgentRole.VECTOR if self.history is not None:
                 return VectorCapabilities(lease=lease, history=self.history, submit=submit)
             case AgentRole.PULSE if self.triggers is not None:
