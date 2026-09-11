@@ -110,7 +110,14 @@ alongside decimals; no value passes through a float.
 
 ## Provider capability matrix
 
-Filled only from what is implemented and verified.
+> **Superseded by [Phase 2E](phase-2e.md).** The matrix below is what Phase 2D
+> shipped, and it was accurate then: no holder or creator provider had been
+> verified, so ATLAS deliberately shipped unable to reach CLEAR. Phase 2E adds
+> verified sources for both domains. See [phase-2e.md](phase-2e.md) for the
+> current support matrix. Nothing in this section was wrong; it was incomplete on
+> purpose, and fail-closed while it was.
+
+Filled only from what was implemented and verified at the time.
 
 | Fact | Robinhood (4663) | BSC (56) | Source |
 | --- | --- | --- | --- |
@@ -118,32 +125,43 @@ Filled only from what is implemented and verified.
 | ERC-20 `decimals()` | AVAILABLE | AVAILABLE | managed EVM RPC `eth_call` |
 | ERC-20 `totalSupply()` | AVAILABLE | AVAILABLE | managed EVM RPC `eth_call` |
 | EIP-1967 proxy / admin slots | AVAILABLE | AVAILABLE | managed EVM RPC `eth_getStorageAt` |
-| Holder concentration | **UNAVAILABLE** | **UNAVAILABLE** | no verified indexer connected |
-| Contract creator / deployer | **UNAVAILABLE** | **UNAVAILABLE** | needs creation history or archive access |
+| Holder concentration | **UNAVAILABLE** *(2E: AVAILABLE)* | **UNAVAILABLE** *(2E: AVAILABLE)* | no verified indexer connected |
+| Contract creator / deployer | **UNAVAILABLE** *(2E: AVAILABLE)* | **UNAVAILABLE** *(2E: AVAILABLE)* | needs creation history or archive access |
 | Developer-wallet relationships | **UNAVAILABLE** | **UNAVAILABLE** | depends on creator provenance |
 
-**Operational consequence, stated plainly:** holder intelligence is a required
-domain, and no verified provider exists for either chain. ATLAS therefore cannot
-reach CLEAR in a real deployment today; it returns INSUFFICIENT_DATA and the case
-blocks. That is the correct fail-closed behaviour. Weakening the policy to let
-the pipeline proceed would be trading on evidence the system never had.
+**Operational consequence as Phase 2D shipped it:** holder intelligence is a
+required domain, and no verified provider existed for either chain. ATLAS
+therefore could not reach CLEAR in a real deployment; it returned
+INSUFFICIENT_DATA and the case blocked. That was the correct fail-closed
+behaviour. Weakening the policy to let the pipeline proceed would have been
+trading on evidence the system never had.
 
 Plain EVM RPC cannot enumerate holders, and rebuilding a holder set from a
 bounded log scan would produce a number that looks authoritative and is not. No
-holder adapter is written against an unverified endpoint, and no provider is
+holder adapter was written against an unverified endpoint, and no provider was
 assumed to support Robinhood Chain because it supports EVM chains generally.
+Phase 2E follows exactly that rule: it connects providers whose responses were
+verified against live API documentation and live responses, and leaves the
+fail-closed path untouched for every chain and domain still unserved.
 
 ## Policy
 
-`atlas-policy-v1` is code-defined and versioned. Thresholds live there, never in
-prompt text and never chosen by a model.
+The policy is code-defined and versioned. Thresholds live there, never in
+prompt text and never chosen by a model. Phase 2D shipped `atlas-policy-v1`;
+Phase 2E raises it to `atlas-policy-v2`, which additionally names the minimum
+holder facts a source must establish before the holder domain counts as
+satisfied.
 
 * Required domains: CONTRACT and HOLDERS. ORIGIN is collected but not required,
   because no verified source exists and blocking on it would say nothing useful.
 * Snapshot validity: 10 minutes — ATLAS's own policy, not borrowed from ORBIT's
   discovery window or from SENTINEL.
 * Maximum source skew: 5 minutes. Facts from different sources are never atomic,
-  so the spread is measured rather than assumed away.
+  so the spread is measured rather than assumed away. Phase 2E adds the caveat
+  that the two operands are only epistemically equal when the holder fact is
+  block-anchored; against a receipt-anchored one the same number bounds the
+  pinned block's age at the moment of the answer and cannot see a lagging
+  indexer, which is why assurance is gated separately.
 
 ### Freshness is anchored to observation, not to collection
 
@@ -151,7 +169,16 @@ Age is measured from `oldest_source_observation` — the earliest moment any
 contributing source actually observed reality — and never from when the
 collector ran. For contract facts that is the **block timestamp**: a block mined
 twenty minutes ago is twenty minutes old however recently it was read. For
-provider facts it is the provider's own observation time.
+provider facts it is the best anchor that provider offers.
+
+Phase 2E qualifies that last sentence, because "the best anchor offered" is not
+always an observation time. A provider that names a block gives one
+(`SOURCE_BLOCK`); a provider that names nothing leaves only the moment its
+response was **received** (`RESPONSE_TIME`), which proves when a representation
+arrived and not when the state behind it was observed. `HolderObservationBasis`
+records which of the two a fact carries, `AtlasPolicy.accepted_holder_observation_bases`
+decides which are good enough to act on, and `docs/phase-2e.md` carries the full
+timestamp taxonomy and the pre-live requirement that follows from it.
 
 This matters because the obvious implementation is wrong. If freshness were
 anchored to collection time, a provider that keeps returning its 10:00 snapshot
@@ -259,5 +286,7 @@ before any risk evaluation, and `RiskOutcome` and `RiskAuthorization` are
 untouched. ANCHOR still owns execution liquidity, routing, slippage and maximum
 safe size; ATLAS observes ownership and control facts only.
 
-Deferred: verified holder and creator providers for both chains, a re-assessment
-trigger, and a concentration threshold chosen from real requirements.
+Deferred at the time: verified holder and creator providers for both chains, a
+re-assessment trigger, and a concentration threshold chosen from real
+requirements. Phase 2E delivers the providers; the re-assessment trigger and the
+threshold remain open.

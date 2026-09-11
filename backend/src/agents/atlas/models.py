@@ -67,6 +67,63 @@ class AtlasSourceFailure(StrEnum):
     UNAVAILABLE = "UNAVAILABLE"
     INVALID_RESPONSE = "INVALID_RESPONSE"
     CHAIN_MISMATCH = "CHAIN_MISMATCH"
+    TOKEN_MISMATCH = "TOKEN_MISMATCH"
+    INCOMPLETE_RESULT = "INCOMPLETE_RESULT"
+    SUPPLY_INCONSISTENT = "SUPPLY_INCONSISTENT"
+    DENOMINATOR_UNKNOWN = "DENOMINATOR_UNKNOWN"
+
+
+class HolderCompleteness(StrEnum):
+    """How much of the holder universe the source actually proved.
+
+    ``COMPLETE`` means every holder row the provider exposes was retrieved.
+    ``TOP_N_ONLY`` means a provably balance-ordered prefix was retrieved, which
+    is sufficient for a top-N concentration against an independently known supply
+    but says nothing about the rest of the distribution. ``UNKNOWN`` means
+    neither could be established, and no concentration metric may be derived
+    from it.
+
+    Completeness is about *our* paging, not about the provider's own filtering.
+    A provider that removes addresses from its holder list server-side still
+    answers ``COMPLETE`` for what it exposes, which is why every such exclusion
+    is recorded separately in ``excluded_addresses`` and never left implicit.
+    """
+
+    COMPLETE = "COMPLETE"
+    TOP_N_ONLY = "TOP_N_ONLY"
+    UNKNOWN = "UNKNOWN"
+
+
+class HolderObservationBasis(StrEnum):
+    """What the holder observation time actually refers to.
+
+    ``SOURCE_BLOCK`` means the provider named the block its holder state belongs
+    to and the timestamp is that block's **chain** time — an authoritative source
+    observation time. ``RESPONSE_TIME`` means the provider only guarantees
+    "current" state with no block and no indexer snapshot timestamp, so the
+    moment the response was **received** is the best anchor available.
+
+    These are not interchangeable. A response receipt time proves only that this
+    representation arrived at time T; it does not prove that the indexed state
+    behind it is from time T, so an indexer running hours behind is invisible to
+    it. That asymmetry is recorded here rather than hidden inside a single
+    timestamp field, and policy decides explicitly which bases it accepts.
+    """
+
+    SOURCE_BLOCK = "SOURCE_BLOCK"
+    RESPONSE_TIME = "RESPONSE_TIME"
+
+
+class OriginVerification(StrEnum):
+    """Whether the creation claim was independently checked against the chain.
+
+    A provider returning well-formed JSON is not verification. Only a creation
+    receipt whose ``contractAddress`` equals the token counts as confirmed.
+    """
+
+    RECEIPT_CONFIRMED = "RECEIPT_CONFIRMED"
+    UNVERIFIED = "UNVERIFIED"
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"
 
 
 class ProxyObservation(StrEnum):
@@ -189,6 +246,65 @@ class HolderShare(Immutable):
     balance_raw: int = Field(ge=0)
     share: Ratio
     is_burn_address: bool = Field(strict=True)
+    # Advisory only. An explorer label never decides what an address is; this
+    # records whether the source said the address has code, nothing more.
+    is_contract: bool | None = None
+
+
+class HolderSourceRow(Immutable):
+    """One raw holder row exactly as a provider reported it, before any policy."""
+
+    address: EvmAddress
+    balance_raw: int = Field(ge=0)
+    is_contract: bool | None = None
+
+
+class HolderFactsSourceResult(Immutable):
+    """The typed answer a holder provider gives. Not yet a safety fact.
+
+    A provider supplies raw rows and provenance. It never supplies a
+    concentration, because the denominator is on-chain total supply, which the
+    deterministic collector owns and the provider is not trusted to state.
+    """
+
+    status: Availability = Availability.UNKNOWN
+    failure: AtlasSourceFailure | None = None
+    source: Identifier
+    chain: Identifier | None = None
+    token_address: EvmAddress | None = None
+    rows: tuple[HolderSourceRow, ...] = Field(default=(), max_length=2000)
+    completeness: HolderCompleteness = HolderCompleteness.UNKNOWN
+    # Addresses the provider itself removes from its holder list, so a metric
+    # that depends on seeing them is withheld rather than silently understated.
+    excluded_addresses: tuple[EvmAddress, ...] = Field(default=(), max_length=8)
+    observation_basis: HolderObservationBasis | None = None
+    # Present only when the provider names the block its holder state belongs to.
+    snapshot_block: int | None = Field(default=None, ge=0)
+    snapshot_timestamp: AwareDatetime | None = None
+    holder_count: int | None = Field(default=None, ge=0)
+    # Kept for reconciliation against the chain, never used as the denominator.
+    provider_total_supply_raw: int | None = Field(default=None, ge=0)
+    requests_made: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def availability_matches_content(self) -> Self:
+        if self.status == Availability.AVAILABLE:
+            if self.failure is not None:
+                raise ValueError("An available holder result cannot carry a source failure")
+            if self.chain is None or self.token_address is None:
+                raise ValueError("An available holder result must identify chain and token")
+            if self.completeness == HolderCompleteness.UNKNOWN:
+                raise ValueError("An available holder result must prove its completeness")
+            if self.observation_basis is None or self.snapshot_timestamp is None:
+                raise ValueError("An available holder result must carry an observation anchor")
+            if (
+                self.observation_basis == HolderObservationBasis.SOURCE_BLOCK
+                and self.snapshot_block is None
+            ):
+                raise ValueError("A block-anchored holder result must name its block")
+        elif self.rows or self.snapshot_block is not None:
+            raise ValueError("An unavailable holder result must not carry observations")
+        return self
 
 
 class HolderFacts(Immutable):
@@ -202,7 +318,22 @@ class HolderFacts(Immutable):
     failure: AtlasSourceFailure | None = None
     source: Identifier
     observed_at: AwareDatetime | None = None
+    observation_basis: HolderObservationBasis | None = None
+    completeness: HolderCompleteness = HolderCompleteness.UNKNOWN
+    # Carried through from the source so a reader can see that the holder list
+    # was filtered upstream, and why an adjustment may be absent.
+    excluded_addresses: tuple[EvmAddress, ...] = Field(default=(), max_length=8)
+    snapshot_block: int | None = Field(default=None, ge=0)
+    # Pinned contract block minus holder snapshot block, when both are known.
+    # Positive means the holder data is older than the block the contract facts
+    # were read at. Negative is the ordinary case, because the pinned block
+    # trails the chain head by the confirmation lag while an indexer tracks the
+    # head — so this is a signed distance, never a one-directional "lag".
+    holder_block_delta: int | None = None
     holder_count: int | None = Field(default=None, ge=0)
+    # The denominator actually divided by: on-chain total supply, never the
+    # provider's own figure.
+    total_supply_raw: int | None = Field(default=None, ge=0)
     top_holders: tuple[HolderShare, ...] = Field(default=(), max_length=50)
     # Raw concentration over the full supply, before any policy adjustment.
     top1_share: Ratio | None = None
@@ -211,6 +342,8 @@ class HolderFacts(Immutable):
     # The same measure with proven burn addresses removed, kept separate so a
     # large position can never be hidden by an adjustment.
     top10_share_excluding_burn: Ratio | None = None
+    burned_raw: int | None = Field(default=None, ge=0)
+    burned_share: Ratio | None = None
 
     @model_validator(mode="after")
     def availability_matches_content(self) -> Self:
@@ -219,6 +352,12 @@ class HolderFacts(Immutable):
                 raise ValueError("Available holder facts cannot carry a source failure")
             if self.observed_at is None or self.top1_share is None:
                 raise ValueError("Available holder facts require an observation time and shares")
+            if self.completeness == HolderCompleteness.UNKNOWN:
+                raise ValueError("Available holder facts require proven completeness")
+            if self.observation_basis is None:
+                raise ValueError("Available holder facts require an observation basis")
+            if self.total_supply_raw is None:
+                raise ValueError("Available holder facts require the denominator they used")
         elif self.top_holders or self.top1_share is not None:
             raise ValueError("Unavailable holder facts must not carry observations")
         return self
@@ -237,6 +376,11 @@ class OriginFacts(Immutable):
     creator_address: EvmAddress | None = None
     creation_block: int | None = Field(default=None, ge=0)
     creation_tx_hash: Hash32 | None = None
+    # A factory deployment means the creator is code, not a person. Both facts
+    # are recorded; neither is interpreted as a developer wallet here.
+    factory_address: EvmAddress | None = None
+    creator_is_contract: bool | None = None
+    verification: OriginVerification = OriginVerification.NOT_ATTEMPTED
 
     @model_validator(mode="after")
     def availability_matches_content(self) -> Self:

@@ -27,18 +27,29 @@ from src.agents.atlas.models import (
     AtlasVerdict,
     ChainSnapshot,
     ContractFacts,
+    HolderCompleteness,
     HolderFacts,
+    HolderFactsSourceResult,
+    HolderObservationBasis,
     HolderShare,
+    HolderSourceRow,
     OriginFacts,
+    OriginVerification,
     ProxyObservation,
 )
-from src.agents.atlas.policy import ATLAS_POLICY_V1, AtlasPolicy, evaluate_snapshot
+from src.agents.atlas.policy import (
+    ATLAS_POLICY_V1,
+    ATLAS_POLICY_V2,
+    AtlasPolicy,
+    evaluate_snapshot,
+)
 from src.agents.atlas.prompt import ATLAS_PROMPT_HASH, ATLAS_PROMPT_VERSION
 from src.agents.atlas.unavailable import UnconfiguredHolderSource, UnconfiguredOriginSource
 from src.agents.atlas.validation import AtlasValidationError, validate_assessment
 
 __all__ = [
     "ATLAS_POLICY_V1",
+    "ATLAS_POLICY_V2",
     "ATLAS_PROMPT_HASH",
     "ATLAS_PROMPT_VERSION",
     "ATLAS_TASK_TYPE",
@@ -59,9 +70,14 @@ __all__ = [
     "AtlasWorkerHandler",
     "ChainSnapshot",
     "ContractFacts",
+    "HolderCompleteness",
     "HolderFacts",
+    "HolderFactsSourceResult",
+    "HolderObservationBasis",
     "HolderShare",
+    "HolderSourceRow",
     "OriginFacts",
+    "OriginVerification",
     "ProxyObservation",
     "UnconfiguredHolderSource",
     "UnconfiguredOriginSource",

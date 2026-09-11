@@ -19,14 +19,18 @@ from src.agents.atlas.models import (
     ChainSnapshot,
     ContractFacts,
     HolderFacts,
+    HolderFactsSourceResult,
     Immutable,
     OriginFacts,
+    OriginVerification,
 )
 from src.agents.atlas.ports import (
     ContractOriginReadPort,
+    CreationVerificationPort,
     HolderIntelligenceReadPort,
     TokenContractReadPort,
 )
+from src.agents.atlas.sources.normalize import HolderNormalizationError, concentration
 from src.core.clock import Clock, SystemClock
 from src.core.numbers import canonical_decimal
 from src.markets.models import Availability, MarketIdentity
@@ -85,6 +89,9 @@ class AtlasSnapshotBuilder:
     contracts: TokenContractReadPort
     holders: HolderIntelligenceReadPort
     origins: ContractOriginReadPort
+    # Optional chain-side confirmation of what a creation provider claims. Absent
+    # means claims stay UNVERIFIED, never silently trusted.
+    verifier: CreationVerificationPort | None = None
     clock: Clock = SystemClock()
 
     async def build(
@@ -97,8 +104,10 @@ class AtlasSnapshotBuilder:
             # at the wrong one is a hard stop rather than a mismatch to record.
             raise AtlasContextUnavailable("SOURCE_CHAIN_MISMATCH")
         contract = await self._contract_facts(token_address, chain)
-        holders = await self._holder_facts(chain.chain, token_address)
-        origin = await self._origin_facts(chain.chain, token_address)
+        # Contract facts come first because the holder denominator is the
+        # on-chain total supply, never a figure the holder provider supplies.
+        holders = await self._holder_facts(chain, token_address, contract)
+        origin = await self._origin_facts(chain, token_address)
         return AtlasOnchainSnapshot(
             trade_case_id=trade_case_id,
             task_id=task_id,
@@ -122,25 +131,132 @@ class AtlasSnapshotBuilder:
                 source=chain.source,
             )
 
-    async def _holder_facts(self, chain: str, token_address: str) -> HolderFacts:
+    async def _holder_facts(
+        self, chain: ChainSnapshot, token_address: str, contract: ContractFacts
+    ) -> HolderFacts:
         try:
-            return await self.holders.holder_facts(chain, token_address)
+            result = await self.holders.holder_facts(chain.chain, token_address)
         except Exception:
             return HolderFacts(
                 status=Availability.UNAVAILABLE,
                 failure=AtlasSourceFailure.UNAVAILABLE,
                 source="unknown",
             )
+        if result.status != Availability.AVAILABLE:
+            return HolderFacts(status=result.status, failure=result.failure, source=result.source)
+        return self._holder_measurement(result, chain, token_address, contract)
 
-    async def _origin_facts(self, chain: str, token_address: str) -> OriginFacts:
+    def _holder_measurement(
+        self,
+        result: HolderFactsSourceResult,
+        chain: ChainSnapshot,
+        token_address: str,
+        contract: ContractFacts,
+    ) -> HolderFacts:
+        """Turn provider rows into the measured fact, or into an honest failure.
+
+        Every concentration is computed here from raw balances and the on-chain
+        supply. A provider's own percentage is never used, so a vendor cannot
+        move a safety metric by disagreeing with arithmetic.
+        """
+
+        def unusable(failure: AtlasSourceFailure) -> HolderFacts:
+            return HolderFacts(
+                status=Availability.UNAVAILABLE, failure=failure, source=result.source
+            )
+
+        if result.token_address != token_address:
+            # The provider answered about a different token.
+            return unusable(AtlasSourceFailure.TOKEN_MISMATCH)
+        if result.chain != chain.chain:
+            return unusable(AtlasSourceFailure.CHAIN_MISMATCH)
+        supply = contract.total_supply_raw if contract.status == Availability.AVAILABLE else None
+        if supply is not None and result.provider_total_supply_raw == 0 and supply > 0:
+            # The two views of the same contract are not merely skewed, they are
+            # incompatible. Reconciliation is exact: no tolerance is guessed.
+            return unusable(AtlasSourceFailure.SUPPLY_INCONSISTENT)
         try:
-            return await self.origins.origin_facts(chain, token_address)
+            measured = concentration(
+                result.rows, supply, result.completeness, result.excluded_addresses
+            )
+        except HolderNormalizationError as error:
+            return unusable(error.failure)
+        return HolderFacts(
+            status=Availability.AVAILABLE,
+            source=result.source,
+            # Anchored to what the source observed, never to when we fetched it.
+            observed_at=result.snapshot_timestamp,
+            observation_basis=result.observation_basis,
+            completeness=result.completeness,
+            excluded_addresses=result.excluded_addresses,
+            snapshot_block=result.snapshot_block,
+            holder_block_delta=(
+                None
+                if result.snapshot_block is None
+                else chain.block_number - result.snapshot_block
+            ),
+            holder_count=result.holder_count,
+            total_supply_raw=supply,
+            top_holders=measured.shares,
+            top1_share=measured.top1_share,
+            top5_share=measured.top5_share,
+            top10_share=measured.top10_share,
+            top10_share_excluding_burn=measured.top10_share_excluding_burn,
+            burned_raw=measured.burned_raw,
+            burned_share=measured.burned_share,
+        )
+
+    async def _origin_facts(self, chain: ChainSnapshot, token_address: str) -> OriginFacts:
+        try:
+            facts = await self.origins.origin_facts(chain.chain, token_address)
         except Exception:
             return OriginFacts(
                 status=Availability.UNAVAILABLE,
                 failure=AtlasSourceFailure.UNAVAILABLE,
                 source="unknown",
             )
+        if facts.status != Availability.AVAILABLE or self.verifier is None:
+            return facts
+        return await self._verified_origin(self.verifier, facts, chain, token_address)
+
+    @staticmethod
+    async def _verified_origin(
+        verifier: CreationVerificationPort,
+        facts: OriginFacts,
+        chain: ChainSnapshot,
+        token_address: str,
+    ) -> OriginFacts:
+        """Check a creation claim against the chain rather than against JSON."""
+        created: str | None = None
+        creator_is_contract: bool | None = None
+        try:
+            if facts.creation_tx_hash is not None:
+                created = await verifier.creation_receipt_contract(facts.creation_tx_hash)
+            if facts.creator_address is not None:
+                creator_is_contract = await verifier.is_contract(
+                    facts.creator_address, chain.block_number
+                )
+        except Exception:
+            # A failed check leaves the claim unverified; it never confirms it.
+            created = None
+        if created is not None and created != token_address:
+            # The named transaction created some other contract, so the creator
+            # it names is not this token's creator.
+            return OriginFacts(
+                status=Availability.UNAVAILABLE,
+                failure=AtlasSourceFailure.INVALID_RESPONSE,
+                source=facts.source,
+            )
+        return facts.model_copy(
+            update={
+                "creator_is_contract": creator_is_contract,
+                "verification": (
+                    OriginVerification.RECEIPT_CONFIRMED
+                    if created is not None
+                    else OriginVerification.UNVERIFIED
+                ),
+            }
+        )
 
 
 @dataclass(frozen=True)
@@ -198,6 +314,23 @@ def snapshot_document(snapshot: AtlasOnchainSnapshot) -> dict[str, object]:
             **_measurement(holders.status, holders.failure),
             "source": holders.source,
             "observed_at": None if holders.observed_at is None else holders.observed_at.isoformat(),
+            "observation_basis": (
+                None if holders.observation_basis is None else holders.observation_basis.value
+            ),
+            "completeness": holders.completeness.value,
+            # What the provider filtered out before we saw it. Part of the
+            # digest, so a provider silently changing its filtering changes the
+            # fact fingerprint instead of passing unnoticed.
+            "excluded_addresses": list(holders.excluded_addresses),
+            "snapshot_block": holders.snapshot_block,
+            "holder_block_delta": holders.holder_block_delta,
+            "total_supply_raw": (
+                None if holders.total_supply_raw is None else str(holders.total_supply_raw)
+            ),
+            "burned_raw": None if holders.burned_raw is None else str(holders.burned_raw),
+            "burned_share": (
+                None if holders.burned_share is None else canonical_decimal(holders.burned_share)
+            ),
             "holder_count": holders.holder_count,
             "top1_share": None
             if holders.top1_share is None
@@ -216,8 +349,12 @@ def snapshot_document(snapshot: AtlasOnchainSnapshot) -> dict[str, object]:
             "top_holders": [
                 {
                     "address": holder.address,
+                    # The exact balance, so two positions that round to the same
+                    # share still produce different digests.
+                    "balance_raw": str(holder.balance_raw),
                     "share": canonical_decimal(holder.share),
                     "is_burn_address": holder.is_burn_address,
+                    "is_contract": holder.is_contract,
                 }
                 for holder in holders.top_holders[:20]
             ],
@@ -227,6 +364,10 @@ def snapshot_document(snapshot: AtlasOnchainSnapshot) -> dict[str, object]:
             "source": snapshot.origin.source,
             "creator_address": snapshot.origin.creator_address,
             "creation_block": snapshot.origin.creation_block,
+            "creation_tx_hash": snapshot.origin.creation_tx_hash,
+            "factory_address": snapshot.origin.factory_address,
+            "creator_is_contract": snapshot.origin.creator_is_contract,
+            "verification": snapshot.origin.verification.value,
         },
     }
 
@@ -248,6 +389,18 @@ def atlas_snapshot_digest(snapshot: AtlasOnchainSnapshot) -> str:
 
 
 def source_skew(snapshot: AtlasOnchainSnapshot) -> timedelta | None:
+    """The spread policy judges: chain **block** time against the holder anchor.
+
+    Deliberately not ``chain.observed_at``. Fetch times say when we ran, and a
+    spread between two fetches would be near zero however old either fact is.
+
+    The two operands are not epistemically equal when the holder anchor is
+    ``RESPONSE_TIME``: one is an authoritative chain observation, the other a
+    response receipt. The difference is then a bound on how far the pinned block
+    lags the moment of the answer, not a source-to-source skew, and it cannot
+    detect an indexer running behind. ``HolderObservationBasis`` on the fact is
+    what says which reading applies; the number alone never does.
+    """
     if snapshot.holders.observed_at is None:
         return None
-    return abs(snapshot.chain.observed_at - snapshot.holders.observed_at)
+    return abs(snapshot.chain.block_timestamp - snapshot.holders.observed_at)

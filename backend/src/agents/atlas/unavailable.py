@@ -8,24 +8,23 @@ fail closed rather than reach CLEAR on evidence it never had.
 
 from dataclasses import dataclass
 
-from src.agents.atlas.models import AtlasSourceFailure, HolderFacts, OriginFacts
+from src.agents.atlas.models import AtlasSourceFailure, HolderFactsSourceResult, OriginFacts
 from src.markets.models import Availability
 
 
 @dataclass(frozen=True)
 class UnconfiguredHolderSource:
-    """No verified holder indexer is connected for either supported chain.
+    """No holder provider is configured for this deployment.
 
-    Robinhood Chain (4663) in particular has no holder API this project has
-    verified. Implementing one against an unverified endpoint, or rebuilding a
-    holder set from a bounded log scan, would produce a number that looks
-    authoritative and is not.
+    Phase 2E connects verified providers, but a credential alone activates
+    nothing: with no provider selected this is still what ATLAS uses, and the
+    holder domain stays honestly unavailable rather than quietly optional.
     """
 
     source: str = "unconfigured:holder-intelligence"
 
-    async def holder_facts(self, chain: str, token_address: str) -> HolderFacts:
-        return HolderFacts(
+    async def holder_facts(self, chain: str, token_address: str) -> HolderFactsSourceResult:
+        return HolderFactsSourceResult(
             status=Availability.UNAVAILABLE,
             failure=AtlasSourceFailure.NOT_CONFIGURED,
             source=self.source,

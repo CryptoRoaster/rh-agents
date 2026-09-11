@@ -1,15 +1,18 @@
 """The deterministic safety core: facts in, verdict out, no model anywhere."""
 
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 
 import pytest
 
 from src.agents.atlas.models import (
+    ZERO_ADDRESS,
     AtlasDomain,
     AtlasReasonCode,
     AtlasSourceFailure,
     AtlasVerdict,
+    HolderObservationBasis,
     ProxyObservation,
 )
 from src.agents.atlas.policy import ATLAS_POLICY_V1, AtlasPolicy, evaluate_snapshot
@@ -32,7 +35,7 @@ def test_complete_fresh_facts_are_clear(now):
     assert decision.verdict == AtlasVerdict.CLEAR
     assert decision.blockers == ()
     assert decision.data_gaps == ()
-    assert decision.policy_version == "atlas-policy-v1"
+    assert decision.policy_version == "atlas-policy-v2"
 
 
 # ------------------------------------------------------- known bad != unknown
@@ -130,6 +133,97 @@ def test_source_skew_beyond_policy_is_insufficient(now):
 def test_skew_within_policy_is_accepted(now):
     close = snapshot(now, holders=holder_facts(now, observed_at=now - timedelta(minutes=4)))
     assert evaluate_snapshot(close, now).verdict == AtlasVerdict.CLEAR
+
+
+# ------------------------------------------------- provenance assurance gating
+
+
+def test_paper_policy_accepts_the_weaker_response_anchor_deliberately(now):
+    """RESPONSE_TIME is accepted here, and that is a named decision.
+
+    It is sound for PAPER evaluation and recorded as the weaker basis it is.
+    What it is not is equivalent to block-anchored provenance: it cannot detect
+    an indexer running behind, which is why the acceptance is a policy field
+    rather than an implicit consequence of what a vendor happens to return.
+    """
+    assert HolderObservationBasis.RESPONSE_TIME in ATLAS_POLICY_V1.accepted_holder_observation_bases
+    response_anchored = snapshot(
+        now,
+        holders=holder_facts(
+            now,
+            observation_basis=HolderObservationBasis.RESPONSE_TIME,
+            snapshot_block=None,
+            holder_block_delta=None,
+        ),
+    )
+    assert evaluate_snapshot(response_anchored, now).verdict == AtlasVerdict.CLEAR
+
+
+def test_a_policy_demanding_block_provenance_rejects_a_response_anchor(now):
+    """The PRE-LIVE invariant, expressed as one field a successor policy sets."""
+    block_pinned_only = replace(
+        ATLAS_POLICY_V1,
+        accepted_holder_observation_bases=frozenset({HolderObservationBasis.SOURCE_BLOCK}),
+    )
+    response_anchored = snapshot(
+        now,
+        holders=holder_facts(
+            now,
+            observation_basis=HolderObservationBasis.RESPONSE_TIME,
+            snapshot_block=None,
+            holder_block_delta=None,
+        ),
+    )
+    decision = evaluate_snapshot(response_anchored, now, block_pinned_only)
+    assert decision.verdict == AtlasVerdict.INSUFFICIENT_DATA
+    assert AtlasReasonCode.HOLDER_FACTS_UNAVAILABLE in decision.data_gaps
+    # An answer arrived and was well formed; it is the assurance that is short.
+    assert response_anchored.availability(AtlasDomain.HOLDERS) == Availability.AVAILABLE
+
+
+def test_a_policy_accepting_no_observation_basis_at_all_is_refused():
+    with pytest.raises(ValueError):
+        replace(ATLAS_POLICY_V1, accepted_holder_observation_bases=frozenset())
+
+
+# --------------------------------------------- threshold vs source exclusions
+
+
+def test_a_filtered_holder_set_is_still_measured_while_no_threshold_judges_it(now):
+    """Today the metric is observed and recorded; nothing decides on it."""
+    assert ATLAS_POLICY_V1.max_top10_concentration is None
+    filtered = snapshot(now, holders=holder_facts(now, excluded_addresses=(ZERO_ADDRESS,)))
+    decision = evaluate_snapshot(filtered, now)
+    assert decision.verdict == AtlasVerdict.CLEAR
+    assert filtered.holders.top10_share == Decimal("0.30")
+
+
+def test_a_threshold_may_not_silently_judge_a_metric_with_source_exclusions(now):
+    """The fail-open a limit exists to prevent.
+
+    Every provider exclusion removes supply from the numerator while the
+    denominator stays full on-chain supply, so the metric can only understate
+    concentration. A threshold that read such a figure as a pass would approve a
+    distribution it never saw. Nothing reconciles an exclusion today, so an
+    exclusion makes the case insufficient instead.
+    """
+    with_threshold = replace(ATLAS_POLICY_V1, max_top10_concentration=Decimal("0.90"))
+    filtered = snapshot(now, holders=holder_facts(now, excluded_addresses=(ZERO_ADDRESS,)))
+    decision = evaluate_snapshot(filtered, now, with_threshold)
+    assert decision.verdict == AtlasVerdict.INSUFFICIENT_DATA
+    assert AtlasReasonCode.HOLDER_FACTS_UNAVAILABLE in decision.data_gaps
+    # The same policy over an unfiltered holder set decides normally.
+    unfiltered = snapshot(now, holders=holder_facts(now))
+    assert evaluate_snapshot(unfiltered, now, with_threshold).verdict == AtlasVerdict.CLEAR
+
+
+def test_an_exceeded_limit_still_blocks_even_on_an_understated_metric(now):
+    """Understated and already over the line means the true figure is over it too."""
+    with_threshold = replace(ATLAS_POLICY_V1, max_top10_concentration=Decimal("0.10"))
+    filtered = snapshot(now, holders=holder_facts(now, excluded_addresses=(ZERO_ADDRESS,)))
+    decision = evaluate_snapshot(filtered, now, with_threshold)
+    assert decision.verdict == AtlasVerdict.BLOCKED
+    assert AtlasReasonCode.HOLDER_CONCENTRATION_EXCEEDED in decision.blockers
 
 
 # ------------------------------------------------------- required vs optional

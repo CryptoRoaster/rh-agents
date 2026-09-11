@@ -41,7 +41,7 @@ from tests.atlas.conftest import (
     StubOrigins,
     chain_snapshot,
     contract_facts,
-    holder_facts,
+    holder_source_result,
     market_identity,
     origin_facts,
 )
@@ -55,7 +55,7 @@ def build_stack(sessions, instant, *, contract=None, holders=None, origin=None):
     runtime = WorkerRuntimeService(sessions, cases, clock=clock)
     builder = AtlasSnapshotBuilder(
         contracts=StubContracts(chain_snapshot(instant), contract or contract_facts()),
-        holders=StubHolders(holders if holders is not None else holder_facts(instant)),
+        holders=StubHolders(holders if holders is not None else holder_source_result(instant)),
         origins=StubOrigins(origin if origin is not None else origin_facts()),
         clock=clock,
     )
@@ -135,7 +135,7 @@ async def test_unobtainable_required_facts_block_as_insufficient(worker_db, now,
     runtime, reader = build_stack(
         sessions,
         now,
-        holders=holder_facts(
+        holders=holder_source_result(
             now, status=Availability.UNAVAILABLE, failure=AtlasSourceFailure.NOT_CONFIGURED
         ),
     )

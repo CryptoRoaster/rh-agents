@@ -266,8 +266,40 @@ insufficient evidence that blocks for a different reason. Supporting this
 required one generic Phase 2A extension, `EvidenceAcceptance`, checked in a
 single place for every evidence type.
 
-Holder concentration and contract creator currently have no verified provider for
-Robinhood Chain or BSC and are reported UNAVAILABLE, so ATLAS cannot reach CLEAR
-in a real deployment yet. That is the intended fail-closed behaviour. Phase 2D
-adds no migration and starts no worker. See
-[the ATLAS safety model and provider capability matrix](docs/phase-2d.md).
+Phase 2D shipped without a verified holder or creator provider, so both domains
+were reported UNAVAILABLE and ATLAS could not reach CLEAR — the intended
+fail-closed behaviour, resolved in Phase 2E. Phase 2D adds no migration and
+starts no worker. See [the ATLAS safety model](docs/phase-2d.md).
+
+## Phase 2E ATLAS data enablement
+
+Phase 2E connects verified holder and contract-origin providers so the required
+holder domain can finally be satisfied — without weakening the policy. Robinhood
+Chain uses the credentialed Blockscout PRO API for holders and creation; BNB
+Smart Chain uses Moralis for holders and Etherscan V2 for creation, because
+Blockscout does not index BSC. The public Robinhood explorer host answers
+server-side clients with an interactive challenge page and is deliberately not
+used: satisfying it would mean impersonating a browser.
+
+Providers supply raw rows and provenance only. Every concentration is computed
+here from integer balances against on-chain `totalSupply()` — no float, no vendor
+percentage — and we exclude nothing from the raw metric, so a liquidity pool or a
+burn address stays visible. What a provider filters upstream is declared rather
+than inferred: Blockscout removes the zero address from its holder list, which is
+recorded on the fact and withholds the burn adjustment that would otherwise rest
+on a lower bound.
+
+Coverage is explicit (`COMPLETE`, `TOP_N_ONLY`, `UNKNOWN`) and freshness is
+anchored to what the source observed rather than to when we fetched. Where the
+source names a block — Robinhood via Blockscout — an indexer lagging the chain
+goes stale rather than being rescued by a fresh round-trip. Where it names none
+— BSC via Moralis — only the response receipt time exists, that weaker basis is
+labelled on the fact, and the policy field that accepts it is the same field a
+future live policy must narrow.
+
+The concentration threshold stays disabled: data became available, a product
+decision did not. A holder-domain PASS therefore means the data-quality
+prerequisite was met, never that the distribution was judged safe. Every provider
+defaults to `disabled`, a credential alone activates nothing, no worker is
+started and no migration is added. See
+[the Phase 2E provider research and support matrix](docs/phase-2e.md).
