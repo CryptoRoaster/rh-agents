@@ -95,6 +95,13 @@ class Settings(BaseSettings):
     atlas_source_timeout_seconds: int = Field(default=10, ge=1, le=60)
     atlas_holder_page_size: int = Field(default=50, ge=10, le=200)
     atlas_holder_max_pages: int = Field(default=1, ge=1, le=5)
+    # Phase 2F SIGNAL. Disabled by default like every other worker, and with no
+    # provider credential of any kind: no social source is integrated yet, so
+    # there is nothing here a misconfiguration could cause to be fetched.
+    signal_worker_enabled: bool = False
+    signal_window_seconds: int = Field(default=21600, ge=300, le=604800)
+    signal_max_observations: int = Field(default=500, ge=10, le=5000)
+    signal_max_model_observations: int = Field(default=25, ge=5, le=100)
 
     @model_validator(mode="after")
     def reasoning_configuration(self) -> "Settings":

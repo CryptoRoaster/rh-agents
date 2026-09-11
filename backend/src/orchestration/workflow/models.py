@@ -16,6 +16,8 @@ from src.risk.authorization import RiskAuthorization, classify_risk_authorizatio
 Nonnegative = Annotated[Decimal, Field(ge=0, allow_inf_nan=False, max_digits=38, decimal_places=18)]
 Positive = Annotated[Decimal, Field(gt=0, allow_inf_nan=False, max_digits=38, decimal_places=18)]
 Confidence = Annotated[Decimal, Field(ge=0, le=1, allow_inf_nan=False)]
+# A proportion of an observation set. Exact, and never a float.
+Share = Annotated[Decimal, Field(ge=0, le=1, allow_inf_nan=False)]
 Code = Annotated[str, Field(pattern=r"^[A-Z][A-Z0-9_]{0,79}$")]
 Identifier = Annotated[str, Field(min_length=1, max_length=200, pattern=r"^\S(?:.*\S)?$")]
 
@@ -253,9 +255,95 @@ class OnchainPayload(AcceptancePayload):
         return EvidenceAcceptance.ACCEPTED
 
 
+class SentimentSourceMetrics(Immutable):
+    """Deterministic structure of the social observation set behind a reading.
+
+    Counts and shares only, computed from normalized observations rather than
+    asked of a model, so a future FUSE can see *why* a sentiment reading is worth
+    what it is worth. Post text never appears here: a duplicate cluster is a hash
+    and a count, which is enough to prove repetition without copying a stranger's
+    writing into this system's records.
+    """
+
+    observation_count: int = Field(ge=0)
+    unique_author_count: int = Field(ge=0)
+    unique_authoring_count: int = Field(ge=0)
+    original_count: int = Field(ge=0)
+    repost_count: int = Field(ge=0)
+    reply_count: int = Field(ge=0)
+    unique_content_count: int = Field(ge=0)
+    duplicate_cluster_count: int = Field(ge=0)
+    duplicate_share: Share = Decimal(0)
+    largest_duplicate_cluster_share: Share = Decimal(0)
+    top1_author_share: Share = Decimal(0)
+    top5_author_share: Share = Decimal(0)
+    burst_share: Share = Decimal(0)
+    strong_binding_count: int = Field(ge=0)
+    weak_binding_count: int = Field(ge=0)
+    excluded_ambiguous_count: int = Field(ge=0)
+    excluded_outside_window_count: int = Field(ge=0)
+    source_count: int = Field(ge=0)
+    sources: tuple[Code, ...] = Field(default=(), max_length=10)
+    window_seconds: int = Field(gt=0)
+    # Source-published times, never fetch receipts. Freshness anchors here.
+    oldest_observation_at: AwareDatetime | None = None
+    latest_observation_at: AwareDatetime | None = None
+    content_hash_algorithm: Identifier
+
+
+class SentimentIntelligence(Immutable):
+    """The record behind a sentiment reading, split by who established what.
+
+    ``data_quality``, ``attention_level``, ``organic_breadth`` and
+    ``manipulation_concern`` are produced by a deterministic policy from the
+    metrics above and stay authoritative. ``sentiment_*``,
+    ``social_demand_indication``, ``narrative_tags`` and ``advisory_summary`` are
+    model interpretation, recorded alongside and never in place of them.
+
+    Sentiment direction and social demand are separate fields on purpose.
+    Approving language is not an intention to buy, and one field would make the
+    two indistinguishable the moment anything downstream read it.
+    """
+
+    policy_version: Identifier
+    data_quality: Code
+    attention_level: Code
+    organic_breadth: Code
+    manipulation_concern: Code
+    gaps: tuple[Code, ...] = Field(default=(), max_length=12)
+    metrics: SentimentSourceMetrics
+    input_digest: Digest
+    sentiment_direction: Code | None = None
+    sentiment_strength: Code | None = None
+    social_demand_indication: Code | None = None
+    narrative_tags: tuple[Code, ...] = Field(default=(), max_length=6)
+    advisory_manipulation_observations: tuple[Code, ...] = Field(default=(), max_length=6)
+    advisory_summary: SafeSummary | None = None
+    cited_observation_ids: tuple[UUID, ...] = Field(default=(), max_length=12)
+    prompt_version: Identifier | None = None
+    prompt_hash: Digest | None = None
+    reasoning_provider: Identifier | None = None
+    reasoning_model: Identifier | None = None
+    output_schema_version: int | None = Field(default=None, ge=1)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    latency_ms: int | None = Field(default=None, ge=0)
+
+
 class SentimentPayload(AcceptancePayload):
+    """Social sentiment. Required by the workflow, and deliberately not safety-critical.
+
+    Acceptance stays unconditional: a negative reading is a valid observation, not
+    a blocker. Whether sentiment *should* stop a case is a synthesis question for
+    a later FUSE, and encoding an answer here would quietly turn a mood into a
+    veto. What does gate the workflow is availability — an unusable observation
+    set leaves the requirement unmet, which is a data question rather than an
+    opinion about the token.
+    """
+
     kind: Literal["sentiment"] = "sentiment"
     assessment: Literal["POSITIVE", "NEUTRAL", "NEGATIVE", "UNKNOWN"]
+    intelligence: "SentimentIntelligence | None" = None
 
 
 class TradeSetupPayload(AcceptancePayload):

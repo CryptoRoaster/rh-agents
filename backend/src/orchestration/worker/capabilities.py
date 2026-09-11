@@ -68,9 +68,15 @@ class OnchainContextPort(Protocol):
 
 
 class SentimentPort(Protocol):
-    """SIGNAL input. Unimplemented in Phase 2B; no social provider is added."""
+    """SIGNAL input: one assembled view of the normalized social observation set.
 
-    async def sentiment(self, market_key: str) -> object: ...
+    The worker never holds a social API client, a session or a URL. Trusted
+    infrastructure decides which source to ask and how to authenticate, applies
+    the observation window and hands over finished normalized observations, so
+    SIGNAL cannot choose what to fetch or widen the interval it reports on.
+    """
+
+    async def sentiment_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
 class MarketHistoryPort(Protocol):
@@ -148,7 +154,7 @@ class AtlasCapabilities:
 @dataclass(frozen=True)
 class SignalCapabilities:
     lease: TaskLease
-    sentiment: SentimentPort
+    context: SentimentPort
     submit: EvidenceSubmissionPort
 
 
