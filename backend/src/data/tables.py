@@ -7,12 +7,14 @@ from uuid import UUID
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     Uuid,
@@ -130,3 +132,53 @@ class AccountRow(Base):
     loss_day: Mapped[date] = mapped_column(Date)
     realized_loss_today_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
     paused: Mapped[bool] = mapped_column(default=False)
+
+
+class RuntimeAuditRow(Base):
+    __tablename__ = "runtime_audit"
+    __table_args__ = (Index("ix_runtime_audit_stream_time", "stream", "recorded_at", "id"),)
+    sequence: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    run_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    stream: Mapped[str] = mapped_column(String(80))
+    source: Mapped[str] = mapped_column(String(40))
+    kind: Mapped[str] = mapped_column(String(40))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+
+
+class EvmCursorRow(Base):
+    __tablename__ = "evm_chain_cursors"
+    __table_args__ = (
+        CheckConstraint(
+            "chain IN ('robinhood', 'bsc') AND network = 'mainnet'", name="evm_cursor_chain"
+        ),
+        CheckConstraint(
+            "last_processed_block >= 0 AND last_safe_block >= 0 AND last_seen_head >= 0",
+            name="evm_cursor_nonnegative",
+        ),
+    )
+    chain: Mapped[str] = mapped_column(String(60), primary_key=True)
+    network: Mapped[str] = mapped_column(String(60))
+    last_seen_head: Mapped[int] = mapped_column(BigInteger)
+    last_safe_block: Mapped[int] = mapped_column(BigInteger)
+    last_processed_block: Mapped[int] = mapped_column(BigInteger)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    session_id: Mapped[UUID] = mapped_column(Uuid)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+
+
+class EvmLogRow(Base):
+    __tablename__ = "evm_log_observations"
+    __table_args__ = (Index("ix_evm_logs_chain_block", "chain", "block_number"),)
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    chain: Mapped[str] = mapped_column(String(60))
+    network: Mapped[str] = mapped_column(String(60))
+    block_number: Mapped[int] = mapped_column(BigInteger)
+    source: Mapped[str] = mapped_column(String(40))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    session_id: Mapped[UUID] = mapped_column(Uuid)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))

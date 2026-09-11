@@ -112,7 +112,7 @@ async def test_readiness_requires_new_migration(monkeypatch, market_sessions):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         assert (await client.get("/ready")).status_code == 503
         async with market_sessions.begin() as session:
-            await session.execute(text("UPDATE alembic_version SET version_num = '0003'"))
+            await session.execute(text("UPDATE alembic_version SET version_num = '0004'"))
         assert (await client.get("/ready")).status_code == 200
 
 

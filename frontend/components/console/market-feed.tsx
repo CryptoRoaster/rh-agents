@@ -62,6 +62,16 @@ export function MarketFeedIndicator() {
               ? `latest ${Math.max(0, Math.floor(((now || Date.parse(feed!.checkedAt)) - Date.parse(chain.observedAt)) / 1000))}s ago`
               : "freshness —"}
           </small>
+          <small>
+            {(() => {
+              const runtime = feed?.runtimeChains?.find(
+                (item) => item.chain === chain.chain,
+              );
+              if (!runtime) return "Runtime unavailable";
+              if (!runtime.configured) return "RPC / WSS: NOT CONFIGURED";
+              return `RPC configured · WSS ${runtime.connected ? "connected" : runtime.state.toLowerCase()} · head ${runtime.headAge === null ? "—" : `${runtime.headAge}s ago`}`;
+            })()}
+          </small>
         </span>
       ))}
       <button

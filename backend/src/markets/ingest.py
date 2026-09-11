@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
-from src.core.clock import SystemClock
+from src.core.clock import Clock, SystemClock
 from src.core.config import Settings
 from src.data.database import connect
 from src.markets.geckoterminal.adapter import GeckoTerminalAdapter
@@ -79,15 +79,20 @@ async def ingest_chain(adapter: GeckoTerminalAdapter, recorder: MarketRecorder) 
     return summary
 
 
-async def run(settings: Settings) -> tuple[IngestionSummary, ...]:
+async def run(
+    settings: Settings,
+    *,
+    clock: Clock | None = None,
+    transport: GeckoTerminalTransport | None = None,
+) -> tuple[IngestionSummary, ...]:
     if settings.market_provider != "geckoterminal":
         raise ConfigurationError()
     chains = selected_chains(settings)
-    clock = SystemClock()
+    clock = clock if clock is not None else SystemClock()
     results = []
     engine, sessions = connect(settings.database_url)
     try:
-        async with GeckoTerminalTransport(settings, clock=clock) as transport:
+        async with transport or GeckoTerminalTransport(settings, clock=clock) as transport:
             directory = NetworkDirectory(transport, settings)
             recorder = MarketRecorder(sessions, clock=clock)
             aborted = False
