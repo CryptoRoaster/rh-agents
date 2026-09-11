@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal, localcontext
 from hashlib import sha256
+from uuid import UUID
 
 from src.agents.signal.models import (
     STRONG_BINDING_BASES,
@@ -42,6 +43,14 @@ WHITESPACE = re.compile(r"\s+")
 
 MAX_RETAINED_CLUSTERS = 20
 MAX_RETAINED_SOURCES = 10
+
+
+class SignalNormalizationError(Exception):
+    """Untrusted source data could not be turned into a usable observation set."""
+
+    def __init__(self, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(reason_code)
 
 
 def normalize_content(text: str) -> str:
@@ -90,6 +99,7 @@ def admit(
     chain: str,
     token_address: str | None,
     admissible_bases: frozenset[MarketBindingBasis],
+    verified_project_authors: frozenset[str] = frozenset(),
 ) -> Admission:
     """Keep only observations that are both current and actually about this token.
 
@@ -99,19 +109,39 @@ def admit(
     TradeCase — where a bare ticker is not, because symbols collide across chains
     and a popular name would otherwise pollute an unrelated case.
 
-    An address binding is re-checked here rather than believed. A provider
-    claiming ``CONTRACT_ADDRESS_EXACT`` for another chain's address is naming a
-    different asset that happens to share a hex string.
+    Both strong bindings are re-checked here rather than believed, because an
+    adapter asserting one is still just a label on untrusted data. An address
+    binding must name this token on this chain — the same hex string elsewhere is
+    a different contract. A ``VERIFIED_PROJECT_LINK`` must come from an author
+    the caller supplies as belonging to the project: a post containing an
+    official-looking URL, a provider that calls a link official, or a model that
+    finds it convincing are none of them verification, and each would let an
+    arbitrary account claim the project's voice.
+
+    ``verified_project_authors`` holds namespaced ``author_key`` values from a
+    trusted project-identity mapping. No such mapping exists in this repository
+    yet, so the collector passes an empty set and every such claim is downgraded.
     """
     admitted: list[SignalObservation] = []
+    seen: set[UUID] = set()
     outside_window = 0
     ambiguous = 0
     unbound = 0
     for item in observations:
+        if item.observation_id in seen:
+            # One post counted twice is one voice counted twice. A provider that
+            # repeats an identifier has returned something we cannot interpret.
+            raise SignalNormalizationError("DUPLICATE_OBSERVATION_ID")
+        seen.add(item.observation_id)
         if not window.contains(item.created_at):
             outside_window += 1
             continue
-        basis = _verified_basis(item, chain=chain, token_address=token_address)
+        basis = _verified_basis(
+            item,
+            chain=chain,
+            token_address=token_address,
+            verified_project_authors=verified_project_authors,
+        )
         if basis not in admissible_bases:
             if basis == MarketBindingBasis.AMBIGUOUS_SYMBOL:
                 ambiguous += 1
@@ -129,17 +159,31 @@ def admit(
 
 
 def _verified_basis(
-    item: SignalObservation, *, chain: str, token_address: str | None
+    item: SignalObservation,
+    *,
+    chain: str,
+    token_address: str | None,
+    verified_project_authors: frozenset[str],
 ) -> MarketBindingBasis:
-    """The binding we can actually stand behind, which may be weaker than claimed."""
-    if item.binding_basis != MarketBindingBasis.CONTRACT_ADDRESS_EXACT:
-        return item.binding_basis
-    if token_address is None or item.binding_address != token_address:
-        return MarketBindingBasis.UNRESOLVED
-    if item.binding_chain != chain:
-        # The same hex string on another chain is another contract entirely.
-        return MarketBindingBasis.UNRESOLVED
-    return MarketBindingBasis.CONTRACT_ADDRESS_EXACT
+    """The binding we can actually stand behind, which may be weaker than claimed.
+
+    A strong binding is a claim about identity, and identity claims are the ones
+    an adapter is least entitled to make on its own. Anything that cannot be
+    checked here falls to ``UNRESOLVED`` rather than being believed at the
+    strength it was asserted.
+    """
+    if item.binding_basis == MarketBindingBasis.CONTRACT_ADDRESS_EXACT:
+        if token_address is None or item.binding_address != token_address:
+            return MarketBindingBasis.UNRESOLVED
+        if item.binding_chain != chain:
+            # The same hex string on another chain is another contract entirely.
+            return MarketBindingBasis.UNRESOLVED
+        return MarketBindingBasis.CONTRACT_ADDRESS_EXACT
+    if item.binding_basis == MarketBindingBasis.VERIFIED_PROJECT_LINK:
+        if item.author_key not in verified_project_authors:
+            return MarketBindingBasis.UNRESOLVED
+        return MarketBindingBasis.VERIFIED_PROJECT_LINK
+    return item.binding_basis
 
 
 def _clusters(
@@ -157,7 +201,7 @@ def _clusters(
         DuplicateCluster(
             content_hash=digest,
             observation_count=len(group),
-            author_count=len({item.author_id for item in group}),
+            author_count=len({item.author_key for item in group}),
             representative_id=group[0].observation_id,
         )
         for digest, group in sorted(members.items(), key=lambda entry: (-len(entry[1]), entry[0]))
@@ -193,6 +237,12 @@ def compute_features(
     Reposts and replies are counted but never treated as authored positions, and
     an author is counted once however often they posted — the two mistakes that
     would let one voice look like a crowd.
+
+    Every identity comparison here uses ``author_key``, never the bare provider
+    handle. Two platforms hand out the same identifier strings to different
+    people, and merging them would both shrink the apparent crowd and inflate the
+    apparent concentration — the exact pair of errors this module exists to
+    prevent, arriving through the back door.
     """
     admitted = admission.admitted
     originals = tuple(item for item in admitted if item.kind == ObservationKind.ORIGINAL)
@@ -203,7 +253,7 @@ def compute_features(
     authored = tuple(item for item in admitted if item.kind != ObservationKind.REPOST)
     clusters, members = _clusters(originals)
     duplicated = sum(cluster.observation_count for cluster in clusters)
-    authors = Counter(item.author_id for item in authored)
+    authors = Counter(item.author_key for item in authored)
     ranked = sorted(authors.values(), reverse=True)
 
     per_source: dict[SignalSource, list[SignalObservation]] = {}
@@ -213,7 +263,7 @@ def compute_features(
         SourceBreakdown(
             source=source,
             observation_count=len(group),
-            unique_author_count=len({item.author_id for item in group}),
+            unique_author_count=len({item.author_key for item in group}),
         )
         for source, group in sorted(per_source.items(), key=lambda entry: entry[0].value)
     )[:MAX_RETAINED_SOURCES]
@@ -222,7 +272,7 @@ def compute_features(
     return SignalQualityFeatures(
         window=window,
         observation_count=len(admitted),
-        unique_author_count=len({item.author_id for item in admitted}),
+        unique_author_count=len({item.author_key for item in admitted}),
         unique_authoring_count=len(authors),
         original_count=len(originals),
         repost_count=sum(1 for item in admitted if item.kind == ObservationKind.REPOST),

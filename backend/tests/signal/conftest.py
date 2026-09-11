@@ -173,7 +173,7 @@ def influencer_set(now) -> tuple[SignalObservation, ...]:
             author=f"replier-{index}",
             text=text,
             kind=ObservationKind.REPLY,
-            referenced=observation_id("influencer-original"),
+            referenced=observation_id("influencer-original", SignalSource.X),
         )
         for index, text in enumerate(
             [
@@ -192,7 +192,7 @@ def influencer_set(now) -> tuple[SignalObservation, ...]:
             author=f"follower-{index}",
             text="DEMO is the most underrated infrastructure play on this chain right now.",
             kind=ObservationKind.REPOST,
-            referenced=observation_id("influencer-original"),
+            referenced=observation_id("influencer-original", SignalSource.X),
         )
         for index in range(45)
     )

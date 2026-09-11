@@ -54,6 +54,7 @@ def test_the_context_reader_holds_no_transport_of_any_kind():
         "policy",
         "max_observations",
         "max_model_observations",
+        "verified_project_authors",
         "clock",
     }
     for forbidden in ("session", "client", "http", "url", "credential", "key", "token"):

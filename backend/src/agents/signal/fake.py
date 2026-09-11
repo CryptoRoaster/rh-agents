@@ -28,9 +28,15 @@ from src.agents.signal.ports import SignalSourceUnavailable
 FAKE_PROVIDER = "fake-social"
 
 
-def observation_id(label: str) -> UUID:
-    """A stable identifier for a fixture post, so digests stay comparable."""
-    return uuid5(NAMESPACE_URL, f"rh-agents:signal:{label}")
+def observation_id(label: str, source: SignalSource = SignalSource.X) -> UUID:
+    """A stable identifier for a fixture post, so digests stay comparable.
+
+    Derived from the source as well as the native identifier, because that is
+    what a real adapter has to do: post ``42`` exists on every platform, and an
+    identifier minted from the native string alone would silently collapse two
+    unrelated posts into one.
+    """
+    return uuid5(NAMESPACE_URL, f"rh-agents:signal:{source.value}:{label}")
 
 
 def observation(
@@ -54,7 +60,7 @@ def observation(
     the one that would hide a fetch-time freshness bug if the two were equal.
     """
     return SignalObservation(
-        observation_id=observation_id(label),
+        observation_id=observation_id(label, source),
         source=source,
         source_native_id=label,
         author_id=author,

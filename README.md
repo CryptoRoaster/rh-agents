@@ -319,15 +319,22 @@ and a model may explain them but never contradict them: a claim of broad interes
 is capped by the measured breadth of who actually spoke. Reposts are counted as
 attention rather than as opinions, so one amplified voice cannot read as a crowd.
 
-Freshness anchors to when a post was written, never to when it was fetched, and a
-bare ticker can never bind a post to a market — an exact contract address is
-re-checked against this token and this chain. Posts reach the model as quoted
+Freshness anchors to when a post was written, never to when it was fetched. A
+bare ticker can never bind a post to a market, an exact contract address is
+re-checked against this token and this chain, and an account can only speak for
+the project if a trusted identity mapping says so — a provider label is not
+verification. Identity itself is namespaced per platform, so the same handle on
+two networks stays two people. Posts reach the model as quoted
 data, and the output schema has no field for a side, a size or an approval, so an
 injected instruction has nothing to aim at.
 
-No social provider is integrated yet. The realistic candidates are researched
-against current official documentation in the phase document, and scraping around
-an access control is explicitly not a fallback. SIGNAL stays required and not
+**SIGNAL is implemented, not operationally data-enabled.** No social provider is
+integrated, no source credential exists in configuration, and the deterministic
+fake source is test-only and reachable from no startup path — nothing can quietly
+carry a real case forward on synthetic sentiment. The realistic candidates are
+researched against current official documentation in the phase document, data
+enablement is Phase 2G, and scraping around an access control is explicitly not a
+fallback. SIGNAL stays required and not
 safety-critical: unusable social data leaves the requirement pending rather than
 blocking a case, and a negative reading stops nothing. No migration, no worker
 started. See [the Phase 2F SIGNAL design and provider research](docs/phase-2f.md).

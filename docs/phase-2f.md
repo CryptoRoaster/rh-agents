@@ -106,13 +106,56 @@ case, so binding strength is explicit:
 | `AMBIGUOUS_SYMBOL` | None — a bare ticker | **No**, counted as a gap |
 | `UNRESOLVED` | None | **No** |
 
-An address binding is **re-checked rather than believed**. A provider claiming
-`CONTRACT_ADDRESS_EXACT` is downgraded to `UNRESOLVED` unless the address it
-names equals this token *and* the chain matches — the same hex string on another
-chain is a different contract entirely. The policy cannot be configured to admit
-`AMBIGUOUS_SYMBOL` or `UNRESOLVED`; it refuses to construct.
+Both strong bindings are **re-checked rather than believed**, because an adapter
+asserting one is still a label on untrusted data and a strong binding is a claim
+about identity — the claim an adapter is least entitled to make alone.
 
-A set that rests entirely on weak bindings is `DEGRADED`, never clean.
+* `CONTRACT_ADDRESS_EXACT` is downgraded to `UNRESOLVED` unless the address it
+  names equals this token *and* the chain matches. The same hex string on another
+  chain is a different contract entirely.
+* `VERIFIED_PROJECT_LINK` is downgraded to `UNRESOLVED` unless the author appears
+  in a trusted project-identity mapping supplied to the collector. A post
+  containing an official-looking URL, a provider that calls a link official, and
+  a model that finds it convincing are none of them verification — and each would
+  otherwise let an arbitrary account claim the project's own voice, which is the
+  strongest binding in the system.
+
+**No such mapping exists in this repository yet**, so the collector passes an
+empty set and every `VERIFIED_PROJECT_LINK` claim is currently downgraded. The
+path is structurally supported and tested by injecting a fixture registry;
+building a real one is a deliberate future decision, not something a provider
+label supplies. The registry is keyed on the same namespaced author identity as
+everything else, so a trusted handle on one platform grants nothing on another.
+
+The policy cannot be configured to admit `AMBIGUOUS_SYMBOL` or `UNRESOLVED`; it
+refuses to construct. A set that rests entirely on weak bindings is `DEGRADED`,
+never clean, and weak bindings stay visibly weak all the way into the model's
+input — there is no field on the assessment through which a model could promote
+one, because binding is input provenance decided before it is ever called.
+
+### Identity is namespaced, and only identity is
+
+A provider-native identifier means something inside its own platform and nothing
+outside it. User `123` on X and user `123` on Reddit are two people; post `42`
+exists everywhere. Every identity comparison therefore uses a namespaced key:
+
+| Concept | Key | Never |
+| --- | --- | --- |
+| Author | `author_key` = `source:author_id` | A bare handle — handles collide across platforms and change over time |
+| Observation | `observation_id`, which an adapter must mint per `(source, native id)` | `source_native_id`, which is provenance only and is never grouped on |
+
+Merging two people makes both of the errors that point at the same wrong
+conclusion: the crowd shrinks and its concentration rises, so an honest
+cross-platform conversation reads as a campaign. Unique author counts, authoring
+counts, top-1 and top-5 concentration, per-source breakdowns, duplicate-cluster
+author counts and the sample's diversity pass all use the namespaced key. A
+repeated `observation_id` is refused outright — one post counted twice is one
+voice counted twice.
+
+**Content similarity is deliberately not identity.** The same shill text posted
+on Farcaster and on X is one duplicate cluster *and* several distinct authors:
+cross-source copying is a real finding, and merging the accounts behind it would
+destroy the evidence for it.
 
 ### Freshness: source time, never fetch time
 
@@ -160,7 +203,22 @@ The top-five concentration term carries a derived guard. With `N` authors postin
 evenly the top-five share is already `5/N`, so for small `N` the threshold is
 crossed by arithmetic alone — six people writing once each produce 0.83. The term
 therefore applies only where an even distribution would sit *below* the
-threshold, which is exactly where exceeding it implies real skew.
+threshold, which is exactly where exceeding it implies real skew. At the shipped
+threshold of 0.80 that boundary falls at seven authors, and it moves with the
+threshold rather than being a number someone picked.
+
+The top-one term needs no such guard: with three or more authors an even
+distribution sits at 0.33, well under its threshold, and the only sets that cross
+it trivially — one or two voices — are already `INSUFFICIENT`, so nothing
+downstream ever acts on the concern. A single post degrades confidence; it is
+never evidence of manipulation. Every share goes through one helper that returns
+zero for an empty denominator, so no count can divide by zero.
+
+Resharers stay visible as participants in `unique_author_count` and in the
+attention count — amplification is real activity. What they are not is authors,
+so they contribute no breadth. Whether an amplifying account is *itself* worth
+modelling — a coordinated retweet ring, say — is a metric this phase does not
+have and does not pretend to.
 
 Burstiness is an indicator and never a verdict: a genuinely viral phrase can also
 arrive in a rush, so it contributes to a concern rather than producing one.
@@ -195,7 +253,14 @@ The mechanism that stops a confident model from overruling arithmetic:
 | `MODERATE` | `MODERATE` |
 | `HIGH` / `VERY_HIGH` | `STRONG` |
 
-A model that claims more is an invalid result, not a downgraded one. Raising a
+This is a **ceiling, not a generator**. Wide authorship permits a strong reading;
+it never produces one. A broad, entirely factual discussion in which nobody
+expresses any interest stays at `NONE`, because permission is not evidence and
+the language still has to say something. The asymmetry is the point: narrow
+authorship can cap an over-confident claim, and nothing can manufacture one.
+
+A model that claims more than the ceiling allows is an invalid result, not a
+downgraded one. Raising a
 manipulation concern the measurements missed is allowed and recorded; lowering
 one is not expressible, because the deterministic levels are computed before the
 model is called and the output schema has no field for them.
@@ -289,8 +354,18 @@ identity, timing, correlation and supersession; the model fills only its own axe
 
 `SentimentPayload` keeps its original `assessment` field and gains an optional
 `intelligence` record carrying the policy version, the four deterministic levels,
-the gaps, the full metrics and the model's advisory reading. Additive, so no
-migration: the existing evidence JSONB payload holds it.
+the gaps, the full metrics and the model's advisory reading.
+
+**Additive, so no migration and no schema bump.** The payload is serialized data
+in an existing JSONB column, nothing that already existed changed shape, and the
+new field defaults to `None` — so sentiment evidence written before this phase
+still parses, round-trips and replays unchanged. There is a test for exactly that
+legacy shape. `schema_version` on the envelope stays 1 because no existing reader
+has to change; a record written now identifies itself through the policy and
+prompt versions it carries, which is what anything later would actually need to
+tell the two apart. An absent `intelligence` is deliberately distinguishable from
+a present one reporting zero observations: the first means nobody measured, the
+second means somebody looked and found nothing.
 
 `MIXED` and `NEUTRAL` both map to `NEUTRAL` in the legacy field, and the
 distinction survives in `intelligence.sentiment_direction`. `UNCLEAR` is never
@@ -312,6 +387,16 @@ Phase 2F changes none of it. The consequences are deliberate:
 * An unusable social set leaves the requirement unmet, and the case waits in
   `EVIDENCE_PENDING` rather than moving to `BLOCKED`. Quality insufficiency
   prevents satisfying the prerequisite; it is not a safety blocker.
+* Being outside the risk digest is a statement about **which digest**, not about
+  when sentiment stops mattering. SIGNAL is a required pre-trigger prerequisite
+  and the evaluator re-checks every one of those on each pass, so a reading that
+  later goes stale moves the case back to `EVIDENCE_PENDING` — through the
+  evaluator, exactly as the engine documents, rather than through the digest. The
+  risk binding itself is untouched, and the case is simply no longer in a status
+  from which anything could proceed. Workflow eligibility and risk-binding
+  validity are different questions, and a required prerequisite cannot vanish
+  underneath a case that still looks executable. Tested against the real
+  evaluator.
 * A **negative** reading is accepted evidence and stops nothing. Whether bad
   sentiment should matter is a synthesis question for a later FUSE, and encoding
   an answer here would quietly turn a mood into a veto.

@@ -247,9 +247,12 @@ class SignalObservation(Immutable):
 
     observation_id: UUID
     source: SignalSource
+    # Provenance only. A provider's own identifier is never used to group or
+    # compare anything, because it means nothing outside its own platform.
     source_native_id: Identifier
-    # A stable pseudonymous handle for the author, normalized by the adapter.
-    # Never a real name, never contact details, never a profile dump.
+    # A stable pseudonymous handle for the author *within its source*. Never a
+    # real name, never contact details, never a profile dump — and never
+    # compared across platforms on its own; see ``author_key``.
     author_id: Identifier
     kind: ObservationKind
     created_at: AwareDatetime
@@ -265,6 +268,29 @@ class SignalObservation(Immutable):
     binding_address: EvmAddress | None = None
     binding_chain: Identifier | None = None
     provider: Identifier
+
+    @property
+    def author_key(self) -> str:
+        """The only identity two observations may be compared on.
+
+        A provider-native identifier has meaning inside its source namespace and
+        nowhere else. User ``123`` on X and user ``123`` on Reddit are two
+        people, and a display handle is worse still: handles collide across
+        platforms and change over time. Merging them would understate how many
+        voices there are and overstate how concentrated they are — turning an
+        honest cross-platform conversation into a measured campaign.
+        """
+        return f"{self.source.value}:{self.author_id}"
+
+    @property
+    def native_key(self) -> str:
+        """The observation's identity in provider terms, namespaced the same way.
+
+        Post ``42`` exists on every platform. This is what a future adapter must
+        map to a distinct ``observation_id``, and what makes that mapping
+        checkable rather than a matter of adapter discipline.
+        """
+        return f"{self.source.value}:{self.source_native_id}"
 
     @model_validator(mode="after")
     def binding_matches_content(self) -> Self:
@@ -396,6 +422,8 @@ class SignalRepresentative(Immutable):
     observation_id: UUID
     source: SignalSource
     author_id: Identifier
+    # The namespaced identity the sample was actually diversified on.
+    author_key: Identifier
     kind: ObservationKind
     created_at: AwareDatetime
     content_hash: ContentHash
@@ -442,8 +470,8 @@ class SignalTaskInput(Immutable):
         return frozenset(item.observation_id for item in self.representatives)
 
     @property
-    def author_ids(self) -> frozenset[str]:
-        return frozenset(item.author_id for item in self.representatives)
+    def author_keys(self) -> frozenset[str]:
+        return frozenset(item.author_key for item in self.representatives)
 
 
 class SignalAssessment(Immutable):

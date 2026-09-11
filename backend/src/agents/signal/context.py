@@ -108,6 +108,7 @@ def sample(
                 observation_id=item.observation_id,
                 source=item.source,
                 author_id=item.author_id,
+                author_key=item.author_key,
                 kind=item.kind,
                 created_at=item.created_at,
                 content_hash=digest,
@@ -116,7 +117,7 @@ def sample(
             )
         )
         taken.add(item.observation_id)
-        authors.add(item.author_id)
+        authors.add(item.author_key)
         seen_text.add(digest)
 
     for cluster in features.duplicate_clusters:
@@ -130,7 +131,7 @@ def sample(
             break
         if (
             item.observation_id not in taken
-            and item.author_id not in authors
+            and item.author_key not in authors
             and content_hash(item.content) not in seen_text
         ):
             take(item, "AUTHOR_DIVERSITY")
@@ -151,6 +152,11 @@ class SignalContextReader:
     policy: SignalQualityPolicy = SIGNAL_QUALITY_V1
     max_observations: int = 500
     max_model_observations: int = 25
+    # Namespaced author keys a trusted project-identity mapping says belong to
+    # this project. Empty by default and empty in practice: no such registry
+    # exists yet, so no adapter can assert the project's own voice. Building one
+    # is a deliberate future decision, not something a provider label supplies.
+    verified_project_authors: frozenset[str] = frozenset()
     clock: Clock = SystemClock()
 
     async def sentiment_context(self, trade_case_id: UUID, task_id: UUID) -> SignalTaskInput:
@@ -176,6 +182,7 @@ class SignalContextReader:
             chain=market.chain,
             token_address=token_address,
             admissible_bases=self.policy.admissible_bases,
+            verified_project_authors=self.verified_project_authors,
         )
         features = compute_features(
             admission, window=window, burst_interval=self.policy.burst_interval
@@ -295,7 +302,7 @@ def signal_document(task_input: SignalTaskInput, window_seconds: int) -> dict[st
             {
                 "observation_id": str(item.observation_id),
                 "source": item.source.value,
-                "author_id": item.author_id,
+                "author_key": item.author_key,
                 "kind": item.kind.value,
                 "created_at": item.created_at.isoformat(),
                 "content_hash": item.content_hash,
