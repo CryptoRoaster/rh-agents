@@ -43,7 +43,7 @@ class MarketRow(Document):
 class MarketObservationRow(Base):
     __tablename__ = "market_observations"
     __table_args__ = (
-        CheckConstraint("schema_version = 1", name="market_observation_version"),
+        CheckConstraint("schema_version IN (1, 2)", name="market_observation_version"),
         Index("ix_observation_pair_time", "provider", "pair_id", "observed_at", "id"),
         Index("ix_observation_asset_time", "asset_id", "observed_at"),
         Index("ix_observation_observed_at", "observed_at"),
@@ -54,7 +54,7 @@ class MarketObservationRow(Base):
     chain: Mapped[str] = mapped_column(String(60))
     network: Mapped[str] = mapped_column(String(60))
     asset_id: Mapped[str] = mapped_column(String(200))
-    pair_id: Mapped[str] = mapped_column(String(200))
+    pair_id: Mapped[str] = mapped_column(String(512))
     correlation_id: Mapped[UUID] = mapped_column(Uuid)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "RH Agents · Trading overview",
   description:
-    "Autonomous intelligence. Deterministic risk. Phase 0 paper trading workspace.",
+    "Multi-Agent On-Chain Trading Console. Real market observations and clearly labeled paper portfolio previews.",
 };
 
 export default function RootLayout({

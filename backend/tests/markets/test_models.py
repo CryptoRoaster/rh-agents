@@ -19,9 +19,7 @@ def test_exact_decimal_and_immutable_roundtrip(observation):
         parsed.price.value_usd = Decimal("1")
 
 
-@pytest.mark.parametrize(
-    "value", [1.5, True, "NaN", "Infinity", "-1", "0", "bad", "1.0000000000000000001"]
-)
+@pytest.mark.parametrize("value", [1.5, True, "NaN", "Infinity", "-1", "0", "bad", "1e-1001"])
 def test_malformed_price_rejected(observation, value):
     data = observation.model_dump()
     data["price"]["value_usd"] = value

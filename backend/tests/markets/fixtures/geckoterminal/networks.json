@@ -1,0 +1,23 @@
+{
+  "data": [
+    {
+      "id": "bsc",
+      "type": "network",
+      "attributes": {
+        "name": "BNB Chain",
+        "coingecko_asset_platform_id": "binance-smart-chain"
+      }
+    },
+    {
+      "id": "robinhood",
+      "type": "network",
+      "attributes": {
+        "name": "Robinhood",
+        "coingecko_asset_platform_id": "robinhood"
+      }
+    }
+  ],
+  "links": {
+    "next": null
+  }
+}
