@@ -76,11 +76,17 @@ class AtlasSourceFailure(StrEnum):
 class HolderCompleteness(StrEnum):
     """How much of the holder universe the source actually proved.
 
-    ``COMPLETE`` means every holder row was retrieved. ``TOP_N_ONLY`` means a
-    provably balance-ordered prefix was retrieved, which is sufficient for a
-    top-N concentration against an independently known supply but says nothing
-    about the rest of the distribution. ``UNKNOWN`` means neither could be
-    established, and no concentration metric may be derived from it.
+    ``COMPLETE`` means every holder row the provider exposes was retrieved.
+    ``TOP_N_ONLY`` means a provably balance-ordered prefix was retrieved, which
+    is sufficient for a top-N concentration against an independently known supply
+    but says nothing about the rest of the distribution. ``UNKNOWN`` means
+    neither could be established, and no concentration metric may be derived
+    from it.
+
+    Completeness is about *our* paging, not about the provider's own filtering.
+    A provider that removes addresses from its holder list server-side still
+    answers ``COMPLETE`` for what it exposes, which is why every such exclusion
+    is recorded separately in ``excluded_addresses`` and never left implicit.
     """
 
     COMPLETE = "COMPLETE"
@@ -92,10 +98,16 @@ class HolderObservationBasis(StrEnum):
     """What the holder observation time actually refers to.
 
     ``SOURCE_BLOCK`` means the provider named the block its holder state belongs
-    to and the timestamp is that block's chain time. ``RESPONSE_TIME`` means the
-    provider only guarantees "current" state with no block provenance, so the
-    moment of the response is the best anchor available — a materially weaker
-    assurance that is recorded rather than disguised.
+    to and the timestamp is that block's **chain** time — an authoritative source
+    observation time. ``RESPONSE_TIME`` means the provider only guarantees
+    "current" state with no block and no indexer snapshot timestamp, so the
+    moment the response was **received** is the best anchor available.
+
+    These are not interchangeable. A response receipt time proves only that this
+    representation arrived at time T; it does not prove that the indexed state
+    behind it is from time T, so an indexer running hours behind is invisible to
+    it. That asymmetry is recorded here rather than hidden inside a single
+    timestamp field, and policy decides explicitly which bases it accepts.
     """
 
     SOURCE_BLOCK = "SOURCE_BLOCK"
@@ -262,6 +274,9 @@ class HolderFactsSourceResult(Immutable):
     token_address: EvmAddress | None = None
     rows: tuple[HolderSourceRow, ...] = Field(default=(), max_length=2000)
     completeness: HolderCompleteness = HolderCompleteness.UNKNOWN
+    # Addresses the provider itself removes from its holder list, so a metric
+    # that depends on seeing them is withheld rather than silently understated.
+    excluded_addresses: tuple[EvmAddress, ...] = Field(default=(), max_length=8)
     observation_basis: HolderObservationBasis | None = None
     # Present only when the provider names the block its holder state belongs to.
     snapshot_block: int | None = Field(default=None, ge=0)
@@ -305,6 +320,9 @@ class HolderFacts(Immutable):
     observed_at: AwareDatetime | None = None
     observation_basis: HolderObservationBasis | None = None
     completeness: HolderCompleteness = HolderCompleteness.UNKNOWN
+    # Carried through from the source so a reader can see that the holder list
+    # was filtered upstream, and why an adjustment may be absent.
+    excluded_addresses: tuple[EvmAddress, ...] = Field(default=(), max_length=8)
     snapshot_block: int | None = Field(default=None, ge=0)
     # Pinned contract block minus holder snapshot block, when both are known.
     # Positive means the holder data is older than the block the contract facts

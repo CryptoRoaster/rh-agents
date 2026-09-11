@@ -12,8 +12,14 @@ from decimal import Decimal
 
 import pytest
 
-from src.agents.atlas.context import AtlasSnapshotBuilder, atlas_snapshot_digest
+from src.agents.atlas.context import (
+    AtlasSnapshotBuilder,
+    atlas_snapshot_digest,
+    snapshot_document,
+    source_skew,
+)
 from src.agents.atlas.models import (
+    ZERO_ADDRESS,
     AtlasDomain,
     AtlasReasonCode,
     AtlasSourceFailure,
@@ -174,6 +180,36 @@ async def test_bsc_holder_intelligence_reaches_the_same_domain_semantics(now):
     assert evaluate_snapshot(snapshot, now).verdict == AtlasVerdict.CLEAR
 
 
+async def test_a_provider_side_exclusion_is_carried_into_the_fact_and_the_digest(now):
+    """Blockscout filters the zero address out of its holder list.
+
+    That is not something a reader should have to infer from a burn total of
+    zero, so the exclusion travels with the fact, reaches the fact document the
+    digest is taken over, and withholds the adjustment that would otherwise rest
+    on a burn figure that could never have seen the sink.
+    """
+    snapshot = await build(robinhood_builder(now), now)
+    assert snapshot.holders.completeness == HolderCompleteness.COMPLETE
+    assert snapshot.holders.excluded_addresses == (ZERO_ADDRESS,)
+    assert snapshot.holders.burned_raw is None
+    assert snapshot.holders.top10_share_excluding_burn is None
+    # The raw metric is untouched: a filtered row cannot be added back, and
+    # nothing else is removed from it.
+    assert snapshot.holders.top1_share == Decimal("0.05")
+    document = snapshot_document(snapshot)
+    holders = document["holders"]
+    assert isinstance(holders, dict)
+    assert holders["excluded_addresses"] == [ZERO_ADDRESS]
+
+
+async def test_a_vendor_that_filters_nothing_still_reports_its_burn_adjustment(now):
+    """The withholding is about the exclusion, not about the vendor's name."""
+    snapshot = await build(bsc_builder(now), now, chain="bsc")
+    assert snapshot.holders.excluded_addresses == ()
+    assert snapshot.holders.completeness == HolderCompleteness.COMPLETE
+    assert snapshot.holders.burned_raw is not None
+
+
 async def test_equivalent_distributions_normalize_identically_across_vendors(now):
     robinhood = await build(robinhood_builder(now), now)
     bsc = await build(bsc_builder(now), now, chain="bsc")
@@ -229,6 +265,32 @@ async def test_an_indexer_far_behind_the_chain_cannot_be_rescued_by_a_fresh_fetc
     assert decision.verdict == AtlasVerdict.INSUFFICIENT_DATA
     assert AtlasReasonCode.SNAPSHOT_SKEW_EXCEEDED in decision.data_gaps
     assert AtlasReasonCode.SNAPSHOT_STALE in decision.data_gaps
+
+
+async def test_reported_skew_is_measured_between_observations_not_between_fetches(now):
+    """`source_skew` must answer the same question the policy asks.
+
+    Fetch times would put both operands within milliseconds of each other however
+    old either fact is, which would turn the reported spread into a measurement
+    of our own scheduling.
+    """
+    recording = blockscout_routes(now=now, head_block=990_000, head_offset=20 * 60)
+    snapshot = await build(robinhood_builder(now, recording=recording), now)
+    assert snapshot.chain.observed_at == now
+    assert source_skew(snapshot) == timedelta(minutes=20) - timedelta(seconds=60)
+    assert AtlasReasonCode.SNAPSHOT_SKEW_EXCEEDED in evaluate_snapshot(snapshot, now).data_gaps
+
+
+async def test_a_receipt_anchored_source_reports_a_spread_that_means_less(now):
+    """The same number, a weaker meaning — which is why the basis travels with it.
+
+    Against a BSC fact this bounds the pinned block's age at the moment of the
+    answer. It is not a source-to-source skew and cannot see a lagging indexer,
+    so assurance is gated on the basis rather than on this figure.
+    """
+    snapshot = await build(bsc_builder(now, observed_offset=0), now, chain="bsc")
+    assert snapshot.holders.observation_basis == HolderObservationBasis.RESPONSE_TIME
+    assert source_skew(snapshot) == timedelta(seconds=60)
 
 
 async def test_holder_data_about_another_token_is_never_accepted(now):

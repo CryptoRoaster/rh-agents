@@ -5,11 +5,23 @@ source. Moralis is used because it documents the two properties the deterministi
 math depends on: raw integer balances, and an explicit ``order`` parameter, so a
 balance-ordered prefix is a stated contract rather than an observed accident.
 
+**Ordering is documented, not proven.** ``order`` is a documented request
+parameter taking ``ASC`` or ``DESC``, and the endpoint is documented as returning
+owners sorted by balance. It is sent explicitly on every page rather than relying
+on the documented default, but the cursor is opaque, so the global top-prefix
+rests on the provider's stated contract rather than on an inspectable keyset
+predicate the way Robinhood's does. Observed order is verified across pages
+regardless.
+
 **Reduced assurance, stated plainly.** Moralis answers with current indexed state
-and names no block, so the holder observation can only be anchored to the moment
-of the response. That is materially weaker than Robinhood's block-anchored
-provenance, it is recorded as ``RESPONSE_TIME`` on the fact, and no code pretends
-the two chains have equal provenance.
+and names no block, no block hash and no indexer snapshot timestamp, so the
+holder observation can only be anchored to the moment the response was received.
+That is materially weaker than Robinhood's block-anchored provenance: it proves
+when this representation arrived, never that the state behind it is that recent,
+so an indexer running behind is invisible to it. It is recorded as
+``RESPONSE_TIME`` on the fact, no code pretends the two chains have equal
+provenance, and nothing here fabricates a block or a snapshot time to fill the
+gap.
 """
 
 from collections.abc import Callable
@@ -153,8 +165,10 @@ class MoralisHolderSource:
             token_address=token_address,
             rows=ordered,
             completeness=HolderCompleteness.COMPLETE if complete else HolderCompleteness.TOP_N_ONLY,
-            # No block is named by this API, so the response moment is the only
-            # honest anchor and is labelled as the weaker basis it is.
+            # No block is named by this API, so the moment the response was
+            # received is the only honest anchor and is labelled as the weaker
+            # basis it is. A re-fetch produces a new receipt time and nothing
+            # more: it can never turn this into block-anchored provenance.
             observation_basis=HolderObservationBasis.RESPONSE_TIME,
             snapshot_block=None,
             snapshot_timestamp=self.clock.now(),

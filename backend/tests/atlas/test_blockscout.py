@@ -17,6 +17,7 @@ from src.agents.atlas.sources.blockscout import (
     BlockscoutContractOriginSource,
     BlockscoutHolderSource,
 )
+from src.agents.atlas.sources.normalize import concentration
 from src.markets.models import Availability
 from tests.atlas.conftest import TOKEN
 from tests.atlas.fake_http import RecordingRoutes, json_response
@@ -158,6 +159,62 @@ async def test_a_continued_page_set_is_reported_as_a_proven_prefix_only():
     # prefix rather than the whole holder universe.
     assert result.completeness == HolderCompleteness.TOP_N_ONLY
     assert len(result.rows) == 24
+
+
+async def test_an_out_of_order_page_is_refused_however_well_formed_it_is():
+    """The provider order guarantee is what makes a prefix a global top-N.
+
+    Blockscout's implementation orders `desc: value, desc: address_hash` and
+    pages with a strictly descending keyset predicate, so a page that arrives
+    unordered means the deployment is not keeping the contract the prefix rests
+    on. Observed-order validation is not that guarantee — it is the check that
+    sits beside it.
+    """
+    payload = page(12)
+    payload["items"] = list(reversed(payload["items"]))
+    recording = routes(holders=payload)
+    result = await source(recording).holder_facts("robinhood", TOKEN)
+    assert result.status == Availability.UNAVAILABLE
+    assert result.failure == AtlasSourceFailure.INVALID_RESPONSE
+
+
+async def test_a_second_page_holding_a_larger_balance_than_the_first_is_refused():
+    """Cross-page monotonicity: page two may only continue strictly downwards."""
+    pages = iter(
+        [
+            page(12, next_params={"value": "1", "address_hash": "0x" + "aa" * 20}),
+            # Every row here outweighs the first page, which the keyset predicate
+            # makes impossible. A locally ordered page is not enough.
+            page(12, start=40, top=9 * 10**22),
+        ]
+    )
+    recording = routes(holders=lambda request: json_response(next(pages)))
+    result = await source(recording).holder_facts("robinhood", TOKEN)
+    assert result.status == Availability.UNAVAILABLE
+    assert result.failure == AtlasSourceFailure.INVALID_RESPONSE
+
+
+async def test_the_holder_list_declares_the_address_the_provider_filters_out():
+    """Blockscout removes the zero address from its holder query. Say so."""
+    recording = routes()
+    result = await source(recording).holder_facts("robinhood", TOKEN)
+    assert result.excluded_addresses == ("0x" + "0" * 40,)
+
+
+async def test_a_provider_filtered_burn_address_withholds_the_burn_adjustment():
+    """A burn total that cannot see a burn sink is a lower bound, not a fact.
+
+    Using it as a denominator adjustment would understate concentration, so the
+    adjusted figure is withheld even though this holder set is COMPLETE.
+    """
+    recording = routes()
+    result = await source(recording).holder_facts("robinhood", TOKEN)
+    assert result.completeness == HolderCompleteness.COMPLETE
+    measured = concentration(result.rows, 10**24, result.completeness, result.excluded_addresses)
+    assert measured.top10_share > 0
+    assert measured.burned_raw is None
+    assert measured.burned_share is None
+    assert measured.top10_share_excluding_burn is None
 
 
 async def test_a_repeating_cursor_cannot_loop_forever():

@@ -16,6 +16,7 @@ from src.agents.atlas.models import (
     AtlasSafetyDecision,
     AtlasVerdict,
     HolderCompleteness,
+    HolderObservationBasis,
     ProxyObservation,
 )
 from src.markets.models import Availability
@@ -50,12 +51,24 @@ class AtlasPolicy:
     accepted_holder_completeness: frozenset[HolderCompleteness] = frozenset(
         {HolderCompleteness.COMPLETE, HolderCompleteness.TOP_N_ONLY}
     )
+    # Which holder provenance qualities are good enough to act on. Accepting
+    # RESPONSE_TIME is a deliberate PAPER-mode decision, not an oversight: a
+    # response receipt proves when a representation arrived, never that the
+    # indexed state behind it is that recent, so it cannot detect an indexer
+    # running behind. A LIVE policy narrows this to SOURCE_BLOCK by changing one
+    # field, which is why the acceptance is a named policy input rather than an
+    # implicit consequence of a provider's capabilities.
+    accepted_holder_observation_bases: frozenset[HolderObservationBasis] = frozenset(
+        {HolderObservationBasis.SOURCE_BLOCK, HolderObservationBasis.RESPONSE_TIME}
+    )
 
     def __post_init__(self) -> None:
         if self.snapshot_validity <= timedelta(0) or self.max_source_skew < timedelta(0):
             raise ValueError("Snapshot validity must be positive and skew non-negative")
         if HolderCompleteness.UNKNOWN in self.accepted_holder_completeness:
             raise ValueError("Unproven holder coverage can never satisfy the holder domain")
+        if not self.accepted_holder_observation_bases:
+            raise ValueError("At least one holder observation basis must be acceptable")
         if self.max_top10_concentration is not None and not (
             Decimal(0) < self.max_top10_concentration <= Decimal(1)
         ):
@@ -76,6 +89,15 @@ class AtlasPolicy:
 # because the data finally exists would invent a threshold nobody chose. With it
 # disabled, a PASS on the holder domain means the data-quality prerequisite was
 # met — not that the distribution was judged safe.
+#
+# PRE-LIVE INVARIANT. This policy accepts RESPONSE_TIME holder provenance, which
+# is sound for PAPER evaluation and insufficient for autonomous execution: it
+# cannot detect a lagging indexer. Before LIVE_AUTONOMOUS is enabled, safety
+# critical holder data must carry provenance able to expose material indexer lag
+# — a successor policy must drop RESPONSE_TIME from
+# ``accepted_holder_observation_bases``, unless a provider contract gives an
+# independently trustworthy current-state freshness guarantee that is reviewed
+# and approved on its own merits. Nothing here enables live mode.
 ATLAS_POLICY_V2 = AtlasPolicy(
     version="atlas-policy-v2",
     expected_chain_ids={"robinhood": 4663, "bsc": 56},
@@ -102,6 +124,13 @@ def _data_gaps(
         gaps.append(AtlasReasonCode.SNAPSHOT_STALE)
     # Facts read from different sources are never atomic. Measure the spread
     # between the observations themselves, again not between fetches.
+    #
+    # The two operands carry different epistemic weight and that is handled
+    # deliberately rather than averaged away. Against a SOURCE_BLOCK holder
+    # anchor this is a true source-to-source skew. Against a RESPONSE_TIME anchor
+    # it bounds only how far the pinned block lags the moment of the answer, so
+    # it is kept as a bound *and* the basis itself must be one the policy accepts
+    # below — the weaker source is gated on assurance, not on this number.
     if snapshot.holders.observed_at is not None:
         skew = abs(snapshot.chain.block_timestamp - snapshot.holders.observed_at)
         if skew > policy.max_source_skew:
@@ -131,6 +160,7 @@ def _data_gaps(
         and snapshot.holders.status == Availability.AVAILABLE
         and (
             snapshot.holders.completeness not in policy.accepted_holder_completeness
+            or snapshot.holders.observation_basis not in policy.accepted_holder_observation_bases
             or snapshot.holders.top10_share is None
         )
     ):

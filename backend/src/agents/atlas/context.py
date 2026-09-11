@@ -176,7 +176,9 @@ class AtlasSnapshotBuilder:
             # incompatible. Reconciliation is exact: no tolerance is guessed.
             return unusable(AtlasSourceFailure.SUPPLY_INCONSISTENT)
         try:
-            measured = concentration(result.rows, supply, result.completeness)
+            measured = concentration(
+                result.rows, supply, result.completeness, result.excluded_addresses
+            )
         except HolderNormalizationError as error:
             return unusable(error.failure)
         return HolderFacts(
@@ -186,6 +188,7 @@ class AtlasSnapshotBuilder:
             observed_at=result.snapshot_timestamp,
             observation_basis=result.observation_basis,
             completeness=result.completeness,
+            excluded_addresses=result.excluded_addresses,
             snapshot_block=result.snapshot_block,
             holder_block_delta=(
                 None
@@ -315,6 +318,10 @@ def snapshot_document(snapshot: AtlasOnchainSnapshot) -> dict[str, object]:
                 None if holders.observation_basis is None else holders.observation_basis.value
             ),
             "completeness": holders.completeness.value,
+            # What the provider filtered out before we saw it. Part of the
+            # digest, so a provider silently changing its filtering changes the
+            # fact fingerprint instead of passing unnoticed.
+            "excluded_addresses": list(holders.excluded_addresses),
             "snapshot_block": holders.snapshot_block,
             "holder_block_delta": holders.holder_block_delta,
             "total_supply_raw": (
@@ -382,6 +389,18 @@ def atlas_snapshot_digest(snapshot: AtlasOnchainSnapshot) -> str:
 
 
 def source_skew(snapshot: AtlasOnchainSnapshot) -> timedelta | None:
+    """The spread policy judges: chain **block** time against the holder anchor.
+
+    Deliberately not ``chain.observed_at``. Fetch times say when we ran, and a
+    spread between two fetches would be near zero however old either fact is.
+
+    The two operands are not epistemically equal when the holder anchor is
+    ``RESPONSE_TIME``: one is an authoritative chain observation, the other a
+    response receipt. The difference is then a bound on how far the pinned block
+    lags the moment of the answer, not a source-to-source skew, and it cannot
+    detect an indexer running behind. ``HolderObservationBasis`` on the fact is
+    what says which reading applies; the number alone never does.
+    """
     if snapshot.holders.observed_at is None:
         return None
-    return abs(snapshot.chain.observed_at - snapshot.holders.observed_at)
+    return abs(snapshot.chain.block_timestamp - snapshot.holders.observed_at)

@@ -5,7 +5,7 @@ vendors. What matters is that the normalized facts are identical in domain
 semantics — the vendor only survives in provenance.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -105,6 +105,52 @@ async def test_a_cursor_continues_the_page_set_within_the_budget():
     assert result.completeness == HolderCompleteness.TOP_N_ONLY
     assert len(result.rows) == 24
     assert recording.requests[1].url.params["cursor"] == "next-one"
+
+
+async def test_every_page_states_the_order_instead_of_trusting_the_default():
+    """`order` defaults to DESC, which is exactly why it is sent explicitly.
+
+    A documented default is a vendor's choice to change; the prefix guarantee
+    rests on the parameter we actually sent, on the continued page as much as on
+    the first.
+    """
+    pages = iter([owners(12, cursor="next-one"), owners(12, start=40, top=10**22)])
+    recording = RecordingRoutes({"/owners": lambda request: json_response(next(pages))})
+    result = await source(recording).holder_facts("bsc", TOKEN)
+    assert result.status == Availability.AVAILABLE
+    assert len(recording.requests) == 2
+    for request in recording.requests:
+        assert request.url.params["order"] == "DESC"
+        assert request.url.params["chain"] == "0x38"
+    assert recording.requests[1].url.params["cursor"] == "next-one"
+
+
+async def test_a_second_receipt_of_the_same_snapshot_stays_response_time_only():
+    """The Phase 2D freshness defect, in the shape this provider can take.
+
+    Moralis names no block and no indexer timestamp, so a second fetch twenty
+    minutes later yields a second *receipt* and nothing more. The test can prove
+    what the basis is called, never that the indexed state moved — that is the
+    limitation, stated rather than papered over.
+    """
+    later = OBSERVED + timedelta(minutes=20)
+    payload = owners(12)
+    recording = RecordingRoutes({"/owners": lambda request: json_response(payload)})
+    first = await source(recording).holder_facts("bsc", TOKEN)
+    second = await MoralisHolderSource(
+        config=MORALIS,
+        chain="bsc",
+        clock=FixedClock(later),
+        transport_factory=recording.transport_factory(),
+    ).holder_facts("bsc", TOKEN)
+
+    assert [row.balance_raw for row in first.rows] == [row.balance_raw for row in second.rows]
+    for result in (first, second):
+        assert result.observation_basis == HolderObservationBasis.RESPONSE_TIME
+        # No block and no indexer snapshot time is invented to fill the gap.
+        assert result.snapshot_block is None
+    assert first.snapshot_timestamp == OBSERVED
+    assert second.snapshot_timestamp == later
 
 
 async def test_a_repeating_cursor_is_refused():

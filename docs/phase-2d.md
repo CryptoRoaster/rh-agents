@@ -157,7 +157,11 @@ satisfied.
 * Snapshot validity: 10 minutes — ATLAS's own policy, not borrowed from ORBIT's
   discovery window or from SENTINEL.
 * Maximum source skew: 5 minutes. Facts from different sources are never atomic,
-  so the spread is measured rather than assumed away.
+  so the spread is measured rather than assumed away. Phase 2E adds the caveat
+  that the two operands are only epistemically equal when the holder fact is
+  block-anchored; against a receipt-anchored one the same number bounds the
+  pinned block's age at the moment of the answer and cannot see a lagging
+  indexer, which is why assurance is gated separately.
 
 ### Freshness is anchored to observation, not to collection
 
@@ -165,7 +169,16 @@ Age is measured from `oldest_source_observation` — the earliest moment any
 contributing source actually observed reality — and never from when the
 collector ran. For contract facts that is the **block timestamp**: a block mined
 twenty minutes ago is twenty minutes old however recently it was read. For
-provider facts it is the provider's own observation time.
+provider facts it is the best anchor that provider offers.
+
+Phase 2E qualifies that last sentence, because "the best anchor offered" is not
+always an observation time. A provider that names a block gives one
+(`SOURCE_BLOCK`); a provider that names nothing leaves only the moment its
+response was **received** (`RESPONSE_TIME`), which proves when a representation
+arrived and not when the state behind it was observed. `HolderObservationBasis`
+records which of the two a fact carries, `AtlasPolicy.accepted_holder_observation_bases`
+decides which are good enough to act on, and `docs/phase-2e.md` carries the full
+timestamp taxonomy and the pre-live requirement that follows from it.
 
 This matters because the obvious implementation is wrong. If freshness were
 anchored to collection time, a provider that keeps returning its 10:00 snapshot

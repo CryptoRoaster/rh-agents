@@ -81,12 +81,20 @@ def concentration(
     rows: tuple[HolderSourceRow, ...],
     total_supply_raw: int | None,
     completeness: HolderCompleteness,
+    excluded_addresses: tuple[str, ...] = (),
 ) -> HolderConcentration:
     """Raw top-N concentration against on-chain supply.
 
-    Nothing is excluded from the raw metric — not liquidity pools, not burn
-    addresses, not the deployer. A large position stays visible as a large
-    position, and any adjustment is reported beside it rather than instead of it.
+    Nothing is excluded *here* — not liquidity pools, not burn addresses, not the
+    deployer. A large position stays visible as a large position, and any
+    adjustment is reported beside it rather than instead of it.
+
+    ``excluded_addresses`` names what the **provider** removed before we ever saw
+    the rows. It changes no raw figure, because a row that never arrived cannot
+    be added back; it only withholds the burn adjustment when a burn address is
+    among the exclusions, since a burn total computed without them is a lower
+    bound and a lower bound used as a denominator adjustment understates
+    concentration.
     """
     if total_supply_raw is None or total_supply_raw <= 0:
         raise HolderNormalizationError(AtlasSourceFailure.DENOMINATOR_UNKNOWN)
@@ -112,10 +120,14 @@ def concentration(
     burned_raw: int | None = None
     burned_share: Decimal | None = None
     adjusted: Decimal | None = None
-    if completeness == HolderCompleteness.COMPLETE:
-        # Only a complete holder set proves how much is actually burned. From a
-        # prefix the burned amount is a lower bound, and a lower bound presented
-        # as a denominator adjustment would understate concentration.
+    if completeness == HolderCompleteness.COMPLETE and not (
+        BURN_ADDRESSES & set(excluded_addresses)
+    ):
+        # Only a complete holder set that could actually contain the burn sinks
+        # proves how much is burned. From a prefix — or from a provider that
+        # filters a burn address out server-side — the burned amount is a lower
+        # bound, and a lower bound presented as a denominator adjustment would
+        # understate concentration.
         burned_raw = sum(row.balance_raw for row in ordered if row.address in BURN_ADDRESSES)
         burned_share = _share(burned_raw, total_supply_raw)
         circulating = total_supply_raw - burned_raw

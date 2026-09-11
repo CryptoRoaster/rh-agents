@@ -283,11 +283,19 @@ used: satisfying it would mean impersonating a browser.
 
 Providers supply raw rows and provenance only. Every concentration is computed
 here from integer balances against on-chain `totalSupply()` — no float, no vendor
-percentage — and nothing is excluded from the raw metric, so a liquidity pool or
-a burn address stays visible. Coverage is explicit (`COMPLETE`, `TOP_N_ONLY`,
-`UNKNOWN`), freshness is anchored to what the source observed rather than to when
-we fetched, and an indexer lagging the chain goes stale rather than being rescued
-by a fresh round-trip.
+percentage — and we exclude nothing from the raw metric, so a liquidity pool or a
+burn address stays visible. What a provider filters upstream is declared rather
+than inferred: Blockscout removes the zero address from its holder list, which is
+recorded on the fact and withholds the burn adjustment that would otherwise rest
+on a lower bound.
+
+Coverage is explicit (`COMPLETE`, `TOP_N_ONLY`, `UNKNOWN`) and freshness is
+anchored to what the source observed rather than to when we fetched. Where the
+source names a block — Robinhood via Blockscout — an indexer lagging the chain
+goes stale rather than being rescued by a fresh round-trip. Where it names none
+— BSC via Moralis — only the response receipt time exists, that weaker basis is
+labelled on the fact, and the policy field that accepts it is the same field a
+future live policy must narrow.
 
 The concentration threshold stays disabled: data became available, a product
 decision did not. A holder-domain PASS therefore means the data-quality

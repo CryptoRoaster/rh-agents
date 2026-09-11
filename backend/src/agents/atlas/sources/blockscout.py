@@ -14,6 +14,10 @@ Holder rows carry no block of their own, so provenance is the indexer head read
 immediately **before** the holder pages. That under-claims freshness rather than
 over-claiming it, and the collector turns the gap between that head and the
 pinned chain block into an explicit lag.
+
+The holder list is ordered and filtered by the provider, and both properties are
+stated explicitly below: descending balance order is proven from the endpoint's
+own implementation, and the zero address is filtered out of it.
 """
 
 from collections.abc import Callable, Mapping
@@ -21,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from src.agents.atlas.models import (
+    ZERO_ADDRESS,
     AtlasSourceFailure,
     HolderCompleteness,
     HolderFactsSourceResult,
@@ -47,12 +52,31 @@ from src.agents.atlas.sources.parsing import (
 )
 from src.markets.models import Availability
 
-# Keyset pagination parameters Blockscout echoes back. The cursor is keyed on
-# balance and address, which is why the result set is ordered by balance: an
-# unordered set could not be paged this way at all. The order is verified on
-# every page regardless.
+# Keyset pagination parameters Blockscout echoes back.
+#
+# Descending global order is a *proven* property of this endpoint, not an
+# inference from the cursor shape. Blockscout's own implementation of
+# ``GET /api/v2/tokens/{hash}/holders`` orders with
+# ``order_by([tb], desc: :value, desc: :address_hash)`` and pages with the keyset
+# predicate ``tb.value < ^value or (tb.value == ^value and tb.address_hash <
+# ^address_hash)``. A later page can therefore only contain rows strictly below
+# the last row of the page before it, so the first page holds the globally
+# largest balances and no unseen page can hide a larger holder. Its OpenAPI
+# operation states the same contract: "List addresses holding a specific token
+# sorted by balance".
+#
+# The provider's tie-break is *descending* address_hash. Ours is ascending, and
+# is a canonical normalization only — never claimed as Blockscout's guarantee.
+# It cannot move a metric: tied rows hold equal balances, so which of them lands
+# in the top-N leaves every top-N sum identical.
 PAGE_PARAMETERS = frozenset({"value", "address_hash", "items_count", "token_id"})
 MAX_ITEMS_PER_PAGE = 200
+
+# Blockscout's holder query filters ``address_hash != burn_address_hash`` — the
+# zero address, and only that one. The list is therefore never the full holder
+# universe, so the exclusion is declared rather than left for a reader to infer
+# from a burn total that silently reads zero.
+EXCLUDED_HOLDER_ADDRESSES: tuple[str, ...] = (ZERO_ADDRESS,)
 
 
 def _timestamp(value: object) -> datetime:
@@ -143,8 +167,10 @@ class BlockscoutHolderSource:
         rows, complete = await self._holder_pages(transport, prefix, token_address)
         ordered = ordered_rows(tuple(rows))
         if not is_descending(tuple(rows)):
-            # Blockscout's keyset cursor only works on a balance-ordered set, so
-            # an unordered page means the contract we rely on is not being kept.
+            # The provider order guarantee is what makes a prefix a *global* top-N.
+            # Checking every row, across page boundaries, is the observed-order
+            # validation that sits beside that guarantee — it can catch a broken
+            # deployment, and it is never mistaken for the guarantee itself.
             raise SourceRequestError(AtlasSourceFailure.INVALID_RESPONSE)
         completeness = HolderCompleteness.COMPLETE if complete else HolderCompleteness.TOP_N_ONLY
         if not complete and len(ordered) < TOP_N:
@@ -156,6 +182,7 @@ class BlockscoutHolderSource:
             token_address=token_address,
             rows=ordered,
             completeness=completeness,
+            excluded_addresses=EXCLUDED_HOLDER_ADDRESSES,
             observation_basis=HolderObservationBasis.SOURCE_BLOCK,
             snapshot_block=head_block,
             snapshot_timestamp=head_time,
