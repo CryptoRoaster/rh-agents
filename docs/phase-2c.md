@@ -46,6 +46,20 @@ envelope, and ORBIT's verified **assessment** supersedes it through the ordinary
 Phase 2A supersession path. COMMANDER's open step remains complete on arrival —
 no COMMANDER reasoning is implemented.
 
+### Current substrate, and an open question
+
+The long-term conceptual flow is *market discovery → ORBIT → COMMANDER opens a
+TradeCase*. That is **not** what runs today. The Phase 2A/2B substrate requires an
+existing TradeCase and task before any worker can claim work, so in Phase 2C ORBIT
+runs **inside an already-created candidate TradeCase** and verifies the candidate
+it was opened from.
+
+This is honest about the current semantics rather than a claim that the ordering
+question is settled. A pre-TradeCase discovery layer — where ORBIT assesses
+candidates before a case exists, and only promising ones become cases — remains a
+deliberate future lifecycle refinement. Phase 2C does not rewrite Phase 2A to
+chase it, because nothing in this phase requires it.
+
 ## Capability boundary
 
 ORBIT receives exactly `{lease, context, submit}`. There is no session,
@@ -204,10 +218,19 @@ open. Migrations `0001`-`0006` are untouched and `0006` remains head.
 `ORBIT_WORKER_ENABLED=false`, `ORBIT_INPUT_MAX_AGE_SECONDS` and
 `ORBIT_DISCOVERY_LIQUIDITY_FLOOR_USD`. Configuration validates that a real
 provider has a key and that enabling ORBIT names a provider, so a half-configured
-runtime fails loudly instead of at call time. The API process never becomes a
-worker host, and no mass autonomous discovery scheduling is introduced: the
-existing MarketWatcher continues ingestion, and an ORBIT runtime is launched
-explicitly.
+runtime fails loudly instead of at call time.
+
+**A credential alone activates nothing.** A machine may hold `ANTHROPIC_API_KEY`
+for entirely unrelated purposes, and credential presence is not consent to spend.
+Real reasoning requires `REASONING_PROVIDER` to name a provider explicitly, and
+running ORBIT requires `ORBIT_WORKER_ENABLED` on top of that.
+
+Beyond those checks, Phase 2C ships **no launcher at all**: nothing in `src/`
+constructs a real provider, nothing reads `ORBIT_WORKER_ENABLED`, and the API
+process never becomes a worker host. These settings are declared intent for the
+phase that introduces a worker entrypoint; until then even a fully configured
+environment cannot make a paid call without new code. The existing MarketWatcher
+continues market ingestion, and no mass autonomous discovery scheduling exists.
 
 ## What Phase 2C does not implement
 

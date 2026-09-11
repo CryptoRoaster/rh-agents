@@ -245,6 +245,8 @@ metadata stays quoted data, and no API key, raw vendor response or model reasoni
 transcript is ever persisted.
 
 Every automated test uses a deterministic offline provider. `REASONING_PROVIDER` is
-`disabled` and `ORBIT_WORKER_ENABLED` is `false` by default, so starting the API
-never makes a paid model call. Phase 2C adds no migration. See
+`disabled` and `ORBIT_WORKER_ENABLED` is `false` by default, and an ambient
+`ANTHROPIC_API_KEY` activates nothing on its own. Phase 2C ships no worker
+launcher either, so even a fully configured environment cannot make a paid call
+without new code. Phase 2C adds no migration. See
 [the ORBIT reference implementation](docs/phase-2c.md).
