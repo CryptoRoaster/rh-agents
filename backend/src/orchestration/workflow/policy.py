@@ -66,7 +66,10 @@ TRADE_CASE_V1 = WorkflowPolicy(
         ),
     ),
     tasks=(
-        TaskDefinition(AgentRole.ORBIT, "VERIFY_DISCOVERY", True, True),
+        # A discovery worker verifies the candidate the case was opened from, so
+        # this is real claimable work rather than a formality. The provenance
+        # envelope recorded at open time is superseded by that assessment.
+        TaskDefinition(AgentRole.ORBIT, "VERIFY_DISCOVERY", True),
         TaskDefinition(AgentRole.COMMANDER, "OPEN_TRADE_CASE", True, True),
         TaskDefinition(AgentRole.ATLAS, "ASSESS_ONCHAIN_INTEGRITY", True),
         TaskDefinition(AgentRole.SIGNAL, "ASSESS_SENTIMENT", True),

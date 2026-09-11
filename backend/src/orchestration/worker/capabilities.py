@@ -30,7 +30,12 @@ from src.orchestration.workflow.models import (
 
 
 class MarketDiscoveryPort(Protocol):
-    """ORBIT input: recorded observations only, never a provider client."""
+    """Recorded market observations only, never a provider client.
+
+    Trusted infrastructure implements this; it is not handed to a worker directly.
+    A discovery worker receives the narrower context port below, assembled from
+    this one, so it never chooses what to read.
+    """
 
     async def candidates(
         self, *, include_fixtures: bool = False, limit: int = 50, offset: int = 0
@@ -39,6 +44,16 @@ class MarketDiscoveryPort(Protocol):
     async def latest(
         self, identity: str, *, include_fixtures: bool = False
     ) -> MarketSnapshot | None: ...
+
+
+class DiscoveryContextPort(Protocol):
+    """ORBIT input: one purpose-built view of the candidate under assessment.
+
+    There is no method to browse other markets, read another role's evidence, see
+    a risk outcome or read TradeCase status.
+    """
+
+    async def candidate_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
 class OnchainIntelligencePort(Protocol):
@@ -116,7 +131,7 @@ class EvidenceSubmissionPort(Protocol):
 @dataclass(frozen=True)
 class OrbitCapabilities:
     lease: TaskLease
-    markets: MarketDiscoveryPort
+    context: DiscoveryContextPort
     submit: EvidenceSubmissionPort
 
 

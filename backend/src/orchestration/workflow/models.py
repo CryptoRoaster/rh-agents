@@ -121,9 +121,42 @@ class EvidenceProvenance(Immutable):
     source_version: Identifier | None = None
 
 
+SafeSummary = Annotated[str, Field(min_length=1, max_length=400)]
+Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class DiscoveryAssessment(Immutable):
+    """Optional verified discovery result plus the provenance that produced it.
+
+    Role-agnostic and provider-neutral on purpose: the workflow records what was
+    concluded and from which inputs, instructions and model, without depending on
+    any specialist's internal schema. Only bounded structured fields are kept —
+    never a raw vendor payload, never hidden model reasoning.
+    """
+
+    classification: Code
+    strength: Code
+    reason_codes: tuple[Code, ...] = Field(min_length=1, max_length=12)
+    data_gaps: tuple[Code, ...] = Field(default=(), max_length=12)
+    cited_observation_ids: tuple[UUID, ...] = Field(min_length=1, max_length=8)
+    summary: SafeSummary
+    input_digest: Digest
+    prompt_version: Identifier
+    prompt_hash: Digest
+    reasoning_provider: Identifier
+    reasoning_model: Identifier
+    output_schema_version: int = Field(ge=1)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    latency_ms: int | None = Field(default=None, ge=0)
+
+
 class DiscoveryPayload(Immutable):
     kind: Literal["discovery"] = "discovery"
     discovery_reference: UUID
+    # Absent on the provenance envelope written when a case is opened; present
+    # once a discovery worker has actually assessed the candidate.
+    assessment: DiscoveryAssessment | None = None
 
 
 class OnchainPayload(Immutable):

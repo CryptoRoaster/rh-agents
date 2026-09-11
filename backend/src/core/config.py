@@ -1,3 +1,4 @@
+from decimal import Decimal
 from typing import Literal
 from urllib.parse import unquote, urlsplit
 
@@ -61,6 +62,29 @@ class Settings(BaseSettings):
     worker_lease_seconds: int = Field(default=60, ge=5, le=3600)
     worker_max_attempts: int = Field(default=3, ge=1, le=10)
     worker_poll_interval_seconds: int = Field(default=5, ge=1, le=300)
+    # Phase 2C reasoning. "disabled" is the default: booting the API must never
+    # start paid model calls, and no reasoning worker runs implicitly.
+    reasoning_provider: Literal["disabled", "fake", "anthropic"] = "disabled"
+    reasoning_model: str = Field(default="claude-opus-5", min_length=1, max_length=80)
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    reasoning_timeout_seconds: int = Field(default=60, ge=5, le=300)
+    reasoning_max_output_tokens: int = Field(default=1024, ge=256, le=8192)
+    anthropic_api_key: SecretStr = SecretStr("")
+    orbit_worker_enabled: bool = False
+    orbit_input_max_age_seconds: int = Field(default=900, ge=30, le=86400)
+    orbit_discovery_liquidity_floor_usd: Decimal = Field(
+        default=Decimal("25000"), ge=0, allow_inf_nan=False
+    )
+
+    @model_validator(mode="after")
+    def reasoning_configuration(self) -> "Settings":
+        # A real provider is only usable once it is fully configured; enabling the
+        # worker without credentials must fail loudly rather than at call time.
+        if self.reasoning_provider == "anthropic" and not self.anthropic_api_key.get_secret_value():
+            raise ValueError("The anthropic reasoning provider requires ANTHROPIC_API_KEY")
+        if self.orbit_worker_enabled and self.reasoning_provider == "disabled":
+            raise ValueError("ORBIT requires a configured reasoning provider")
+        return self
 
     @model_validator(mode="after")
     def runtime_configuration(self) -> "Settings":
