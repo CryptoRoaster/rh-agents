@@ -59,6 +59,14 @@ Phase 0 `RiskOutcome` is unchanged. One deterministic classifier, `RiskAuthoriza
 
 PostgreSQL row locks serialize updates to one case. Unique idempotency and revision constraints reject conflicting replay, while append-only triggers protect evidence, risk bindings, transitions, and timeline events. Public `/api/trade-cases` routes are GET-only. Future workers receive typed submit capabilities rather than database, signer, executor, or force-transition access. See [Phase 2A workflow details](docs/phase-2a.md).
 
+## Phase 2B worker capability runtime
+
+`WorkerRuntimeService` is the only boundary through which a future specialist worker can affect authoritative state. Processing is at-least-once: a worker may repeat a task after a crash, a lost lease or an ambiguous acknowledgement, and duplicate execution produces no duplicate effect because a database-enforced single active lease, durable idempotency, immutable attempt history and idempotent evidence submission combine.
+
+Workers are untrusted for authorization. They receive role-composed capabilities containing only permitted read ports and, for the six evidence roles, one write port already bound to their lease. No capability carries a database session, RPC or HTTP client, signer, wallet, executor, ledger write, SENTINEL mutation or status setter, and SENTINEL, LEDGER and EXECUTOR are absent from `AgentRole` entirely. Every submission is re-verified server-side regardless of which object the worker was handed.
+
+Evidence recording, task completion and deterministic evaluation commit in one transaction, so a crash leaves neither a successful task without evidence nor evidence without completion. Leases expire, heartbeats extend only their own lease within a budget, bounded sweeps reclaim abandoned work, and typed failure categories drive deterministic bounded retries with durable backoff. Public `/api/workers` routes are GET-only; claim, heartbeat and completion stay internal. The runtime is disabled by default and no reasoning worker exists. See [Phase 2B worker runtime details](docs/phase-2b.md).
+
 ## Typed asynchronous contracts
 
 Pydantic contracts reject extra fields and nonfinite amounts. Records carry UUIDs, timezone-aware timestamps, source, and correlation IDs. Decisions use discriminated observation/setup/intent payloads. SENTINEL, LEDGER, and EXECUTOR are deliberately excluded from the LLM role enum. FUSE and COMMANDER may propose intents; proposal traces must match.
