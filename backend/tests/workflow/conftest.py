@@ -29,14 +29,18 @@ async def workflow_db(now):
     try:
         async with engine.begin() as connection:
             if url:
-                path = Path(__file__).parents[2] / "migrations/versions/0005_trade_case_workflow.py"
-                spec = importlib.util.spec_from_file_location("workflow_migration", path)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
+                versions = Path(__file__).parents[2] / "migrations/versions"
+                modules = []
+                for name in ("0005_trade_case_workflow", "0006_worker_runtime"):
+                    spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    modules.append(module)
 
                 def migrate(sync_connection):
                     with Operations.context(MigrationContext.configure(sync_connection)):
-                        module.upgrade()
+                        for item in modules:
+                            item.upgrade()
 
                 await connection.run_sync(migrate)
             else:

@@ -205,3 +205,23 @@ Read-only observability is available at `/api/trade-cases`, with case detail, ti
 task subresources. No public mutation route or active worker is added. Future workers must submit
 typed evidence through the internal service; they receive no arbitrary database writes, signer,
 executor, status override, or SENTINEL override. See [the Phase 2A lifecycle and boundaries](docs/phase-2a.md).
+
+## Phase 2B worker capability runtime
+
+Migration `0006` adds the durable runtime that future ORBIT, ATLAS, SIGNAL, VECTOR,
+PULSE, ANCHOR, FUSE and COMMANDER workers must use. Task processing is
+at-least-once with database-enforced single active leases, durable idempotency and
+immutable attempt history, so a crashed or slow worker can safely repeat work
+without duplicating any authoritative effect.
+
+Workers receive role-composed capabilities rather than infrastructure: no database
+session, RPC or HTTP client, signer, wallet, executor or ledger write exists in any
+capability, and every submission is independently re-verified server-side. Evidence
+recording, task completion and deterministic evaluation commit atomically. Expired
+leases are reclaimed by bounded sweeps, and typed failure categories drive bounded
+retries with durable backoff instead of endless looping.
+
+Read-only observability lives at `/api/worker-runtime`, `/api/workers` and
+`/api/worker-attempts`. There is no public claim, heartbeat or completion route.
+`WORKER_RUNTIME_ENABLED` is `false` by default and no reasoning worker, model
+provider or prompt is included. See [the Phase 2B runtime and capability model](docs/phase-2b.md).

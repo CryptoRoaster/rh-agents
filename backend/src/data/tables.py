@@ -19,6 +19,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -219,7 +220,23 @@ class TradeCaseTaskRow(Base):
         UniqueConstraint(
             "trade_case_id", "role", "task_type", "attempt", name="uq_trade_case_task_attempt"
         ),
+        # One row per work slot; `attempt` is a mutable counter, not a new row.
+        UniqueConstraint("trade_case_id", "role", "task_type", name="uq_trade_case_task_slot"),
+        CheckConstraint("lease_renewals >= 0", name="trade_case_task_renewals_nonnegative"),
+        CheckConstraint("max_attempts >= 1", name="trade_case_task_attempts_positive"),
+        CheckConstraint(
+            "lease_expires_at IS NULL OR lease_started_at IS NULL"
+            " OR lease_expires_at > lease_started_at",
+            name="trade_case_task_lease_window",
+        ),
+        # A lease is all-or-nothing: never a holder without a token, or the reverse.
+        CheckConstraint(
+            "(lease_id IS NULL) = (worker_instance_id IS NULL)",
+            name="trade_case_task_lease_pairing",
+        ),
         Index("ix_trade_case_tasks_case_status", "trade_case_id", "status"),
+        Index("ix_trade_case_tasks_claim", "role", "status", "next_eligible_at", "created_at"),
+        Index("ix_trade_case_tasks_lease_expiry", "status", "lease_expires_at"),
     )
     task_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
     trade_case_id: Mapped[UUID] = mapped_column(ForeignKey("trade_cases.id", ondelete="CASCADE"))
@@ -235,6 +252,21 @@ class TradeCaseTaskRow(Base):
     correlation_id: Mapped[UUID] = mapped_column(Uuid, index=True)
     reason_code: Mapped[str] = mapped_column(String(80))
     idempotency_key: Mapped[str] = mapped_column(String(200), unique=True)
+    # Phase 2B current lease and scheduling state. Held on the task aggregate
+    # rather than in a separate lease table so that "at most one active lease"
+    # holds by construction: one row owns at most one lease_id. Immutable attempt
+    # history lives in worker_task_attempts.
+    lease_id: Mapped[UUID | None] = mapped_column(Uuid)
+    worker_instance_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("worker_instances.worker_instance_id")
+    )
+    lease_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_renewals: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    next_eligible_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    max_attempts: Mapped[int] = mapped_column(Integer, server_default=text("3"))
+    failure_category: Mapped[str | None] = mapped_column(String(40))
 
 
 class TradeCaseEvidenceRow(Base):
@@ -330,3 +362,65 @@ class TradeCaseEventRow(Base):
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     correlation_id: Mapped[UUID] = mapped_column(Uuid, index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+
+
+class WorkerInstanceRow(Base):
+    """A registered worker runtime instance.
+
+    Persisted because lease ownership, crash diagnosis and attempt audit all need a
+    stable, independently identifiable claimant. Ephemeral host or process metadata
+    is deliberately not part of this logical identity.
+    """
+
+    __tablename__ = "worker_instances"
+    __table_args__ = (Index("ix_worker_instances_role_status", "role", "status"),)
+    worker_instance_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    role: Mapped[str] = mapped_column(String(40))
+    runtime_version: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(40))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    registration_key: Mapped[str] = mapped_column(String(200), unique=True)
+    registration_fingerprint: Mapped[str] = mapped_column(String(64))
+
+
+class WorkerTaskAttemptRow(Base):
+    """Immutable-once-finished history of every worker attempt.
+
+    Heartbeats deliberately do not touch this table; they update the task
+    aggregate's current lease state. An attempt row is inserted on claim and
+    written exactly once more, when it finishes. A database trigger then rejects
+    any further update, and deletes and truncation always.
+    """
+
+    __tablename__ = "worker_task_attempts"
+    __table_args__ = (
+        UniqueConstraint("task_id", "attempt_number", name="uq_worker_attempt_number"),
+        CheckConstraint("attempt_number >= 1", name="worker_attempt_number_positive"),
+        CheckConstraint("lease_expires_at > started_at", name="worker_attempt_lease_window"),
+        CheckConstraint(
+            "(finished_at IS NULL) = (outcome IS NULL)", name="worker_attempt_outcome_pairing"
+        ),
+        CheckConstraint(
+            "finished_at IS NULL OR finished_at >= started_at", name="worker_attempt_ordering"
+        ),
+        Index("ix_worker_attempts_task", "task_id", "attempt_number"),
+        Index("ix_worker_attempts_instance", "worker_instance_id", "started_at"),
+    )
+    attempt_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    trade_case_id: Mapped[UUID] = mapped_column(ForeignKey("trade_cases.id", ondelete="CASCADE"))
+    task_id: Mapped[UUID] = mapped_column(ForeignKey("trade_case_tasks.task_id"))
+    role: Mapped[str] = mapped_column(String(40))
+    worker_instance_id: Mapped[UUID] = mapped_column(
+        ForeignKey("worker_instances.worker_instance_id")
+    )
+    lease_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    attempt_number: Mapped[int] = mapped_column(Integer)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    outcome: Mapped[str | None] = mapped_column(String(40))
+    reason_code: Mapped[str] = mapped_column(String(80))
+    failure_category: Mapped[str | None] = mapped_column(String(40))
+    runtime_version: Mapped[str] = mapped_column(String(40))
+    correlation_id: Mapped[UUID] = mapped_column(Uuid, index=True)

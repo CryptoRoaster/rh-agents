@@ -387,27 +387,46 @@ class TradeCaseService:
         *,
         expected_revision: int | None = None,
     ) -> EvidenceEnvelope:
-        submission = EvidenceSubmission.model_validate_json(submission.model_dump_json())
         async with self.sessions.begin() as session:
-            row = await self._locked_case(session, trade_case_id)
-            existing = await session.scalar(
-                select(TradeCaseEvidenceRow).where(
-                    TradeCaseEvidenceRow.idempotency_key == submission.idempotency_key
-                )
+            return await self.record_evidence_in_session(
+                session, trade_case_id, submission, expected_revision=expected_revision
             )
-            if existing is not None:
-                envelope = evidence_from_row(existing)
-                if (
-                    existing.trade_case_id != trade_case_id
-                    or existing.submission_fingerprint != submission.fingerprint()
-                ):
-                    raise WorkflowFailure(WorkflowErrorCode.IDEMPOTENCY_CONFLICT)
-                return envelope
-            self._mutable(row, expected_revision)
-            envelope = await self._insert_evidence(session, row, submission)
-            await self._complete_evidence_task(session, row, submission.evidence_type)
-            await self._stabilize(session, row)
+
+    async def record_evidence_in_session(
+        self,
+        session: AsyncSession,
+        trade_case_id: UUID,
+        submission: EvidenceSubmission,
+        *,
+        expected_revision: int | None = None,
+    ) -> EvidenceEnvelope:
+        """Record evidence inside a caller-owned transaction.
+
+        The worker runtime needs evidence recording and task completion to commit
+        atomically, so it joins this transaction instead of reimplementing any
+        workflow rule. Re-locking an already locked case in the same transaction
+        is a no-op.
+        """
+        submission = EvidenceSubmission.model_validate_json(submission.model_dump_json())
+        row = await self._locked_case(session, trade_case_id)
+        existing = await session.scalar(
+            select(TradeCaseEvidenceRow).where(
+                TradeCaseEvidenceRow.idempotency_key == submission.idempotency_key
+            )
+        )
+        if existing is not None:
+            envelope = evidence_from_row(existing)
+            if (
+                existing.trade_case_id != trade_case_id
+                or existing.submission_fingerprint != submission.fingerprint()
+            ):
+                raise WorkflowFailure(WorkflowErrorCode.IDEMPOTENCY_CONFLICT)
             return envelope
+        self._mutable(row, expected_revision)
+        envelope = await self._insert_evidence(session, row, submission)
+        await self._complete_evidence_task(session, row, submission.evidence_type)
+        await self._stabilize(session, row)
+        return envelope
 
     async def _insert_evidence(
         self,
@@ -543,12 +562,13 @@ class TradeCaseService:
         self, session: AsyncSession, row: TradeCaseRow, evidence_type: EvidenceType
     ) -> None:
         requirement = self.policy.requirement(evidence_type)
+        # One row per (case, role, task_type) slot; `attempt` is a mutable counter,
+        # so completion must not be pinned to the first attempt.
         task = await session.scalar(
             select(TradeCaseTaskRow).where(
                 TradeCaseTaskRow.trade_case_id == row.id,
                 TradeCaseTaskRow.role == requirement.role.value,
                 TradeCaseTaskRow.task_type == requirement.task_type,
-                TradeCaseTaskRow.attempt == 1,
             )
         )
         if task is None or SpecialistTaskStatus(task.status) in TERMINAL_TASK_STATUSES:

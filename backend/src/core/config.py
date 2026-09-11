@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     evm_recovery_chunk_size: int = Field(default=100, ge=1, le=1000)
     evm_reorg_window: int = Field(default=64, ge=2, le=1000)
     evm_stale_seconds: int = Field(default=60, ge=5, le=600)
+    # Phase 2B worker runtime. Disabled by default: no reasoning worker exists,
+    # and the API process must never become a worker host implicitly.
+    worker_runtime_enabled: bool = False
+    worker_lease_seconds: int = Field(default=60, ge=5, le=3600)
+    worker_max_attempts: int = Field(default=3, ge=1, le=10)
+    worker_poll_interval_seconds: int = Field(default=5, ge=1, le=300)
 
     @model_validator(mode="after")
     def runtime_configuration(self) -> "Settings":
