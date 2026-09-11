@@ -70,6 +70,13 @@ class FakeClient:
             return "0x" + "0" * 63 + "1"
         return str(value)
 
+    async def receipt_contract_address(self, tx_hash: str) -> str | None:
+        self.calls.append(("receipt", tx_hash))
+        value = self.overrides.get("receipt", TOKEN)
+        if isinstance(value, Exception):
+            raise value
+        return None if value is None else str(value)
+
     async def storage_at(self, address: str, slot: str, block: int) -> str:
         self.calls.append(("storage", (address, slot, block)))
         value = self.overrides.get(slot)
@@ -208,3 +215,46 @@ def test_the_documented_eip1967_slots_are_used_verbatim():
     assert ADMIN_SLOT == "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103"
     assert DECIMALS_SELECTOR == "0x313ce567"
     assert TOTAL_SUPPLY_SELECTOR == "0x18160ddd"
+
+
+# ------------------------------------------------------- creation verification
+
+
+async def test_a_creation_receipt_confirms_which_contract_was_created(now):
+    source = RpcTokenContractSource(
+        client=FakeClient(), config=config("robinhood", 4663), clock=FixedClock(now)
+    )
+    assert await source.creation_receipt_contract("0x" + "11" * 32) == TOKEN
+
+
+async def test_a_transaction_that_created_nothing_answers_none(now):
+    source = RpcTokenContractSource(
+        client=FakeClient(receipt=None), config=config("robinhood", 4663), clock=FixedClock(now)
+    )
+    assert await source.creation_receipt_contract("0x" + "11" * 32) is None
+
+
+async def test_a_failed_receipt_read_leaves_the_claim_unverified_rather_than_confirmed(now):
+    source = RpcTokenContractSource(
+        client=FakeClient(receipt=RuntimeFailure(ErrorCode.TIMEOUT)),
+        config=config("robinhood", 4663),
+        clock=FixedClock(now),
+    )
+    assert await source.creation_receipt_contract("0x" + "11" * 32) is None
+
+
+@pytest.mark.parametrize(("code", "expected"), [("0x6080", True), ("0x", False)])
+async def test_creator_code_presence_is_read_at_the_pinned_block(now, code, expected):
+    source = RpcTokenContractSource(
+        client=FakeClient(code=code), config=config("robinhood", 4663), clock=FixedClock(now)
+    )
+    assert await source.is_contract("0x" + "e7" * 20, 1_000_000) is expected
+
+
+async def test_an_unreadable_creator_address_answers_unknown_not_false(now):
+    source = RpcTokenContractSource(
+        client=FakeClient(code=RuntimeFailure(ErrorCode.UNAVAILABLE)),
+        config=config("robinhood", 4663),
+        clock=FixedClock(now),
+    )
+    assert await source.is_contract("0x" + "e7" * 20, 1_000_000) is None

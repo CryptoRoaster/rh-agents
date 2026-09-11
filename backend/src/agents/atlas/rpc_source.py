@@ -107,6 +107,32 @@ class RpcTokenContractSource:
             admin_address=admin,
         )
 
+    async def creation_receipt_contract(self, tx_hash: str) -> str | None:
+        """Chain-side confirmation of a creation claim, or None when unobtainable.
+
+        A provider can say anything about who deployed a token. The creation
+        receipt is the chain's own answer, so it is what a claim is checked
+        against. A failed read returns None, which leaves the claim unverified
+        rather than silently confirming it.
+        """
+        try:
+            return await self.client.receipt_contract_address(tx_hash)
+        except RuntimeFailure:
+            return None
+
+    async def is_contract(self, address: str, block: int) -> bool | None:
+        """Whether a creator address is itself code, at the pinned block.
+
+        Many tokens are deployed by factories. Knowing that the creator is a
+        contract keeps it from being read as a person's wallet; it is recorded as
+        a fact and interpreted no further here.
+        """
+        try:
+            code = await self.client.code(address, block)
+        except RuntimeFailure:
+            return None
+        return len(code) > 2
+
     async def _call_int(self, address: str, selector: str, block: int) -> int | None:
         try:
             result = await self.client.call(address, selector, block)

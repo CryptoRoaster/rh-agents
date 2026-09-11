@@ -114,6 +114,7 @@ class EvmRpcClient:
             "eth_getCode",
             "eth_call",
             "eth_getStorageAt",
+            "eth_getTransactionReceipt",
         }:
             raise RuntimeFailure(ErrorCode.CONFIGURATION)
         if method != "eth_chainId" and not self.verified:
@@ -222,6 +223,28 @@ class EvmRpcClient:
         if not isinstance(result, str) or re.fullmatch(r"0x[0-9a-f]{64}", result) is None:
             raise RuntimeFailure(ErrorCode.CONTRACT)
         return result
+
+    async def receipt_contract_address(self, tx_hash: str) -> str | None:
+        """The contract a transaction created, or None when it created none.
+
+        Read-only, and deliberately narrow: the receipt is never returned, so
+        this cannot become a general transaction-inspection surface. A pending or
+        unknown transaction answers None rather than raising, because "not found"
+        is an answer about the chain, not a transport failure.
+        """
+        if re.fullmatch(r"0x[0-9a-f]{64}", tx_hash) is None:
+            raise RuntimeFailure(ErrorCode.CONFIGURATION)
+        result = await self._request("eth_getTransactionReceipt", [tx_hash])
+        if result is None:
+            return None
+        if not isinstance(result, dict):
+            raise RuntimeFailure(ErrorCode.CONTRACT)
+        created = result.get("contractAddress")
+        if created is None:
+            return None
+        if not isinstance(created, str) or re.fullmatch(r"0x[0-9a-fA-F]{40}", created) is None:
+            raise RuntimeFailure(ErrorCode.CONTRACT)
+        return created.lower()
 
     @staticmethod
     def _require_address(address: str, block: int) -> None:

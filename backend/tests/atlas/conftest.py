@@ -9,9 +9,14 @@ from src.agents.atlas.models import (
     AtlasOnchainSnapshot,
     ChainSnapshot,
     ContractFacts,
+    HolderCompleteness,
     HolderFacts,
+    HolderFactsSourceResult,
+    HolderObservationBasis,
     HolderShare,
+    HolderSourceRow,
     OriginFacts,
+    OriginVerification,
     ProxyObservation,
 )
 from src.core.clock import FixedClock
@@ -80,6 +85,9 @@ def contract_facts(
     )
 
 
+TOTAL_SUPPLY = 1_000_000 * 10**18
+
+
 def holder_facts(
     now,
     *,
@@ -88,6 +96,10 @@ def holder_facts(
     top10="0.30",
     failure=None,
     observed_at=None,
+    completeness=HolderCompleteness.TOP_N_ONLY,
+    observation_basis=HolderObservationBasis.SOURCE_BLOCK,
+    snapshot_block=1_000_000,
+    holder_block_delta=0,
 ) -> HolderFacts:
     if status != Availability.AVAILABLE:
         return HolderFacts(status=status, failure=failure, source="test-indexer")
@@ -95,7 +107,12 @@ def holder_facts(
         status=status,
         source="test-indexer",
         observed_at=observed_at or now,
+        observation_basis=observation_basis,
+        completeness=completeness,
+        snapshot_block=snapshot_block,
+        holder_block_delta=holder_block_delta,
         holder_count=4200,
+        total_supply_raw=TOTAL_SUPPLY,
         top_holders=(
             HolderShare(
                 address=WHALE,
@@ -117,15 +134,88 @@ def holder_facts(
     )
 
 
-def origin_facts(*, status=Availability.AVAILABLE, failure=None) -> OriginFacts:
+def holder_rows(count=12, *, top_balance=50_000 * 10**18, step=1_000 * 10**18):
+    """A descending, duplicate-free row set with one canonical burn holder."""
+    rows = [
+        HolderSourceRow(
+            address="0x" + f"{index + 1:02x}" * 20,
+            balance_raw=top_balance - index * step,
+            is_contract=False,
+        )
+        for index in range(count - 1)
+    ]
+    rows.append(HolderSourceRow(address=BURN, balance_raw=1_000 * 10**18))
+    return tuple(sorted(rows, key=lambda row: (-row.balance_raw, row.address)))
+
+
+def holder_source_result(
+    now,
+    *,
+    status=Availability.AVAILABLE,
+    failure=None,
+    rows=None,
+    completeness=HolderCompleteness.TOP_N_ONLY,
+    observation_basis=HolderObservationBasis.SOURCE_BLOCK,
+    snapshot_block=1_000_000,
+    snapshot_timestamp=None,
+    chain="robinhood",
+    token_address=TOKEN,
+    holder_count=4200,
+    provider_total_supply_raw=TOTAL_SUPPLY,
+) -> HolderFactsSourceResult:
+    if status != Availability.AVAILABLE:
+        return HolderFactsSourceResult(status=status, failure=failure, source="test-indexer")
+    return HolderFactsSourceResult(
+        status=status,
+        source="test-indexer",
+        chain=chain,
+        token_address=token_address,
+        rows=holder_rows() if rows is None else rows,
+        completeness=completeness,
+        observation_basis=observation_basis,
+        snapshot_block=snapshot_block,
+        snapshot_timestamp=snapshot_timestamp or now,
+        holder_count=holder_count,
+        provider_total_supply_raw=provider_total_supply_raw,
+        requests_made=3,
+    )
+
+
+CREATOR = "0x" + "e7" * 20
+CREATION_TX = "0x" + "11" * 32
+
+
+def origin_facts(
+    *,
+    status=Availability.AVAILABLE,
+    failure=None,
+    creation_tx_hash=CREATION_TX,
+    verification=OriginVerification.NOT_ATTEMPTED,
+) -> OriginFacts:
     if status != Availability.AVAILABLE:
         return OriginFacts(status=status, failure=failure, source="test-origin")
     return OriginFacts(
         status=status,
         source="test-origin",
-        creator_address="0x" + "e7" * 20,
+        creator_address=CREATOR,
         creation_block=900_000,
+        creation_tx_hash=creation_tx_hash,
+        verification=verification,
     )
+
+
+class StubVerifier:
+    """Chain-side confirmation stub. ``created`` None means the check failed."""
+
+    def __init__(self, created=TOKEN, creator_is_contract=False) -> None:
+        self._created = created
+        self._creator_is_contract = creator_is_contract
+
+    async def creation_receipt_contract(self, tx_hash):
+        return self._created
+
+    async def is_contract(self, address, block):
+        return self._creator_is_contract
 
 
 def snapshot(
@@ -166,11 +256,11 @@ class StubContracts:
 
 
 class StubHolders:
-    def __init__(self, facts) -> None:
-        self._facts = facts
+    def __init__(self, result) -> None:
+        self._result = result
 
     async def holder_facts(self, chain, token_address):
-        return self._facts
+        return self._result
 
 
 class StubOrigins:
@@ -181,11 +271,12 @@ class StubOrigins:
         return self._facts
 
 
-def builder_for(now, *, chain=None, contract=None, holders=None, origin=None):
+def builder_for(now, *, chain=None, contract=None, holders=None, origin=None, verifier=None):
     return AtlasSnapshotBuilder(
         contracts=StubContracts(chain or chain_snapshot(now), contract or contract_facts()),
-        holders=StubHolders(holders if holders is not None else holder_facts(now)),
+        holders=StubHolders(holders if holders is not None else holder_source_result(now)),
         origins=StubOrigins(origin if origin is not None else origin_facts()),
+        verifier=verifier,
         clock=FixedClock(now),
     )
 

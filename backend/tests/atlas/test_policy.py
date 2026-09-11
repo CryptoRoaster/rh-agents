@@ -32,7 +32,7 @@ def test_complete_fresh_facts_are_clear(now):
     assert decision.verdict == AtlasVerdict.CLEAR
     assert decision.blockers == ()
     assert decision.data_gaps == ()
-    assert decision.policy_version == "atlas-policy-v1"
+    assert decision.policy_version == "atlas-policy-v2"
 
 
 # ------------------------------------------------------- known bad != unknown

@@ -15,6 +15,7 @@ from src.agents.atlas.models import (
     AtlasReasonCode,
     AtlasSafetyDecision,
     AtlasVerdict,
+    HolderCompleteness,
     ProxyObservation,
 )
 from src.markets.models import Availability
@@ -43,10 +44,18 @@ class AtlasPolicy:
     # an invented number would be worse than an explicit absence.
     max_top10_concentration: Decimal | None
     block_on_proxy_admin: bool
+    # Which holder-coverage proofs are good enough to measure a top-ten share.
+    # A source that could not establish its own coverage never satisfies the
+    # holder domain, however cleanly it returned HTTP 200.
+    accepted_holder_completeness: frozenset[HolderCompleteness] = frozenset(
+        {HolderCompleteness.COMPLETE, HolderCompleteness.TOP_N_ONLY}
+    )
 
     def __post_init__(self) -> None:
         if self.snapshot_validity <= timedelta(0) or self.max_source_skew < timedelta(0):
             raise ValueError("Snapshot validity must be positive and skew non-negative")
+        if HolderCompleteness.UNKNOWN in self.accepted_holder_completeness:
+            raise ValueError("Unproven holder coverage can never satisfy the holder domain")
         if self.max_top10_concentration is not None and not (
             Decimal(0) < self.max_top10_concentration <= Decimal(1)
         ):
@@ -56,11 +65,19 @@ class AtlasPolicy:
 
 
 # Provisional PAPER-mode policy. Holder intelligence is required because
-# autonomous trading cannot be justified without it, which means ATLAS cannot
-# reach CLEAR until a trusted holder source exists. That is the intended
-# fail-closed behaviour, not a gap to be worked around.
-ATLAS_POLICY_V1 = AtlasPolicy(
-    version="atlas-policy-v1",
+# autonomous trading cannot be justified without it. Phase 2E connects verified
+# holder sources, so this requirement is now satisfiable — but only by facts that
+# are fresh, token-matched and provably complete enough to support the metric.
+# Where no provider is configured the domain stays unavailable and ATLAS still
+# cannot reach CLEAR, which is the same fail-closed behaviour as before.
+#
+# ``max_top10_concentration`` stays disabled deliberately. A concentration limit
+# is a product decision with real financial meaning, and enabling one merely
+# because the data finally exists would invent a threshold nobody chose. With it
+# disabled, a PASS on the holder domain means the data-quality prerequisite was
+# met — not that the distribution was judged safe.
+ATLAS_POLICY_V2 = AtlasPolicy(
+    version="atlas-policy-v2",
     expected_chain_ids={"robinhood": 4663, "bsc": 56},
     required_domains=frozenset({AtlasDomain.CONTRACT, AtlasDomain.HOLDERS}),
     snapshot_validity=timedelta(minutes=10),
@@ -68,6 +85,10 @@ ATLAS_POLICY_V1 = AtlasPolicy(
     max_top10_concentration=None,
     block_on_proxy_admin=False,
 )
+
+# The name Phase 2D shipped under. Kept as an alias so existing call sites and
+# evidence readers keep working; the policy itself is versioned in its payload.
+ATLAS_POLICY_V1 = ATLAS_POLICY_V2
 
 
 def _data_gaps(
@@ -105,6 +126,17 @@ def _data_gaps(
         and snapshot.contract.total_supply_raw is None
     ):
         gaps.append(AtlasReasonCode.TOTAL_SUPPLY_UNKNOWN)
+    if (
+        AtlasDomain.HOLDERS in policy.required_domains
+        and snapshot.holders.status == Availability.AVAILABLE
+        and (
+            snapshot.holders.completeness not in policy.accepted_holder_completeness
+            or snapshot.holders.top10_share is None
+        )
+    ):
+        # An answer arrived, but not one the metric can be computed from. Policy
+        # names the minimum facts explicitly rather than trusting a status flag.
+        gaps.append(AtlasReasonCode.HOLDER_FACTS_UNAVAILABLE)
     return gaps
 
 
@@ -141,13 +173,18 @@ def _blockers(snapshot: AtlasOnchainSnapshot, policy: AtlasPolicy) -> list[Atlas
 
 
 def evaluate_snapshot(
-    snapshot: AtlasOnchainSnapshot, now: datetime, policy: AtlasPolicy = ATLAS_POLICY_V1
+    snapshot: AtlasOnchainSnapshot, now: datetime, policy: AtlasPolicy = ATLAS_POLICY_V2
 ) -> AtlasSafetyDecision:
     """Derive the authoritative safety verdict. No model input participates.
 
     A known violation outranks a missing fact: both stop the case, but "we
     measured this and it is dangerous" is the more precise statement and is
     reported as such, with any gaps recorded alongside.
+
+    CLEAR means every required fact was established, fresh and internally
+    consistent, and no configured deterministic blocker fired. It is not a claim
+    that the token is economically safe, and no threshold that is switched off
+    can be read as one that passed.
     """
     blockers = _blockers(snapshot, policy)
     gaps = _data_gaps(snapshot, now, policy)

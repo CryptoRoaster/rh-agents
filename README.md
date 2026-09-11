@@ -266,8 +266,32 @@ insufficient evidence that blocks for a different reason. Supporting this
 required one generic Phase 2A extension, `EvidenceAcceptance`, checked in a
 single place for every evidence type.
 
-Holder concentration and contract creator currently have no verified provider for
-Robinhood Chain or BSC and are reported UNAVAILABLE, so ATLAS cannot reach CLEAR
-in a real deployment yet. That is the intended fail-closed behaviour. Phase 2D
-adds no migration and starts no worker. See
-[the ATLAS safety model and provider capability matrix](docs/phase-2d.md).
+Phase 2D shipped without a verified holder or creator provider, so both domains
+were reported UNAVAILABLE and ATLAS could not reach CLEAR — the intended
+fail-closed behaviour, resolved in Phase 2E. Phase 2D adds no migration and
+starts no worker. See [the ATLAS safety model](docs/phase-2d.md).
+
+## Phase 2E ATLAS data enablement
+
+Phase 2E connects verified holder and contract-origin providers so the required
+holder domain can finally be satisfied — without weakening the policy. Robinhood
+Chain uses the credentialed Blockscout PRO API for holders and creation; BNB
+Smart Chain uses Moralis for holders and Etherscan V2 for creation, because
+Blockscout does not index BSC. The public Robinhood explorer host answers
+server-side clients with an interactive challenge page and is deliberately not
+used: satisfying it would mean impersonating a browser.
+
+Providers supply raw rows and provenance only. Every concentration is computed
+here from integer balances against on-chain `totalSupply()` — no float, no vendor
+percentage — and nothing is excluded from the raw metric, so a liquidity pool or
+a burn address stays visible. Coverage is explicit (`COMPLETE`, `TOP_N_ONLY`,
+`UNKNOWN`), freshness is anchored to what the source observed rather than to when
+we fetched, and an indexer lagging the chain goes stale rather than being rescued
+by a fresh round-trip.
+
+The concentration threshold stays disabled: data became available, a product
+decision did not. A holder-domain PASS therefore means the data-quality
+prerequisite was met, never that the distribution was judged safe. Every provider
+defaults to `disabled`, a credential alone activates nothing, no worker is
+started and no migration is added. See
+[the Phase 2E provider research and support matrix](docs/phase-2e.md).

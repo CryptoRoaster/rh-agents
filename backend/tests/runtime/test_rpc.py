@@ -231,3 +231,87 @@ async def test_block_and_logs_contract(chain_config, settings):
             await rpc.logs(spec, 10, 10000)
     finally:
         await rpc.close()
+
+
+# ------------------------------------------------- creation receipt retrieval
+
+TX = "0x" + "11" * 32
+CREATED = "0x" + "a1" * 20
+
+
+def receipt_transport(result, chain_id):
+    def handler(request):
+        payload = json.loads(request.content)
+        if payload["method"] == "eth_chainId":
+            return httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": payload["id"], "result": hex(chain_id)}
+            )
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": result})
+
+    return httpx.MockTransport(handler)
+
+
+async def test_a_creation_receipt_returns_only_the_created_address(chain_config, settings):
+    rpc = EvmRpcClient(
+        chain_config,
+        settings,
+        transport=receipt_transport(
+            {"contractAddress": CREATED.upper().replace("0X", "0x"), "status": "0x1"},
+            chain_config.chain_id,
+        ),
+    )
+    try:
+        await rpc.verify_chain()
+        # Only the created address is surfaced; the receipt itself never is.
+        assert await rpc.receipt_contract_address(TX) == CREATED
+    finally:
+        await rpc.close()
+
+
+@pytest.mark.parametrize("result", [None, {"contractAddress": None, "status": "0x1"}])
+async def test_a_receipt_without_a_created_contract_answers_none(chain_config, settings, result):
+    rpc = EvmRpcClient(
+        chain_config, settings, transport=receipt_transport(result, chain_config.chain_id)
+    )
+    try:
+        await rpc.verify_chain()
+        assert await rpc.receipt_contract_address(TX) is None
+    finally:
+        await rpc.close()
+
+
+@pytest.mark.parametrize("result", [{"contractAddress": "nope"}, "0x1", 7])
+async def test_a_malformed_receipt_is_refused(chain_config, settings, result):
+    rpc = EvmRpcClient(
+        chain_config, settings, transport=receipt_transport(result, chain_config.chain_id)
+    )
+    try:
+        await rpc.verify_chain()
+        with pytest.raises(RuntimeFailure):
+            await rpc.receipt_contract_address(TX)
+    finally:
+        await rpc.close()
+
+
+@pytest.mark.parametrize("tx_hash", ["0x1234", "not-a-hash", "0x" + "11" * 31, "0x" + "AA" * 32])
+async def test_a_transaction_hash_that_is_not_32_bytes_is_refused(chain_config, settings, tx_hash):
+    rpc = EvmRpcClient(
+        chain_config, settings, transport=receipt_transport(None, chain_config.chain_id)
+    )
+    try:
+        await rpc.verify_chain()
+        with pytest.raises(RuntimeFailure):
+            await rpc.receipt_contract_address(tx_hash)
+    finally:
+        await rpc.close()
+
+
+async def test_a_receipt_read_still_requires_a_verified_chain(chain_config, settings):
+    rpc = EvmRpcClient(
+        chain_config, settings, transport=receipt_transport(None, chain_config.chain_id)
+    )
+    try:
+        with pytest.raises(RuntimeFailure):
+            await rpc.receipt_contract_address(TX)
+    finally:
+        await rpc.close()

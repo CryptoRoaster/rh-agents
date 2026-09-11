@@ -79,6 +79,22 @@ class Settings(BaseSettings):
     # safety policy is code-defined and versioned rather than env-mutable.
     atlas_worker_enabled: bool = False
     atlas_snapshot_max_age_seconds: int = Field(default=600, ge=30, le=86400)
+    # Phase 2E ATLAS fact providers, one per chain and fact domain. Every one
+    # defaults to "disabled": a key sitting in the environment is not consent to
+    # spend, and selecting a provider still starts no worker.
+    atlas_rh_holder_provider: Literal["disabled", "blockscout"] = "disabled"
+    atlas_bsc_holder_provider: Literal["disabled", "moralis"] = "disabled"
+    atlas_rh_origin_provider: Literal["disabled", "blockscout"] = "disabled"
+    atlas_bsc_origin_provider: Literal["disabled", "etherscan"] = "disabled"
+    blockscout_base_url: str = "https://api.blockscout.com"
+    blockscout_api_key: SecretStr = SecretStr("")
+    moralis_base_url: str = "https://deep-index.moralis.io/api/v2.2"
+    moralis_api_key: SecretStr = SecretStr("")
+    etherscan_base_url: str = "https://api.etherscan.io"
+    etherscan_api_key: SecretStr = SecretStr("")
+    atlas_source_timeout_seconds: int = Field(default=10, ge=1, le=60)
+    atlas_holder_page_size: int = Field(default=50, ge=10, le=200)
+    atlas_holder_max_pages: int = Field(default=1, ge=1, le=5)
 
     @model_validator(mode="after")
     def reasoning_configuration(self) -> "Settings":
@@ -92,6 +108,26 @@ class Settings(BaseSettings):
             # ATLAS reads chain facts; enabling it without the EVM runtime would
             # guarantee an unavailable contract domain rather than fail loudly.
             raise ValueError("ATLAS requires the EVM runtime for on-chain facts")
+        return self
+
+    @model_validator(mode="after")
+    def atlas_source_configuration(self) -> "Settings":
+        # A selected provider that cannot authenticate would fail on the first
+        # safety-critical read. Refusing to boot is louder and safer.
+        credentials = {
+            "blockscout": self.blockscout_api_key,
+            "moralis": self.moralis_api_key,
+            "etherscan": self.etherscan_api_key,
+        }
+        selected = {
+            self.atlas_rh_holder_provider,
+            self.atlas_bsc_holder_provider,
+            self.atlas_rh_origin_provider,
+            self.atlas_bsc_origin_provider,
+        } - {"disabled"}
+        for provider in sorted(selected):
+            if not credentials[provider].get_secret_value():
+                raise ValueError("A selected ATLAS fact provider requires its API key")
         return self
 
     @model_validator(mode="after")
@@ -155,6 +191,31 @@ class Settings(BaseSettings):
             or any(c.isspace() for c in value)
         ):
             raise ValueError("GeckoTerminal requires an HTTPS /api/v2 URL without credentials")
+        return value.rstrip("/")
+
+    @field_validator("blockscout_base_url", "moralis_base_url", "etherscan_base_url")
+    @classmethod
+    def require_provider_origin(cls, value: str) -> str:
+        """An allowlisted HTTPS origin with no embedded credentials.
+
+        The base URL is the only host a fact adapter can ever reach, so it is
+        pinned by configuration rather than chosen at call time. Embedded
+        credentials, a query string or a fragment would all be ways to smuggle a
+        secret or a redirect target into a request.
+        """
+        url = urlsplit(value)
+        if (
+            url.scheme != "https"
+            or not url.hostname
+            or url.username
+            or url.password
+            or url.query
+            or url.fragment
+            or (url.port is not None and not 1 <= url.port <= 65535)
+            or any(character.isspace() for character in value)
+            or len(value) > 200
+        ):
+            raise ValueError("An ATLAS provider base URL must be a plain HTTPS origin")
         return value.rstrip("/")
 
     @field_validator("geckoterminal_robinhood_network_id", "geckoterminal_bsc_network_id")
