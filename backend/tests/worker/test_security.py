@@ -221,3 +221,184 @@ async def test_a_role_cannot_borrow_another_roles_port(runtime, now, trace, role
     with pytest.raises(WorkerFailure) as caught:
         provider.build(fake_lease(role, now, trace))
     assert caught.value.code == WorkerErrorCode.ROLE_NOT_AUTHORIZED
+
+
+# ------------------------------------------------- runtime identity and leases
+
+
+async def test_registration_retry_within_one_start_is_idempotent(runtime):
+    """A: the same registration request resolves to the same instance."""
+    from src.orchestration.worker.models import WorkerRegistration
+
+    registration = WorkerRegistration(
+        registration_key="runtime:fixed-start",
+        role=AgentRole.ATLAS,
+        runtime_version="worker-runtime-v1",
+    )
+    first = await runtime.register_worker(registration)
+    retried = await runtime.register_worker(registration)
+    assert retried.worker_instance_id == first.worker_instance_id
+
+
+async def test_two_genuine_runtime_starts_are_two_instances(runtime, now, trace):
+    """B: same role and version, two process lifetimes, two identities."""
+    from src.orchestration.worker.runner import new_registration_key
+    from tests.worker.test_scenarios import CrashingAtlasWorker, atlas_provider
+
+    first_key = new_registration_key()
+    second_key = new_registration_key()
+    assert first_key != second_key
+
+    from src.orchestration.worker.runner import WorkerRunner
+
+    runners = [
+        WorkerRunner(runtime, CrashingAtlasWorker(), atlas_provider(runtime)) for _ in range(2)
+    ]
+    # A runner mints its own key, so nothing pins a role to a permanent identity.
+    assert runners[0].registration_key != runners[1].registration_key
+    ids = [await runner.register() for runner in runners]
+    assert ids[0] != ids[1]
+    assert len(await runtime.workers(role=AgentRole.ATLAS)) == 2
+
+
+async def test_registration_key_is_never_derived_from_role_or_version(runtime):
+    from src.orchestration.worker.runner import new_registration_key
+
+    keys = {new_registration_key() for _ in range(50)}
+    assert len(keys) == 50
+    for key in keys:
+        assert "ATLAS" not in key and "worker-runtime-v1" not in key
+
+
+async def test_lease_ids_are_random_and_not_derived(worker_db, now, trace):
+    """lease_id must stay unguessable; identical inputs still yield new tokens."""
+    from datetime import timedelta
+
+    from src.orchestration.worker.policy import WORKER_RUNTIME_V1
+    from tests.worker.conftest import build_runtime
+    from tests.worker.test_worker_runtime import register
+
+    _, sessions = worker_db
+    runtime = build_runtime(sessions, now)
+    _, first = await claimed(runtime, now, trace, key="identity-lease")
+    # Recovery starts the retry backoff, so reclaiming happens one step later.
+    expiry = build_runtime(sessions, now + WORKER_RUNTIME_V1.lease_duration + timedelta(seconds=1))
+    await expiry.recover_expired_leases()
+    later = build_runtime(
+        sessions,
+        now
+        + WORKER_RUNTIME_V1.lease_duration
+        + WORKER_RUNTIME_V1.retry_delay(1)
+        + timedelta(seconds=2),
+    )
+    second_worker = await register(later, key="identity-lease-2")
+    second = await later.claim_next_task(second_worker.worker_instance_id)
+    assert second is not None
+    # Same task, same role: a derived token would repeat. A random one cannot.
+    assert second.lease_id != first.lease_id
+    assert second.lease_id.version == 4
+
+
+async def test_identity_and_lease_are_not_interchangeable(worker_db, now, trace):
+    """C-H: only the exact current pairing may mutate anything."""
+    from datetime import timedelta
+
+    from src.orchestration.worker.policy import WORKER_RUNTIME_V1
+    from tests.worker.conftest import build_runtime
+    from tests.worker.test_worker_runtime import evidence_result, register
+
+    _, sessions = worker_db
+    runtime = build_runtime(sessions, now)
+    trade_case = await open_case(runtime.cases, now, trace, "identity-matrix")
+    old_worker = await register(runtime, key="identity-old")
+    old_lease = await runtime.claim_next_task(old_worker.worker_instance_id)
+    assert old_lease is not None
+
+    # C: the process dies; its replacement is a different runtime instance.
+    expiry = build_runtime(sessions, now + WORKER_RUNTIME_V1.lease_duration + timedelta(seconds=1))
+    await expiry.recover_expired_leases()
+    later = build_runtime(
+        sessions,
+        now
+        + WORKER_RUNTIME_V1.lease_duration
+        + WORKER_RUNTIME_V1.retry_delay(1)
+        + timedelta(seconds=2),
+    )
+    new_worker = await register(later, key="identity-new")
+    assert new_worker.worker_instance_id != old_worker.worker_instance_id
+
+    # D: the replacement reclaims and receives a genuinely new lease.
+    new_lease = await later.claim_next_task(new_worker.worker_instance_id)
+    assert new_lease is not None
+    assert new_lease.lease_id != old_lease.lease_id
+    assert new_lease.attempt_number == old_lease.attempt_number + 1
+
+    result = evidence_result(trade_case, new_lease, later.clock.now(), result_key="matrix")
+
+    # E: old identity with its own old lease.
+    with pytest.raises(WorkerFailure) as caught:
+        await later.submit_task_result(old_lease, result)
+    assert caught.value.code == WorkerErrorCode.LEASE_EXPIRED
+
+    # F: new identity presenting the old lease token.
+    with pytest.raises(WorkerFailure) as caught:
+        await later.submit_task_result(
+            old_lease.model_copy(update={"worker_instance_id": new_worker.worker_instance_id}),
+            result,
+        )
+    assert caught.value.code in {
+        WorkerErrorCode.LEASE_OWNER_MISMATCH,
+        WorkerErrorCode.LEASE_EXPIRED,
+    }
+
+    # G: old identity presenting the current lease token.
+    with pytest.raises(WorkerFailure) as caught:
+        await later.submit_task_result(
+            new_lease.model_copy(update={"worker_instance_id": old_worker.worker_instance_id}),
+            result,
+        )
+    assert caught.value.code == WorkerErrorCode.LEASE_OWNER_MISMATCH
+
+    # H: only the exact current pairing is accepted.
+    accepted = await later.submit_task_result(new_lease, result)
+    assert accepted.outcome.value == "SUCCEEDED"
+    onchain = [
+        item
+        for item in await later.cases.evidence(trade_case.id)
+        if item.evidence_type.value == "ONCHAIN_EVIDENCE"
+    ]
+    assert len(onchain) == 1
+
+
+async def test_a_worker_without_standing_cannot_write_its_own_denial(worker_db, now, trace):
+    """A denied audit record must never become an authorization bypass."""
+    from datetime import timedelta
+
+    from src.orchestration.worker.policy import WORKER_RUNTIME_V1
+    from src.orchestration.worker.runner import WorkerRunner
+    from tests.worker.conftest import build_runtime
+    from tests.worker.test_scenarios import SuccessfulAtlasWorker, atlas_provider
+
+    _, sessions = worker_db
+    runtime = build_runtime(sessions, now)
+    trade_case = await open_case(runtime.cases, now, trace, "identity-standing")
+    handler = SuccessfulAtlasWorker(trade_case=trade_case, now=now)
+    runner = WorkerRunner(runtime, handler, atlas_provider(runtime))
+    await runner.register()
+    lease = await runtime.claim_next_task(runner.worker_instance_id)
+    assert lease is not None
+
+    expired = build_runtime(sessions, now + WORKER_RUNTIME_V1.lease_duration + timedelta(seconds=1))
+    stale_runner = WorkerRunner(
+        expired,
+        handler,
+        atlas_provider(expired),
+        registration_key=runner.registration_key,
+    )
+    stale_runner.worker_instance_id = runner.worker_instance_id
+    before = len(await expired.attempts(task_id=lease.task_id))
+    with pytest.raises(WorkerFailure) as caught:
+        await stale_runner._record_refusal(lease, WorkerFailure(WorkerErrorCode.LEASE_EXPIRED))
+    assert caught.value.code == WorkerErrorCode.LEASE_EXPIRED
+    # It propagated instead of writing; recovery owns the abandoned attempt.
+    assert len(await expired.attempts(task_id=lease.task_id)) == before

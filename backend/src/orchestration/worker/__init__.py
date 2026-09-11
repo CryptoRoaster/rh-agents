@@ -19,7 +19,12 @@ from src.orchestration.worker.models import (
     WorkerInstanceStatus,
     WorkerRegistration,
 )
-from src.orchestration.worker.runner import CapabilityProvider, WorkerHandler, WorkerRunner
+from src.orchestration.worker.runner import (
+    CapabilityProvider,
+    WorkerHandler,
+    WorkerRunner,
+    new_registration_key,
+)
 from src.orchestration.worker.service import WorkerRuntimeService
 
 __all__ = [
@@ -38,4 +43,5 @@ __all__ = [
     "WorkerRegistration",
     "WorkerRunner",
     "WorkerRuntimeService",
+    "new_registration_key",
 ]

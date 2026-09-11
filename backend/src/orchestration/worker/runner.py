@@ -9,7 +9,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from src.core.models import AgentRole
 from src.orchestration.worker.capabilities import (
@@ -43,6 +43,20 @@ from src.orchestration.worker.models import (
     WorkerRegistration,
 )
 from src.orchestration.worker.service import WorkerRuntimeService
+
+
+def new_registration_key() -> str:
+    """Mint an idempotency token for exactly one runtime start.
+
+    A registration key identifies a single process lifetime, not a role and not a
+    deployment slot. Retrying the same registration reuses the key so the runtime
+    keeps one worker_instance_id; a genuinely new process mints a new key and is a
+    new instance. Deriving it from role, host or version instead would merge a
+    crashed process and its replacement into one identity and make attempt history
+    unable to tell them apart.
+    """
+    return f"runtime:{uuid4()}"
+
 
 REFUSAL_CATEGORIES = {
     WorkerErrorCode.ROLE_NOT_AUTHORIZED: WorkerFailureCategory.CAPABILITY_DENIED,
@@ -137,7 +151,7 @@ class WorkerRunner:
         handler: WorkerHandler,
         capabilities: CapabilityProvider,
         *,
-        registration_key: str,
+        registration_key: str | None = None,
         runtime_version: str = "worker-runtime-v1",
         poll_interval: timedelta = timedelta(seconds=5),
     ) -> None:
@@ -146,7 +160,12 @@ class WorkerRunner:
         self.service = service
         self.handler = handler
         self.capabilities = capabilities
-        self.registration_key = registration_key
+        # One runner is one runtime lifetime, so it mints its own key by default.
+        # Passing one explicitly is for resuming a specific registration, never for
+        # pinning a role or deployment to a permanent identity.
+        self.registration_key = (
+            registration_key if registration_key is not None else new_registration_key()
+        )
         self.runtime_version = runtime_version
         self.poll_interval = poll_interval
         self.worker_instance_id: UUID | None = None

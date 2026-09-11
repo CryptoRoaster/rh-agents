@@ -54,12 +54,34 @@ sequenceDiagram
 
 ## Worker identity
 
-A logical registration (`registration_key`, role, runtime version) maps to a
-stable `worker_instance_id` UUID. Registration is idempotent; the same key with a
-different role or version is a `WORKER_IDENTITY_CONFLICT`. Ephemeral host and
-process metadata are deliberately not part of this identity, so restarting a host
-does not invent a new logical claimant, while each instance stays independently
-identifiable for audit and crash diagnosis.
+`worker_instance_id` identifies **one runtime lifetime**, not a role and not a
+deployment slot. A `registration_key` is the idempotency token for exactly one
+runtime start, minted freshly by `new_registration_key()` when a runner is
+constructed, and `worker_instance_id` is derived from it deterministically so a
+retried registration call resolves to the same instance.
+
+The distinction is deliberate and matters for audit:
+
+| Concept | Example | Stable across restarts |
+| --- | --- | --- |
+| Role | `ATLAS` | yes |
+| Runtime instance | the process that started at 10:00 | **no** |
+
+An ATLAS process that starts at 10:00 and crashes at 10:12 and its replacement
+starting at 10:13 are two `worker_instance_id` values, because the replacement
+mints a new registration key. They must not collapse into one identity merely
+because the role and runtime version are unchanged, or attempt history could no
+longer say which process abandoned a lease.
+
+Deriving the key from a role, host, deployment name or runtime version would
+produce exactly that collapse and is therefore never done. Registration stays
+idempotent for the retries of a single start; the same key with a different role
+or version is a `WORKER_IDENTITY_CONFLICT`.
+
+`worker_instance_id` is not a secret and grants nothing on its own. Authority
+always requires the exact active combination of trade case, task, owning
+`worker_instance_id` and `lease_id`, where `lease_id` is a fresh random UUID4 per
+attempt and is never derived from the task, worker, role or attempt number.
 
 ## Leases
 
