@@ -1,6 +1,6 @@
 # Architecture
 
-CryptoRoaster/rh-agents is a new, independent autonomous on-chain trading system. Phase 0 implements typed boundaries, deterministic paper trading, persistence, and a dashboard preview. Phase 1A adds provider-neutral market observation recording and read paths, with no live-money execution. Phase 1B adds public GeckoTerminal EVM market ingestion. No files or dependencies come from ClawfredAI/polma-db.
+CryptoRoaster/rh-agents is a new, independent autonomous on-chain trading system. Phase 0 implements typed boundaries, deterministic paper trading, persistence, and a dashboard preview. Phase 1 adds provider-neutral market recording, public EVM ingestion, and a controlled realtime data runtime. Phase 2A adds the durable deterministic TradeCase workflow used by future team workers. No files or dependencies come from ClawfredAI/polma-db.
 
 ## Non-negotiable invariants
 
@@ -20,14 +20,15 @@ CryptoRoaster/rh-agents is a new, independent autonomous on-chain trading system
 ```mermaid
 flowchart LR
   Feeds[Market / Data Feeds] --> ORBIT
-  ORBIT --> ATLAS
-  ORBIT --> SIGNAL
-  ORBIT --> VECTOR
-  ATLAS --> PULSE
-  SIGNAL --> PULSE
-  VECTOR --> PULSE
-  PULSE --> ANCHOR --> SENTINEL --> FUSE --> COMMANDER
-  COMMANDER --> FinalRisk[Final SENTINEL validation]
+  ORBIT --> Open[COMMANDER opens TradeCase]
+  Open --> ATLAS
+  Open --> SIGNAL
+  Open --> VECTOR
+  ATLAS --> FUSE
+  SIGNAL --> FUSE
+  VECTOR --> FUSE
+  FUSE --> PULSE --> ANCHOR --> SENTINEL --> COMMANDER
+  COMMANDER --> FinalRisk[Final SENTINEL revalidation]
   FinalRisk --> EXECUTOR --> LEDGER
   LEDGER --> DB[(PostgreSQL)]
 ```
@@ -46,7 +47,17 @@ flowchart LR
 | LEDGER | Fills, cost basis, positions, PnL, reconciliation | Deterministic accounting; reconciliation planned |
 | EXECUTOR | Simulate; later sign, send, confirm, reconcile | Infrastructure service; paper only |
 
-The initial SENTINEL stage validates upstream information. A second check immediately before execution validates the **final** intent against the current portfolio; FUSE and COMMANDER cannot carry an earlier approval across changed terms. LLM implementations and the autonomous scheduling loop are Phase 1 work.
+The initial SENTINEL stage validates upstream information. A second check immediately before execution validates the **final** intent against the current portfolio; FUSE and COMMANDER cannot carry an earlier approval across changed terms. Phase 2A implements only the deterministic workflow and evidence boundary. LLM implementations and the autonomous scheduling loop remain future work.
+
+## Phase 2A TradeCase workflow
+
+`TradeCaseService` is the only normal mutation boundary for workflow state. It persists a frozen market-bound TradeCase, durable specialist tasks, immutable typed evidence, structured blockers, SENTINEL bindings, state transitions, and a sequence-ordered audit timeline. `TradeCaseEvaluator` derives state under the central versioned `trade-case-v1` policy; callers cannot set a status or override a blocker.
+
+Safety-critical ATLAS, VECTOR, PULSE, and ANCHOR evidence fails closed when UNKNOWN, UNAVAILABLE, INVALID, or STALE. Freshness uses the trusted Clock. A trigger references the exact current VECTOR evidence, and ANCHOR references both setup and trigger. The risk-input digest binds SENTINEL to the active safety evidence; a changed or expired input invalidates an earlier authorization.
+
+Phase 0 `RiskOutcome` is unchanged. One deterministic classifier, `RiskAuthorization`, is the single interpretation of a final SENTINEL decision: `APPROVED`, `LIMITED`, or `REJECTED`. `LIMITED` is reached only when a `REJECT` is exclusively a resizable sizing rejection carrying a strictly positive bounded capacity; `PAUSE_SYSTEM`, any non-sizing reason code, any unrecognised code, and any future outcome all fail closed to `REJECTED`. `RISK_APPROVED` and `RISK_LIMITED` are authorizations rather than endings and stay revalidatable, so changed safety evidence revokes them; only `RISK_REJECTED`, `EXPIRED`, and `CANCELLED` are terminal. Every deterministic limit a future execution boundary must honour is persisted in its own typed Decimal column.
+
+PostgreSQL row locks serialize updates to one case. Unique idempotency and revision constraints reject conflicting replay, while append-only triggers protect evidence, risk bindings, transitions, and timeline events. Public `/api/trade-cases` routes are GET-only. Future workers receive typed submit capabilities rather than database, signer, executor, or force-transition access. See [Phase 2A workflow details](docs/phase-2a.md).
 
 ## Typed asynchronous contracts
 

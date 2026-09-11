@@ -17,6 +17,7 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    UniqueConstraint,
     Uuid,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -181,4 +182,151 @@ class EvmLogRow(Base):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     session_id: Mapped[UUID] = mapped_column(Uuid)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+
+
+class TradeCaseRow(Base):
+    __tablename__ = "trade_cases"
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="trade_case_revision_positive"),
+        Index("ix_trade_cases_status_updated", "status", "updated_at", "id"),
+        Index("ix_trade_cases_market", "chain", "network", "market_key"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    workflow_version: Mapped[str] = mapped_column(String(40))
+    market_key: Mapped[str] = mapped_column(String(1200))
+    chain: Mapped[str] = mapped_column(String(60))
+    network: Mapped[str] = mapped_column(String(60))
+    status: Mapped[str] = mapped_column(String(40))
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    originating_discovery_reference: Mapped[UUID] = mapped_column(Uuid)
+    strategy_policy_id: Mapped[str | None] = mapped_column(String(200))
+    revision: Mapped[int] = mapped_column(Integer)
+    reason_code: Mapped[str] = mapped_column(String(80))
+    blockers: Mapped[list[dict[str, Any]]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+    risk_input_digest: Mapped[str | None] = mapped_column(String(64))
+    correlation_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    open_idempotency_key: Mapped[str] = mapped_column(String(200), unique=True)
+    open_fingerprint: Mapped[str] = mapped_column(String(64))
+    market_payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+
+
+class TradeCaseTaskRow(Base):
+    __tablename__ = "trade_case_tasks"
+    __table_args__ = (
+        UniqueConstraint(
+            "trade_case_id", "role", "task_type", "attempt", name="uq_trade_case_task_attempt"
+        ),
+        Index("ix_trade_case_tasks_case_status", "trade_case_id", "status"),
+    )
+    task_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    trade_case_id: Mapped[UUID] = mapped_column(ForeignKey("trade_cases.id", ondelete="CASCADE"))
+    role: Mapped[str] = mapped_column(String(40))
+    task_type: Mapped[str] = mapped_column(String(80))
+    required: Mapped[bool] = mapped_column(Boolean)
+    status: Mapped[str] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt: Mapped[int] = mapped_column(Integer)
+    correlation_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    reason_code: Mapped[str] = mapped_column(String(80))
+    idempotency_key: Mapped[str] = mapped_column(String(200), unique=True)
+
+
+class TradeCaseEvidenceRow(Base):
+    __tablename__ = "trade_case_evidence"
+    __table_args__ = (Index("ix_trade_case_evidence_case_type", "trade_case_id", "evidence_type"),)
+    evidence_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    trade_case_id: Mapped[UUID] = mapped_column(ForeignKey("trade_cases.id", ondelete="CASCADE"))
+    producer_role: Mapped[str] = mapped_column(String(40))
+    evidence_type: Mapped[str] = mapped_column(String(60))
+    schema_version: Mapped[int] = mapped_column(Integer)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(40))
+    correlation_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    supersedes_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("trade_case_evidence.evidence_id")
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(200), unique=True)
+    submission_fingerprint: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+
+
+class TradeCaseRiskBindingRow(Base):
+    """Immutable SENTINEL decisions bound to one TradeCase risk-input digest.
+
+    Every restriction a future execution boundary must honour has its own typed
+    column. ``payload`` keeps the whole decision for audit provenance only.
+    """
+
+    __tablename__ = "trade_case_risk_bindings"
+    __table_args__ = (
+        UniqueConstraint("trade_case_id", "case_revision", name="uq_trade_case_risk_revision"),
+        CheckConstraint(
+            "position_size_limit_usd >= 0", name="trade_case_risk_position_limit_nonnegative"
+        ),
+        CheckConstraint(
+            "max_additional_notional_usd >= 0", name="trade_case_risk_notional_nonnegative"
+        ),
+        CheckConstraint(
+            "max_slippage_bps >= 0 AND max_slippage_bps <= 10000",
+            name="trade_case_risk_slippage_bounded",
+        ),
+        Index("ix_trade_case_risk_case_time", "trade_case_id", "evaluated_at"),
+    )
+    binding_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    trade_case_id: Mapped[UUID] = mapped_column(ForeignKey("trade_cases.id", ondelete="CASCADE"))
+    risk_decision_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    case_revision: Mapped[int] = mapped_column(Integer)
+    risk_input_digest: Mapped[str] = mapped_column(String(64))
+    outcome: Mapped[str] = mapped_column(String(40))
+    authorization: Mapped[str] = mapped_column("risk_authorization", String(40))
+    reason_codes: Mapped[list[str]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+    position_size_limit_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    max_additional_notional_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    max_slippage_bps: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    correlation_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+
+
+class TradeCaseTransitionRow(Base):
+    __tablename__ = "trade_case_transitions"
+    __table_args__ = (
+        UniqueConstraint("trade_case_id", "revision", name="uq_trade_case_transition_revision"),
+        Index("ix_trade_case_transition_case_time", "trade_case_id", "recorded_at"),
+    )
+    transition_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    trade_case_id: Mapped[UUID] = mapped_column(ForeignKey("trade_cases.id", ondelete="CASCADE"))
+    revision: Mapped[int] = mapped_column(Integer)
+    from_status: Mapped[str] = mapped_column(String(40))
+    to_status: Mapped[str] = mapped_column(String(40))
+    reason_code: Mapped[str] = mapped_column(String(80))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    correlation_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    blockers: Mapped[list[dict[str, Any]]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+    risk_input_digest: Mapped[str | None] = mapped_column(String(64))
+
+
+class TradeCaseEventRow(Base):
+    __tablename__ = "trade_case_events"
+    __table_args__ = (Index("ix_trade_case_events_case_sequence", "trade_case_id", "sequence"),)
+    sequence: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    event_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    trade_case_id: Mapped[UUID] = mapped_column(ForeignKey("trade_cases.id", ondelete="CASCADE"))
+    event_type: Mapped[str] = mapped_column(String(80))
+    reason_code: Mapped[str] = mapped_column(String(80))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    correlation_id: Mapped[UUID] = mapped_column(Uuid, index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))

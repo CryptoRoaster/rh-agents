@@ -5,6 +5,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from src.agents.registry import COMPONENTS
 from src.api.markets import router as markets_router
 from src.api.runtime import router as runtime_router
+from src.api.trade_cases import router as trade_cases_router
 from src.core.config import Settings
 from src.core.models import RiskLimits
 from src.data.database import connect
@@ -12,14 +13,15 @@ from src.data.database import connect
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
-    app = FastAPI(title="rh-agents", version="0.2.0", description="Phase 1A · paper only")
+    app = FastAPI(title="rh-agents", version="0.4.0", description="Phase 2A · paper only")
     app.state.settings = settings
     app.include_router(markets_router)
     app.include_router(runtime_router)
+    app.include_router(trade_cases_router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
-        return {"status": "ok", "phase": "1A", "mode": settings.trading_mode.value}
+        return {"status": "ok", "phase": "2A", "mode": settings.trading_mode.value}
 
     @app.get("/ready")
     async def ready() -> dict[str, str]:
@@ -27,7 +29,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             async with engine.connect() as connection:
                 revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
-                if revision != "0004":
+                if revision != "0005":
                     raise HTTPException(status_code=503, detail="Database migration is not current")
         except (SQLAlchemyError, OSError) as error:
             raise HTTPException(
@@ -40,7 +42,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/system")
     async def system() -> dict[str, object]:
         return {
-            "phase": "1A",
+            "phase": "2A",
             "mode": settings.trading_mode,
             "live_enabled": False,
             "agents": [component.model_dump() for component in COMPONENTS],

@@ -2,7 +2,7 @@
 
 Phase 1B EVM market-data ingestion and recording foundation for CryptoRoaster's autonomous multi-agent on-chain trading system, built on the Phase 0 paper executor. Agents will autonomously request trades; deterministic risk controls are mandatory and cannot be overridden. Individual trades do not require human approval.
 
-**Paper only. No wallets, signing, blockchain calls, live trading or running LLM agents.** This repository is independent of ClawfredAI/polma-db.
+**Paper only. No wallets, signing, transaction broadcasting, live trading or running LLM agents.** This repository is independent of ClawfredAI/polma-db.
 
 ## Local setup (macOS)
 
@@ -82,10 +82,10 @@ backend/
     risk/           SENTINEL deterministic policy
     execution/      Abstract Executor and deterministic PaperExecutor
     ledger/         Weighted-average spot accounting and PnL
-    orchestration/  Typed asyncio bus and transactional paper coordinator
+    orchestration/  Typed bus, paper coordinator, and deterministic TradeCase workflow
     api/            Read-only FastAPI foundation
   tests/            Contract, safety, executor, accounting, persistence tests
-  migrations/       Alembic PostgreSQL foundation and append-only market observations
+  migrations/       Alembic PostgreSQL foundation, data runtime, and TradeCase workflow
 frontend/
   app/              Next.js App Router and light dashboard theme
   components/       Dashboard shell and Recharts equity chart
@@ -189,3 +189,19 @@ Rejected counts isolated malformed provider entries. Failed includes rejected en
 The optional native runtime adds scheduled GeckoTerminal discovery and a separate managed EVM RPC/WSS path for Robinhood mainnet (4663) and BSC mainnet (56). Both are disabled by default. Configure `.env`, apply migration 0004, then run `uv run python -m src.runtime.main` from `backend/`. Enable only the services and chains whose configuration is ready.
 
 The watcher defaults to 90 seconds after completion and holds PostgreSQL ownership. Chain workers verify both endpoints, recover confirmed gaps through HTTP, retain durable cursors, and expose read-only `/api/runtime` health. No wallet, signing, LLM or trading functionality is added. Market observation remains distinct from SENTINEL approval evidence. See [runtime operation, recovery and limits](docs/phase-1c.md).
+
+## Phase 2A TradeCase workflow
+
+Migration `0005` adds the PostgreSQL-authoritative team workflow for future ORBIT, ATLAS, SIGNAL,
+VECTOR, FUSE, PULSE, ANCHOR, and COMMANDER workers. The versioned evaluator derives state from
+immutable typed evidence, trusted-time freshness, structured blockers, and the existing deterministic
+SENTINEL decision. VECTOR/PULSE/ANCHOR references and a canonical safety-evidence digest prevent
+stale setup, trigger, liquidity, or authorization reuse. A single deterministic `RiskAuthorization`
+classifier reads each final SENTINEL decision as APPROVED, LIMITED, or REJECTED; a pause or any
+non-sizing rejection fails closed, and both authorized states stay revalidatable. Row locks, monotonic revisions, unique idempotency keys, and
+append-only audit tables make concurrent replay deterministic.
+
+Read-only observability is available at `/api/trade-cases`, with case detail, timeline, evidence, and
+task subresources. No public mutation route or active worker is added. Future workers must submit
+typed evidence through the internal service; they receive no arbitrary database writes, signer,
+executor, status override, or SENTINEL override. See [the Phase 2A lifecycle and boundaries](docs/phase-2a.md).
