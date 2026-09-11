@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     orbit_discovery_liquidity_floor_usd: Decimal = Field(
         default=Decimal("25000"), ge=0, allow_inf_nan=False
     )
+    # Phase 2D ATLAS. Disabled by default like every other worker; the core
+    # safety policy is code-defined and versioned rather than env-mutable.
+    atlas_worker_enabled: bool = False
+    atlas_snapshot_max_age_seconds: int = Field(default=600, ge=30, le=86400)
 
     @model_validator(mode="after")
     def reasoning_configuration(self) -> "Settings":
@@ -84,6 +88,10 @@ class Settings(BaseSettings):
             raise ValueError("The anthropic reasoning provider requires ANTHROPIC_API_KEY")
         if self.orbit_worker_enabled and self.reasoning_provider == "disabled":
             raise ValueError("ORBIT requires a configured reasoning provider")
+        if self.atlas_worker_enabled and not self.evm_runtime_enabled:
+            # ATLAS reads chain facts; enabling it without the EVM runtime would
+            # guarantee an unavailable contract domain rather than fail loudly.
+            raise ValueError("ATLAS requires the EVM runtime for on-chain facts")
         return self
 
     @model_validator(mode="after")

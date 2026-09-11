@@ -106,6 +106,24 @@ class EvidenceStatus(StrEnum):
     STALE = "STALE"
 
 
+class EvidenceAcceptance(StrEnum):
+    """Whether an available envelope's own content satisfies its requirement.
+
+    Deliberately a second axis, independent of EvidenceStatus. Availability says
+    whether a fact could be observed; acceptance says what the observed fact
+    means. A known-bad fact is AVAILABLE and BLOCKED — never disguised as UNKNOWN,
+    because "we measured this and it is dangerous" and "we could not measure this"
+    are different states that must stay distinguishable in the audit record.
+
+    Derived deterministically from the typed payload. No worker, model, FUSE or
+    COMMANDER can set or override it.
+    """
+
+    ACCEPTED = "ACCEPTED"
+    BLOCKED = "BLOCKED"
+    INSUFFICIENT = "INSUFFICIENT"
+
+
 class EvidenceType(StrEnum):
     DISCOVERY = "DISCOVERY_EVIDENCE"
     ONCHAIN = "ONCHAIN_EVIDENCE"
@@ -151,7 +169,18 @@ class DiscoveryAssessment(Immutable):
     latency_ms: int | None = Field(default=None, ge=0)
 
 
-class DiscoveryPayload(Immutable):
+class AcceptancePayload(Immutable):
+    """Base for typed evidence payloads.
+
+    Most evidence carries no content-level policy of its own; its availability is
+    the whole question. Payloads that do carry one override ``acceptance``.
+    """
+
+    def acceptance(self) -> EvidenceAcceptance:
+        return EvidenceAcceptance.ACCEPTED
+
+
+class DiscoveryPayload(AcceptancePayload):
     kind: Literal["discovery"] = "discovery"
     discovery_reference: UUID
     # Absent on the provenance envelope written when a case is opened; present
@@ -159,19 +188,77 @@ class DiscoveryPayload(Immutable):
     assessment: DiscoveryAssessment | None = None
 
 
-class OnchainPayload(Immutable):
+class OnchainAdvisoryFinding(Immutable):
+    """Model commentary. Advisory only; it never changes a domain verdict."""
+
+    kind: Literal["VERIFIED_FACT", "INFERENCE"]
+    code: Code
+    statement: Annotated[str, Field(min_length=1, max_length=300)]
+    referenced_addresses: tuple[Identifier, ...] = Field(default=(), max_length=8)
+
+
+class OnchainIntelligence(Immutable):
+    """The deterministic record behind an on-chain verdict.
+
+    Verdict, blockers, gaps, per-domain availability and provenance are all
+    produced by policy. ``advisory_*`` fields carry optional model commentary and
+    have no authority over any of it.
+    """
+
+    verdict: Code
+    policy_version: Identifier
+    blockers: tuple[Code, ...] = Field(default=(), max_length=12)
+    data_gaps: tuple[Code, ...] = Field(default=(), max_length=12)
+    domain_status: dict[str, str]
+    chain_id: int = Field(gt=0)
+    block_number: int = Field(ge=0)
+    snapshot_digest: Digest
+    advisory_summary: SafeSummary | None = None
+    advisory_findings: tuple[OnchainAdvisoryFinding, ...] = Field(default=(), max_length=10)
+    reasoning_provider: Identifier | None = None
+    reasoning_model: Identifier | None = None
+    prompt_version: Identifier | None = None
+    prompt_hash: Digest | None = None
+
+
+class OnchainPayload(AcceptancePayload):
+    """On-chain integrity across three fact domains.
+
+    Each domain is one of three genuinely different states: PASS means the domain
+    was established and is acceptable, FAIL means it was established and violates
+    policy, UNKNOWN means it could not be established at all. Collapsing FAIL into
+    UNKNOWN would hide a measured danger behind a missing measurement.
+    """
+
     kind: Literal["onchain"] = "onchain"
     holder_integrity: Literal["PASS", "FAIL", "UNKNOWN"]
     dev_wallet_integrity: Literal["PASS", "FAIL", "UNKNOWN"]
     contract_integrity: Literal["PASS", "FAIL", "UNKNOWN"]
 
+    # Deterministic detail recorded alongside the three domain verdicts, so a
+    # future FUSE never has to parse prose to learn why.
+    intelligence: "OnchainIntelligence | None" = None
 
-class SentimentPayload(Immutable):
+    @property
+    def domains(self) -> tuple[str, str, str]:
+        return (self.holder_integrity, self.dev_wallet_integrity, self.contract_integrity)
+
+    def acceptance(self) -> EvidenceAcceptance:
+        # A known violation blocks even though the fact is perfectly available;
+        # a domain that could not be established is insufficient, not safe.
+        if "FAIL" in self.domains:
+            return EvidenceAcceptance.BLOCKED
+        if "UNKNOWN" in self.domains:
+            return EvidenceAcceptance.INSUFFICIENT
+        return EvidenceAcceptance.ACCEPTED
+
+
+class SentimentPayload(AcceptancePayload):
     kind: Literal["sentiment"] = "sentiment"
     assessment: Literal["POSITIVE", "NEUTRAL", "NEGATIVE", "UNKNOWN"]
 
 
-class TradeSetupPayload(Immutable):
+class TradeSetupPayload(AcceptancePayload):
     kind: Literal["trade_setup"] = "trade_setup"
     setup_id: UUID
     side: Side
@@ -180,14 +267,14 @@ class TradeSetupPayload(Immutable):
     target_prices: tuple[Positive, ...] = Field(min_length=1)
 
 
-class TriggerPayload(Immutable):
+class TriggerPayload(AcceptancePayload):
     kind: Literal["trigger"] = "trigger"
     setup_evidence_id: UUID
     observed_price: Positive
     trigger_code: Code
 
 
-class LiquidityExecutionPayload(Immutable):
+class LiquidityExecutionPayload(AcceptancePayload):
     kind: Literal["liquidity_execution"] = "liquidity_execution"
     setup_evidence_id: UUID
     trigger_evidence_id: UUID
@@ -261,17 +348,15 @@ class EvidenceSubmission(Immutable):
             ):
                 raise ValueError("Available execution evidence requires complete routing metrics")
         if self.status == EvidenceStatus.AVAILABLE and isinstance(self.payload, OnchainPayload):
-            if any(
-                value != "PASS"
-                for value in (
-                    self.payload.holder_integrity,
-                    self.payload.dev_wallet_integrity,
-                    self.payload.contract_integrity,
-                )
-            ):
+            # A measured violation is a fact and belongs in available evidence, so
+            # that "known dangerous" never has to masquerade as "unknown". What
+            # cannot appear in available evidence is an unestablished domain.
+            if "UNKNOWN" in self.payload.domains:
                 raise ValueError(
-                    "Available on-chain evidence requires every integrity check to pass"
+                    "Available on-chain evidence cannot contain an unestablished domain"
                 )
+            if "FAIL" in self.payload.domains and not self.reason_codes:
+                raise ValueError("A known on-chain violation requires a safe reason code")
         if (
             self.status == EvidenceStatus.AVAILABLE
             and isinstance(self.payload, SentimentPayload)

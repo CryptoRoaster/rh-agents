@@ -7,6 +7,7 @@ from hashlib import sha256
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
     Blocker,
+    EvidenceAcceptance,
     EvidenceEnvelope,
     EvidenceStatus,
     EvidenceType,
@@ -108,6 +109,24 @@ def risk_input_digest(
     return sha256(canonical.encode()).hexdigest()
 
 
+def unusable_reason(item: EvidenceEnvelope, now: datetime) -> str | None:
+    """Why this envelope cannot satisfy its requirement, or None if it can.
+
+    Two independent questions, asked in one place so no caller can answer only
+    the first. Is the envelope itself usable — present, fresh, available? And does
+    the fact it carries satisfy the deterministic policy the payload encodes? A
+    known-bad fact is available and still blocks, which is why availability alone
+    was never a sufficient test.
+    """
+    effective = item.effective_status(now)
+    if effective != EvidenceStatus.AVAILABLE:
+        return effective.value
+    acceptance = item.payload.acceptance()
+    if acceptance != EvidenceAcceptance.ACCEPTED:
+        return acceptance.value
+    return None
+
+
 class TradeCaseEvaluator:
     def __init__(self, policy: WorkflowPolicy = TRADE_CASE_V1) -> None:
         self.policy = policy
@@ -145,12 +164,12 @@ class TradeCaseEvaluator:
                     )
                 )
                 continue
-            effective = item.effective_status(now)
-            if effective != EvidenceStatus.AVAILABLE:
+            reason = unusable_reason(item, now)
+            if reason is not None:
                 target = pre_blockers if requirement.safety_critical else pre_missing
                 target.append(
                     Blocker(
-                        code=f"{requirement.role.value}_{effective.value}",
+                        code=f"{requirement.role.value}_{reason}",
                         role=requirement.role,
                         evidence_type=requirement.evidence_type,
                         evidence_id=item.evidence_id,
@@ -170,14 +189,14 @@ class TradeCaseEvaluator:
         trigger = current.get(EvidenceType.TRIGGER)
         if trigger is None:
             return Evaluation(TradeCaseStatus.READY_FOR_TRIGGER, "WAITING_FOR_CURRENT_TRIGGER")
-        trigger_status = trigger.effective_status(now)
-        if trigger_status != EvidenceStatus.AVAILABLE:
+        trigger_reason = unusable_reason(trigger, now)
+        if trigger_reason is not None:
             return Evaluation(
                 TradeCaseStatus.BLOCKED,
                 "TRIGGER_EVIDENCE_BLOCKED",
                 (
                     Blocker(
-                        code=f"PULSE_{trigger_status.value}",
+                        code=f"PULSE_{trigger_reason}",
                         role=self.policy.requirement(EvidenceType.TRIGGER).role,
                         evidence_type=EvidenceType.TRIGGER,
                         evidence_id=trigger.evidence_id,
@@ -206,14 +225,14 @@ class TradeCaseEvaluator:
             return Evaluation(
                 TradeCaseStatus.EXECUTION_EVIDENCE_PENDING, "EXECUTION_EVIDENCE_PENDING"
             )
-        anchor_status = anchor.effective_status(now)
-        if anchor_status != EvidenceStatus.AVAILABLE:
+        anchor_reason = unusable_reason(anchor, now)
+        if anchor_reason is not None:
             return Evaluation(
                 TradeCaseStatus.BLOCKED,
                 "EXECUTION_EVIDENCE_BLOCKED",
                 (
                     Blocker(
-                        code=f"ANCHOR_{anchor_status.value}_EXECUTION_EVIDENCE",
+                        code=f"ANCHOR_{anchor_reason}_EXECUTION_EVIDENCE",
                         role=self.policy.requirement(EvidenceType.LIQUIDITY_EXECUTION).role,
                         evidence_type=EvidenceType.LIQUIDITY_EXECUTION,
                         evidence_id=anchor.evidence_id,

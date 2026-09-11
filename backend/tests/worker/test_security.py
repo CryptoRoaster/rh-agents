@@ -40,7 +40,7 @@ FORBIDDEN_SURFACE = (
 
 
 class FakeOnchain:
-    async def token_integrity(self, market_key: str) -> object:
+    async def onchain_context(self, trade_case_id, task_id) -> object:
         return {}
 
 
@@ -54,12 +54,16 @@ async def test_a_built_capability_exposes_nothing_dangerous(runtime, now, trace)
     for attribute in reachable:
         assert not any(bad in attribute.lower() for bad in FORBIDDEN_SURFACE), attribute
     # Exactly three things: which lease, one read port, one bound write port.
-    assert reachable == {"lease", "onchain", "submit"}
+    assert reachable == {"lease", "context", "submit"}
 
     # The bound write port cannot be aimed at another task or another attempt.
     submit_surface = {name for name in dir(capabilities.submit) if not name.startswith("_")}
     assert submit_surface == {"lease", "submit_evidence"}
     assert capabilities.submit.lease.task_id == lease.task_id
+    # The read port offers one question and no way to ask another.
+    assert {name for name in dir(capabilities.context) if not name.startswith("_")} == {
+        "onchain_context"
+    }
 
 
 async def test_capability_cannot_be_built_for_a_role_without_its_port(runtime, now, trace):
@@ -190,7 +194,7 @@ def fake_lease(role, now, trace):
 
 ROLE_PORT = {
     AgentRole.ORBIT: ("context", {"context", "lease", "submit"}),
-    AgentRole.ATLAS: ("onchain", {"onchain", "lease", "submit"}),
+    AgentRole.ATLAS: ("onchain", {"context", "lease", "submit"}),
     AgentRole.SIGNAL: ("sentiment", {"sentiment", "lease", "submit"}),
     AgentRole.VECTOR: ("history", {"history", "lease", "submit"}),
     AgentRole.PULSE: ("triggers", {"triggers", "lease", "submit"}),
@@ -209,9 +213,11 @@ async def test_every_role_receives_exactly_its_own_composed_capability(runtime, 
     assert reachable == expected
     # Only the six evidence roles get a write port at all.
     assert ("submit" in reachable) == (role not in {AgentRole.FUSE, AgentRole.COMMANDER})
-    for other_port in ROLE_PORT.values():
-        if other_port[0] != port_name:
-            assert not hasattr(capabilities, other_port[0])
+    # No role reaches an attribute that belongs only to some other role. ORBIT and
+    # ATLAS both name their read port "context", so compare surfaces rather than
+    # assuming the provider field and the capability attribute share a name.
+    foreign = {attribute for _, surface in ROLE_PORT.values() for attribute in surface} - expected
+    assert reachable.isdisjoint(foreign)
 
 
 @pytest.mark.parametrize("role", sorted(ROLE_PORT))

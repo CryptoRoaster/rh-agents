@@ -56,12 +56,15 @@ class DiscoveryContextPort(Protocol):
     async def candidate_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
-class OnchainIntelligencePort(Protocol):
-    """ATLAS input. Intentionally unimplemented in Phase 2B: the approved holder,
-    developer-wallet and contract-integrity source is a later phase. No speculative
-    vendor dependency is added here."""
+class OnchainContextPort(Protocol):
+    """ATLAS input: one assembled view of the deterministic on-chain snapshot.
 
-    async def token_integrity(self, market_key: str) -> object: ...
+    The worker never holds an RPC client, an indexer client or a session. A
+    trusted collector performs the reads and hands over the finished facts, so
+    ATLAS cannot choose what to query or how to interpret a failed call.
+    """
+
+    async def onchain_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
 class SentimentPort(Protocol):
@@ -138,7 +141,7 @@ class OrbitCapabilities:
 @dataclass(frozen=True)
 class AtlasCapabilities:
     lease: TaskLease
-    onchain: OnchainIntelligencePort
+    context: OnchainContextPort
     submit: EvidenceSubmissionPort
 
 
