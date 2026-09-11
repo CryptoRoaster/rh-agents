@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import type { ChainFeed, MarketChain } from "@/lib/market-feed";
+import type { ChainFeed, MarketChain, RuntimeChain } from "@/lib/market-feed";
 export const dynamic = "force-dynamic";
 // Read-only server boundary. No credentials, mutation routes or provider HTTP clients.
 async function readChain(chain: MarketChain): Promise<ChainFeed> {
@@ -65,9 +65,77 @@ async function readChain(chain: MarketChain): Promise<ChainFeed> {
   }
 }
 export async function GET() {
-  const chains = await Promise.all([readChain("robinhood"), readChain("bsc")]);
+  const [rh, bsc, runtimeChains] = await Promise.all([
+    readChain("robinhood"),
+    readChain("bsc"),
+    readRuntime(),
+  ]);
+  const chains = [rh, bsc];
   return NextResponse.json(
-    { provider: "geckoterminal", checkedAt: new Date().toISOString(), chains },
+    {
+      provider: "geckoterminal",
+      checkedAt: new Date().toISOString(),
+      chains,
+      runtimeChains,
+    },
     { headers: { "Cache-Control": "no-store" } },
   );
+}
+
+async function readRuntime(): Promise<RuntimeChain[]> {
+  try {
+    const base = new URL(
+      process.env.MARKET_API_BASE_URL ?? "http://127.0.0.1:8000",
+    );
+    if (
+      !["http:", "https:"].includes(base.protocol) ||
+      base.username ||
+      base.password
+    )
+      return [];
+    const response = await fetch(new URL("/api/runtime/chains", base), {
+      cache: "no-store",
+      signal: AbortSignal.timeout(4000),
+      redirect: "error",
+    });
+    if (!response.ok) return [];
+    const rows: unknown = await response.json();
+    if (!Array.isArray(rows) || rows.length !== 2) return [];
+    const states = [
+      "STARTING",
+      "HEALTHY",
+      "DEGRADED",
+      "STALE",
+      "DISCONNECTED",
+      "STOPPED",
+      "ERROR",
+    ];
+    const result: RuntimeChain[] = [];
+    for (const row of rows) {
+      if (
+        !row ||
+        typeof row !== "object" ||
+        !["robinhood", "bsc"].includes(row.chain) ||
+        typeof row.configured !== "boolean" ||
+        typeof row.wss_connected !== "boolean" ||
+        !states.includes(row.state) ||
+        result.some((item) => item.chain === row.chain)
+      )
+        return [];
+      result.push({
+        chain: row.chain,
+        configured: row.configured,
+        connected: row.wss_connected,
+        state: row.state,
+        headAge:
+          Number.isSafeInteger(row.latest_head_age_seconds) &&
+          row.latest_head_age_seconds >= 0
+            ? row.latest_head_age_seconds
+            : null,
+      });
+    }
+    return result;
+  } catch {
+    return [];
+  }
 }

@@ -10,6 +10,14 @@ export interface MarketFeed {
   provider: "geckoterminal";
   checkedAt: string;
   chains: ChainFeed[];
+  runtimeChains?: RuntimeChain[];
+}
+export interface RuntimeChain {
+  chain: MarketChain;
+  configured: boolean;
+  connected: boolean;
+  state: string;
+  headAge: number | null;
 }
 export const emptyChains: ChainFeed[] = ["robinhood", "bsc"].map((chain) => ({
   chain: chain as MarketChain,

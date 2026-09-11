@@ -4,6 +4,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from src.agents.registry import COMPONENTS
 from src.api.markets import router as markets_router
+from src.api.runtime import router as runtime_router
 from src.core.config import Settings
 from src.core.models import RiskLimits
 from src.data.database import connect
@@ -14,6 +15,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="rh-agents", version="0.2.0", description="Phase 1A · paper only")
     app.state.settings = settings
     app.include_router(markets_router)
+    app.include_router(runtime_router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -25,7 +27,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             async with engine.connect() as connection:
                 revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
-                if revision != "0003":
+                if revision != "0004":
                     raise HTTPException(status_code=503, detail="Database migration is not current")
         except (SQLAlchemyError, OSError) as error:
             raise HTTPException(

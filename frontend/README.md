@@ -40,3 +40,5 @@ npm run build
 ```
 
 Browser verification covers desktop overflow, missing backend, agent filtering and chart period controls. HTTP contract simulation covers separate chain counts, empty responses, the 100-row cap, fixture rejection and provider-backend failure. Test responses do not establish live provider availability.
+
+Phase 1C adds one read-only `/api/runtime/chains` request to the existing server feed route. The same strip shows per-chain RPC configured, WSS state and head age; responses are reduced to an allowlisted safe projection. Missing configuration and backend failures never imply healthy connections. The dashboard layout and demo sections are otherwise unchanged.

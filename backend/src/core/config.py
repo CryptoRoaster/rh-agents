@@ -1,7 +1,7 @@
 from typing import Literal
 from urllib.parse import unquote, urlsplit
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -33,6 +33,61 @@ class Settings(BaseSettings):
     geckoterminal_retry_delay_seconds: int = Field(default=2, ge=0, le=10)
     geckoterminal_max_retry_after_seconds: int = Field(default=5, ge=0, le=30)
     trading_mode: Literal[TradingMode.OBSERVE, TradingMode.PAPER] = TradingMode.OBSERVE
+    market_watcher_enabled: bool = False
+    market_watch_interval_seconds: int = Field(default=90, ge=60, le=86400)
+    evm_runtime_enabled: bool = False
+    rh_chain_enabled: bool = False
+    bsc_chain_enabled: bool = False
+    rh_chain_id: Literal[4663] = 4663
+    bsc_chain_id: Literal[56] = 56
+    rh_rpc_http_url: SecretStr = SecretStr("")
+    rh_rpc_ws_url: SecretStr = SecretStr("")
+    bsc_rpc_http_url: SecretStr = SecretStr("")
+    bsc_rpc_ws_url: SecretStr = SecretStr("")
+    rh_confirmations_required: int = Field(default=12, ge=1, le=1000)
+    bsc_confirmations_required: int = Field(default=12, ge=1, le=1000)
+    evm_timeout_seconds: int = Field(default=15, ge=1, le=60)
+    evm_retries: int = Field(default=2, ge=0, le=3)
+    evm_retry_delay_seconds: int = Field(default=2, ge=0, le=10)
+    evm_max_retry_delay_seconds: int = Field(default=15, ge=1, le=60)
+    evm_reconnect_attempts: int = Field(default=5, ge=0, le=10)
+    evm_queue_size: int = Field(default=64, ge=1, le=1024)
+    evm_recovery_chunk_size: int = Field(default=100, ge=1, le=1000)
+    evm_reorg_window: int = Field(default=64, ge=2, le=1000)
+    evm_stale_seconds: int = Field(default=60, ge=5, le=600)
+
+    @model_validator(mode="after")
+    def runtime_configuration(self) -> "Settings":
+        if self.market_watcher_enabled:
+            if self.market_provider != "geckoterminal":
+                raise ValueError("Watcher requires geckoterminal")
+            if self.market_watch_interval_seconds * 8 < self.geckoterminal_max_http_attempts * 60:
+                raise ValueError(
+                    "Watcher interval exceeds conservative eight-attempt/minute budget"
+                )
+        if self.evm_runtime_enabled:
+            for prefix in ("rh", "bsc"):
+                if not getattr(self, f"{prefix}_chain_enabled"):
+                    continue
+                for suffix, schemes in (("http", ("http", "https")), ("ws", ("ws", "wss"))):
+                    secret: SecretStr = getattr(self, f"{prefix}_rpc_{suffix}_url")
+                    try:
+                        value = secret.get_secret_value()
+                        parsed = urlsplit(value)
+                        valid = (
+                            parsed.scheme in schemes
+                            and bool(parsed.hostname)
+                            and not parsed.fragment
+                            and not any(c.isspace() for c in value)
+                            and (parsed.port is None or 1 <= parsed.port <= 65535)
+                        )
+                    except ValueError:
+                        valid = False
+                    if not valid:
+                        raise ValueError(
+                            "Enabled EVM chain requires valid HTTP and WSS configuration"
+                        )
+        return self
 
     @field_validator("market_chains")
     @classmethod
