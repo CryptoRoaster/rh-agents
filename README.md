@@ -250,3 +250,24 @@ Every automated test uses a deterministic offline provider. `REASONING_PROVIDER`
 launcher either, so even a fully configured environment cannot make a paid call
 without new code. Phase 2C adds no migration. See
 [the ORBIT reference implementation](docs/phase-2c.md).
+
+## Phase 2D ATLAS on-chain intelligence
+
+ATLAS is the first safety-critical specialist worker. Deterministic collectors
+establish on-chain facts with explicit availability and provenance, a versioned
+code-defined policy computes the safety verdict from those facts alone, and only
+then may a model add advisory commentary. A model that insists everything is safe
+cannot clear a blocker, cannot turn a missing fact into an available one, and
+cannot name an address it was not shown.
+
+Known bad is never recorded as unknown: a measured violation is available
+evidence whose content blocks the case, while an unobtainable fact is
+insufficient evidence that blocks for a different reason. Supporting this
+required one generic Phase 2A extension, `EvidenceAcceptance`, checked in a
+single place for every evidence type.
+
+Holder concentration and contract creator currently have no verified provider for
+Robinhood Chain or BSC and are reported UNAVAILABLE, so ATLAS cannot reach CLEAR
+in a real deployment yet. That is the intended fail-closed behaviour. Phase 2D
+adds no migration and starts no worker. See
+[the ATLAS safety model and provider capability matrix](docs/phase-2d.md).

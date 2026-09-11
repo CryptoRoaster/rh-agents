@@ -39,10 +39,10 @@ from tests.worker.test_worker_runtime import claimed, evidence_result, register
 
 
 class FakeOnchainSource:
-    """Stands in for the approved ATLAS intelligence port, which a later phase owns."""
+    """Stands in for the assembled ATLAS on-chain context."""
 
-    async def token_integrity(self, market_key: str) -> object:
-        return {"holder_integrity": "PASS"}
+    async def onchain_context(self, trade_case_id, task_id) -> object:
+        return {"contract": {"status": "AVAILABLE"}}
 
 
 @dataclass
@@ -60,7 +60,7 @@ class SuccessfulAtlasWorker:
         self.calls += 1
         if self.invoked is not None:
             self.invoked.set()
-        await capabilities.onchain.token_integrity("market")
+        await capabilities.context.onchain_context(lease.trade_case_id, lease.task_id)
         evidence_type, payload = ROLE_PAYLOADS[AgentRole.ATLAS]
         return EvidenceTaskResult(
             submission=submission(

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from decimal import Decimal
 
@@ -103,7 +104,17 @@ class EvmRpcClient:
         if not self.config.http_url.get_secret_value():
             raise RuntimeFailure(ErrorCode.CONFIGURATION)
         # Private implementation only; public interface has four read methods.
-        if method not in {"eth_chainId", "eth_blockNumber", "eth_getBlockByNumber", "eth_getLogs"}:
+        # Explicit read allowlist. There is deliberately no generic rpc(method,
+        # params) entry point, and no write or send method appears here.
+        if method not in {
+            "eth_chainId",
+            "eth_blockNumber",
+            "eth_getBlockByNumber",
+            "eth_getLogs",
+            "eth_getCode",
+            "eth_call",
+            "eth_getStorageAt",
+        }:
             raise RuntimeFailure(ErrorCode.CONFIGURATION)
         if method != "eth_chainId" and not self.verified:
             raise RuntimeFailure(ErrorCode.CHAIN_ID_MISMATCH)
@@ -179,6 +190,45 @@ class EvmRpcClient:
         if head.number != number:
             raise RuntimeFailure(ErrorCode.CONTRACT)
         return head
+
+    async def code(self, address: str, block: int) -> str:
+        """Contract bytecode at an explicit block. Read-only."""
+        self._require_address(address, block)
+        result = await self._request("eth_getCode", [address, hex(block)])
+        if not isinstance(result, str) or not result.startswith("0x"):
+            raise RuntimeFailure(ErrorCode.CONTRACT)
+        return result
+
+    async def call(self, address: str, selector: str, block: int) -> str:
+        """A single view call by 4-byte selector, with no arguments.
+
+        Arguments are not accepted, so this cannot be turned into a general
+        contract-interaction surface.
+        """
+        self._require_address(address, block)
+        if re.fullmatch(r"0x[0-9a-f]{8}", selector) is None:
+            raise RuntimeFailure(ErrorCode.CONFIGURATION)
+        result = await self._request("eth_call", [{"to": address, "data": selector}, hex(block)])
+        if not isinstance(result, str) or not result.startswith("0x"):
+            raise RuntimeFailure(ErrorCode.CONTRACT)
+        return result
+
+    async def storage_at(self, address: str, slot: str, block: int) -> str:
+        """One storage slot at an explicit block, for documented standard slots."""
+        self._require_address(address, block)
+        if re.fullmatch(r"0x[0-9a-f]{64}", slot) is None:
+            raise RuntimeFailure(ErrorCode.CONFIGURATION)
+        result = await self._request("eth_getStorageAt", [address, slot, hex(block)])
+        if not isinstance(result, str) or re.fullmatch(r"0x[0-9a-f]{64}", result) is None:
+            raise RuntimeFailure(ErrorCode.CONTRACT)
+        return result
+
+    @staticmethod
+    def _require_address(address: str, block: int) -> None:
+        if re.fullmatch(r"0x[0-9a-f]{40}", address) is None:
+            raise RuntimeFailure(ErrorCode.CONFIGURATION)
+        if type(block) is not int or block < 0:
+            raise RuntimeFailure(ErrorCode.CONFIGURATION)
 
     async def logs(self, spec: SubscriptionSpec, start: int, end: int) -> tuple[Log, ...]:
         if (

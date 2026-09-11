@@ -21,7 +21,7 @@ from src.orchestration.worker.capabilities import (
     ExecutionAssessmentPort,
     FuseCapabilities,
     MarketHistoryPort,
-    OnchainIntelligencePort,
+    OnchainContextPort,
     OrbitCapabilities,
     PulseCapabilities,
     SentimentPort,
@@ -111,7 +111,7 @@ class CapabilityProvider:
 
     service: WorkerRuntimeService
     context: DiscoveryContextPort | None = None
-    onchain: OnchainIntelligencePort | None = None
+    onchain: OnchainContextPort | None = None
     sentiment: SentimentPort | None = None
     history: MarketHistoryPort | None = None
     triggers: TriggerFeedPort | None = None
@@ -125,7 +125,7 @@ class CapabilityProvider:
             case AgentRole.ORBIT if self.context is not None:
                 return OrbitCapabilities(lease=lease, context=self.context, submit=submit)
             case AgentRole.ATLAS if self.onchain is not None:
-                return AtlasCapabilities(lease=lease, onchain=self.onchain, submit=submit)
+                return AtlasCapabilities(lease=lease, context=self.onchain, submit=submit)
             case AgentRole.SIGNAL if self.sentiment is not None:
                 return SignalCapabilities(lease=lease, sentiment=self.sentiment, submit=submit)
             case AgentRole.VECTOR if self.history is not None:
