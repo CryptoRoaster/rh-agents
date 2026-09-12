@@ -200,10 +200,34 @@ would be fabricated structure, which is the exact thing this phase exists to
 prevent. Gaps are recovered from the timestamps, counted, and reported.
 
 Coverage is derived from the bars in one place, never declared by a caller:
-`COMPLETE` (the full requested window, contiguous), `PARTIAL` (short or gapped),
-`EMPTY` (no closed bar). A young pool with six hours of trading reports six bars
-and `PARTIAL`; whether that is *enough* is the policy's decision, not the
-provider's.
+`COMPLETE` (the full requested window arrived, contiguous), `PARTIAL` (short or
+gapped), `EMPTY` (no closed bar). A young pool with six hours of trading reports
+six bars and `PARTIAL`; whether that is *enough* is the policy's decision, not
+the provider's.
+
+`COMPLETE` is scoped to **VECTOR's bounded request** and means nothing beyond it.
+It does not assert that the provider has no older bars, that the pool has no
+longer history, or that this is everything GeckoTerminal has ever known about the
+market. It means: the window this phase asked for arrived whole. Older history
+almost certainly exists and is deliberately not fetched.
+
+### Why 48 requested and 24 required
+
+Two different numbers doing two different jobs, and neither is an analysis
+horizon claim.
+
+**48 is a request size.** One extra bar beyond it is asked for because the newest
+is always discarded unread, and a wider request absorbs untraded gaps without
+failing admission — a market with six missing hours still clears the 24-bar floor.
+
+**24 is the admission floor.** It is the minimum closed structure a setup may be
+drawn from, and it is what the timeframe/horizon binding is checked against.
+
+The model receives whatever actually arrived, which is normally the full window
+and never more than it. Nothing infers a "48-hour analysis": `VectorTaskInput`
+carries the supplied bar count, the window bounds and the requested size as three
+distinct facts, and a test asserts the window span equals the interval times the
+number of bars actually supplied.
 
 These are **pool-specific DEX bars**, not exchange-wide market history, and the
 series carries its own pair, chain, venue, provider and price basis so it can
@@ -259,15 +283,98 @@ enough yet. Wiring faults (`IDENTITY_MISMATCH`, `PRICE_BASIS_MISMATCH`,
 them. An unconfigured source is `CAPABILITY_DENIED`, because retrying will not
 configure one.
 
-### No migration, and no candle archive
+### Decision inputs are kept, not merely fingerprinted
 
-Bars are read into bounded context and never persisted. Auditability comes from
-the input digest — which now fingerprints every bar shown — plus the window's own
-coordinates recorded on the evidence: provider, timeframe, bar count, window
-start and end, coverage, and the observed range. That answers which market, which
-price, which window, which timeframe, which source, which policy, which prompt
-and which model produced a given setup, without this system accumulating market
-data it has no mandate to store. Alembic head remains `0006`.
+A follow-up audit found the first version of this insufficient. Auditability
+rested on the input digest plus window coordinates — and a SHA-256 proves two
+inputs are *equal* only if you still possess one of them. It cannot say what the
+input was. If the provider revises a candle, changes its normalization or is
+replaced, or if our own normalization changes, "what exact market structure
+caused this setup?" becomes unanswerable, and the standing invariant is that
+decisions are traceable.
+
+So the bounded structure is stored **with** the decision: `RecordedMarketStructure`
+on the evidence payload holds the market identity, the pool, the provider, the
+timeframe, the price basis, the coverage, the window, the observed range, the
+policy version, a self-verifying `structure_digest`, and the normalized closed
+bars themselves — not a summary of them. If the model saw 30 bars, 30 bars are
+kept.
+
+This is not a market-data warehouse and must not become one. It is one decision's
+input, capped at 200 bars, with no raw provider payload, no request metadata, no
+headers, no retrieval latency and no credential. There is exactly **one**
+canonicalization (`structure_document`) feeding the model document, the input
+digest and the durable record, so the stored form cannot drift from the hashed
+form. A test deserializes accepted evidence, rebuilds the canonical structure and
+recomputes the digest to an exact match; another asserts the record claims
+nothing the model was not given, and that the model received nothing the record
+omits.
+
+Retrieval time stays out by construction: two fetches of the same closed bars
+produce the same record and the same digest. Source bar timestamps stay in,
+because they are the market's own account of when it traded.
+
+Everything is additive and optional, so Phase 2A payloads and earlier Phase 2H
+details replay unchanged. No migration; Alembic head remains `0006`.
+
+### Provider failures are typed, and a rate limit is never an empty market
+
+During the market-data audit a bounded live probe read "0 pools" from BSC; the
+true condition was an HTTP 429. The transport had always typed that correctly,
+but a follow-up audit found the typed error escaped the VECTOR context reader
+untranslated and landed in the worker runtime's catch-all as
+`INTERNAL`/`HANDLER_ERROR` — a provider rate limit recorded as a bug in our own
+code.
+
+The port's contract is now explicit: a market history source raises
+`MarketHistoryUnavailable` with a safe reason code, and the adapter — which is
+where provider knowledge belongs — translates its own error types into it. A
+caller that had to catch GeckoTerminal's classes would be coupled to the adapter;
+one that caught nothing would misreport weather as a defect.
+
+| Provider condition | Reason code | Category |
+| --- | --- | --- |
+| 429 | `MARKET_HISTORY_PROVIDER_RATE_LIMITED` | TRANSIENT |
+| 5xx / connectivity | `MARKET_HISTORY_PROVIDER_UNAVAILABLE` | TRANSIENT |
+| request budget spent | `MARKET_HISTORY_REQUEST_BUDGET_EXHAUSTED` | TRANSIENT |
+| malformed response | `MARKET_HISTORY_PROVIDER_CONTRACT` | INTERNAL |
+| wrong pool or orientation | `MARKET_HISTORY_PROVIDER_IDENTITY` | INTERNAL |
+| other 4xx | `MARKET_HISTORY_PROVIDER_REJECTED` | INTERNAL |
+| network not served | `MARKET_HISTORY_NETWORK_UNSUPPORTED` | INTERNAL |
+| 401 / 403 | `MARKET_HISTORY_PROVIDER_NOT_AUTHORIZED` | CAPABILITY_DENIED |
+
+None of these ever becomes an empty series. A rate limit is not an untraded
+market, an unsupported network is not a pool without bars, and a transport
+failure is not insufficient history — each confusion would be read downstream as
+a fact about the market. The sufficiency verdicts and the provider reason codes
+are disjoint vocabularies, and a test asserts they stay so.
+
+**Retry ownership.** The transport makes at most one extra HTTP attempt, because
+the shared infrastructure has that behaviour; it is not a loop. Phase 2B then
+retries the whole task with its own durable backoff. The product stays small
+rather than becoming accidental provider pressure, and a test pins the HTTP
+attempt count.
+
+### Closed-bar classification is time arithmetic
+
+Production decides closure from the trusted clock alone: a bar is closed when
+`opened_at + interval <= clock.now()`, in timezone-aware UTC. No price comparison
+participates, and a test reads the implementation to keep it that way — the live
+smoke's observation that the forming bar's close equals the current spot price is
+a **provider contract-change detector**, never the algorithm. A quiet interval
+whose price had not moved would look closed under a price comparison, and a busy
+one would not.
+
+Boundary behaviour is pinned exactly: at 08:00:00Z the bar opened at 07:00:00Z is
+closed and the one opened at 08:00:00Z is not; at 07:59:59.999Z the 07:00 bar is
+still forming. A bar opening a full interval beyond the clock is a contract
+violation rather than a forming interval — dropping it silently would let a
+provider clock fault look like an ordinary short window — while a bar opening
+moments ahead at an exact boundary is tolerated as ordinary clock skew and simply
+excluded as unclosed.
+
+An open bar never counts toward the minimum. Twenty-three closed bars plus one
+forming is twenty-three, and twenty-three is insufficient: no model is called.
 
 ## Nothing is invented when there is nothing to reason from
 

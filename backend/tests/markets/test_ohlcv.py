@@ -8,6 +8,7 @@ because of.
 """
 
 import json
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -16,11 +17,15 @@ import pytest
 
 from src.core.clock import FixedClock
 from src.core.config import Settings
-from src.markets.geckoterminal.errors import ContractError, IdentityError
 from src.markets.geckoterminal.networks import CHAINS, NetworkDirectory
 from src.markets.geckoterminal.ohlcv import GeckoTerminalOhlcvSource
 from src.markets.geckoterminal.transport import GeckoTerminalTransport
-from src.markets.history import HistoryCoverage, MarketBar, interval_seconds
+from src.markets.history import (
+    HistoryCoverage,
+    MarketBar,
+    MarketHistoryUnavailable,
+    interval_seconds,
+)
 from src.markets.models import MarketIdentity
 from tests.markets.test_geckoterminal import fixture
 
@@ -29,6 +34,19 @@ QUOTE = "0x" + "b2" * 20
 POOL = "0x" + "e5" * 20
 # 2026-09-12 06:00:00Z — an exact hour, as every hourly bar opening is.
 ANCHOR = datetime(2026, 9, 12, 6, tzinfo=UTC)
+
+
+@contextmanager
+def refuses(reason_code: str):
+    """The port promises a safe reason code, never a provider exception class.
+
+    A caller that had to catch GeckoTerminal's own error types would be coupled
+    to this adapter; one that caught nothing would see a rate limit arrive as an
+    unexplained internal failure.
+    """
+    with pytest.raises(MarketHistoryUnavailable) as error:
+        yield
+    assert error.value.reason_code == reason_code
 
 
 @pytest.fixture
@@ -197,14 +215,14 @@ async def test_rows_in_any_order_normalize_to_the_same_series(settings):
 async def test_scenario_f_a_low_above_its_high_is_refused(settings):
     broken = rows(30)
     broken[3] = [broken[3][0], "1.00", "0.90", "1.10", "1.00", "10"]
-    with pytest.raises(ContractError):
+    with refuses("MARKET_HISTORY_PROVIDER_CONTRACT"):
         await fetch(settings, body(broken), now=ANCHOR + timedelta(hours=1))
 
 
 async def test_a_close_outside_its_own_bar_is_refused(settings):
     broken = rows(30)
     broken[3] = [broken[3][0], "1.00", "1.05", "0.95", "1.50", "10"]
-    with pytest.raises(ContractError):
+    with refuses("MARKET_HISTORY_PROVIDER_CONTRACT"):
         await fetch(settings, body(broken), now=ANCHOR + timedelta(hours=1))
 
 
@@ -223,7 +241,7 @@ async def test_a_malformed_row_refuses_the_whole_series(settings, row):
     """One bad bar is a contract violation, not a thin market to be worked around."""
     broken = rows(30)
     broken[5] = row
-    with pytest.raises(ContractError):
+    with refuses("MARKET_HISTORY_PROVIDER_CONTRACT"):
         await fetch(settings, body(broken), now=ANCHOR + timedelta(hours=1))
 
 
@@ -238,7 +256,7 @@ async def test_scenario_g_a_timestamp_off_the_interval_grid_is_refused(settings,
     """
     broken = rows(30)
     broken[4] = [broken[4][0] + offset, "1.0", "1.1", "0.9", "1.0", "10"]
-    with pytest.raises(ContractError):
+    with refuses("MARKET_HISTORY_PROVIDER_CONTRACT"):
         await fetch(settings, body(broken), now=ANCHOR + timedelta(hours=1))
 
 
@@ -246,7 +264,7 @@ async def test_scenario_h_the_same_interval_twice_is_refused(settings):
     """Choosing between two copies would be inventing which one happened."""
     duplicated = rows(30)
     duplicated[7] = list(duplicated[6])
-    with pytest.raises(ContractError):
+    with refuses("MARKET_HISTORY_PROVIDER_CONTRACT"):
         await fetch(settings, body(duplicated), now=ANCHOR + timedelta(hours=1))
 
 
@@ -283,7 +301,7 @@ async def test_scenario_i_a_series_priced_on_the_quote_side_is_refused(settings)
     inverted numbers can sit within a fraction of a percent of the correct ones,
     so no magnitude check would catch it.
     """
-    with pytest.raises(IdentityError):
+    with refuses("MARKET_HISTORY_PROVIDER_IDENTITY"):
         await fetch(
             settings,
             body(rows(30), base=QUOTE, quote=BASE),
@@ -292,7 +310,7 @@ async def test_scenario_i_a_series_priced_on_the_quote_side_is_refused(settings)
 
 
 async def test_scenario_j_a_series_for_another_token_is_refused(settings):
-    with pytest.raises(IdentityError):
+    with refuses("MARKET_HISTORY_PROVIDER_IDENTITY"):
         await fetch(
             settings,
             body(rows(30), base="0x" + "cc" * 20),
@@ -301,12 +319,12 @@ async def test_scenario_j_a_series_for_another_token_is_refused(settings):
 
 
 async def test_a_series_naming_one_token_on_both_sides_is_refused(settings):
-    with pytest.raises(IdentityError):
+    with refuses("MARKET_HISTORY_PROVIDER_IDENTITY"):
         await fetch(settings, body(rows(30), quote=BASE), now=ANCHOR + timedelta(hours=1))
 
 
 async def test_a_market_on_another_chain_is_refused_before_any_request(settings):
-    with pytest.raises(IdentityError):
+    with refuses("MARKET_HISTORY_PROVIDER_IDENTITY"):
         await fetch(
             settings,
             body(rows(30)),
@@ -410,7 +428,7 @@ def test_an_undocumented_timeframe_combination_is_refused(timeframe, aggregate):
 
 async def test_something_that_is_not_a_market_identity_is_refused(settings):
     """The source is given a typed identity or nothing at all."""
-    with pytest.raises(IdentityError):
+    with refuses("MARKET_HISTORY_PROVIDER_IDENTITY"):
         await fetch(
             settings,
             body(rows(30)),
@@ -427,10 +445,261 @@ async def test_an_identity_naming_one_token_on_both_sides_is_refused(settings):
     degenerate case is refused outright rather than passed.
     """
     degenerate = identity().model_copy(update={"quote_asset_id": f"bsc:mainnet:{BASE}"})
-    with pytest.raises(IdentityError):
+    with refuses("MARKET_HISTORY_PROVIDER_IDENTITY"):
         await fetch(
             settings,
             body(rows(30), quote=BASE),
             now=ANCHOR + timedelta(hours=1),
             market=degenerate,
         )
+
+
+# ---------------------------------------------------- provider failures
+
+
+def failing(status: int, body_text: str = "{}"):
+    def handle(request):
+        if request.url.path.endswith("/networks"):
+            return httpx.Response(200, text=fixture("networks"))
+        return httpx.Response(status, text=body_text)
+
+    return handle
+
+
+async def fetch_with(settings, handle, *, now, bars=24):
+    async def no_sleep(_):
+        return None
+
+    async with GeckoTerminalTransport(
+        settings, transport=httpx.MockTransport(handle), sleep=no_sleep
+    ) as transport:
+        source = GeckoTerminalOhlcvSource(
+            transport,
+            NetworkDirectory(transport, settings),
+            CHAINS["bsc"],
+            settings,
+            clock=FixedClock(now),
+        )
+        return await source.history(identity(), timeframe="hour", aggregate=1, bars=bars)
+
+
+RATE_LIMITED = (
+    '{"status":{"error_code":429,"error_message":'
+    '"You\'ve exceeded the Rate Limit. Please visit ... to subscribe"}}'
+)
+
+
+async def test_a_rate_limit_is_never_an_empty_market(settings):
+    """The distinction that matters most in this whole adapter.
+
+    During the audit a bounded live probe read "0 pools" from BSC and the true
+    condition was a 429. A rate limit that arrives as an empty dataset would be
+    read downstream as a fact about the market — no bars, therefore insufficient
+    history, therefore this market cannot support a setup — when the truth is
+    that nobody asked the market anything.
+    """
+    with refuses("MARKET_HISTORY_PROVIDER_RATE_LIMITED"):
+        await fetch_with(settings, failing(429, RATE_LIMITED), now=ANCHOR + timedelta(hours=1))
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [
+        (429, "MARKET_HISTORY_PROVIDER_RATE_LIMITED"),
+        (500, "MARKET_HISTORY_PROVIDER_UNAVAILABLE"),
+        (503, "MARKET_HISTORY_PROVIDER_UNAVAILABLE"),
+        (401, "MARKET_HISTORY_PROVIDER_NOT_AUTHORIZED"),
+        (403, "MARKET_HISTORY_PROVIDER_NOT_AUTHORIZED"),
+        (404, "MARKET_HISTORY_PROVIDER_REJECTED"),
+        (400, "MARKET_HISTORY_PROVIDER_REJECTED"),
+    ],
+)
+async def test_every_provider_failure_arrives_as_a_typed_reason(settings, status, reason):
+    with refuses(reason):
+        await fetch_with(settings, failing(status), now=ANCHOR + timedelta(hours=1))
+
+
+async def test_a_rate_limited_directory_lookup_is_typed_the_same_way(settings):
+    """The network resolution is part of the same read and fails the same way."""
+
+    def handle(request):
+        return httpx.Response(429, text=RATE_LIMITED)
+
+    with refuses("MARKET_HISTORY_PROVIDER_RATE_LIMITED"):
+        await fetch_with(settings, handle, now=ANCHOR + timedelta(hours=1))
+
+
+async def test_the_transport_retries_are_bounded_and_small(settings):
+    """No retry multiplication: Phase 2B owns durable retry, not this adapter.
+
+    The transport's own retry exists because the shared infrastructure has it;
+    it is one extra attempt, not a loop. The worker runtime then retries the
+    whole task with its own backoff, so the product stays small rather than
+    becoming accidental provider pressure.
+    """
+    attempts: list[httpx.Request] = []
+
+    def handle(request):
+        attempts.append(request)
+        if request.url.path.endswith("/networks"):
+            return httpx.Response(200, text=fixture("networks"))
+        return httpx.Response(429, text=RATE_LIMITED)
+
+    with refuses("MARKET_HISTORY_PROVIDER_RATE_LIMITED"):
+        await fetch_with(settings, handle, now=ANCHOR + timedelta(hours=1))
+    ohlcv_attempts = [item for item in attempts if "ohlcv" in item.url.path]
+    assert len(ohlcv_attempts) == settings.geckoterminal_retries + 1 == 2
+
+
+# ------------------------------------------- closed-bar boundary conditions
+
+
+@pytest.mark.parametrize(
+    ("retrieved_at", "newest_expected_open"),
+    [
+        # 08:00:00Z: the 07:00 bar has ended, the 08:00 bar has only just begun.
+        (datetime(2026, 9, 12, 8, tzinfo=UTC), datetime(2026, 9, 12, 7, tzinfo=UTC)),
+        # One millisecond earlier, the 07:00 bar is still being written.
+        (
+            datetime(2026, 9, 12, 7, 59, 59, 999000, tzinfo=UTC),
+            datetime(2026, 9, 12, 6, tzinfo=UTC),
+        ),
+        # Mid-interval, nothing changes: closure is time arithmetic, not price.
+        (datetime(2026, 9, 12, 8, 30, tzinfo=UTC), datetime(2026, 9, 12, 7, tzinfo=UTC)),
+    ],
+)
+async def test_the_closure_boundary_is_exact(settings, retrieved_at, newest_expected_open):
+    """Deterministic from the trusted clock and the interval, and nothing else.
+
+    In particular never from the close matching the current spot price. The live
+    smoke observed that equality; production must not depend on it, because a
+    quiet interval whose price has not moved would look closed and a busy one
+    would not.
+    """
+    payload = body(rows(30, newest_open=datetime(2026, 9, 12, 8, tzinfo=UTC)))
+    history = await fetch(settings, payload, now=retrieved_at)
+    assert history.bars[-1].opened_at == newest_expected_open
+    assert history.bars[-1].closed_at <= retrieved_at
+
+
+async def test_a_bar_that_opens_after_the_trusted_clock_is_refused(settings):
+    """Not a forming interval — an impossible one.
+
+    Dropping it silently alongside the currently open bar would let a provider
+    clock fault look like an ordinary short window.
+    """
+    payload = rows(30)
+    payload.insert(
+        0,
+        [
+            int((ANCHOR + timedelta(hours=5)).timestamp()),
+            "1.0",
+            "1.1",
+            "0.9",
+            "1.0",
+            "10",
+        ],
+    )
+    with refuses("MARKET_HISTORY_PROVIDER_CONTRACT"):
+        await fetch(settings, body(payload), now=ANCHOR + timedelta(hours=1))
+
+
+async def test_a_bar_opening_moments_ahead_at_a_boundary_is_tolerated(settings):
+    """Clock skew at an exact boundary is not a provider fault.
+
+    At 07:59:59.999 the interval opening at 08:00 has not begun by our clock and
+    may well have by theirs. It is excluded as unclosed, like any forming bar,
+    rather than treated as impossible — the tolerance is one interval, which a
+    genuinely wrong timestamp cannot hide inside.
+    """
+    payload = body(rows(30, newest_open=datetime(2026, 9, 12, 8, tzinfo=UTC)))
+    history = await fetch(
+        settings, payload, now=datetime(2026, 9, 12, 7, 59, 59, 999000, tzinfo=UTC)
+    )
+    assert history.bars[-1].opened_at == datetime(2026, 9, 12, 6, tzinfo=UTC)
+
+
+async def test_an_open_bar_never_counts_toward_the_window(settings):
+    """Scenario: 24 closed plus one open. The open one is excluded, not counted."""
+    payload = body(rows(30, newest_open=datetime(2026, 9, 12, 8, tzinfo=UTC)))
+    history = await fetch(settings, payload, now=datetime(2026, 9, 12, 8, 30, tzinfo=UTC), bars=24)
+    assert len(history.bars) == 24
+    assert all(bar.opened_at < datetime(2026, 9, 12, 8, tzinfo=UTC) for bar in history.bars)
+    assert history.coverage == HistoryCoverage.COMPLETE
+
+
+# ------------------------------------------------- selection determinism
+
+
+async def test_the_same_response_and_clock_select_the_same_bars(settings):
+    payload = body(rows(40))
+    first = await fetch(settings, payload, now=ANCHOR + timedelta(hours=1), bars=24)
+    again = await fetch(settings, payload, now=ANCHOR + timedelta(hours=1), bars=24)
+    assert first.bars == again.bars
+    assert first.coverage == again.coverage
+    assert first.observed_at == again.observed_at
+
+
+async def test_the_window_keeps_the_newest_bars_when_more_arrive(settings):
+    """Trimming takes the most recent window, never an arbitrary slice."""
+    history = await fetch(settings, body(rows(40)), now=ANCHOR + timedelta(hours=1), bars=10)
+    assert len(history.bars) == 10
+    assert history.bars[-1].opened_at == ANCHOR
+    assert history.bars[0].opened_at == ANCHOR - timedelta(hours=9)
+
+
+async def test_provider_ordering_never_leaks_into_the_model_contract(settings):
+    """The provider sends newest-first; VECTOR reads oldest-first, always."""
+    history = await fetch(settings, body(rows(30)), now=ANCHOR + timedelta(hours=1))
+    assert [bar.opened_at for bar in history.bars] == sorted(bar.opened_at for bar in history.bars)
+
+
+def test_production_never_classifies_a_bar_by_comparing_it_to_the_spot_price():
+    """The invariant the opt-in live smoke must not be mistaken for.
+
+    That smoke observes the forming bar's close equalling the current pool price.
+    The observation is a provider contract-change detector, never an algorithm: a
+    quiet interval whose price had not moved would look closed under a price
+    comparison, and a busy one would not. Production reads the trusted clock and
+    the interval, and nothing else.
+    """
+    import inspect
+
+    from src.markets.geckoterminal import ohlcv
+
+    source = inspect.getsource(ohlcv.GeckoTerminalOhlcvSource._closed_only)
+    assert "closed_at <= fetched_at" in source
+    for forbidden in ("price", "close ==", "spot", "base_token_price"):
+        assert forbidden not in source
+
+
+def test_an_unmapped_provider_failure_still_leaves_as_a_safe_code():
+    """The translation is total. A new provider error type cannot escape untyped.
+
+    Adding an error class to the provider layer without touching this table would
+    otherwise reintroduce exactly the defect the translation exists to close: a
+    provider condition arriving at the worker runtime as an unexplained internal
+    failure.
+    """
+    from src.markets.geckoterminal.errors import ConfigurationError, ProviderError
+    from src.markets.geckoterminal.ohlcv import history_failure
+
+    translated = history_failure(ConfigurationError())
+    assert isinstance(translated, MarketHistoryUnavailable)
+    assert translated.reason_code == "MARKET_HISTORY_PROVIDER_UNAVAILABLE"
+    assert history_failure(ProviderError()).reason_code.startswith("MARKET_HISTORY_")
+
+
+def test_every_provider_error_class_translates():
+    """No subclass in the provider layer is left without a safe code."""
+    from src.markets.geckoterminal import errors
+    from src.markets.geckoterminal.ohlcv import history_failure
+
+    classes = [
+        value
+        for value in vars(errors).values()
+        if isinstance(value, type) and issubclass(value, errors.ProviderError)
+    ]
+    assert len(classes) >= 8
+    for cls in classes:
+        assert history_failure(cls()).reason_code.startswith("MARKET_HISTORY_")

@@ -110,6 +110,68 @@ def structure_view(history: MarketHistory, now: datetime) -> VectorMarketStructu
     )
 
 
+def structure_document(structure: VectorMarketStructure) -> dict[str, object]:
+    """The canonical form of the market structure, built exactly once.
+
+    The model document, the input digest and the durable record all come through
+    here. One canonicalization means a stored snapshot cannot drift from what was
+    hashed, and a later reconstruction cannot disagree with the original for
+    formatting reasons rather than substantive ones.
+
+    Retrieval time is absent by construction: it says when we looked, never what
+    the market did. Source bar timestamps are present, because they are the
+    market's own account of itself.
+    """
+    return {
+        "provider": structure.provider,
+        "timeframe": structure.timeframe,
+        "interval_seconds": structure.interval_seconds,
+        "price_basis": structure.price_basis,
+        "coverage": structure.coverage,
+        "requested_bars": structure.requested_bars,
+        "missing_intervals": structure.missing_intervals,
+        "window_start": structure.window_start.isoformat(),
+        "window_end": structure.window_end.isoformat(),
+        "observed_range_low": canonical_decimal(structure.range_low),
+        "observed_range_high": canonical_decimal(structure.range_high),
+        "bars": [
+            {
+                "opened_at": bar.opened_at.isoformat(),
+                "open": canonical_decimal(bar.open),
+                "high": canonical_decimal(bar.high),
+                "low": canonical_decimal(bar.low),
+                "close": canonical_decimal(bar.close),
+                "volume": canonical_decimal(bar.volume),
+            }
+            for bar in structure.bars
+        ],
+    }
+
+
+def structure_digest(structure: VectorMarketStructure) -> str:
+    """Fingerprint of the market structure alone.
+
+    Distinct from the input digest, which also covers the price snapshot and the
+    other roles' conclusions. This one is self-contained, so the structure stored
+    on an accepted setup can be reconstructed and verified on its own — without
+    still possessing the rest of the input, and without the provider still
+    serving the same bars.
+    """
+    return _canonical_digest(structure_document(structure))
+
+
+def _canonical_digest(document: dict[str, object]) -> str:
+    return sha256(
+        json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+            ensure_ascii=True,
+        ).encode()
+    ).hexdigest()
+
+
 def _summary(
     envelope: EvidenceEnvelope, headline: str | None, codes: tuple[str, ...]
 ) -> EvidenceSummary:
@@ -298,30 +360,7 @@ def setup_document(task_input: VectorTaskInput) -> dict[str, object]:
         # The closed bars themselves, so the digest fingerprints the structure
         # that was shown rather than a summary of it. Bar age is excluded for the
         # same reason snapshot age is.
-        "market_structure": {
-            "provider": market.structure.provider,
-            "timeframe": market.structure.timeframe,
-            "interval_seconds": market.structure.interval_seconds,
-            "price_basis": market.structure.price_basis,
-            "coverage": market.structure.coverage,
-            "requested_bars": market.structure.requested_bars,
-            "missing_intervals": market.structure.missing_intervals,
-            "window_start": market.structure.window_start.isoformat(),
-            "window_end": market.structure.window_end.isoformat(),
-            "observed_range_low": canonical_decimal(market.structure.range_low),
-            "observed_range_high": canonical_decimal(market.structure.range_high),
-            "bars": [
-                {
-                    "opened_at": bar.opened_at.isoformat(),
-                    "open": canonical_decimal(bar.open),
-                    "high": canonical_decimal(bar.high),
-                    "low": canonical_decimal(bar.low),
-                    "close": canonical_decimal(bar.close),
-                    "volume": canonical_decimal(bar.volume),
-                }
-                for bar in market.structure.bars
-            ],
-        },
+        "market_structure": structure_document(market.structure),
         "evidence": [
             {
                 "evidence_id": str(item.evidence_id),
@@ -345,14 +384,7 @@ def vector_input_digest(task_input: VectorTaskInput) -> str:
     moment of reading, so including it would make one unchanged snapshot hash
     differently on every pass.
     """
-    canonical = json.dumps(
-        setup_document(task_input),
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-        ensure_ascii=True,
-    )
-    return sha256(canonical.encode()).hexdigest()
+    return _canonical_digest(setup_document(task_input))
 
 
 def setup_fingerprint(

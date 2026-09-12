@@ -366,6 +366,65 @@ class TradeSetupTrigger(Immutable):
     expires_at: AwareDatetime
 
 
+class RecordedBar(Immutable):
+    """One closed interval exactly as VECTOR was shown it.
+
+    Decimal throughout and no provider metadata: this is the normalized fact the
+    reasoning was performed over, not a copy of a response.
+    """
+
+    opened_at: AwareDatetime
+    open: Positive
+    high: Positive
+    low: Positive
+    close: Positive
+    volume: Nonnegative
+
+
+class RecordedMarketStructure(Immutable):
+    """The bounded market structure an accepted setup was drawn from.
+
+    A digest proves two inputs are equal; it cannot say what either one was. If
+    the provider revises a candle, changes its normalization, or is replaced —
+    or if our own normalization changes — a digest alone leaves "what exact
+    market structure caused this setup?" unanswerable. The standing invariant is
+    that decisions are traceable, so the answer is kept rather than referenced.
+
+    This is deliberately not a market-data warehouse. It is the bounded input to
+    one decision, stored with that decision: at most a couple of hundred
+    normalized bars, no raw provider payload, no request metadata, no headers, no
+    retrieval latency, no credential. Retrieval time is absent by construction —
+    two fetches of the same closed bars produce the same record and the same
+    digest.
+    """
+
+    pair_id: Identifier
+    chain: Identifier
+    network: Identifier
+    venue: Identifier
+    base_asset_id: Identifier
+    quote_asset_id: Identifier
+    provider: Identifier
+    # The provider's own spelling, verbatim. Recording a normalized variant here
+    # would mean reconstruction had to transform it back, which is precisely the
+    # kind of drift a durable decision input exists to rule out.
+    timeframe: Identifier
+    interval_seconds: int = Field(gt=0)
+    price_basis: Code
+    coverage: Code
+    requested_bars: int = Field(gt=0)
+    missing_intervals: int = Field(ge=0)
+    window_start: AwareDatetime
+    window_end: AwareDatetime
+    observed_range_low: Positive
+    observed_range_high: Positive
+    policy_version: Identifier
+    # Bounded hard. This is one decision's input, never an archive.
+    bars: tuple[RecordedBar, ...] = Field(min_length=1, max_length=200)
+    # Self-verifying: recomputed from the bars above, it must equal this.
+    structure_digest: Digest
+
+
 class TradeSetupDetail(Immutable):
     """The structured record behind a setup, for PULSE and a future FUSE.
 
@@ -394,13 +453,16 @@ class TradeSetupDetail(Immutable):
     # window, which timeframe and which provider produced a setup, without
     # turning the evidence table into a candle archive.
     history_provider: Identifier | None = None
-    history_timeframe: Code | None = None
+    history_timeframe: Identifier | None = None
     history_bar_count: int | None = Field(default=None, ge=0)
     history_window_start: AwareDatetime | None = None
     history_window_end: AwareDatetime | None = None
     history_coverage: Code | None = None
     observed_range_low: Positive | None = None
     observed_range_high: Positive | None = None
+    # The exact normalized structure the model reasoned over. Additive and
+    # optional, so evidence written before it stays readable.
+    structure: "RecordedMarketStructure | None" = None
     prompt_version: Identifier | None = None
     prompt_hash: Digest | None = None
     reasoning_provider: Identifier | None = None

@@ -33,7 +33,7 @@ ascending rather than trusting the order, so a provider change reorders nothing
 downstream.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated, Literal
 
 from pydantic import Field, ValidationError, field_validator
@@ -41,13 +41,24 @@ from pydantic import Field, ValidationError, field_validator
 from src.core.clock import Clock, SystemClock
 from src.core.config import Settings
 from src.markets.geckoterminal.dto import DTO, Text
-from src.markets.geckoterminal.errors import ContractError, IdentityError
+from src.markets.geckoterminal.errors import (
+    AuthenticationError,
+    BudgetError,
+    ClientError,
+    ContractError,
+    IdentityError,
+    ProviderError,
+    RateLimitError,
+    UnavailableError,
+    UnsupportedNetworkError,
+)
 from src.markets.geckoterminal.networks import Chain, NetworkDirectory, validate
 from src.markets.geckoterminal.transport import GeckoTerminalTransport
 from src.markets.history import (
     USD_PER_BASE_UNIT,
     MarketBar,
     MarketHistory,
+    MarketHistoryUnavailable,
     bar_from_row,
     coverage_for,
     empty_history,
@@ -61,6 +72,38 @@ from src.markets.models import MarketIdentity
 # the series can be called USD per base unit.
 CURRENCY = "usd"
 TOKEN_SIDE = "base"
+
+# How each provider failure reaches a consumer of the port. The port's contract
+# is that it raises MarketHistoryUnavailable with a safe code, so provider
+# exception types stop here: a caller that had to catch GeckoTerminal's classes
+# would be coupled to this adapter, and one that caught nothing would turn a rate
+# limit into an unexplained internal error.
+#
+# Emphatically none of these becomes an empty series. A rate limit is not an
+# untraded market, an unsupported network is not a pool without bars, and a
+# transport failure is not insufficient history. Each of those confusions would
+# be read downstream as a fact about the market.
+HISTORY_FAILURES: tuple[tuple[type[ProviderError], str], ...] = (
+    (RateLimitError, "MARKET_HISTORY_PROVIDER_RATE_LIMITED"),
+    (AuthenticationError, "MARKET_HISTORY_PROVIDER_NOT_AUTHORIZED"),
+    (BudgetError, "MARKET_HISTORY_REQUEST_BUDGET_EXHAUSTED"),
+    (UnsupportedNetworkError, "MARKET_HISTORY_NETWORK_UNSUPPORTED"),
+    # IdentityError subclasses ContractError, so it is listed first.
+    (IdentityError, "MARKET_HISTORY_PROVIDER_IDENTITY"),
+    (ContractError, "MARKET_HISTORY_PROVIDER_CONTRACT"),
+    # A 4xx the provider chose to return: it rejected this request and will
+    # reject the identical one again, so it is not weather to be waited out.
+    (ClientError, "MARKET_HISTORY_PROVIDER_REJECTED"),
+    (UnavailableError, "MARKET_HISTORY_PROVIDER_UNAVAILABLE"),
+)
+
+
+def history_failure(error: ProviderError) -> MarketHistoryUnavailable:
+    """Translate a provider failure into the port's own safe vocabulary."""
+    for provider_error, reason_code in HISTORY_FAILURES:
+        if isinstance(error, provider_error):
+            return MarketHistoryUnavailable(reason_code)
+    return MarketHistoryUnavailable("MARKET_HISTORY_PROVIDER_UNAVAILABLE")
 
 
 class OhlcvAttributes(DTO):
@@ -135,6 +178,15 @@ class GeckoTerminalOhlcvSource:
     async def history(
         self, identity: object, *, timeframe: str, aggregate: int, bars: int
     ) -> MarketHistory:
+        """One bounded read, or a typed refusal in the port's own vocabulary."""
+        try:
+            return await self._history(identity, timeframe, aggregate, bars)
+        except ProviderError as error:
+            raise history_failure(error) from None
+
+    async def _history(
+        self, identity: object, timeframe: str, aggregate: int, bars: int
+    ) -> MarketHistory:
         if not isinstance(identity, MarketIdentity):
             raise IdentityError()
         if identity.chain != self._chain.name:
@@ -193,6 +245,14 @@ class GeckoTerminalOhlcvSource:
         if len(openings) != len(ordered):
             # The same interval twice is incoherent, and choosing between the two
             # copies would be inventing which one the market actually did.
+            raise ContractError()
+        # An interval that has not begun is not an interval still being written,
+        # and dropping it silently alongside the forming bar would let a provider
+        # clock fault look like an ordinary short window. The tolerance is one
+        # interval, because at an exact boundary the provider's clock and ours
+        # can legitimately disagree by milliseconds — a bar opening a whole
+        # interval ahead cannot be explained that way.
+        if any(bar.opened_at >= fetched_at + timedelta(seconds=step) for bar in ordered):
             raise ContractError()
         closed = self._closed_only(ordered, fetched_at)[-requested:]
         if not closed:

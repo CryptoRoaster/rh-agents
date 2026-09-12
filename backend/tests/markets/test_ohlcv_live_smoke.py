@@ -1,4 +1,13 @@
-"""Optional bounded live OHLCV reads. Never run in CI and never by default.
+"""Provider contract-change detector. Never run in CI and never by default.
+
+This file is **not** the production candle-closure algorithm and nothing here is
+used to classify bars at runtime. Production decides closure from time arithmetic
+against the trusted clock alone (``bar_end <= now``); see
+``GeckoTerminalOhlcvSource._closed_only``. The observations below exist so that if
+GeckoTerminal changes its semantics — ordering, timestamp meaning, or whether the
+newest interval is still forming — it fails loudly here before we trust new data.
+
+Optional bounded live OHLCV reads.
 
 Enabled only by ``RH_AGENTS_LIVE_OHLCV_SMOKE=1``. The GeckoTerminal public API
 needs no credential, so there is no key here and nothing to leak; the opt-in
@@ -114,7 +123,7 @@ async def test_a_quote_oriented_series_is_refused_against_a_real_pool(chain):
     exactly what a misconfigured market would look like. The response's own
     ``meta.base`` disagrees, and the read is refused.
     """
-    from src.markets.geckoterminal.errors import IdentityError
+    from src.markets.history import MarketHistoryUnavailable
 
     settings = Settings(
         _env_file=None,
@@ -133,5 +142,6 @@ async def test_a_quote_oriented_series_is_refused_against_a_real_pool(chain):
         source = GeckoTerminalOhlcvSource(
             transport, NetworkDirectory(transport, settings), CHAINS[chain], settings
         )
-        with pytest.raises(IdentityError):
+        with pytest.raises(MarketHistoryUnavailable) as error:
             await source.history(swapped, timeframe="hour", aggregate=1, bars=6)
+    assert error.value.reason_code == "MARKET_HISTORY_PROVIDER_IDENTITY"

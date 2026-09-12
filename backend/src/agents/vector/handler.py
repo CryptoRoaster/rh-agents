@@ -28,6 +28,7 @@ from datetime import timedelta
 from src.agents.vector.context import (
     build_setup,
     reasoning_payload,
+    structure_digest,
     vector_input_digest,
 )
 from src.agents.vector.models import (
@@ -59,6 +60,8 @@ from src.orchestration.workflow.models import (
     EvidenceStatus,
     EvidenceSubmission,
     EvidenceType,
+    RecordedBar,
+    RecordedMarketStructure,
     TradeSetupDetail,
     TradeSetupPayload,
     TradeSetupTrigger,
@@ -104,6 +107,21 @@ CONTEXT_FAILURES: dict[str, WorkerFailureCategory] = {
     # No provider is wired at all. Retrying will not configure one, and inventing
     # structure to proceed without it is the exact failure this phase closed.
     "MARKET_HISTORY_SOURCE_NOT_CONFIGURED": WorkerFailureCategory.CAPABILITY_DENIED,
+    # Provider-side failures, typed by the adapter rather than escaping as an
+    # unexplained internal error. A rate limit is weather; it is never an empty
+    # market, and it is never a bug in this handler.
+    "MARKET_HISTORY_PROVIDER_RATE_LIMITED": WorkerFailureCategory.TRANSIENT,
+    "MARKET_HISTORY_PROVIDER_UNAVAILABLE": WorkerFailureCategory.TRANSIENT,
+    "MARKET_HISTORY_REQUEST_BUDGET_EXHAUSTED": WorkerFailureCategory.TRANSIENT,
+    # A broken contract, a wrong-identity series or a network the provider does
+    # not serve are all faults retrying cannot reach.
+    "MARKET_HISTORY_PROVIDER_CONTRACT": WorkerFailureCategory.INTERNAL,
+    "MARKET_HISTORY_PROVIDER_IDENTITY": WorkerFailureCategory.INTERNAL,
+    "MARKET_HISTORY_NETWORK_UNSUPPORTED": WorkerFailureCategory.INTERNAL,
+    "MARKET_HISTORY_PROVIDER_REJECTED": WorkerFailureCategory.INTERNAL,
+    # A credential the provider rejected is an operational problem, not a market
+    # one, and no amount of retrying supplies a working key.
+    "MARKET_HISTORY_PROVIDER_NOT_AUTHORIZED": WorkerFailureCategory.CAPABILITY_DENIED,
 }
 
 
@@ -184,7 +202,8 @@ class VectorWorkerHandler:
         digest: str,
     ) -> EvidenceSubmission:
         """Build the envelope from runtime facts. The model fills only the setup."""
-        structure = task_input.market.structure
+        market = task_input.market
+        structure = market.structure
         return EvidenceSubmission(
             idempotency_key=f"vector:{task_input.task_id}:{setup.setup_fingerprint}",
             producer_role=AgentRole.VECTOR,
@@ -230,15 +249,47 @@ class VectorWorkerHandler:
                     summary=setup.summary,
                     input_digest=digest,
                     history_provider=structure.provider,
-                    # A code in the payload's own vocabulary; the provider's
-                    # lowercase spelling stays in the provider layer.
-                    history_timeframe=structure.timeframe.upper(),
+                    history_timeframe=structure.timeframe,
                     history_bar_count=len(structure.bars),
                     history_window_start=structure.window_start,
                     history_window_end=structure.window_end,
                     history_coverage=structure.coverage,
                     observed_range_low=structure.range_low,
                     observed_range_high=structure.range_high,
+                    # The bars themselves, so the decision stays answerable if
+                    # the provider revises a candle or our normalization changes.
+                    structure=RecordedMarketStructure(
+                        pair_id=market.pair_id,
+                        chain=market.chain,
+                        network=market.network,
+                        venue=market.venue,
+                        base_asset_id=market.base_asset_id,
+                        quote_asset_id=market.quote_asset_id,
+                        provider=structure.provider,
+                        timeframe=structure.timeframe,
+                        interval_seconds=structure.interval_seconds,
+                        price_basis=structure.price_basis,
+                        coverage=structure.coverage,
+                        requested_bars=structure.requested_bars,
+                        missing_intervals=structure.missing_intervals,
+                        window_start=structure.window_start,
+                        window_end=structure.window_end,
+                        observed_range_low=structure.range_low,
+                        observed_range_high=structure.range_high,
+                        policy_version=task_input.policy_version,
+                        bars=tuple(
+                            RecordedBar(
+                                opened_at=bar.opened_at,
+                                open=bar.open,
+                                high=bar.high,
+                                low=bar.low,
+                                close=bar.close,
+                                volume=bar.volume,
+                            )
+                            for bar in structure.bars
+                        ),
+                        structure_digest=structure_digest(structure),
+                    ),
                     prompt_version=VECTOR_PROMPT_VERSION,
                     prompt_hash=VECTOR_PROMPT_HASH,
                     reasoning_provider=result.model.provider,

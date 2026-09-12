@@ -376,3 +376,37 @@ def test_an_accepted_setup_can_be_audited_back_to_its_inputs():
         "observed_range_high",
     ):
         assert required in present
+
+
+def test_the_durable_record_cannot_become_a_market_data_warehouse():
+    """Bounded to one decision's input, with no place for provider noise."""
+    from src.orchestration.workflow.models import RecordedBar, RecordedMarketStructure
+
+    assert set(RecordedBar.model_fields) == {
+        "opened_at",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    }
+    for forbidden in (
+        "fetched_at",
+        "retrieved_at",
+        "latency_ms",
+        "raw_payload",
+        "request_headers",
+        "api_key",
+        "url",
+        "response",
+    ):
+        assert forbidden not in RecordedMarketStructure.model_fields
+
+
+def test_the_recorded_structure_reaches_no_provider_type():
+    """The evidence payload names market facts, never a provider adapter."""
+    from pathlib import Path
+
+    source = Path("src/orchestration/workflow/models.py").read_text().lower()
+    for forbidden in ("geckoterminal", "httpx", "ohlcv_list"):
+        assert forbidden not in source

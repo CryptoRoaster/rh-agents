@@ -363,7 +363,7 @@ async def test_the_evidence_records_which_structure_the_setup_was_drawn_from(now
     assert detail is not None
     structure = context.market.structure
     assert detail.history_provider == structure.provider
-    assert detail.history_timeframe == "HOUR"
+    assert detail.history_timeframe == "hour"
     assert detail.history_bar_count == len(structure.bars)
     assert detail.history_window_start == structure.window_start
     assert detail.history_window_end == structure.window_end

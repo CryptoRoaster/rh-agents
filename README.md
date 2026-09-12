@@ -431,5 +431,16 @@ on one pool the wrong unit landed within 0.2% of the right one, so the request i
 explicit and the response's own account of which token it priced is checked
 against ours.
 
-Bars are read and used, never stored. Disabled by default, no migration, no
-worker started. See [the Phase 2H VECTOR design](docs/phase-2h.md).
+The bars a setup was drawn from are kept with it. A fingerprint can prove two
+inputs are the same; it cannot tell you what either one was, and a provider that
+revises a candle would leave the decision unexplainable. So the evidence stores
+the bounded normalized window itself — the bars the model actually saw, nothing
+about how they were fetched — and reconstructs to an exact digest match. It is
+one decision's input, not a market-data archive.
+
+A rate limit is never mistaken for an empty market. The provider's failures are
+typed at the adapter, so a 429 is transient weather rather than a claim that this
+market has no history — and never an internal error in our own code.
+
+Disabled by default, no migration, no worker started. See [the Phase 2H VECTOR
+design](docs/phase-2h.md).

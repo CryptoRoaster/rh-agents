@@ -492,3 +492,111 @@ async def test_a_source_that_cannot_answer_ends_the_attempt_safely(now):
     with pytest.raises(VectorContextUnavailable) as error:
         await reader.setup_context(uuid4(), uuid4())
     assert error.value.reason_code == "MARKET_HISTORY_SOURCE_NOT_CONFIGURED"
+
+
+# ------------------------------------- the open bar never fills the minimum
+
+
+async def test_an_open_bar_is_not_counted_toward_the_minimum(now):
+    """23 closed plus one still forming is 23, and 23 is not enough.
+
+    Counting the open interval to reach the threshold would mean the whole
+    sufficiency gate could be satisfied by a bar whose high and low are not
+    finished being made.
+    """
+    short = history_for(now, bars=MINIMUM - 1)
+    assert len(short.bars) == MINIMUM - 1
+    assert verdict_for(now, short) == VectorMarketDataSufficiency.MARKET_HISTORY_TOO_SHORT
+    with pytest.raises(VectorContextUnavailable) as error:
+        await read(now, history=short)
+    assert error.value.reason_code == "MARKET_HISTORY_TOO_SHORT"
+
+
+async def test_exactly_the_minimum_of_closed_bars_is_admitted(now):
+    context = await read(now, history=history_for(now, bars=MINIMUM))
+    assert len(context.market.structure.bars) == MINIMUM
+
+
+async def test_the_supplied_window_is_explicit_rather_than_implied(now):
+    """48 is requested, 24 is required, and the model is told what it actually got.
+
+    The request size is an implementation detail — one extra bar covers the
+    forming interval, and a wider window absorbs gaps without failing admission.
+    It must never read as a claimed analysis horizon, so the count, the window
+    bounds and the requested size are all present and distinct.
+    """
+    structure = (await read(now, history=history_for(now, bars=30))).market.structure
+    assert len(structure.bars) == 30
+    assert structure.requested_bars == VECTOR_SETUP_V1.history_bars == 48
+    assert VECTOR_SETUP_V1.min_closed_bars == 24
+    assert structure.window_start < structure.window_end
+    span = (structure.window_end - structure.window_start).total_seconds()
+    assert span == structure.interval_seconds * len(structure.bars)
+
+
+# ------------------------------------------- provider failure classification
+
+
+@pytest.mark.parametrize(
+    ("reason", "category"),
+    [
+        ("MARKET_HISTORY_PROVIDER_RATE_LIMITED", WorkerFailureCategory.TRANSIENT),
+        ("MARKET_HISTORY_PROVIDER_UNAVAILABLE", WorkerFailureCategory.TRANSIENT),
+        ("MARKET_HISTORY_REQUEST_BUDGET_EXHAUSTED", WorkerFailureCategory.TRANSIENT),
+        ("MARKET_HISTORY_PROVIDER_CONTRACT", WorkerFailureCategory.INTERNAL),
+        ("MARKET_HISTORY_PROVIDER_IDENTITY", WorkerFailureCategory.INTERNAL),
+        ("MARKET_HISTORY_PROVIDER_REJECTED", WorkerFailureCategory.INTERNAL),
+        ("MARKET_HISTORY_NETWORK_UNSUPPORTED", WorkerFailureCategory.INTERNAL),
+        ("MARKET_HISTORY_PROVIDER_NOT_AUTHORIZED", WorkerFailureCategory.CAPABILITY_DENIED),
+    ],
+)
+async def test_a_provider_failure_is_classified_rather_than_escaping(now, reason, category):
+    """Every provider condition arrives as a typed outcome, never as a handler bug.
+
+    Before this, a rate limit escaped the context reader untyped and landed in
+    the runner's catch-all as INTERNAL/HANDLER_ERROR — indistinguishable from a
+    defect in our own code.
+    """
+    assert CONTEXT_FAILURES[reason] == category
+
+    class Failing:
+        async def setup_context(self, trade_case_id, task_id):
+            raise VectorContextUnavailable(reason)
+
+    provider = DeterministicReasoningProvider.returning(reply(now))
+    lease = lease_for(task_input(now), now)
+    outcome = await VectorWorkerHandler(provider=provider).handle(
+        lease, VectorCapabilities(lease=lease, context=Failing(), submit=object())
+    )
+    assert isinstance(outcome, TaskFailureReport)
+    assert outcome.reason_code == reason
+    assert outcome.category == category
+    # And no reasoning request was spent on it.
+    assert provider.calls == []
+
+
+async def test_a_rate_limited_provider_produces_no_setup_at_all(now):
+    """Not an empty market, not a short window: no answer, and no evidence."""
+    reader = VectorContextReader(
+        cases=StubCases(StubTradeCase(market_identity())),
+        markets=StubMarkets(snapshot_for(now)),
+        history=StubHistory(MarketHistoryUnavailable("MARKET_HISTORY_PROVIDER_RATE_LIMITED")),
+        clock=FixedClock(now),
+        include_fixtures=True,
+    )
+    with pytest.raises(VectorContextUnavailable) as error:
+        await reader.setup_context(uuid4(), uuid4())
+    assert error.value.reason_code == "MARKET_HISTORY_PROVIDER_RATE_LIMITED"
+    assert CONTEXT_FAILURES[error.value.reason_code] == WorkerFailureCategory.TRANSIENT
+
+
+def test_a_rate_limit_is_not_any_kind_of_statement_about_the_market():
+    """The codes are kept apart so downstream can never conflate them."""
+    limited = "MARKET_HISTORY_PROVIDER_RATE_LIMITED"
+    for market_fact in (
+        VectorMarketDataSufficiency.MARKET_HISTORY_EMPTY,
+        VectorMarketDataSufficiency.MARKET_HISTORY_TOO_SHORT,
+        VectorMarketDataSufficiency.MARKET_HISTORY_TOO_GAPPED,
+    ):
+        assert limited != market_fact.value
+    assert limited not in {item.value for item in VectorMarketDataSufficiency}
