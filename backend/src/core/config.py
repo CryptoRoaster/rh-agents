@@ -113,6 +113,19 @@ class Settings(BaseSettings):
     signal_source_timeout_seconds: int = Field(default=10, ge=1, le=60)
     signal_neynar_page_size: int = Field(default=50, ge=10, le=100)
     signal_neynar_max_pages: int = Field(default=2, ge=1, le=5)
+    # Phase 2H VECTOR. Disabled by default like every other worker. The setup
+    # geometry rules, price envelope, grounding band, lifetime bounds and market
+    # data sufficiency thresholds are code-defined and versioned rather than
+    # env-mutable: they decide whether a proposal about money is coherent and
+    # whether its inputs could support it, and that is a reviewable change
+    # rather than a knob.
+    vector_worker_enabled: bool = False
+    # Where recorded market structure comes from. "disabled" is the default, and
+    # it fails closed: without a series VECTOR proposes nothing at all, which is
+    # the correct outcome rather than a gap to be filled with a single price.
+    # There is deliberately no "fake" option — synthetic candles must not be
+    # reachable from a production configuration.
+    vector_history_provider: Literal["disabled", "geckoterminal"] = "disabled"
 
     @model_validator(mode="after")
     def reasoning_configuration(self) -> "Settings":
@@ -217,6 +230,14 @@ class Settings(BaseSettings):
         # read. Refusing to boot is louder and cheaper than discovering it later.
         if self.signal_social_provider != "disabled" and not self.neynar_api_key.get_secret_value():
             raise ValueError("A selected SIGNAL social provider requires its API key")
+        # The market history adapter is the GeckoTerminal one, so selecting it
+        # while the market provider is a fixture would read structure from one
+        # world and prices from another.
+        if (
+            self.vector_history_provider == "geckoterminal"
+            and self.market_provider != "geckoterminal"
+        ):
+            raise ValueError("VECTOR market history requires the matching market provider")
         return self
 
     @field_validator("neynar_base_url")

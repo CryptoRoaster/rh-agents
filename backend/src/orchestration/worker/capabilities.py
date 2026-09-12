@@ -79,10 +79,16 @@ class SentimentPort(Protocol):
     async def sentiment_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
-class MarketHistoryPort(Protocol):
-    """VECTOR input. Unimplemented in Phase 2B."""
+class SetupContextPort(Protocol):
+    """VECTOR input: one assembled view of the market a setup would be about.
 
-    async def history(self, market_key: str) -> object: ...
+    The worker never holds a market provider client, an RPC client or a session.
+    Trusted infrastructure performs the reads, applies the freshness policy and
+    hands over finished facts, so VECTOR cannot choose what to query or reason
+    from a price nobody observed.
+    """
+
+    async def setup_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
 class TriggerFeedPort(Protocol):
@@ -161,7 +167,7 @@ class SignalCapabilities:
 @dataclass(frozen=True)
 class VectorCapabilities:
     lease: TaskLease
-    history: MarketHistoryPort
+    context: SetupContextPort
     submit: EvidenceSubmissionPort
 
 

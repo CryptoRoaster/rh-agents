@@ -366,3 +366,81 @@ The provider is disabled by default and a key alone selects nothing. There is no
 synthetic fallback: if the provider cannot answer, SIGNAL is unavailable and the
 case waits. No scraping, no wallet or payment path, no migration, no worker
 started. See [the Phase 2G provider contract and chain-identity design](docs/phase-2g.md).
+
+## Phase 2H VECTOR trade setup
+
+VECTOR proposes the setup: a side, an entry, the level at which the idea is
+wrong, ordered objectives and an expiry. It is the first specialist whose output
+describes an action, and it is still only evidence. PULSE watches the trigger,
+ANCHOR assesses execution conditions and SENTINEL decides risk, independently and
+in that order.
+
+Nothing here can size, route or approve anything. The schema has no field for a
+position size, a slippage tolerance, a venue or an approval, so a model that
+fully complied with a hostile instruction embedded in another role's summary
+would still have nowhere to put one — and `extra="forbid"` turns the attempt into
+a parse error at the boundary.
+
+A setup is refused, never repaired. An invalidation above the entry is not
+quietly reordered, unsorted targets are not sorted, an expiry past the horizon is
+not clamped and a level with a lost decimal point is not pulled back to the edge.
+Each of those would create a setup nobody proposed while the record still
+credited it to the model. The proposal is rejected with a reason code and the
+attempt retries.
+
+A setup is a statement about price levels, so a missing, stale, mismatched or
+priceless market observation ends the attempt before the model is ever called.
+There is no fallback setup and the previous one is never reissued as new: a stale
+setup silently renewed would be the most dangerous artefact this system could
+produce, because everything downstream reads a current setup as a current
+opinion.
+
+A pre-push audit found the version of this that shipped first could do something
+worse. Given one observed price of 1.00 and nothing else, it produced an entry at
+1.10, an invalidation at 0.92 and targets at 1.25 and 1.45 — and recorded them as
+available, accepted evidence. The levels were ordered correctly and inside the
+sanity envelope, so every check passed. None of them was in the data. A validator
+can prove a setup holds together; it cannot prove anyone had reason to propose
+it.
+
+So VECTOR now reads bounded market history — closed hourly bars for the same pool
+— and two gates stand either side of the model. Before it, a deterministic
+verdict decides whether enough structure exists to ask at all: enough closed
+bars, recent enough measured from when they closed, few enough untraded gaps, and
+the right pool in the right unit. The model is never asked whether its own input
+was good enough. After it, every proposed level must sit inside the range the
+market actually traded, widened enough that a breakout above every recorded high
+is still proposable and a number from nowhere is not.
+
+If that structure cannot be obtained, nothing is produced and the case waits.
+That is the point: no setup is better than an invented one. No indicator is
+computed, no candle is synthesized, and an interval nobody traded in is reported
+as a gap rather than filled with a flat bar.
+
+Because the setup is safety-critical, replacing it withdraws what was built on
+it. The trigger that named the old setup stops matching, the execution
+assessment underneath it stops being current, and an existing risk approval — or
+a limited authorization — is revoked. An expired setup blocks rather than
+lingers, because the evidence expires exactly when it does.
+
+History comes from GeckoTerminal's OHLCV endpoint, verified live on both
+supported chains. Its newest bar is always still forming — its close matched the
+pool's live price exactly on both — so that bar is dropped rather than treated as
+settled. Orientation is a request parameter, and getting it wrong is not obvious:
+on one pool the wrong unit landed within 0.2% of the right one, so the request is
+explicit and the response's own account of which token it priced is checked
+against ours.
+
+The bars a setup was drawn from are kept with it. A fingerprint can prove two
+inputs are the same; it cannot tell you what either one was, and a provider that
+revises a candle would leave the decision unexplainable. So the evidence stores
+the bounded normalized window itself — the bars the model actually saw, nothing
+about how they were fetched — and reconstructs to an exact digest match. It is
+one decision's input, not a market-data archive.
+
+A rate limit is never mistaken for an empty market. The provider's failures are
+typed at the adapter, so a 429 is transient weather rather than a claim that this
+market has no history — and never an internal error in our own code.
+
+Disabled by default, no migration, no worker started. See [the Phase 2H VECTOR
+design](docs/phase-2h.md).
