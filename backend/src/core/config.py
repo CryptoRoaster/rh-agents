@@ -113,6 +113,11 @@ class Settings(BaseSettings):
     signal_source_timeout_seconds: int = Field(default=10, ge=1, le=60)
     signal_neynar_page_size: int = Field(default=50, ge=10, le=100)
     signal_neynar_max_pages: int = Field(default=2, ge=1, le=5)
+    # Phase 2H VECTOR. Disabled by default like every other worker. The setup
+    # geometry rules, price envelope and lifetime bounds are code-defined and
+    # versioned rather than env-mutable: they decide whether a proposal about
+    # money is coherent, and that is a reviewable change rather than a knob.
+    vector_worker_enabled: bool = False
 
     @model_validator(mode="after")
     def reasoning_configuration(self) -> "Settings":

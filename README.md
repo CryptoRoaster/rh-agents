@@ -366,3 +366,42 @@ The provider is disabled by default and a key alone selects nothing. There is no
 synthetic fallback: if the provider cannot answer, SIGNAL is unavailable and the
 case waits. No scraping, no wallet or payment path, no migration, no worker
 started. See [the Phase 2G provider contract and chain-identity design](docs/phase-2g.md).
+
+## Phase 2H VECTOR trade setup
+
+VECTOR proposes the setup: a side, an entry, the level at which the idea is
+wrong, ordered objectives and an expiry. It is the first specialist whose output
+describes an action, and it is still only evidence. PULSE watches the trigger,
+ANCHOR assesses execution conditions and SENTINEL decides risk, independently and
+in that order.
+
+Nothing here can size, route or approve anything. The schema has no field for a
+position size, a slippage tolerance, a venue or an approval, so a model that
+fully complied with a hostile instruction embedded in another role's summary
+would still have nowhere to put one — and `extra="forbid"` turns the attempt into
+a parse error at the boundary.
+
+A setup is refused, never repaired. An invalidation above the entry is not
+quietly reordered, unsorted targets are not sorted, an expiry past the horizon is
+not clamped and a level with a lost decimal point is not pulled back to the edge.
+Each of those would create a setup nobody proposed while the record still
+credited it to the model. The proposal is rejected with a reason code and the
+attempt retries.
+
+A setup is a statement about price levels, so a missing, stale, mismatched or
+priceless market observation ends the attempt before the model is ever called.
+There is no fallback setup and the previous one is never reissued as new: a stale
+setup silently renewed would be the most dangerous artefact this system could
+produce, because everything downstream reads a current setup as a current
+opinion. The market layer records only the newest observation, so there are no
+candles and no trend features, and the document says so rather than inventing a
+bar series.
+
+Because the setup is safety-critical, replacing it withdraws what was built on
+it. The trigger that named the old setup stops matching, the execution
+assessment underneath it stops being current, and an existing risk approval — or
+a limited authorization — is revoked. An expired setup blocks rather than
+lingers, because the evidence expires exactly when it does.
+
+Disabled by default, no migration, no worker started. See [the Phase 2H VECTOR
+design](docs/phase-2h.md).

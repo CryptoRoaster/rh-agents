@@ -20,11 +20,11 @@ from src.orchestration.worker.capabilities import (
     EvidenceSubmissionPort,
     ExecutionAssessmentPort,
     FuseCapabilities,
-    MarketHistoryPort,
     OnchainContextPort,
     OrbitCapabilities,
     PulseCapabilities,
     SentimentPort,
+    SetupContextPort,
     SignalCapabilities,
     TriggerFeedPort,
     ValidatedEvidencePort,
@@ -113,7 +113,7 @@ class CapabilityProvider:
     context: DiscoveryContextPort | None = None
     onchain: OnchainContextPort | None = None
     sentiment: SentimentPort | None = None
-    history: MarketHistoryPort | None = None
+    setup: SetupContextPort | None = None
     triggers: TriggerFeedPort | None = None
     execution: ExecutionAssessmentPort | None = None
     evidence: ValidatedEvidencePort | None = None
@@ -128,8 +128,8 @@ class CapabilityProvider:
                 return AtlasCapabilities(lease=lease, context=self.onchain, submit=submit)
             case AgentRole.SIGNAL if self.sentiment is not None:
                 return SignalCapabilities(lease=lease, context=self.sentiment, submit=submit)
-            case AgentRole.VECTOR if self.history is not None:
-                return VectorCapabilities(lease=lease, history=self.history, submit=submit)
+            case AgentRole.VECTOR if self.setup is not None:
+                return VectorCapabilities(lease=lease, context=self.setup, submit=submit)
             case AgentRole.PULSE if self.triggers is not None:
                 return PulseCapabilities(lease=lease, triggers=self.triggers, submit=submit)
             case AgentRole.ANCHOR if self.execution is not None:

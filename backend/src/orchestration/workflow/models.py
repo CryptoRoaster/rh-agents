@@ -348,13 +348,76 @@ class SentimentPayload(AcceptancePayload):
     intelligence: "SentimentIntelligence | None" = None
 
 
+class TradeSetupTrigger(Immutable):
+    """The condition a future PULSE watches for, in terms it can decide.
+
+    Deliberately a comparison rather than a description. A trigger expressed as
+    prose would need a model to evaluate it, which would put a second
+    probabilistic judgement between the setup and the act and leave no way to say
+    afterwards what the system had been waiting for.
+    """
+
+    type: Code
+    price_basis: Code
+    reference_price: Positive | None = None
+    zone_low: Positive | None = None
+    zone_high: Positive | None = None
+    valid_from: AwareDatetime
+    expires_at: AwareDatetime
+
+
+class TradeSetupDetail(Immutable):
+    """The structured record behind a setup, for PULSE and a future FUSE.
+
+    The legacy fields above stay exactly as they were; everything a watcher or a
+    synthesiser would otherwise have to infer from prose lives here instead —
+    which side of an entry band, what condition is being waited for, when the
+    proposal stops being current, and which input and instructions produced it.
+    """
+
+    setup_fingerprint: Digest
+    policy_version: Identifier
+    kind: Code
+    price_basis: Code
+    entry_low: Positive
+    entry_high: Positive
+    # The observed price the proposal was drawn from, so a reader can see how far
+    # the levels sat from the market at the time.
+    reference_price: Positive
+    expires_at: AwareDatetime
+    trigger: TradeSetupTrigger
+    reason_codes: tuple[Code, ...] = Field(default=(), max_length=8)
+    summary: SafeSummary
+    input_digest: Digest
+    prompt_version: Identifier | None = None
+    prompt_hash: Digest | None = None
+    reasoning_provider: Identifier | None = None
+    reasoning_model: Identifier | None = None
+    output_schema_version: int | None = Field(default=None, ge=1)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    latency_ms: int | None = Field(default=None, ge=0)
+
+
 class TradeSetupPayload(AcceptancePayload):
+    """A proposed setup. Analytical evidence, never an authorization.
+
+    Acceptance stays unconditional: a structurally invalid proposal never becomes
+    evidence in the first place, because the worker refuses it before submission
+    rather than recording it as available and letting the workflow sort it out.
+    What this payload asserts is that a setup was proposed — not that anyone may
+    act on it, which remains PULSE's, ANCHOR's and SENTINEL's question in turn.
+    """
+
     kind: Literal["trade_setup"] = "trade_setup"
     setup_id: UUID
     side: Side
     entry_price: Positive
     invalidation_price: Positive
     target_prices: tuple[Positive, ...] = Field(min_length=1)
+    # Absent on evidence written before Phase 2H; present for anything a VECTOR
+    # worker produced.
+    setup: "TradeSetupDetail | None" = None
 
 
 class TriggerPayload(AcceptancePayload):
