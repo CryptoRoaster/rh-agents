@@ -195,12 +195,19 @@ async def test_evidence_records_hashes_and_metrics_rather_than_a_corpus(now):
 # --------------------------------------------------------------- settings
 
 
-def test_no_worker_starts_and_no_social_credential_exists_by_default():
+def test_no_worker_starts_and_no_social_source_is_selected_by_default():
+    """Phase 2G added one provider. Nothing about it is on by default.
+
+    The credential field exists and is empty, the provider is disabled, and no
+    other social vendor was introduced — Phase 2G is deliberately Farcaster only,
+    so one real provider path can be validated before the semantics multiply.
+    """
     configured = settings()
     assert configured.signal_worker_enabled is False
+    assert configured.signal_social_provider == "disabled"
+    assert configured.neynar_api_key.get_secret_value() == ""
     for name in Settings.model_fields:
-        assert "social" not in name
-        assert not name.startswith(("x_api", "reddit_", "telegram_", "farcaster_"))
+        assert not name.startswith(("x_api", "reddit_", "telegram_", "discord_"))
 
 
 def test_the_signal_bounds_are_configurable_within_safe_limits():

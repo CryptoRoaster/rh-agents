@@ -357,10 +357,16 @@ def test_nothing_wires_a_signal_worker_at_startup():
 
 
 def test_the_fake_source_is_never_a_configured_provider_option():
+    from typing import get_args
+
     from src.core.config import Settings
 
     rendered = repr(Settings.model_fields)
     assert "fake-social" not in rendered
     assert "DeterministicSignalSource" not in rendered
-    # And no setting selects a social provider at all, because none exists.
-    assert not [name for name in Settings.model_fields if name.endswith("_social_provider")]
+    # Phase 2G added a real provider. The fixture source is still not among the
+    # things a deployment can select, which is the invariant that matters.
+    assert set(get_args(Settings.model_fields["signal_social_provider"].annotation)) == {
+        "disabled",
+        "neynar",
+    }

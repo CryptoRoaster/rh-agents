@@ -84,7 +84,14 @@ class MarketBindingBasis(StrEnum):
     TradeCase. The bases below are ordered by how much they actually prove:
 
     * ``CONTRACT_ADDRESS_EXACT`` — the text contains this token's contract
-      address on this chain. Deterministically checkable, and checked.
+      address *and* deterministic context naming this chain. Checkable, and
+      checked.
+    * ``CONTRACT_ADDRESS_UNSCOPED`` — the text contains this token's address with
+      no trustworthy chain context. A 20-byte address is chain-scoped: the same
+      deployer and nonce produce the same address on every EVM chain, so a
+      scammer can cheaply occupy it elsewhere. Far stronger evidence than a
+      ticker, and still not proof of *which* contract is meant, so it is
+      admissible and weak rather than strong.
     * ``VERIFIED_PROJECT_LINK`` — the source is an account or domain the project
       itself is recorded as owning.
     * ``UNIQUE_SYMBOL_WITH_CONTEXT`` — the symbol plus corroborating context the
@@ -94,6 +101,7 @@ class MarketBindingBasis(StrEnum):
     """
 
     CONTRACT_ADDRESS_EXACT = "CONTRACT_ADDRESS_EXACT"
+    CONTRACT_ADDRESS_UNSCOPED = "CONTRACT_ADDRESS_UNSCOPED"
     VERIFIED_PROJECT_LINK = "VERIFIED_PROJECT_LINK"
     UNIQUE_SYMBOL_WITH_CONTEXT = "UNIQUE_SYMBOL_WITH_CONTEXT"
     AMBIGUOUS_SYMBOL = "AMBIGUOUS_SYMBOL"
@@ -187,6 +195,23 @@ class SignalDataQuality(StrEnum):
     INSUFFICIENT = "INSUFFICIENT"
 
 
+class CollectionCoverage(StrEnum):
+    """How completely the provider's own result stream was read.
+
+    Two situations that look identical in a list of observations and are not.
+    ``PROVIDER_RESULTS_EXHAUSTED`` means the provider offered no further page:
+    this is everything it had for the query. ``TRUNCATED_BY_LOCAL_BUDGET`` means
+    it offered more and we stopped — a deliberate cost decision whose consequence
+    is that the collected set is the newest slice, not the whole interval.
+
+    Neither is a census either way: no provider here documents exhaustive
+    matching. The distinction is about whether *we* chose the boundary.
+    """
+
+    PROVIDER_RESULTS_EXHAUSTED = "PROVIDER_RESULTS_EXHAUSTED"
+    TRUNCATED_BY_LOCAL_BUDGET = "TRUNCATED_BY_LOCAL_BUDGET"
+
+
 class SignalGap(StrEnum):
     """Why the observation set is weaker than it looks. Never a sentiment value."""
 
@@ -201,6 +226,7 @@ class SignalGap(StrEnum):
     DUPLICATE_DOMINATED = "DUPLICATE_DOMINATED"
     AUTHOR_CONCENTRATED = "AUTHOR_CONCENTRATED"
     SOURCE_UNAVAILABLE = "SOURCE_UNAVAILABLE"
+    COLLECTION_TRUNCATED = "COLLECTION_TRUNCATED"
 
 
 class SignalNarrative(StrEnum):
@@ -298,12 +324,30 @@ class SignalObservation(Immutable):
             self.binding_address is None or self.binding_chain is None
         ):
             raise ValueError("An address binding must name the address and its chain")
+        if self.binding_basis == MarketBindingBasis.CONTRACT_ADDRESS_UNSCOPED and (
+            self.binding_address is None or self.binding_chain is not None
+        ):
+            # Unscoped means the address is known and the chain deliberately is
+            # not. Carrying a chain here would be a claim the basis denies.
+            raise ValueError("An unscoped address binding names an address and no chain")
         if self.kind != ObservationKind.ORIGINAL and self.referenced_observation_id is None:
             # A share or a reply that names nothing it responds to cannot be
             # distinguished from an original, which is exactly the confusion the
             # kind exists to prevent.
             raise ValueError("A repost or reply must reference the observation it responds to")
         return self
+
+
+class ObservationCollection(Immutable):
+    """What a source returned, and how far through its results we actually read.
+
+    The coverage travels with the observations because it cannot be recovered
+    from them. A hundred casts that exhausted the provider and a hundred that hit
+    our page budget are the same list and different evidence.
+    """
+
+    observations: tuple[SignalObservation, ...] = Field(default=(), max_length=5000)
+    coverage: CollectionCoverage = CollectionCoverage.PROVIDER_RESULTS_EXHAUSTED
 
 
 class SignalWindow(Immutable):
@@ -385,6 +429,8 @@ class SignalQualityFeatures(Immutable):
     excluded_outside_window_count: int = Field(ge=0)
     excluded_unbound_count: int = Field(ge=0)
     received_count: int = Field(ge=0)
+    # Whether the provider ran out of results or we stopped reading them.
+    coverage: CollectionCoverage = CollectionCoverage.PROVIDER_RESULTS_EXHAUSTED
     sources: tuple[SourceBreakdown, ...] = Field(default=(), max_length=10)
     # The newest admissible observation. Freshness anchors here, never to a fetch.
     latest_observation_at: AwareDatetime | None = None

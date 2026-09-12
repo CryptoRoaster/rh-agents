@@ -16,7 +16,9 @@ from datetime import datetime, timedelta
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from src.agents.signal.models import (
+    CollectionCoverage,
     MarketBindingBasis,
+    ObservationCollection,
     ObservationEngagement,
     ObservationKind,
     SignalObservation,
@@ -92,6 +94,7 @@ class DeterministicSignalSource:
     """
 
     scripted: tuple[SignalObservation, ...] = ()
+    coverage: CollectionCoverage = CollectionCoverage.PROVIDER_RESULTS_EXHAUSTED
     failure: str | None = None
     calls: list[tuple[str, str, SignalWindow]] = field(default_factory=list)
 
@@ -100,9 +103,14 @@ class DeterministicSignalSource:
         return cls(failure=reason_code)
 
     async def observations(
-        self, *, chain: str, pair_id: str, window: SignalWindow
-    ) -> tuple[SignalObservation, ...]:
+        self,
+        *,
+        chain: str,
+        pair_id: str,
+        token_address: str | None,
+        window: SignalWindow,
+    ) -> ObservationCollection:
         self.calls.append((chain, pair_id, window))
         if self.failure is not None:
             raise SignalSourceUnavailable(self.failure)
-        return self.scripted
+        return ObservationCollection(observations=self.scripted, coverage=self.coverage)

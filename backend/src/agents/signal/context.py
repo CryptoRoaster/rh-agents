@@ -20,6 +20,8 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from src.agents.signal.models import (
+    CollectionCoverage,
+    ObservationCollection,
     ObservationKind,
     SignalObservation,
     SignalQualityFeatures,
@@ -167,15 +169,23 @@ class SignalContextReader:
         token_address = token_address_of(market.base_asset_id)
         unavailable = False
         try:
-            observations = await self.source.observations(
-                chain=market.chain, pair_id=market.pair_id, window=window
+            collected = await self.source.observations(
+                chain=market.chain,
+                pair_id=market.pair_id,
+                token_address=token_address,
+                window=window,
             )
         except SignalSourceUnavailable:
             # A source that cannot answer is an explicit absence, never an empty
             # feed that could be mistaken for a quiet one.
-            observations = ()
+            collected = ObservationCollection()
             unavailable = True
-        observations = observations[: self.max_observations]
+        observations = collected.observations[: self.max_observations]
+        coverage = (
+            CollectionCoverage.TRUNCATED_BY_LOCAL_BUDGET
+            if len(collected.observations) > self.max_observations
+            else collected.coverage
+        )
         admission = admit(
             observations,
             window=window,
@@ -183,6 +193,7 @@ class SignalContextReader:
             token_address=token_address,
             admissible_bases=self.policy.admissible_bases,
             verified_project_authors=self.verified_project_authors,
+            coverage=coverage,
         )
         features = compute_features(
             admission, window=window, burst_interval=self.policy.burst_interval
@@ -238,6 +249,7 @@ def _features_document(features: SignalQualityFeatures) -> dict[str, object]:
         "excluded_outside_window_count": features.excluded_outside_window_count,
         "excluded_unbound_count": features.excluded_unbound_count,
         "received_count": features.received_count,
+        "coverage": features.coverage.value,
         "source_count": features.source_count,
         "sources": [
             {

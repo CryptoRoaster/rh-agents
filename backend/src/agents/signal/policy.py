@@ -18,6 +18,7 @@ from decimal import Decimal
 from src.agents.signal.models import (
     DEMAND_ORDER,
     LEVEL_ORDER,
+    CollectionCoverage,
     MarketBindingBasis,
     QualitativeLevel,
     SignalDataQuality,
@@ -116,12 +117,14 @@ SIGNAL_QUALITY_V1 = SignalQualityPolicy(
     top1_author_share_severe=Decimal("0.50"),
     top5_author_share_elevated=Decimal("0.80"),
     burst_share_elevated=Decimal("0.50"),
-    # A symbol with resolvable context is admissible but weaker, and is counted
-    # separately so a set that rests entirely on it cannot look strongly bound.
+    # An unscoped address and a symbol with resolvable context are both
+    # admissible and both weak, counted separately so a set that rests entirely
+    # on them cannot look strongly bound.
     admissible_bases=frozenset(
         {
             MarketBindingBasis.CONTRACT_ADDRESS_EXACT,
             MarketBindingBasis.VERIFIED_PROJECT_LINK,
+            MarketBindingBasis.CONTRACT_ADDRESS_UNSCOPED,
             MarketBindingBasis.UNIQUE_SYMBOL_WITH_CONTEXT,
         }
     ),
@@ -222,6 +225,10 @@ def _gaps(
         gaps.append(SignalGap.STALE_OBSERVATIONS_EXCLUDED)
     if features.source_count == 1 and features.observation_count > 0:
         gaps.append(SignalGap.SINGLE_SOURCE_ONLY)
+    if features.coverage == CollectionCoverage.TRUNCATED_BY_LOCAL_BUDGET:
+        # The provider had more and we stopped reading. What was collected is
+        # still real, and it is the newest slice rather than the whole window.
+        gaps.append(SignalGap.COLLECTION_TRUNCATED)
     if features.duplicate_share >= policy.duplicate_share_elevated:
         gaps.append(SignalGap.DUPLICATE_DOMINATED)
     if features.top1_author_share >= policy.top1_author_share_severe or _top_five_dominates(
@@ -264,6 +271,9 @@ def assess_structure(
         LEVEL_ORDER[manipulation] >= LEVEL_ORDER[QualitativeLevel.HIGH]
         or LEVEL_ORDER[breadth] <= LEVEL_ORDER[QualitativeLevel.LOW]
         or features.strong_binding_count == 0
+        # A truncated stream is interpretable and is not a clean read of the
+        # window it claims to describe, so it can never be better than degraded.
+        or features.coverage == CollectionCoverage.TRUNCATED_BY_LOCAL_BUDGET
     ):
         quality = SignalDataQuality.DEGRADED
     else:

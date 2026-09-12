@@ -119,6 +119,7 @@ def _metrics(features: SignalQualityFeatures, window_seconds: int) -> SentimentS
         weak_binding_count=features.weak_binding_count,
         excluded_ambiguous_count=features.excluded_ambiguous_count,
         excluded_outside_window_count=features.excluded_outside_window_count,
+        coverage=features.coverage.value,
         source_count=features.source_count,
         sources=tuple(entry.source.value for entry in features.sources),
         window_seconds=window_seconds,
