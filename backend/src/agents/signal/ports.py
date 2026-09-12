@@ -10,7 +10,7 @@ retrieve an arbitrary address is a capability a prompt can eventually aim.
 from typing import Protocol
 from uuid import UUID
 
-from src.agents.signal.models import SignalObservation, SignalTaskInput, SignalWindow
+from src.agents.signal.models import ObservationCollection, SignalTaskInput, SignalWindow
 
 
 class SignalSourceUnavailable(Exception):
@@ -32,6 +32,9 @@ class SignalObservationReadPort(Protocol):
     a policy decision and a provider cannot widen it by returning older rows —
     anything outside the window is dropped downstream regardless.
 
+    The answer carries its own coverage, because "the provider had nothing more"
+    and "we stopped reading" are different evidence behind an identical list.
+
     ``token_address`` is what a real adapter searches for, and is deliberately
     separate from ``pair_id``: the pair identifies a pool, and a pool address is
     not the thing people write about. Supplying it here is not a binding claim.
@@ -46,7 +49,7 @@ class SignalObservationReadPort(Protocol):
         pair_id: str,
         token_address: str | None,
         window: SignalWindow,
-    ) -> tuple[SignalObservation, ...]: ...
+    ) -> ObservationCollection: ...
 
 
 class SignalContextPort(Protocol):

@@ -45,6 +45,51 @@ ADDRESS_SEGMENTS = frozenset({"address", "token", "tokens"})
 # (the brokerage, the app, the company — overwhelmingly not the chain), and "rh"
 # (two letters that mean everything). A chain claim that rests on those is not a
 # claim worth making.
+# Words that turn a nearby chain name into something other than a claim that the
+# address lives there. Deliberately blunt: this is not a parser, and a false
+# negative costs recall while a false positive costs a wrong identity.
+NEGATING_WORDS = frozenset(
+    {
+        "not",
+        "no",
+        "never",
+        "nor",
+        "isn't",
+        "isnt",
+        "aren't",
+        "arent",
+        "unrelated",
+        "avoid",
+        "fake",
+        "scam",
+        "ignore",
+        "wrong",
+        "maybe",
+        "might",
+        "probably",
+        "possibly",
+        "perhaps",
+        "unsure",
+        "unclear",
+        "allegedly",
+        "supposedly",
+        "rumour",
+        "rumor",
+        "if",
+        "unless",
+        "versus",
+        "vs",
+        "unlike",
+        "except",
+        "besides",
+    }
+)
+
+# How far back to look. Four words reaches "this address is unrelated to BSC"
+# without reaching the "not financial advice" that opens half of all crypto
+# posts and has nothing to do with the chain named two sentences later.
+NEGATION_WINDOW = 4
+
 CHAIN_ALIASES: dict[str, str] = {
     "bnb smart chain": "bsc",
     "bnb chain": "bsc",
@@ -89,21 +134,52 @@ def _explorer_chains(text: str, address: str) -> set[str]:
     return found
 
 
+def _positive_mention(lowered: str, match: re.Match[str]) -> bool:
+    """Whether this occurrence reads as a claim rather than a denial or a guess.
+
+    "not on BSC", "fake BSC contract", "avoid the BSC version" and "maybe BSC"
+    all contain the word. None of them says the address is there, and a naive
+    substring match would turn every one of them into a strong chain binding on
+    the wrong chain — which is worse than having no context at all.
+
+    The check is a short backward window plus a trailing question mark. It is not
+    an attempt to understand the sentence, and it is not meant to be: anything it
+    is unsure about falls through to no context, and an unscoped address is the
+    honest record of that.
+    """
+    preceding = lowered[: match.start()].split()[-NEGATION_WINDOW:]
+    if any(word.strip(".,;:()\"'") in NEGATING_WORDS for word in preceding):
+        return False
+    return not lowered[match.end() :].lstrip().startswith("?")
+
+
 def _named_chains(text: str) -> set[str]:
-    """Chains named explicitly in the prose, matched on whole words only.
+    """Chains named explicitly and affirmatively in the prose.
 
     URLs are removed before matching. A hostname is not a claim: anyone can
     register ``bsc-totally-real.example``, and letting a link's spelling grant
     chain context would hand the strongest half of an identity decision to
     whoever chose the domain. Links only ever speak through the explorer
     allowlist above, where the host is compared in full.
+
+    Two conditions, both necessary. Exactly one supported chain may be mentioned
+    at all — a cast weighing "BSC or Robinhood Chain?" has named two and settled
+    neither, however affirmative one of the mentions looks in isolation. And that
+    single chain must be mentioned affirmatively somewhere: a text that only
+    denies it has established nothing, and one that argues with itself has
+    established less.
     """
     lowered = URL.sub(" ", text).lower()
-    found: set[str] = set()
+    mentioned: set[str] = set()
+    affirmed: set[str] = set()
+    denied: set[str] = set()
     for alias, chain in CHAIN_ALIASES.items():
-        if re.search(rf"(?<![0-9a-z]){re.escape(alias)}(?![0-9a-z])", lowered):
-            found.add(chain)
-    return found
+        for match in re.finditer(rf"(?<![0-9a-z]){re.escape(alias)}(?![0-9a-z])", lowered):
+            mentioned.add(chain)
+            (affirmed if _positive_mention(lowered, match) else denied).add(chain)
+    if len(mentioned) != 1:
+        return set()
+    return affirmed - denied
 
 
 def resolve_chain(text: str, address: str) -> str | None:

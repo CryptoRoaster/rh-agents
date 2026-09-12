@@ -195,6 +195,23 @@ class SignalDataQuality(StrEnum):
     INSUFFICIENT = "INSUFFICIENT"
 
 
+class CollectionCoverage(StrEnum):
+    """How completely the provider's own result stream was read.
+
+    Two situations that look identical in a list of observations and are not.
+    ``PROVIDER_RESULTS_EXHAUSTED`` means the provider offered no further page:
+    this is everything it had for the query. ``TRUNCATED_BY_LOCAL_BUDGET`` means
+    it offered more and we stopped — a deliberate cost decision whose consequence
+    is that the collected set is the newest slice, not the whole interval.
+
+    Neither is a census either way: no provider here documents exhaustive
+    matching. The distinction is about whether *we* chose the boundary.
+    """
+
+    PROVIDER_RESULTS_EXHAUSTED = "PROVIDER_RESULTS_EXHAUSTED"
+    TRUNCATED_BY_LOCAL_BUDGET = "TRUNCATED_BY_LOCAL_BUDGET"
+
+
 class SignalGap(StrEnum):
     """Why the observation set is weaker than it looks. Never a sentiment value."""
 
@@ -209,6 +226,7 @@ class SignalGap(StrEnum):
     DUPLICATE_DOMINATED = "DUPLICATE_DOMINATED"
     AUTHOR_CONCENTRATED = "AUTHOR_CONCENTRATED"
     SOURCE_UNAVAILABLE = "SOURCE_UNAVAILABLE"
+    COLLECTION_TRUNCATED = "COLLECTION_TRUNCATED"
 
 
 class SignalNarrative(StrEnum):
@@ -320,6 +338,18 @@ class SignalObservation(Immutable):
         return self
 
 
+class ObservationCollection(Immutable):
+    """What a source returned, and how far through its results we actually read.
+
+    The coverage travels with the observations because it cannot be recovered
+    from them. A hundred casts that exhausted the provider and a hundred that hit
+    our page budget are the same list and different evidence.
+    """
+
+    observations: tuple[SignalObservation, ...] = Field(default=(), max_length=5000)
+    coverage: CollectionCoverage = CollectionCoverage.PROVIDER_RESULTS_EXHAUSTED
+
+
 class SignalWindow(Immutable):
     """The interval SIGNAL claims to describe, anchored to source time.
 
@@ -399,6 +429,8 @@ class SignalQualityFeatures(Immutable):
     excluded_outside_window_count: int = Field(ge=0)
     excluded_unbound_count: int = Field(ge=0)
     received_count: int = Field(ge=0)
+    # Whether the provider ran out of results or we stopped reading them.
+    coverage: CollectionCoverage = CollectionCoverage.PROVIDER_RESULTS_EXHAUSTED
     sources: tuple[SourceBreakdown, ...] = Field(default=(), max_length=10)
     # The newest admissible observation. Freshness anchors here, never to a fetch.
     latest_observation_at: AwareDatetime | None = None

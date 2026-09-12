@@ -19,6 +19,7 @@ from uuid import UUID
 
 from src.agents.signal.models import (
     STRONG_BINDING_BASES,
+    CollectionCoverage,
     DuplicateCluster,
     MarketBindingBasis,
     ObservationKind,
@@ -90,6 +91,7 @@ class Admission:
     outside_window: int
     ambiguous: int
     unbound: int
+    coverage: CollectionCoverage = CollectionCoverage.PROVIDER_RESULTS_EXHAUSTED
 
 
 def admit(
@@ -100,6 +102,7 @@ def admit(
     token_address: str | None,
     admissible_bases: frozenset[MarketBindingBasis],
     verified_project_authors: frozenset[str] = frozenset(),
+    coverage: CollectionCoverage = CollectionCoverage.PROVIDER_RESULTS_EXHAUSTED,
 ) -> Admission:
     """Keep only observations that are both current and actually about this token.
 
@@ -155,6 +158,7 @@ def admit(
         outside_window=outside_window,
         ambiguous=ambiguous,
         unbound=unbound,
+        coverage=coverage,
     )
 
 
@@ -303,6 +307,7 @@ def compute_features(
         excluded_outside_window_count=admission.outside_window,
         excluded_unbound_count=admission.unbound,
         received_count=admission.received_count,
+        coverage=admission.coverage,
         sources=sources,
         latest_observation_at=created[-1] if created else None,
         oldest_observation_at=created[0] if created else None,

@@ -29,13 +29,15 @@ class RecordingRoutes:
         self.requests.append(request)
         return self.handler(request)
 
-    def transport_factory(self, **overrides: object) -> Callable[[object], SocialTransport]:
-        def factory(config: object) -> SocialTransport:
+    def transport_factory(self, **overrides: object) -> Callable[..., SocialTransport]:
+        def factory(config: object, query_classes: int = 1) -> SocialTransport:
+            budget = getattr(config, "max_requests", None)
             settings: dict[str, object] = {
                 "base_url": getattr(config, "base_url", "https://provider.invalid"),
                 "headers": {"x-api-key": str(getattr(config, "api_key", ""))},
-                # Mirror the real factory: the budget comes from the config.
-                "max_requests": getattr(config, "max_requests", 4),
+                # Mirror the real factory: the budget comes from the plan that
+                # will actually run, not from a constant.
+                "max_requests": budget(query_classes) if callable(budget) else 4,
                 "timeout_seconds": getattr(config, "timeout_seconds", 10),
                 "transport": httpx.MockTransport(self),
             }

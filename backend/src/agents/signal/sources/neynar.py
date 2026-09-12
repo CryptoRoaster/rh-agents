@@ -35,7 +35,9 @@ from datetime import UTC, datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from src.agents.signal.models import (
+    CollectionCoverage,
     MarketBindingBasis,
+    ObservationCollection,
     ObservationEngagement,
     ObservationKind,
     SignalObservation,
@@ -125,20 +127,25 @@ class NeynarConfig:
     max_pages: int = 2
     page_size: int = 50
 
-    @property
-    def max_requests(self) -> int:
-        """One budget for the whole plan: every page of every query class."""
-        return self.max_pages * 2
+    def max_requests(self, query_classes: int) -> int:
+        """The budget for the plan that will actually run.
+
+        Derived from the query classes this TradeCase produces rather than from a
+        constant. One reachable class is one class's worth of pages; reserving
+        budget for a search nobody makes would overstate the cost of every
+        assessment, and understating it later would be worse.
+        """
+        return max(1, query_classes) * self.max_pages
 
 
-def transport_for(config: NeynarConfig) -> SocialTransport:
+def transport_for(config: NeynarConfig, query_classes: int = 1) -> SocialTransport:
     # The key travels in a header, so it cannot leak through a URL in a log line,
     # a proxy access record or an exception.
     return SocialTransport(
         base_url=config.base_url,
         headers={"x-api-key": config.api_key},
         timeout_seconds=config.timeout_seconds,
-        max_requests=config.max_requests,
+        max_requests=config.max_requests(query_classes),
     )
 
 
@@ -161,7 +168,7 @@ class NeynarSignalSource:
     """Public Farcaster casts, normalized into Phase 2F observations."""
 
     config: NeynarConfig
-    transport_factory: Callable[[NeynarConfig], SocialTransport] = field(default=transport_for)
+    transport_factory: Callable[[NeynarConfig, int], SocialTransport] = field(default=transport_for)
     clock: Clock = field(default_factory=SystemClock)
 
     async def observations(
@@ -171,7 +178,7 @@ class NeynarSignalSource:
         pair_id: str,
         token_address: str | None,
         window: SignalWindow,
-    ) -> tuple[SignalObservation, ...]:
+    ) -> ObservationCollection:
         """Every distinct cast the plan found, normalized and deduplicated.
 
         A provider failure is raised as an explicit unavailability. It is never an
@@ -179,9 +186,15 @@ class NeynarSignalSource:
         find out" are different facts and the second must not be able to pass for
         the first.
         """
-        transport = self.transport_factory(self.config)
+        plan = self.query_plan(token_address, None)
+        if not plan:
+            # Nothing identifies the asset, so there is no search to make. That
+            # is an empty collection, not a provider failure, and no request is
+            # sent to discover it.
+            return ObservationCollection()
+        transport = self.transport_factory(self.config, len(plan))
         try:
-            return await self._collect(transport, window, token_address)
+            return await self._collect(transport, plan, window, token_address)
         except SignalTransportError as error:
             raise SignalSourceUnavailable(error.failure.value) from None
         finally:
@@ -203,22 +216,41 @@ class NeynarSignalSource:
         return tuple(classes)
 
     async def _collect(
-        self, transport: SocialTransport, window: SignalWindow, token_address: str | None
-    ) -> tuple[SignalObservation, ...]:
+        self,
+        transport: SocialTransport,
+        plan: tuple[QueryClass, ...],
+        window: SignalWindow,
+        token_address: str | None,
+    ) -> ObservationCollection:
         found: dict[str, SignalObservation] = {}
-        for query_class in self.query_plan(token_address, None):
-            for cast in await self._search(transport, query_class, window):
+        truncated = False
+        for query_class in plan:
+            casts, exhausted = await self._search(transport, query_class, window)
+            truncated = truncated or not exhausted
+            for cast in casts:
                 observation = self._observation(cast, token_address)
                 # The same cast can match several query classes. It is one post
                 # by one author either way, so the first normalization wins and
                 # nothing about it is counted twice.
                 found.setdefault(observation.source_native_id, observation)
-        return tuple(found.values())
+        return ObservationCollection(
+            observations=tuple(found.values()),
+            coverage=(
+                CollectionCoverage.TRUNCATED_BY_LOCAL_BUDGET
+                if truncated
+                else CollectionCoverage.PROVIDER_RESULTS_EXHAUSTED
+            ),
+        )
 
     async def _search(
         self, transport: SocialTransport, query_class: QueryClass, window: SignalWindow
-    ) -> list[Mapping[str, object]]:
-        """Bounded cursor paging over one query class."""
+    ) -> tuple[list[Mapping[str, object]], bool]:
+        """Bounded cursor paging. Returns the casts and whether the stream ended.
+
+        A stream that ended is everything the provider had for this query. A
+        stream we stopped reading is a deliberate cost decision, and saying so is
+        the difference between a sample and a claim about the window.
+        """
         casts: list[Mapping[str, object]] = []
         cursors: set[str] = set()
         cursor: str | None = None
@@ -243,7 +275,7 @@ class NeynarSignalSource:
             casts.extend(page)
             cursor = _cursor(result.get("next"))
             if cursor is None:
-                break
+                return casts, True
             if not page:
                 # An empty page that still promises more is incoherent.
                 raise SignalTransportError(SignalSourceFailure.PAGINATION_INCONSISTENT)
@@ -251,7 +283,8 @@ class NeynarSignalSource:
                 # A repeating cursor is how a paginator loops forever.
                 raise SignalTransportError(SignalSourceFailure.PAGINATION_INCONSISTENT)
             cursors.add(cursor)
-        return casts
+        # The loop ran out of pages while the provider still offered more.
+        return casts, False
 
     def _observation(
         self, cast: Mapping[str, object], token_address: str | None

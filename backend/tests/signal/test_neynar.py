@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from src.agents.signal.models import (
+    CollectionCoverage,
     MarketBindingBasis,
     ObservationKind,
     SignalSource,
@@ -95,10 +96,10 @@ def source(recording: RecordingRoutes) -> NeynarSignalSource:
 
 async def collect(handler, *, token=TOKEN):
     recording = RecordingRoutes(handler)
-    observations = await source(recording).observations(
+    collected = await source(recording).observations(
         chain=CHAIN, pair_id=f"{CHAIN}:mainnet:pool", token_address=token, window=window()
     )
-    return recording, observations
+    return recording, collected.observations
 
 
 # ------------------------------------------------------ request construction
@@ -364,11 +365,13 @@ async def test_the_page_budget_bounds_one_assessment():
         return json_response(page([cast(served, text=f"gm {TOKEN}")], cursor=f"cursor-{served}"))
 
     recording = RecordingRoutes(always_more)
-    observations = await source(recording).observations(
+    collected = await source(recording).observations(
         chain=CHAIN, pair_id="p", token_address=TOKEN, window=window()
     )
     assert len(recording.requests) == CONFIG.max_pages
-    assert len(observations) == CONFIG.max_pages
+    assert len(collected.observations) == CONFIG.max_pages
+    # And it says so: the provider had more and we stopped reading.
+    assert collected.coverage == CollectionCoverage.TRUNCATED_BY_LOCAL_BUDGET
 
 
 async def test_a_page_larger_than_the_provider_cap_is_refused():

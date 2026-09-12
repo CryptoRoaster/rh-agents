@@ -354,7 +354,13 @@ therefore this post is about our token" is circular. Chain context comes only
 from the post itself — an allowlisted explorer link or an explicit chain name —
 and an exact address without it is recorded as a weak, unscoped reference rather
 than attributed to our chain. Anyone can register a domain that spells a chain's
-name, so links only count through the allowlist.
+name, so links only count through the allowlist, and a name only counts when the
+post actually asserts it: "not on BSC" and "maybe BSC" establish nothing.
+
+What was collected is described as what it is. A result set the provider ran out
+of is typed apart from one our own page budget cut short, and a cut-short sample
+is flagged, capped at degraded quality, and openly biased toward the newest
+posts.
 
 The provider is disabled by default and a key alone selects nothing. There is no
 synthetic fallback: if the provider cannot answer, SIGNAL is unavailable and the

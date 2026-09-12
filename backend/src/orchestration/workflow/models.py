@@ -283,6 +283,8 @@ class SentimentSourceMetrics(Immutable):
     excluded_ambiguous_count: int = Field(ge=0)
     excluded_outside_window_count: int = Field(ge=0)
     source_count: int = Field(ge=0)
+    # Whether the provider ran out of results or a local budget stopped the read.
+    coverage: Code | None = None
     sources: tuple[Code, ...] = Field(default=(), max_length=10)
     window_seconds: int = Field(gt=0)
     # Source-published times, never fetch receipts. Freshness anchors here.

@@ -101,7 +101,8 @@ address path segment naming the address in question:
 | `bscscan.com`, `www.bscscan.com` | `bsc` |
 | `robinhoodchain.blockscout.com` | `robinhood` |
 
-**A tiny closed alias set,** matched on whole words in prose only:
+**A tiny closed alias set,** matched on whole words in prose only — and only
+when the mention is affirmative:
 
 | Alias | Chain |
 | --- | --- |
@@ -118,6 +119,38 @@ because the alias appeared in the hostname. Anyone can register that domain. If 
 link's spelling could grant chain context, the strongest half of an identity
 decision would belong to whoever bought the name. Links now speak only through
 the explorer allowlist, where the host is compared in full.
+
+**A word is not a claim.** `not on BSC`, `this is NOT BNB Chain`, `fake BSC
+contract`, `avoid the BSC version`, `this address is unrelated to BSC`, `maybe
+BSC`, `probably BSC` and `BSC?` all contain the alias, and none of them says the
+address is there. A naive substring match turned every one of them into a strong
+binding on the wrong chain — caught by its own test, and worse than having no
+context at all.
+
+Two conditions now govern a textual alias, and both are necessary:
+
+* **exactly one supported chain may be mentioned at all.** A cast weighing "BSC
+  or Robinhood Chain?" has named two and settled neither, however affirmative one
+  mention looks in isolation;
+* **that chain must be mentioned affirmatively.** A short backward window of four
+  words is checked for negation, uncertainty and contrast markers, and a trailing
+  `?` disqualifies the mention. Where a cast both affirms and denies, the denial
+  wins: a text that argues with itself has established less than one that says
+  nothing.
+
+The window is four words on purpose. It reaches "this address is unrelated to
+BSC" without reaching the "not financial advice" that opens half of all crypto
+posts and has nothing to do with a chain named two sentences later.
+
+This is emphatically **not** a natural-language parser and is not trying to be.
+Anything it is unsure about falls through to no context, and an unscoped address
+is the honest record of that. False negatives cost recall; false strong bindings
+cost identity.
+
+Explorer links are unaffected by negation, and deliberately so. A bscscan link
+containing the address is structural evidence that the address is being discussed
+as a BSC address, whatever the poster thinks of it — "this is NOT the real one,
+see <bscscan link>" still establishes the chain while denying the endorsement.
 
 **Ambiguity resolves to nothing, in every direction.** Two supported chains named
 in one cast, an explorer link contradicting the prose, or no signal at all are the
@@ -187,8 +220,27 @@ recently it was collected, and freshness continues to depend only on the first.
 **Coverage is a result set, not a census.** Neynar documents no exhaustiveness
 guarantee for cast search, so SIGNAL evidence means *"analysis of the observation
 set this bounded query plan collected"* — never *"all Farcaster sentiment"* and
-certainly never "all public opinion". The bounded page budget makes that even more
-true: a busy token's discussion is sampled, not enumerated.
+certainly never "all public opinion".
+
+Within that, two situations look identical in a list of observations and are not,
+so they are typed separately and travel with the collection:
+
+| Coverage | Meaning |
+| --- | --- |
+| `PROVIDER_RESULTS_EXHAUSTED` | The provider offered no further page. This is everything it had for the query |
+| `TRUNCATED_BY_LOCAL_BUDGET` | It offered more and we stopped — a cost decision of ours, not a fact about the world |
+
+A truncated collection raises a `COLLECTION_TRUNCATED` gap and can never be
+better than `DEGRADED`. It stays interpretable, because the newest slice of a
+conversation is real data and refusing to read it would be its own distortion —
+but it is not a clean read of the window it names, and evidence must not suggest
+otherwise.
+
+**Truncation is biased toward the newest casts.** `desc_chron` means the pages we
+read are the most recent matches, so a truncated sample over-represents the end
+of the window. That is defensible for current sentiment and is *not* a uniform
+sample across six hours: breadth and manipulation figures computed from it
+describe the sample, not the interval.
 
 ## Normalization
 
@@ -236,9 +288,15 @@ Binding precedence is resolved from content, not from which search found it.
 | --- | --- |
 | Pages per query class | `SIGNAL_NEYNAR_MAX_PAGES` (default 2) |
 | Casts per page | `SIGNAL_NEYNAR_PAGE_SIZE` (default 50, provider max 100) |
-| HTTP requests per assessment | `max_pages × 2` query classes = 4 by default |
+| HTTP requests per assessment | `max_pages × the query classes that actually run`. With only the address class reachable today that is **2**, not 4 |
 | Response bytes | 2 MB per response |
 | Timeout | `SIGNAL_SOURCE_TIMEOUT_SECONDS` (default 10) |
+
+The budget is derived from the plan the current TradeCase produces, not from a
+constant. Reserving room for a search nobody makes would overstate the cost of
+every assessment, and a hard-coded multiplier would keep doing so after the plan
+changed. A market with no usable base-asset address produces no query class, and
+therefore sends no request at all.
 
 Budget exhaustion is an explicit typed failure, never a quietly "complete"
 result. A provider that always promises another page cannot spend an account
