@@ -27,12 +27,10 @@ the old one, it changes the canonical `risk_input_digest` and revokes any
 authorization pinned to the old one. `tests/vector/test_workflow.py` proves both
 directions, for `RISK_APPROVED` and for `RISK_LIMITED`.
 
-**The market layer exposes only the newest snapshot per stream.** There is no
-history, so there are no candles, no moving averages, no recent high and no
-trend feature. A setup is drawn from one observed price and the document says so.
-Assembling a bar series out of sparse snapshots and calling it OHLC would be a
-fabrication wearing the name of market data; `test_no_price_history_is_offered_because_none_is_recorded`
-keeps that door shut.
+**The market layer exposed only the newest snapshot per stream.** This was true
+when the worker was written and it turned out to be the phase's central defect.
+It is addressed below in *Grounding*, and the market layer now records bounded
+closed-bar history for the same pool.
 
 **Price orientation is USD per one base unit,** via `Measurement.value_usd`. It
 is declared once as `PRICE_BASIS = "USD_PER_BASE_UNIT"`, carried on the setup and
@@ -81,7 +79,8 @@ hold together is refused with a safe reason code and the runtime retries.
 | `BREAKOUT_REQUIRES_A_SINGLE_LEVEL` | a band wearing a breakout's name |
 | `INVALIDATION_NOT_BELOW_ENTRY` | a long idea already wrong where it enters |
 | `TARGET_NOT_ABOVE_ENTRY` | objectives pointing the wrong way |
-| `LEVEL_OUTSIDE_PRICE_ENVELOPE` | a lost decimal point or an invented figure |
+| `LEVEL_OUTSIDE_PRICE_ENVELOPE` | a lost decimal point against the current price |
+| `LEVEL_NOT_GROUNDED_IN_OBSERVED_RANGE` | a level the observed market never went near |
 | `SETUP_LIFETIME_TOO_SHORT` / `SETUP_LIFETIME_TOO_LONG` | an expiry outside the horizon |
 | `UNKNOWN_OBSERVATION_REFERENCE` / `UNKNOWN_EVIDENCE_REFERENCE` | a citation of something never shown |
 | `UNSUPPORTED_SIDE` / `UNSUPPORTED_SETUP_KIND` / `TOO_MANY_TARGETS` | outside the declared policy |
@@ -101,6 +100,175 @@ The policy is **not** a risk engine. There is no exposure limit, no position
 size, no daily loss cap, no cash check and no slippage tolerance here — those are
 SENTINEL's and ANCHOR's, and a second opinion on them would be worse than none.
 
+## Grounding: the defect this phase had, and how it was closed
+
+The first implementation of VECTOR could produce a complete, `AVAILABLE`,
+`ACCEPTED` trade setup from **one number**. Shown an observed price of 1.00 and
+nothing else, the model returned a breakout entry at 1.10, an invalidation at
+0.92 and targets at 1.25 and 1.45. Every deterministic check passed, because
+every deterministic check was structural: the targets were ordered, the
+invalidation sat below the entry, and all four levels were inside the 0.25–4.00
+price envelope.
+
+Nothing in the supplied data said 1.10 was resistance. Nothing said 0.92 was
+support. Nothing said anything about either level, because the input contained no
+information from which a level could be located at all. The validator had
+confirmed the *geometry* of a setup and the evidence record then asserted a
+*supported* one — and everything downstream reads an `AVAILABLE` setup as an
+analytical conclusion.
+
+A price envelope only bounds absurdity. It cannot manufacture evidence.
+
+Two things were added, and they do different jobs:
+
+**A sufficiency gate, before the model.** `VectorMarketDataSufficiency` decides
+deterministically whether enough structure exists to ask for a setup at all. It
+is arithmetic over counts and timestamps, it runs before any reasoning request,
+and the model is never consulted about whether its own input was adequate — a
+model asked that question answers in the direction of having an answer, and the
+case this gate exists for is exactly the one where it would be least reliable.
+
+**A grounding band, after the model.** Every proposed level must sit inside the
+observed range widened by a multiple of itself. It is deliberately weaker than
+"pick a prior high", which would make the validator choose the setup, and
+deliberately stronger than nothing. A breakout above every recorded high stays
+proposable, because that is what a breakout is; a level unrelated to anything the
+market has done does not.
+
+Both bounds apply and neither replaces the other. Against an observed price of
+1.00 in a market that traded between 0.9702 and 1.0302, a level of 1000000 is
+caught by the envelope and a level of 3.50 — comfortably inside that envelope —
+is caught by the band.
+
+## Market history
+
+| Concern | Verified answer |
+| --- | --- |
+| Provider | GeckoTerminal V2 public API, `Accept: application/json;version=20230203` |
+| Endpoint | `GET /networks/{network}/pools/{pool_address}/ohlcv/{timeframe}` |
+| Timeframes | `day` \| `hour` \| `minute` |
+| Aggregates | day: `1`; hour: `1`, `4`, `12`; minute: `1`, `5`, `15` |
+| `limit` | default 100, maximum 1000 |
+| `currency` | `usd` \| `token`, default `usd` |
+| `token` | `base` \| `quote` \| address, default `base` |
+| `include_empty_intervals` | default `false` |
+| Response | `data.attributes.ohlcv_list`: `[timestamp, open, high, low, close, volume]` |
+| `meta.base` / `meta.quote` | the provider states which token it priced |
+| Rate limit | ~10 calls/minute on the public tier |
+| Robinhood (`robinhood`) | **supported** — verified live, 24 closed hourly bars |
+| BSC (`bsc`) | **supported** — verified live, 24 closed hourly bars |
+
+Three facts the adapter depends on are **not** in the provider's documentation
+and were established empirically. Each is asserted by the optional live smoke, so
+a provider change surfaces there first.
+
+**Rows arrive newest-first.** Confirmed on both chains. Normalization sorts
+ascending rather than trusting the order.
+
+**The timestamp is the interval's opening.** An hourly bar stamped 07:00 covers
+07:00–08:00.
+
+**The newest bar is still forming, and nothing marks it.** At 07:35Z the newest
+hourly bar opened at 07:00Z and its close was byte-identical to the pool's live
+`base_token_price_usd` — on Robinhood *and* on BSC. It is the current price
+wearing a candle's shape. It is dropped. Included, it would understate the range
+and invent a high and a low the interval has not finished making. One extra bar
+is requested so discarding it costs no coverage.
+
+### Orientation is a parameter, and getting it wrong is not obvious
+
+On the Robinhood NVDA/USDG pool, one interval returned three different closes:
+
+| Parameters | Close | Meaning |
+| --- | --- | --- |
+| `currency=usd&token=base` | 219.483735394483 | USD per NVDA — correct |
+| `currency=usd&token=quote` | 1.00017330493874 | USD per USDG; `meta.base`/`meta.quote` swap |
+| `currency=token&token=base` | 219.151021699933 | NVDA priced in USDG, not dollars |
+
+The third sits within 0.2% of the correct value, because the quote asset is a
+dollar stablecoin. No magnitude check would catch it. So both parameters are sent
+explicitly even though both are the documented defaults — a default belongs to
+the vendor, a parameter to the caller — and the response's own `meta.base.address`
+is compared against the market's base token. An inverted series is refused
+structurally rather than by inspecting whether the numbers look plausible.
+
+### What is stored, and what is not
+
+`include_empty_intervals` is sent as `false`. An interval in which nobody traded
+is a fact about the market; a synthesized flat bar carrying the previous close
+would be fabricated structure, which is the exact thing this phase exists to
+prevent. Gaps are recovered from the timestamps, counted, and reported.
+
+Coverage is derived from the bars in one place, never declared by a caller:
+`COMPLETE` (the full requested window, contiguous), `PARTIAL` (short or gapped),
+`EMPTY` (no closed bar). A young pool with six hours of trading reports six bars
+and `PARTIAL`; whether that is *enough* is the policy's decision, not the
+provider's.
+
+These are **pool-specific DEX bars**, not exchange-wide market history, and the
+series carries its own pair, chain, venue, provider and price basis so it can
+never be silently read as another market's.
+
+### Sufficiency policy, versioned as `vector-setup-v2`
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| Timeframe | 1-hour bars | one timeframe, chosen against the horizon |
+| Requested | 48 bars | two days, bounded |
+| Required | 24 closed bars | a full day of structure |
+| Max history age | 2 hours | one interval plus the one still forming |
+| Max gap fraction | 0.25 | a window that is mostly holes is an outline |
+| Grounding band | 3× observed range | scales with what this market actually does |
+| Flat-market floor | 10% of price | a quiet market must not refuse its own levels |
+
+The timeframe is **bound to the setup horizon in code**, and the two ways they
+can be mismatched are refused by the policy's own constructor rather than left to
+judgement: a bar may not be longer than the longest permitted setup (thirty daily
+bars cannot support a four-hour idea), and the required window may not be shorter
+than it (five one-minute bars cannot support a four-hour thesis). With 24 hourly
+bars behind a setup that lives at most four hours, the window is six times the
+longest horizon it supports.
+
+No indicator is computed. There is no RSI, MACD, Bollinger band, moving average
+or trend label anywhere in this phase, and no synthetic candle is ever
+constructed. VECTOR is given bars; it is not given a thesis, because a computed
+view would be this system taking a position and then asking a model to agree with
+it, leaving the reasoning attributable to neither.
+
+### Current price and closed bars stay separate
+
+`latest_price` is the snapshot — where the market is now, and what a trigger
+would fire on. The bars are closed structure — where its levels are. The newest
+bar's close never replaces the current price, and both freshness rules apply
+independently: a fresh price does not rescue a stale series, and a fresh series
+does not rescue a stale price.
+
+### If structure cannot be obtained
+
+`vector_history_provider` defaults to `"disabled"`, and the context reader's
+default source refuses rather than returning an empty series — so a deployment
+that forgot to configure a provider produces a refusal, not a setup drawn from
+one price. No model is called, no `TRADE_SETUP_EVIDENCE` is produced, and the
+TradeCase waits under the ordinary workflow rules. That is preferable to
+model-generated pseudo-analysis, which is the whole finding of this audit.
+
+Recoverable shortfalls (`MARKET_HISTORY_EMPTY`, `TOO_SHORT`, `TOO_STALE`,
+`TOO_GAPPED`) are retried as transient: a market may simply not have traded
+enough yet. Wiring faults (`IDENTITY_MISMATCH`, `PRICE_BASIS_MISMATCH`,
+`TIMEFRAME_MISMATCH`, `IN_FUTURE`) are internal, because retrying cannot reach
+them. An unconfigured source is `CAPABILITY_DENIED`, because retrying will not
+configure one.
+
+### No migration, and no candle archive
+
+Bars are read into bounded context and never persisted. Auditability comes from
+the input digest — which now fingerprints every bar shown — plus the window's own
+coordinates recorded on the evidence: provider, timeframe, bar count, window
+start and end, coverage, and the observed range. That answers which market, which
+price, which window, which timeframe, which source, which policy, which prompt
+and which model produced a given setup, without this system accumulating market
+data it has no mandate to store. Alembic head remains `0006`.
+
 ## Nothing is invented when there is nothing to reason from
 
 A setup is a statement about price levels, so the context layer refuses to
@@ -116,6 +284,12 @@ for the request.
 | `PRICE_UNAVAILABLE` | TRANSIENT | no level to reason from — not a zero, not a guess |
 | `MARKET_IDENTITY_MISMATCH` | INTERNAL | a wiring fault retrying cannot fix |
 | `MARKET_OBSERVATION_IN_FUTURE` | INTERNAL | a clock fault, same |
+| `MARKET_HISTORY_EMPTY` / `TOO_SHORT` | TRANSIENT | the market may not have traded enough yet |
+| `MARKET_HISTORY_TOO_STALE` / `TOO_GAPPED` | TRANSIENT | the series may resume |
+| `MARKET_HISTORY_IDENTITY_MISMATCH` | INTERNAL | another pool's structure |
+| `MARKET_HISTORY_PRICE_BASIS_MISMATCH` | INTERNAL | another unit |
+| `MARKET_HISTORY_TIMEFRAME_MISMATCH` | INTERNAL | unbinds the horizon |
+| `MARKET_HISTORY_SOURCE_NOT_CONFIGURED` | CAPABILITY_DENIED | retrying configures nothing |
 
 The five-minute freshness bound is deliberately tighter than ORBIT's discovery
 window. Discovery asks whether a market is worth a look and a fifteen-minute-old
@@ -132,9 +306,10 @@ downstream reads a current setup as a current opinion.
 
 ## Two fingerprints, two questions
 
-`vector_input_digest` identifies **what VECTOR was shown**. An unchanged market
-hashes identically however often it is read, which is why observation *age* — a
-quantity relative to the moment of reading — is excluded from it.
+`vector_input_digest` identifies **what VECTOR was shown**, including every bar
+of the supplied window. Change one bar and the digest changes; refetch the same
+bars an hour later and it does not, because retrieval time — like observation age
+— measures when we looked rather than what the market did, and is excluded.
 
 `setup_fingerprint` identifies **the proposal itself**: geometry, trigger,
 expiry, market and the input digest it was drawn from. Two identical setups are
@@ -205,7 +380,8 @@ turns an attempt to add one into a parse error at the boundary.
 
 ## Test scenarios
 
-`tests/vector/` holds 204 tests across five files, covering the package fully.
+`tests/vector/` and `tests/markets/` hold the suites for this phase, covering
+every new and changed module completely.
 
 | Scenario | Covered by |
 | --- | --- |
@@ -224,6 +400,13 @@ turns an attempt to add one into a parse error at the boundary.
 | P: an expired setup blocks rather than lingers | `test_workflow.py` |
 | Q: an observation for another market produces no setup | `test_workflow.py` |
 | R: one declared price orientation throughout | `test_context.py` |
+| One spot price alone is insufficient | `test_sufficiency.py` |
+| Stale history, stale price, and each failing to rescue the other | `test_sufficiency.py` |
+| Malformed, unordered, duplicated or off-grid bars | `test_ohlcv.py`, `test_history.py` |
+| Inverted or foreign-market series | `test_ohlcv.py`, `test_sufficiency.py` |
+| Partial windows above and below the minimum | `test_sufficiency.py` |
+| Same bars refetched, and one bar changed | `test_sufficiency.py` |
+| Live provider contract on both chains | `test_ohlcv_live_smoke.py` (opt-in) |
 
 One runtime behaviour is worth naming because it is stricter than expected.
 Scenario O resolves as `LEASE_EXPIRED`, not `RESULT_CONFLICT`: the runtime checks
@@ -238,6 +421,9 @@ differently.
   something can, without a model.
 * No sizing, routing, slippage or venue selection anywhere.
 * No risk binding, and no path from a setup to an executable state.
-* No price history, no indicators, no backtest and no strategy parameters.
+* No indicators, no backtest and no strategy parameters. Bars are facts; the
+  thesis is the model's and the bounds are the policy's.
+* No second timeframe. One was chosen against the horizon deliberately.
+* No persisted candle archive and no migration.
 * No Docker, no containers, no wallet, no signer, no broadcast, no live
   execution.

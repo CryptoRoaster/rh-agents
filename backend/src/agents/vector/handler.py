@@ -43,6 +43,7 @@ from src.agents.vector.prompt import (
     VECTOR_PROMPT_HASH,
     VECTOR_PROMPT_VERSION,
 )
+from src.agents.vector.sufficiency import RECOVERABLE
 from src.agents.vector.validation import VectorValidationError, trigger_for, validate_proposal
 from src.core.models import AgentRole
 from src.orchestration.worker.capabilities import VectorCapabilities
@@ -91,6 +92,18 @@ CONTEXT_FAILURES: dict[str, WorkerFailureCategory] = {
     "PRICE_UNAVAILABLE": WorkerFailureCategory.TRANSIENT,
     "MARKET_IDENTITY_MISMATCH": WorkerFailureCategory.INTERNAL,
     "MARKET_OBSERVATION_IN_FUTURE": WorkerFailureCategory.INTERNAL,
+    # A market that has not traded enough yet may trade enough later, so these
+    # are retried. None of them produces a setup in the meantime.
+    **{code.value: WorkerFailureCategory.TRANSIENT for code in RECOVERABLE},
+    # A series for the wrong pool, in the wrong unit or on the wrong timeframe is
+    # a wiring fault. Retrying cannot reach it.
+    "MARKET_HISTORY_IDENTITY_MISMATCH": WorkerFailureCategory.INTERNAL,
+    "MARKET_HISTORY_PRICE_BASIS_MISMATCH": WorkerFailureCategory.INTERNAL,
+    "MARKET_HISTORY_TIMEFRAME_MISMATCH": WorkerFailureCategory.INTERNAL,
+    "MARKET_HISTORY_IN_FUTURE": WorkerFailureCategory.INTERNAL,
+    # No provider is wired at all. Retrying will not configure one, and inventing
+    # structure to proceed without it is the exact failure this phase closed.
+    "MARKET_HISTORY_SOURCE_NOT_CONFIGURED": WorkerFailureCategory.CAPABILITY_DENIED,
 }
 
 
@@ -171,6 +184,7 @@ class VectorWorkerHandler:
         digest: str,
     ) -> EvidenceSubmission:
         """Build the envelope from runtime facts. The model fills only the setup."""
+        structure = task_input.market.structure
         return EvidenceSubmission(
             idempotency_key=f"vector:{task_input.task_id}:{setup.setup_fingerprint}",
             producer_role=AgentRole.VECTOR,
@@ -215,6 +229,16 @@ class VectorWorkerHandler:
                     reason_codes=tuple(code.value for code in setup.reason_codes),
                     summary=setup.summary,
                     input_digest=digest,
+                    history_provider=structure.provider,
+                    # A code in the payload's own vocabulary; the provider's
+                    # lowercase spelling stays in the provider layer.
+                    history_timeframe=structure.timeframe.upper(),
+                    history_bar_count=len(structure.bars),
+                    history_window_start=structure.window_start,
+                    history_window_end=structure.window_end,
+                    history_coverage=structure.coverage,
+                    observed_range_low=structure.range_low,
+                    observed_range_high=structure.range_high,
                     prompt_version=VECTOR_PROMPT_VERSION,
                     prompt_hash=VECTOR_PROMPT_HASH,
                     reasoning_provider=result.model.provider,

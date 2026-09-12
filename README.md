@@ -393,9 +393,29 @@ priceless market observation ends the attempt before the model is ever called.
 There is no fallback setup and the previous one is never reissued as new: a stale
 setup silently renewed would be the most dangerous artefact this system could
 produce, because everything downstream reads a current setup as a current
-opinion. The market layer records only the newest observation, so there are no
-candles and no trend features, and the document says so rather than inventing a
-bar series.
+opinion.
+
+A pre-push audit found the version of this that shipped first could do something
+worse. Given one observed price of 1.00 and nothing else, it produced an entry at
+1.10, an invalidation at 0.92 and targets at 1.25 and 1.45 — and recorded them as
+available, accepted evidence. The levels were ordered correctly and inside the
+sanity envelope, so every check passed. None of them was in the data. A validator
+can prove a setup holds together; it cannot prove anyone had reason to propose
+it.
+
+So VECTOR now reads bounded market history — closed hourly bars for the same pool
+— and two gates stand either side of the model. Before it, a deterministic
+verdict decides whether enough structure exists to ask at all: enough closed
+bars, recent enough measured from when they closed, few enough untraded gaps, and
+the right pool in the right unit. The model is never asked whether its own input
+was good enough. After it, every proposed level must sit inside the range the
+market actually traded, widened enough that a breakout above every recorded high
+is still proposable and a number from nowhere is not.
+
+If that structure cannot be obtained, nothing is produced and the case waits.
+That is the point: no setup is better than an invented one. No indicator is
+computed, no candle is synthesized, and an interval nobody traded in is reported
+as a gap rather than filled with a flat bar.
 
 Because the setup is safety-critical, replacing it withdraws what was built on
 it. The trigger that named the old setup stops matching, the execution
@@ -403,5 +423,13 @@ assessment underneath it stops being current, and an existing risk approval — 
 a limited authorization — is revoked. An expired setup blocks rather than
 lingers, because the evidence expires exactly when it does.
 
-Disabled by default, no migration, no worker started. See [the Phase 2H VECTOR
-design](docs/phase-2h.md).
+History comes from GeckoTerminal's OHLCV endpoint, verified live on both
+supported chains. Its newest bar is always still forming — its close matched the
+pool's live price exactly on both — so that bar is dropped rather than treated as
+settled. Orientation is a request parameter, and getting it wrong is not obvious:
+on one pool the wrong unit landed within 0.2% of the right one, so the request is
+explicit and the response's own account of which token it priced is checked
+against ours.
+
+Bars are read and used, never stored. Disabled by default, no migration, no
+worker started. See [the Phase 2H VECTOR design](docs/phase-2h.md).

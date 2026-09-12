@@ -38,11 +38,14 @@ from src.orchestration.workflow.models import (
     TriggerPayload,
 )
 from tests.vector.conftest import (
+    HISTORY_BARS,
     PAIR_ID,
     StubCases,
+    StubHistory,
     StubMarkets,
     StubTradeCase,
     breakout,
+    history_for,
     market_identity,
     task_input,
 )
@@ -65,10 +68,11 @@ def snapshot_for(now, *, minutes_ago: int = 1, price=Decimal("1.00"), pair_id=PA
 DEFAULT = object()
 
 
-async def read(now, *, snapshot=DEFAULT, evidence=(), market=None):
+async def read(now, *, snapshot=DEFAULT, evidence=(), market=None, history=DEFAULT):
     reader = VectorContextReader(
         cases=StubCases(StubTradeCase(market or market_identity()), evidence),
         markets=StubMarkets(snapshot_for(now) if snapshot is DEFAULT else snapshot),
+        history=StubHistory(history_for(now) if history is DEFAULT else history),
         clock=FixedClock(now),
         include_fixtures=True,
     )
@@ -152,9 +156,9 @@ async def test_the_document_states_the_orientation_to_the_model(now):
 
 
 async def test_the_same_market_fingerprints_identically(now):
-    snapshot = snapshot_for(now)
-    first = await read(now, snapshot=snapshot)
-    later = await read(now + timedelta(minutes=1), snapshot=snapshot)
+    snapshot, history = snapshot_for(now), history_for(now)
+    first = await read(now, snapshot=snapshot, history=history)
+    later = await read(now + timedelta(minutes=1), snapshot=snapshot, history=history)
     assert vector_input_digest(first) == vector_input_digest(later)
 
 
@@ -166,10 +170,11 @@ async def test_a_changed_price_changes_the_fingerprint(now):
 
 async def test_the_digest_ignores_when_we_read(now):
     """Observation age is relative to the read and is deliberately excluded."""
-    snapshot = snapshot_for(now, minutes_ago=1)
-    first = await read(now, snapshot=snapshot)
-    later = await read(now + timedelta(minutes=2), snapshot=snapshot)
+    snapshot, history = snapshot_for(now, minutes_ago=1), history_for(now)
+    first = await read(now, snapshot=snapshot, history=history)
+    later = await read(now + timedelta(minutes=2), snapshot=snapshot, history=history)
     assert first.market.age_seconds != later.market.age_seconds
+    assert first.market.structure.age_seconds != later.market.structure.age_seconds
     assert vector_input_digest(first) == vector_input_digest(later)
 
 
@@ -250,16 +255,51 @@ async def test_an_unknown_measurement_reaches_the_model_as_unknown(now):
     assert entry["value_usd"] is None
 
 
-async def test_no_price_history_is_offered_because_none_is_recorded(now):
-    """The market layer exposes only the newest observation per stream.
+async def test_the_document_carries_the_bars_the_levels_must_answer_to(now):
+    """The correction to this phase's original defect, stated as a document.
 
-    Assembling a candle series from sparse snapshots and calling it OHLC would be
-    a fabrication wearing the name of market data, so the context offers one
-    observation and says so.
+    Before market history this document held one price and the model returned
+    four numbers. Now the structure a level must answer to is in front of it, and
+    the input digest fingerprints exactly those bars.
+    """
+    structure = setup_document(await read(now))["market_structure"]
+    assert isinstance(structure, dict)
+    assert len(structure["bars"]) == HISTORY_BARS
+    assert structure["price_basis"] == "USD_PER_BASE_UNIT"
+    assert structure["timeframe"] == "hour"
+    assert structure["interval_seconds"] == 3600
+    first = structure["bars"][0]
+    assert set(first) == {"opened_at", "open", "high", "low", "close", "volume"}
+    # Canonical decimal text, never a float and never through one.
+    assert all(isinstance(first[key], str) for key in ("open", "high", "low", "close"))
+
+
+async def test_no_indicator_or_derived_signal_is_computed_for_the_model(now):
+    """Facts, not conclusions. VECTOR is given bars; it is not given a thesis.
+
+    A computed trend or oscillator would be this system taking a view and then
+    asking a model to agree with it, and afterwards the reasoning would be
+    attributable to neither.
     """
     document = setup_document(await read(now))
-    for absent in ("history", "candles", "ohlc", "bars", "recent_high", "recent_low"):
-        assert absent not in document
+    structure = document["market_structure"]
+    assert isinstance(structure, dict)
+    # Field names, not a rendered blob: "rsi" is a substring of "version", and a
+    # substring search would have quietly passed for the wrong reason.
+    names = set(document) | set(structure) | set(structure["bars"][0])
+    for absent in ("rsi", "macd", "bollinger", "sma", "ema", "momentum", "moving_average"):
+        assert absent not in names
+
+
+async def test_the_current_price_and_the_newest_close_stay_separate_facts(now):
+    """A careless assembler would collapse these into one number."""
+    context = await read(now)
+    newest_close = context.market.structure.bars[-1].close
+    assert context.latest_price == Decimal("1.00")
+    assert newest_close != context.latest_price
+    # The snapshot keeps its own observation time; the series keeps the moment
+    # its last bar closed. Neither is derived from the other.
+    assert context.market.observed_at != context.market.structure.window_end
 
 
 def test_the_task_input_has_no_field_through_which_a_capability_could_arrive():

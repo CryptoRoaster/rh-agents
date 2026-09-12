@@ -77,7 +77,7 @@ def test_the_read_port_a_worker_receives_has_exactly_one_method():
 def test_the_context_reader_holds_no_transport_and_no_writer():
     """It reads recorded market data and recorded evidence. It writes nothing."""
     names = {item.name for item in fields(VectorContextReader)}
-    assert names == {"cases", "markets", "policy", "clock", "include_fixtures"}
+    assert names == {"cases", "markets", "history", "policy", "clock", "include_fixtures"}
     for forbidden in ("session", "client", "http", "url", "credential", "key", "token"):
         assert not any(forbidden in name for name in names)
 
@@ -217,7 +217,7 @@ def test_the_prompt_states_the_boundary_the_schema_already_enforces():
 def test_the_prompt_is_versioned_and_hashed():
     from hashlib import sha256
 
-    assert VECTOR_PROMPT_VERSION == "vector-v1"
+    assert VECTOR_PROMPT_VERSION == "vector-v2"
     assert VECTOR_PROMPT_HASH == sha256(VECTOR_INSTRUCTIONS.encode()).hexdigest()
 
 
@@ -265,3 +265,114 @@ def test_the_vector_phase_did_not_loosen_any_earlier_boundary():
     for role in (AgentRole.ORBIT, AgentRole.ATLAS, AgentRole.SIGNAL):
         surface = {item.name for item in fields(CAPABILITY_TYPES[role])}
         assert surface == {"lease", "context", "submit"}
+
+
+# ------------------------------------------- the market-history boundary
+
+
+def test_the_worker_never_receives_a_history_source():
+    """Market history is infrastructure. The worker sees one finished view.
+
+    The reader holds the source; the capability the worker is handed does not,
+    and there is no attribute on it through which one could be reached.
+    """
+    assert "history" not in {item.name for item in fields(VectorCapabilities)}
+    surface = {name for name in dir(VectorCapabilities) if not name.startswith("_")}
+    for forbidden in ("history", "markets", "provider", "transport", "ohlcv", "geckoterminal"):
+        assert forbidden not in surface
+
+
+def test_the_vector_package_cannot_reach_the_provider_adapter():
+    """VECTOR names the port, never the GeckoTerminal implementation of it."""
+    from pathlib import Path
+
+    sources = "\n".join(path.read_text() for path in sorted(Path("src/agents/vector").glob("*.py")))
+    for forbidden in ("geckoterminal", "httpx", "GeckoTerminalTransport", "ohlcv"):
+        assert forbidden not in sources, f"VECTOR reaches {forbidden}"
+    # It depends on the market layer's contracts and nothing that performs I/O.
+    assert "from src.markets.history import" in sources
+
+
+def test_the_history_port_a_reader_holds_has_exactly_one_method():
+    from src.markets.history import MarketHistorySource
+
+    methods = {
+        name
+        for name in dir(MarketHistorySource)
+        if not name.startswith("_") and callable(getattr(MarketHistorySource, name, None))
+    }
+    assert methods == {"history"}
+
+
+def test_a_series_carries_no_credential_url_or_raw_provider_payload(now):
+    from tests.vector.conftest import history_for
+
+    rendered = history_for(now, bars=24).model_dump_json()
+    for forbidden in ("http://", "https://", "api_key", "Authorization", "x-cg", "raw"):
+        assert forbidden not in rendered
+
+
+def test_no_market_history_provider_is_selected_by_default():
+    configured = settings()
+    assert configured.vector_history_provider == "disabled"
+    assert configured.vector_worker_enabled is False
+    # No synthetic candle feed is reachable from a production configuration.
+    assert "fake" not in repr(Settings.model_fields["vector_history_provider"]).lower()
+
+
+def test_selecting_the_history_provider_requires_the_matching_market_provider():
+    """Structure from one world and prices from another would be incoherent."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        settings(vector_history_provider="geckoterminal", market_provider="fixture")
+    configured = settings(vector_history_provider="geckoterminal", market_provider="geckoterminal")
+    assert configured.vector_history_provider == "geckoterminal"
+
+
+def test_nothing_wires_a_market_history_source_at_startup():
+    for symbol in ("GeckoTerminalOhlcvSource", "vector_history_provider"):
+        assert tracked(symbol, "backend/src/api/", "backend/src/runtime/") == "", (
+            f"{symbol} is reachable from a startup path"
+        )
+
+
+def test_no_candle_archive_is_persisted():
+    """Bars are read into bounded context; they never become a table.
+
+    Auditability comes from the input digest plus the window's own coordinates,
+    which is enough to answer what a setup was drawn from without accumulating
+    market data this system has no mandate to store.
+    """
+    from pathlib import Path
+
+    tables = Path("src/data/tables.py").read_text().lower()
+    for forbidden in ("marketbar", "ohlcv", "candle", "market_history"):
+        assert forbidden not in tables
+    migrations = sorted(Path("../backend/migrations/versions").glob("*.py"))
+    assert migrations and all("ohlcv" not in path.read_text().lower() for path in migrations)
+
+
+def test_an_accepted_setup_can_be_audited_back_to_its_inputs():
+    """Which market, which window, which timeframe, which source, which digest."""
+    from src.orchestration.workflow.models import TradeSetupDetail
+
+    present = set(TradeSetupDetail.model_fields)
+    for required in (
+        "input_digest",
+        "policy_version",
+        "prompt_version",
+        "prompt_hash",
+        "reasoning_provider",
+        "reasoning_model",
+        "reference_price",
+        "history_provider",
+        "history_timeframe",
+        "history_bar_count",
+        "history_window_start",
+        "history_window_end",
+        "history_coverage",
+        "observed_range_low",
+        "observed_range_high",
+    ):
+        assert required in present

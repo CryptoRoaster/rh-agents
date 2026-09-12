@@ -100,7 +100,7 @@ async def test_scenario_a_a_coherent_setup_becomes_evidence(now):
     # The legacy single entry is the highest price at which the setup is entered.
     assert payload.entry_price == Decimal("1.10")
     assert payload.invalidation_price == Decimal("0.92")
-    assert payload.target_prices == (Decimal("1.25"), Decimal("1.45"))
+    assert payload.target_prices == (Decimal("1.15"), Decimal("1.20"))
 
     detail = payload.setup
     assert detail is not None
@@ -153,6 +153,9 @@ async def test_a_setup_carries_no_execution_authority(now):
     [
         ({"invalidation_price": Decimal("1.20")}, "INVALIDATION_NOT_BELOW_ENTRY"),
         ({"targets": (Decimal("1.05"),)}, "TARGET_NOT_ABOVE_ENTRY"),
+        # Ordered, coherent, inside the price envelope — and about a market the
+        # supplied bars never described.
+        ({"targets": (Decimal("3.50"),)}, "LEVEL_NOT_GROUNDED_IN_OBSERVED_RANGE"),
         (
             {
                 "entry_low": Decimal("1000000"),
@@ -312,7 +315,7 @@ async def test_a_different_setup_is_a_different_result_key(now):
     moved = await run(
         now,
         DeterministicReasoningProvider.returning(
-            reply(now, entry_low=Decimal("1.15"), entry_high=Decimal("1.15"))
+            reply(now, entry_low=Decimal("1.12"), entry_high=Decimal("1.12"))
         ),
         context=context,
     )
@@ -345,3 +348,42 @@ async def test_a_context_port_returning_the_wrong_shape_is_caught_at_the_boundar
     assert outcome.category == WorkerFailureCategory.INTERNAL
     assert outcome.reason_code == "CONTEXT_SCHEMA_MISMATCH"
     assert provider.calls == []
+
+
+async def test_the_evidence_records_which_structure_the_setup_was_drawn_from(now):
+    """Auditability without a candle archive.
+
+    Bounded coordinates plus the input digest answer, later, exactly which
+    window produced a setup — without this system accumulating market data it
+    has no mandate to store.
+    """
+    context, outcome = await run(now, DeterministicReasoningProvider.returning(reply(now)))
+    assert isinstance(outcome, EvidenceTaskResult)
+    detail = outcome.submission.payload.setup
+    assert detail is not None
+    structure = context.market.structure
+    assert detail.history_provider == structure.provider
+    assert detail.history_timeframe == "HOUR"
+    assert detail.history_bar_count == len(structure.bars)
+    assert detail.history_window_start == structure.window_start
+    assert detail.history_window_end == structure.window_end
+    assert detail.history_coverage == structure.coverage
+    assert (detail.observed_range_low, detail.observed_range_high) == (
+        structure.range_low,
+        structure.range_high,
+    )
+    # The reference price stays the snapshot's, never the newest bar's close.
+    assert detail.reference_price == context.latest_price
+    assert detail.reference_price != structure.bars[-1].close
+
+
+async def test_a_setup_drawn_from_a_different_window_is_a_different_setup(now):
+    """The input digest covers the bars, so the fingerprint moves when they do."""
+    from tests.vector.conftest import history_for, task_input
+
+    first = task_input(now, history=history_for(now, bars=30))
+    other = task_input(now, history=history_for(now, bars=29))
+    a = await run(now, DeterministicReasoningProvider.returning(reply(now)), context=first)
+    b = await run(now, DeterministicReasoningProvider.returning(reply(now)), context=other)
+    assert isinstance(a[1], EvidenceTaskResult) and isinstance(b[1], EvidenceTaskResult)
+    assert a[1].result_key != b[1].result_key

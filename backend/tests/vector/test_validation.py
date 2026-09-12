@@ -169,37 +169,88 @@ def test_a_lost_decimal_point_downward_is_refused(now):
         )
 
 
-def test_an_aggressive_but_sane_setup_is_not_refused(now):
-    """The envelope is a typo filter, not a view on what price is reasonable."""
-    validate_proposal(
-        breakout(
-            now,
-            entry_low=Decimal("1.10"),
-            entry_high=Decimal("1.10"),
-            invalidation_price=Decimal("0.80"),
-            targets=(Decimal("2.00"), Decimal("3.50")),
-        ),
-        task_input(now),
-    )
+def test_the_envelope_alone_permits_a_level_the_market_never_went_near(now):
+    """Why the envelope was never sufficient on its own.
+
+    A quarter to four times the observed price is a typo filter. It has no
+    opinion about whether the market has ever traded anywhere near a level, which
+    is exactly the gap a single price snapshot left open.
+    """
+    low, high = VECTOR_SETUP_V1.envelope(SPOT)
+    assert low == Decimal("0.25")
+    assert high == Decimal("4")
+    assert low <= Decimal("0.80") <= high
+    assert low <= Decimal("3.50") <= high
 
 
 def test_the_envelope_is_computed_from_the_observed_price(now):
     low, high = VECTOR_SETUP_V1.envelope(SPOT)
-    assert low == Decimal("0.25")
-    assert high == Decimal("4")
+    assert (low, high) == (Decimal("0.25"), Decimal("4"))
 
 
-def test_a_level_exactly_on_the_envelope_edge_is_allowed(now):
-    validate_proposal(
-        breakout(
-            now,
-            entry_low=Decimal("1.10"),
-            entry_high=Decimal("1.10"),
-            invalidation_price=Decimal("0.25"),
-            targets=(Decimal("4"),),
-        ),
-        task_input(now),
-    )
+# ------------------------------------------------ grounding in observed structure
+
+
+def test_a_level_the_observed_market_never_approached_is_refused(now):
+    """Scenario O restated for the real defect: geometry alone is not support.
+
+    These levels are ordered correctly, inside the price envelope and internally
+    coherent. They are refused because the supplied bars ran between 0.9702 and
+    1.0302 and say nothing whatever about 2.00 or 3.50.
+    """
+    with pytest.raises(VectorValidationError) as error:
+        validate_proposal(
+            breakout(
+                now,
+                entry_low=Decimal("1.10"),
+                entry_high=Decimal("1.10"),
+                invalidation_price=Decimal("0.80"),
+                targets=(Decimal("2.00"), Decimal("3.50")),
+            ),
+            task_input(now),
+        )
+    assert error.value.reason_code == "LEVEL_NOT_GROUNDED_IN_OBSERVED_RANGE"
+
+
+def test_a_breakout_above_every_recorded_high_is_still_proposable(now):
+    """The band must not refuse the thing a breakout *is*."""
+    structure = task_input(now).market.structure
+    assert Decimal("1.10") > structure.range_high
+    validate_proposal(breakout(now), task_input(now))
+
+
+def test_an_invalidation_below_every_recorded_low_is_still_proposable(now):
+    structure = task_input(now).market.structure
+    assert Decimal("0.92") < structure.range_low
+    validate_proposal(breakout(now), task_input(now))
+
+
+def test_the_band_widens_with_what_the_market_actually_did(now):
+    """A volatile market earns a wider band; a quiet one does not."""
+    from src.agents.vector.sufficiency import grounding_band
+
+    quiet = grounding_band(Decimal("0.99"), Decimal("1.01"), SPOT, VECTOR_SETUP_V1)
+    wild = grounding_band(Decimal("0.50"), Decimal("2.00"), SPOT, VECTOR_SETUP_V1)
+    assert wild[1] - wild[0] > quiet[1] - quiet[0]
+
+
+def test_a_flat_market_does_not_collapse_the_band_onto_a_point(now):
+    """Otherwise a market that barely moved would refuse every level it had."""
+    from src.agents.vector.sufficiency import grounding_band
+
+    low, high = grounding_band(SPOT, SPOT, SPOT, VECTOR_SETUP_V1)
+    assert low < SPOT < high
+    assert high - low == SPOT * VECTOR_SETUP_V1.flat_market_floor * 2
+
+
+def test_both_bounds_apply_and_neither_replaces_the_other(now):
+    """The envelope catches a decimal point; the band catches an invention."""
+    context = task_input(now)
+    absurd = Decimal("1000000")
+    ungrounded = Decimal("3.50")
+    envelope_low, envelope_high = VECTOR_SETUP_V1.envelope(context.latest_price)
+    assert absurd > envelope_high
+    assert envelope_low <= ungrounded <= envelope_high
 
 
 # ----------------------------------------------------------------- expiry
@@ -266,7 +317,7 @@ def test_the_policy_supports_exactly_the_two_long_shapes():
 
 
 def test_the_policy_is_versioned():
-    assert VECTOR_SETUP_V1.version == "vector-setup-v1"
+    assert VECTOR_SETUP_V1.version == "vector-setup-v2"
 
 
 @pytest.mark.parametrize(
@@ -281,6 +332,15 @@ def test_the_policy_is_versioned():
         ("max_level_multiple", Decimal("0.5")),
         ("min_level_fraction", Decimal("2")),
         ("max_input_age", timedelta(0)),
+        ("min_closed_bars", 0),
+        ("history_bars", 1),
+        ("max_history_age", timedelta(minutes=30)),
+        ("max_missing_fraction", Decimal(1)),
+        ("flat_market_floor", Decimal(0)),
+        ("history_timeframe", "week"),
+        ("history_aggregate", 7),
+        # Thirty daily bars cannot support a four-hour setup: the bar outlives it.
+        ("history_timeframe", "day"),
     ],
 )
 def test_an_incoherent_policy_refuses_to_exist(field, value):
@@ -477,4 +537,4 @@ def test_a_policy_that_allows_fewer_targets_refuses_the_extra_ones(now):
     with pytest.raises(VectorValidationError) as error:
         validate_proposal(breakout(now), task_input(now), policy)
     assert error.value.reason_code == "TOO_MANY_TARGETS"
-    validate_proposal(breakout(now, targets=(Decimal("1.25"),)), task_input(now), policy)
+    validate_proposal(breakout(now, targets=(Decimal("1.20"),)), task_input(now), policy)

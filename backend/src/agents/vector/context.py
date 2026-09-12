@@ -22,18 +22,28 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from src.agents.vector.models import (
     PRICE_BASIS,
     EvidenceSummary,
+    ObservedBar,
     ObservedMeasurement,
     TriggerCondition,
     VectorMarketContext,
+    VectorMarketStructure,
     VectorSetup,
     VectorSetupProposal,
     VectorTaskInput,
 )
 from src.agents.vector.policy import VECTOR_SETUP_V1, VectorSetupPolicy
 from src.agents.vector.ports import VectorContextUnavailable
+from src.agents.vector.sufficiency import VectorMarketDataSufficiency, assess
 from src.core.clock import Clock, SystemClock
 from src.core.numbers import canonical_decimal
-from src.markets.models import Availability, MarketSnapshot, Measurement
+from src.markets.history import (
+    MarketHistory,
+    MarketHistorySource,
+    MarketHistoryUnavailable,
+    UnconfiguredHistorySource,
+    interval_seconds,
+)
+from src.markets.models import Availability, MarketIdentity, MarketSnapshot, Measurement
 from src.orchestration.workflow.engine import active_evidence, unusable_reason
 from src.orchestration.workflow.models import EvidenceEnvelope, EvidenceType, TradeCase
 
@@ -64,6 +74,39 @@ def measurement_view(measurement: Measurement) -> ObservedMeasurement:
         status=measurement.status,
         value_usd=measurement.value_usd,
         observed_at=measurement.observed_at,
+    )
+
+
+def structure_view(history: MarketHistory, now: datetime) -> VectorMarketStructure:
+    """Flatten a recorded series into the bounded view the model is shown.
+
+    A copy rather than a reference, because the input digest has to fingerprint
+    precisely the numbers that were shown. Retrieval time is not copied: it says
+    when we looked, and including it would make one unchanged window hash
+    differently on every pass.
+    """
+    assert history.bars and history.observed_at is not None and history.window_start is not None
+    return VectorMarketStructure(
+        provider=history.provider,
+        timeframe=history.timeframe,
+        interval_seconds=interval_seconds(history.timeframe, history.aggregate),
+        bars=tuple(
+            ObservedBar(
+                opened_at=bar.opened_at,
+                open=bar.open,
+                high=bar.high,
+                low=bar.low,
+                close=bar.close,
+                volume=bar.volume,
+            )
+            for bar in history.bars
+        ),
+        coverage=history.coverage.value,
+        requested_bars=history.requested_bars,
+        missing_intervals=history.missing_intervals,
+        window_start=history.window_start,
+        window_end=history.observed_at,
+        age_seconds=max(0, int((now - history.observed_at).total_seconds())),
     )
 
 
@@ -129,6 +172,10 @@ class VectorContextReader:
 
     cases: TradeCaseIdentitySource
     markets: VectorMarketInput
+    # Recorded market structure. Defaults to the source that says no provider is
+    # wired, so a deployment that forgot to configure one produces a refusal
+    # rather than a setup drawn from a single price.
+    history: MarketHistorySource = UnconfiguredHistorySource()
     policy: VectorSetupPolicy = VECTOR_SETUP_V1
     clock: Clock = SystemClock()
     include_fixtures: bool = False
@@ -154,6 +201,7 @@ class VectorContextReader:
             # There is no level to reason from. Not a zero, not a guess.
             raise VectorContextUnavailable("PRICE_UNAVAILABLE")
 
+        structure = await self._structure(trade_case.market, now)
         market = VectorMarketContext(
             snapshot_id=snapshot.id,
             pair_id=snapshot.pair.pair_id,
@@ -171,6 +219,7 @@ class VectorContextReader:
             liquidity=measurement_view(snapshot.liquidity),
             volume=measurement_view(snapshot.volume),
             volume_window_seconds=snapshot.volume.window_seconds,
+            structure=structure,
         )
         current = active_evidence(await self.cases.evidence(trade_case_id))
         existing = current.get(EvidenceType.TRADE_SETUP)
@@ -183,6 +232,30 @@ class VectorContextReader:
             evaluated_at=now,
             supersedes_evidence_id=existing.evidence_id if existing is not None else None,
         )
+
+    async def _structure(self, identity: MarketIdentity, now: datetime) -> VectorMarketStructure:
+        """Obtain recorded structure, or refuse before anything is asked of a model.
+
+        Exactly one provider read per context acquisition. The Phase 2B runtime
+        owns retries, so a failure here ends the attempt and is retried as a task
+        rather than re-fetched in a loop that would multiply provider requests.
+        """
+        try:
+            history = await self.history.history(
+                identity,
+                timeframe=self.policy.history_timeframe,
+                aggregate=self.policy.history_aggregate,
+                bars=self.policy.history_bars,
+            )
+        except MarketHistoryUnavailable as error:
+            raise VectorContextUnavailable(error.reason_code) from None
+        verdict = assess(history, identity, now, self.policy)
+        if verdict != VectorMarketDataSufficiency.SUFFICIENT:
+            # No model call. A market whose structure cannot be established is one
+            # this system has nothing to say about, and saying nothing is the
+            # correct output rather than a gap to be filled in.
+            raise VectorContextUnavailable(verdict.value)
+        return structure_view(history, now)
 
 
 def _measurement_document(measurement: ObservedMeasurement) -> dict[str, object]:
@@ -222,6 +295,33 @@ def setup_document(task_input: VectorTaskInput) -> dict[str, object]:
         "liquidity": _measurement_document(market.liquidity),
         "volume": _measurement_document(market.volume),
         "volume_window_seconds": market.volume_window_seconds,
+        # The closed bars themselves, so the digest fingerprints the structure
+        # that was shown rather than a summary of it. Bar age is excluded for the
+        # same reason snapshot age is.
+        "market_structure": {
+            "provider": market.structure.provider,
+            "timeframe": market.structure.timeframe,
+            "interval_seconds": market.structure.interval_seconds,
+            "price_basis": market.structure.price_basis,
+            "coverage": market.structure.coverage,
+            "requested_bars": market.structure.requested_bars,
+            "missing_intervals": market.structure.missing_intervals,
+            "window_start": market.structure.window_start.isoformat(),
+            "window_end": market.structure.window_end.isoformat(),
+            "observed_range_low": canonical_decimal(market.structure.range_low),
+            "observed_range_high": canonical_decimal(market.structure.range_high),
+            "bars": [
+                {
+                    "opened_at": bar.opened_at.isoformat(),
+                    "open": canonical_decimal(bar.open),
+                    "high": canonical_decimal(bar.high),
+                    "low": canonical_decimal(bar.low),
+                    "close": canonical_decimal(bar.close),
+                    "volume": canonical_decimal(bar.volume),
+                }
+                for bar in market.structure.bars
+            ],
+        },
         "evidence": [
             {
                 "evidence_id": str(item.evidence_id),
@@ -340,6 +440,7 @@ def reasoning_payload(task_input: VectorTaskInput) -> dict[str, object]:
     """The quoted data document handed to the provider, with no instructions in it."""
     document = setup_document(task_input)
     document["age_seconds"] = task_input.market.age_seconds
+    document["market_structure_age_seconds"] = task_input.market.structure.age_seconds
     document["evaluated_at"] = task_input.evaluated_at.isoformat()
     document["setup_horizon"] = {
         "minimum_seconds": int(VECTOR_SETUP_V1.min_setup_lifetime.total_seconds()),

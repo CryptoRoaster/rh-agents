@@ -389,6 +389,18 @@ class TradeSetupDetail(Immutable):
     reason_codes: tuple[Code, ...] = Field(default=(), max_length=8)
     summary: SafeSummary
     input_digest: Digest
+    # Which market structure the proposal was drawn from. Bounded facts and a
+    # digest rather than a copy of the bars: enough to answer afterwards which
+    # window, which timeframe and which provider produced a setup, without
+    # turning the evidence table into a candle archive.
+    history_provider: Identifier | None = None
+    history_timeframe: Code | None = None
+    history_bar_count: int | None = Field(default=None, ge=0)
+    history_window_start: AwareDatetime | None = None
+    history_window_end: AwareDatetime | None = None
+    history_coverage: Code | None = None
+    observed_range_low: Positive | None = None
+    observed_range_high: Positive | None = None
     prompt_version: Identifier | None = None
     prompt_hash: Digest | None = None
     reasoning_provider: Identifier | None = None

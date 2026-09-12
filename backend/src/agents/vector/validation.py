@@ -29,6 +29,7 @@ from src.agents.vector.models import (
     VectorTaskInput,
 )
 from src.agents.vector.policy import REQUIRED_TRIGGER, VECTOR_SETUP_V1, VectorSetupPolicy
+from src.agents.vector.sufficiency import grounding_band
 
 
 class VectorValidationError(Exception):
@@ -107,6 +108,41 @@ def _check_envelope(
         raise VectorValidationError("LEVEL_OUTSIDE_PRICE_ENVELOPE")
 
 
+def _check_grounding(
+    proposal: VectorSetupProposal, task_input: VectorTaskInput, policy: VectorSetupPolicy
+) -> None:
+    """Whether the levels bear any relation to the structure that was supplied.
+
+    This is the check the phase originally lacked, and the reason the market
+    series exists. The envelope above only asks whether a number is the right
+    order of magnitude for the current price; a model shown a single price of
+    1.00 could satisfy it with any level between 0.25 and 4.00, which is to say
+    with an invented one.
+
+    What is asked here is weaker than "pick a prior high" and stronger than
+    nothing: every level must sit inside the observed range widened by a multiple
+    of itself. A breakout above every recorded high stays proposable, because
+    that is what a breakout is. A level unrelated to anything the market has
+    actually done does not.
+
+    The validator still chooses nothing. It cannot make a setup better, move a
+    level, or prefer one proposal to another — it can only refuse one that the
+    supplied evidence does not reach.
+    """
+    structure = task_input.market.structure
+    low, high = grounding_band(
+        structure.range_low, structure.range_high, task_input.latest_price, policy
+    )
+    levels = (
+        proposal.entry_low,
+        proposal.entry_high,
+        proposal.invalidation_price,
+        *proposal.targets,
+    )
+    if any(level < low or level > high for level in levels):
+        raise VectorValidationError("LEVEL_NOT_GROUNDED_IN_OBSERVED_RANGE")
+
+
 def _check_lifetime(
     proposal: VectorSetupProposal, now: datetime, policy: VectorSetupPolicy
 ) -> None:
@@ -141,4 +177,8 @@ def validate_proposal(
 
     _check_geometry(proposal)
     _check_envelope(proposal, task_input.latest_price, policy)
+    # Both bounds apply and neither replaces the other: the envelope catches a
+    # lost decimal point against the current price, the grounding band catches a
+    # level the observed market never went near.
+    _check_grounding(proposal, task_input, policy)
     _check_lifetime(proposal, task_input.evaluated_at, policy)

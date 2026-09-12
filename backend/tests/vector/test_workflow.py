@@ -40,7 +40,7 @@ from src.orchestration.workflow.models import (
 from src.orchestration.workflow.policy import TRADE_CASE_V1
 from src.orchestration.workflow.service import TradeCaseService
 from src.reasoning.fake import DeterministicReasoningProvider
-from tests.vector.conftest import StubMarkets, market_identity
+from tests.vector.conftest import StubHistory, StubMarkets, history_for, market_identity
 from tests.vector.test_context import snapshot_for
 from tests.vector.test_scenarios import Fixed, NoSubmit, lease_for, reply
 from tests.worker.conftest import (
@@ -67,17 +67,25 @@ def proposal(instant, **overrides):
     return reply(instant, **overrides)
 
 
-def build_stack(sessions, instant, *, snapshot=None):
+def build_stack(sessions, instant, *, snapshot=None, history=None):
     clock = FixedClock(instant)
     cases = TradeCaseService(sessions, clock=clock)
     runtime = WorkerRuntimeService(sessions, cases, clock=clock)
     reader = VectorContextReader(
         cases=cases,
         markets=StubMarkets(snapshot_for(instant) if snapshot is None else snapshot),
+        # Bars end on the hour, so a stack built mid-hour still reads a series
+        # whose newest bar closed at the top of the current one.
+        history=StubHistory(history if history is not None else history_for(aligned(instant))),
         clock=clock,
         include_fixtures=True,
     )
     return runtime, reader
+
+
+def aligned(instant):
+    """The most recent exact hour, which is where a closed hourly bar ends."""
+    return instant.replace(minute=0, second=0, microsecond=0)
 
 
 async def open_case(cases, now, trace, key):
@@ -286,8 +294,8 @@ async def test_scenario_k_a_new_setup_invalidates_the_trigger_watching_the_old_o
         trade_case.id,
         later,
         trace,
-        entry_low=Decimal("1.20"),
-        entry_high=Decimal("1.20"),
+        entry_low=Decimal("1.12"),
+        entry_high=Decimal("1.12"),
     )
     assert refreshed.supersedes_evidence_id == first.evidence_id
 
@@ -295,7 +303,7 @@ async def test_scenario_k_a_new_setup_invalidates_the_trigger_watching_the_old_o
     assert len(envelopes) == 2
     second = next(item for item in envelopes if item.supersedes_id is not None)
     assert second.supersedes_id == first.evidence_id
-    assert second.payload.entry_price == Decimal("1.20")
+    assert second.payload.entry_price == Decimal("1.12")
 
     # The case backtracks: the trigger is no longer about the current setup, and
     # the execution assessment underneath it is not current either.
@@ -323,11 +331,11 @@ async def test_only_one_setup_is_ever_active(worker_db, now, trace):
         trade_case.id,
         later,
         trace,
-        entry_low=Decimal("1.20"),
-        entry_high=Decimal("1.20"),
+        entry_low=Decimal("1.12"),
+        entry_high=Decimal("1.12"),
     )
     current = active_evidence(await later_runtime.cases.evidence(trade_case.id))
-    assert current[EvidenceType.TRADE_SETUP].payload.entry_price == Decimal("1.20")
+    assert current[EvidenceType.TRADE_SETUP].payload.entry_price == Decimal("1.12")
 
 
 # ------------------------------------------------- L: risk invalidation
@@ -370,8 +378,8 @@ async def test_scenario_l_a_new_setup_revokes_an_approval(worker_db, now, trace)
         trade_case.id,
         later,
         trace,
-        entry_low=Decimal("1.20"),
-        entry_high=Decimal("1.20"),
+        entry_low=Decimal("1.12"),
+        entry_high=Decimal("1.12"),
     )
 
     revoked = await later_runtime.cases.get_trade_case(trade_case.id)
@@ -413,8 +421,8 @@ async def test_scenario_l_a_new_setup_also_revokes_a_limited_authorization(worke
         trade_case.id,
         later,
         trace,
-        entry_low=Decimal("1.20"),
-        entry_high=Decimal("1.20"),
+        entry_low=Decimal("1.12"),
+        entry_high=Decimal("1.12"),
     )
     revoked = await later_runtime.cases.get_trade_case(trade_case.id)
     assert revoked.status != TradeCaseStatus.RISK_LIMITED
@@ -517,7 +525,7 @@ async def test_scenario_o_a_different_setup_on_the_same_attempt_is_refused(worke
 
     divergent = VectorWorkerHandler(
         provider=DeterministicReasoningProvider.returning(
-            proposal(now, entry_low=Decimal("1.20"), entry_high=Decimal("1.20"))
+            proposal(now, entry_low=Decimal("1.12"), entry_high=Decimal("1.12"))
         )
     )
     second = await divergent.handle(lease, capabilities)

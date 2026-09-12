@@ -178,14 +178,87 @@ class ObservedMeasurement(Immutable):
         return self
 
 
+class ObservedBar(Immutable):
+    """One closed interval of recorded market structure, flattened for the model.
+
+    A copy of the market layer's bar rather than a reference to it, because the
+    input digest has to fingerprint exactly the numbers VECTOR saw. Prices are
+    Decimal and the interval is the one the whole series uses.
+    """
+
+    opened_at: AwareDatetime
+    open: Price
+    high: Price
+    low: Price
+    close: Price
+    volume: Amount
+
+
+class VectorMarketStructure(Immutable):
+    """The bounded factual structure a setup may be drawn from.
+
+    This is the answer to the defect that motivated it. Without a series VECTOR
+    was shown one number and returned four, and the extra three were invented:
+    an observed price of 1.00 does not say that 1.10 is resistance or that 0.92
+    is support. Recorded highs and lows say something about both.
+
+    What is deliberately absent is as important. No indicator is computed, no
+    trend is named, no level is selected and no bar is synthesized. These are the
+    provider's own closed bars for this pool, and every conclusion drawn from
+    them is the model's to propose and the validator's to bound.
+    """
+
+    provider: Identifier
+    timeframe: Identifier
+    interval_seconds: int = Field(gt=0)
+    price_basis: Literal["USD_PER_BASE_UNIT"] = PRICE_BASIS
+    # Oldest first. Bounded hard: this is context for one proposal, not an archive.
+    bars: tuple[ObservedBar, ...] = Field(min_length=1, max_length=200)
+    coverage: Identifier
+    requested_bars: int = Field(gt=0)
+    # Missing intervals are the ones in which nobody traded. Reported rather than
+    # filled, so a quiet market never looks like a continuous one.
+    missing_intervals: int = Field(ge=0)
+    window_start: AwareDatetime
+    window_end: AwareDatetime
+    # Age of the newest *closed* bar, by source time. Excluded from the digest
+    # for the same reason snapshot age is: it measures when we looked.
+    age_seconds: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def coherent_window(self) -> Self:
+        if self.window_end <= self.window_start:
+            raise ValueError("A window must end after it starts")
+        if len(self.bars) > self.requested_bars:
+            raise ValueError("A series cannot hold more bars than were requested")
+        previous: ObservedBar | None = None
+        for bar in self.bars:
+            if bar.low > bar.high or not (
+                bar.low <= bar.open <= bar.high and bar.low <= bar.close <= bar.high
+            ):
+                raise ValueError("Open and close must sit inside the bar's own range")
+            if previous is not None and bar.opened_at <= previous.opened_at:
+                raise ValueError("Bars must be ordered oldest first and be distinct")
+            previous = bar
+        return self
+
+    @property
+    def range_low(self) -> Decimal:
+        return min(bar.low for bar in self.bars)
+
+    @property
+    def range_high(self) -> Decimal:
+        return max(bar.high for bar in self.bars)
+
+
 class VectorMarketContext(Immutable):
     """Everything VECTOR is allowed to see about the market, and nothing else.
 
-    One snapshot, because one snapshot is what the market layer records and
-    exposes. There is no price history here and none is invented: the reader
-    deliberately returns only the newest observation per stream, so a candle
-    series assembled from sparse snapshots would be a fabrication wearing the
-    name of market data.
+    Two distinct things, kept distinct. The **snapshot** is the current price,
+    which is what a level is judged against and what a trigger would fire on. The
+    **structure** is closed history, which is where a level can be reasoned from.
+    The newest bar's close is not the current price and never replaces it: one is
+    a settled interval, the other is now.
     """
 
     snapshot_id: UUID
@@ -205,6 +278,7 @@ class VectorMarketContext(Immutable):
     liquidity: ObservedMeasurement
     volume: ObservedMeasurement
     volume_window_seconds: int = Field(gt=0)
+    structure: VectorMarketStructure
 
     @property
     def observation_ids(self) -> frozenset[UUID]:
