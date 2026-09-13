@@ -5,7 +5,7 @@ grants authority; it only describes the identities, leases and results the
 deterministic runtime services validate before accepting any effect.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 from uuid import UUID
@@ -40,6 +40,8 @@ class WorkerErrorCode(StrEnum):
     ROLE_NOT_AUTHORIZED = "ROLE_NOT_AUTHORIZED"
     EVIDENCE_TYPE_NOT_AUTHORIZED = "EVIDENCE_TYPE_NOT_AUTHORIZED"
     RESULT_CONFLICT = "RESULT_CONFLICT"
+    WAIT_NOT_PERMITTED = "WAIT_NOT_PERMITTED"
+    WAIT_REASON_NOT_PERMITTED = "WAIT_REASON_NOT_PERMITTED"
     MAX_ATTEMPTS_EXCEEDED = "MAX_ATTEMPTS_EXCEEDED"
 
 
@@ -76,6 +78,17 @@ TERMINAL_ATTEMPT_OUTCOMES = frozenset(TaskAttemptOutcome)
 # Outcomes that record work done rather than work gone wrong. Neither may carry
 # a failure category, and neither is an error for an operator to look at.
 NON_FAILURE_OUTCOMES = frozenset({TaskAttemptOutcome.SUCCEEDED, TaskAttemptOutcome.WAITING})
+
+# What counts against the retry budget. Deliberately not every non-success:
+# waiting is work done, and a superseded or cancelled attempt was not the
+# worker's doing either.
+FAILURE_OUTCOMES = frozenset(
+    {
+        TaskAttemptOutcome.FAILED_RETRYABLE,
+        TaskAttemptOutcome.FAILED_PERMANENT,
+        TaskAttemptOutcome.LEASE_EXPIRED,
+    }
+)
 
 
 class WorkerFailureCategory(StrEnum):
@@ -190,20 +203,21 @@ class TaskWaitReport(Immutable):
     budget on ordinary operation and fill an audit trail with incidents that
     never happened.
 
-    ``retry_after`` is the worker's proposal, not its decision. The runtime
-    clamps it, because a worker that could name its own schedule could poll a
-    provider as fast as it liked.
+    **A worker reports a fact; it does not choose a schedule.** Cadence is
+    policy, and a worker that could name its own would be able to postpone a task
+    indefinitely or hammer a provider at will. The runtime derives the next
+    eligibility time from the task's own server-side policy and accepts only the
+    reasons that policy allows.
+
+    ``not_after`` is the one exception, and it can only ever *shorten* the wait:
+    a monitor knows when the thing it watches stops being watchable, and
+    scheduling a check past that point would queue work that cannot succeed. It
+    cannot extend anything, which is the direction that would matter.
     """
 
     kind: Literal["wait"] = "wait"
     reason_code: Code
-    retry_after: timedelta
-
-    @model_validator(mode="after")
-    def forward(self) -> Self:
-        if self.retry_after <= timedelta(0):
-            raise ValueError("A wait must schedule the next check in the future")
-        return self
+    not_after: AwareDatetime | None = None
 
 
 TaskOutcomeReport = Annotated[

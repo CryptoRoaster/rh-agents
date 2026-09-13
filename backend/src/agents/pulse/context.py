@@ -38,6 +38,7 @@ from src.markets.models import Availability, MarketSnapshot
 from src.orchestration.workflow.engine import active_evidence, unusable_reason
 from src.orchestration.workflow.models import (
     EvidenceEnvelope,
+    EvidenceStatus,
     EvidenceType,
     TradeCase,
     TradeSetupPayload,
@@ -57,17 +58,36 @@ class PulseMarketInput(Protocol):
         self, identity: str, *, include_fixtures: bool = False
     ) -> MarketSnapshot | None: ...
 
+    async def observations(
+        self,
+        identity: str,
+        *,
+        since: datetime,
+        until: datetime,
+        limit: int,
+        include_fixtures: bool = False,
+    ) -> tuple[MarketSnapshot, ...]: ...
+
 
 def watched_trigger(envelope: EvidenceEnvelope, now: datetime) -> WatchedTrigger | None:
     """Copy the machine-evaluable condition out of the authoritative setup.
 
     Returns ``None`` when there is nothing a monitor could watch: evidence the
-    workflow already considers unusable, or a setup written before the trigger
-    grammar existed. Neither is inferred around — a setup whose condition is only
-    prose has no condition as far as PULSE is concerned, and guessing one from
-    the entry price would be inventing the contract.
+    workflow considers unusable on its content, or a setup written before the
+    trigger grammar existed. Neither is inferred around — a setup whose condition
+    is only prose has no condition as far as PULSE is concerned, and guessing one
+    from the entry price would be inventing the contract.
+
+    Expiry is the deliberate exception. VECTOR sets an envelope's validity to the
+    setup's own expiry, so a setup that has run out is *both* stale evidence and
+    an expired condition at the same instant. Treating it only as unusable would
+    report "nothing to watch", which is what a monitor says while it waits for a
+    new setup — and the watch would go on rechecking a window that has closed
+    forever. Surfacing the condition lets the evaluator say what actually
+    happened, and lets the runtime end the watch.
     """
-    if unusable_reason(envelope, now) is not None:
+    reason = unusable_reason(envelope, now)
+    if reason is not None and reason != EvidenceStatus.STALE.value:
         return None
     payload = envelope.payload
     if not isinstance(payload, TradeSetupPayload) or payload.setup is None:
@@ -140,10 +160,28 @@ class PulseContextReader:
         setup = current.get(EvidenceType.TRADE_SETUP)
         trigger = None if setup is None else watched_trigger(setup, now)
 
+        window: tuple[MarketSnapshot, ...] = ()
+        truncated = False
+        if trigger is not None:
+            # Everything recorded since the later of "the setup began" and "the
+            # freshness window opened". A crossing outside either bound is not an
+            # opportunity: one predates the proposal, the other is too old to be
+            # a statement about now.
+            since = max(trigger.valid_from, now - self.policy.max_observation_age)
+            window = await self.markets.observations(
+                trade_case.market.pair_id,
+                since=since,
+                until=now + self.policy.max_clock_skew,
+                limit=self.policy.max_observations,
+                include_fixtures=self.include_fixtures,
+            )
+            # The read returns one extra row precisely so this is knowable.
+            truncated = len(window) > self.policy.max_observations
+            window = window[: self.policy.max_observations]
+
         snapshot = await self.markets.latest(
             trade_case.market.pair_id, include_fixtures=self.include_fixtures
         )
-        observation = None if snapshot is None else price_observation(snapshot, trade_case)
         # A market read that answered about the wrong pair is a wiring fault, and
         # it is left for the evaluator to refuse explicitly rather than silently
         # dropped here — a monitor that quietly saw no price would wait forever
@@ -153,7 +191,13 @@ class PulseContextReader:
             task_id=task_id,
             market_pair_id=trade_case.market.pair_id,
             trigger=trigger,
-            observation=observation,
+            observations=tuple(
+                observation
+                for observation in (price_observation(item, trade_case) for item in window)
+                if observation is not None
+            ),
+            window_truncated=truncated,
+            latest=None if snapshot is None else price_observation(snapshot, trade_case),
             policy_version=self.policy.version,
             evaluated_at=now,
         )

@@ -68,6 +68,10 @@ class TriggerOutcome(StrEnum):
     # The observation cannot be compared to this condition at all: another
     # market, another unit, or a timestamp outside the setup's own window.
     OBSERVATION_INVALID = "OBSERVATION_INVALID"
+    # More observations arrived in the window than the bounded read may return,
+    # and none of the visible ones crossed. A negative answer would be a claim
+    # about rows nobody looked at.
+    OBSERVATION_BUDGET_EXCEEDED = "OBSERVATION_BUDGET_EXCEEDED"
 
 
 # Which outcomes mean "ask again later" rather than "something is wrong". Stated
@@ -94,6 +98,7 @@ class PulseReasonCode(StrEnum):
     OBSERVATION_BEFORE_SETUP = "OBSERVATION_BEFORE_SETUP"
     OBSERVATION_AFTER_SETUP = "OBSERVATION_AFTER_SETUP"
     OBSERVATION_IN_FUTURE = "OBSERVATION_IN_FUTURE"
+    OBSERVATION_BUDGET_EXCEEDED = "OBSERVATION_BUDGET_EXCEEDED"
     MARKET_IDENTITY_MISMATCH = "MARKET_IDENTITY_MISMATCH"
     PRICE_BASIS_MISMATCH = "PRICE_BASIS_MISMATCH"
     PRICE_UNAVAILABLE = "PRICE_UNAVAILABLE"
@@ -183,7 +188,21 @@ class PulseTaskInput(Immutable):
     task_id: UUID
     market_pair_id: Identifier
     trigger: WatchedTrigger | None = None
-    observation: PriceObservation | None = None
+    # Every recorded observation inside the bounded window, oldest first.
+    #
+    # A window rather than a single price, because a monitor given only the
+    # latest one cannot see a level that was crossed and then left: the system
+    # would have durably recorded the crossing and still reported that nothing
+    # happened. What PULSE promises is to process faithfully what the market
+    # layer recorded — not to watch every tick, which it cannot do.
+    observations: tuple[PriceObservation, ...] = ()
+    # True when more observations existed in the window than the bounded read
+    # returns, so a negative answer cannot be trusted.
+    window_truncated: bool = Field(default=False, strict=True)
+    # The newest recorded observation of any age, used only to explain an empty
+    # window: a market that has never been priced and one whose feed has stalled
+    # are different situations and deserve different reason codes.
+    latest: PriceObservation | None = None
     policy_version: Identifier
     evaluated_at: AwareDatetime
 

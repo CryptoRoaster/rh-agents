@@ -27,7 +27,6 @@ waiting cases cost a thousand rows rather than a thousand coroutines.
 
 import json
 from dataclasses import dataclass
-from datetime import timedelta
 from hashlib import sha256
 
 from src.agents.pulse.evaluator import evaluate
@@ -162,7 +161,10 @@ class PulseWorkerHandler:
         evaluation = evaluate(task_input, task_input.evaluated_at, self.policy)
         if evaluation.outcome == TriggerOutcome.TRIGGERED:
             return self._evidence(lease, task_input, evaluation)
-        if evaluation.outcome == TriggerOutcome.OBSERVATION_INVALID:
+        if evaluation.outcome in (
+            TriggerOutcome.OBSERVATION_INVALID,
+            TriggerOutcome.OBSERVATION_BUDGET_EXCEEDED,
+        ):
             # A price that cannot be compared to this condition is a wiring
             # fault. Waiting patiently for it to become comparable would be
             # waiting for something that cannot happen.
@@ -170,42 +172,29 @@ class PulseWorkerHandler:
                 category=WorkerFailureCategory.INTERNAL,
                 reason_code=evaluation.reason_code.value,
             )
-        if evaluation.outcome == TriggerOutcome.SETUP_EXPIRED:
-            # The window closed. Not an error and not a trigger; the watch is
-            # over unless a new setup arrives, and the runtime decides that.
-            return TaskWaitReport(
-                reason_code=evaluation.reason_code.value,
-                retry_after=self.policy.poll_interval,
-            )
+        # Everything else is ordinary patience. The cadence is the runtime's to
+        # decide; all this reports is the fact it found and, where it knows one,
+        # the moment after which looking again would be pointless.
         return TaskWaitReport(
             reason_code=evaluation.reason_code.value,
-            retry_after=self._next_check(task_input, evaluation),
+            not_after=None if task_input.trigger is None else task_input.trigger.expires_at,
         )
-
-    def _next_check(self, task_input: PulseTaskInput, evaluation: TriggerEvaluation) -> timedelta:
-        """When to look again, never past the window being watched.
-
-        Scheduling beyond a setup's expiry would queue checks that cannot
-        possibly succeed. The runtime clamps this into its own bounds afterwards,
-        so a very short remaining window still produces a legal interval.
-        """
-        interval = self.policy.poll_interval
-        trigger = task_input.trigger
-        if trigger is None:
-            return interval
-        remaining = trigger.expires_at - evaluation.evaluated_at
-        if timedelta(0) < remaining < interval:
-            return remaining
-        return interval
 
     def _evidence(
         self, lease: TaskLease, task_input: PulseTaskInput, evaluation: TriggerEvaluation
     ) -> EvidenceTaskResult:
         """Build the envelope from runtime facts. Nothing here is a judgement."""
         trigger = task_input.trigger
-        observation = task_input.observation
-        assert trigger is not None and observation is not None
+        assert trigger is not None
         assert evaluation.observed_price is not None and evaluation.observed_at is not None
+        # The exact observation the comparison used, located by the identity the
+        # evaluation recorded rather than by re-deciding which one qualified.
+        observation = next(
+            item
+            for item in task_input.observations
+            if item.observed_at == evaluation.observed_at
+            and item.price == evaluation.observed_price
+        )
         digest = trigger_digest(task_input, trigger, observation, evaluation, self.policy)
         return EvidenceTaskResult(
             submission=EvidenceSubmission(

@@ -470,6 +470,27 @@ So waiting became a real answer: the attempt closes honestly, the task is
 rescheduled in the database, and nobody is paged. One check per claim, so a
 thousand waiting cases are a thousand rows rather than a thousand loops.
 
+Who decides *when* to look again matters too. At first the worker proposed the
+interval and the runtime merely trimmed it, which quietly meant any worker could
+postpone any task for as long as it liked. The schedule now belongs entirely to
+the server, a task may only wait if its own policy says so and only for reasons
+that policy lists, and the one timing hint a monitor can still give can shorten
+the wait but never extend it.
+
+The first version of this could miss the thing it was built to catch. It read
+only the newest recorded price, so a market that crossed the level and came back
+before the next check looked exactly like a market that had never crossed at all
+— even though the crossing was sitting in the database. It now reads the whole
+recent window and takes the earliest crossing in it, which also means the
+evidence can answer *when* the system first saw the trigger.
+
+What it promises is worth being precise about: it does not watch the market, it
+watches what the market layer recorded. Inside that stream nothing qualifying is
+skipped. Outside it, nothing is claimed. And a crossing that has aged out is
+still ignored on purpose — it describes a market that has moved on, and proving a
+trigger fired is not the same as proving the price is still there. ANCHOR decides
+that part later, and may well say no.
+
 A price from the wrong pool, or in the wrong unit, is not a price that has failed
 to reach a level — it is incomparable, and saying "not yet" would mean waiting
 patiently for something that can never happen. Those are faults. Being too old is

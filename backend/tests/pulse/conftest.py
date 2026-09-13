@@ -25,9 +25,13 @@ from src.orchestration.workflow.models import (
     TradeSetupPayload,
     TradeSetupTrigger,
 )
+from tests.markets.conftest import market_sessions as market_sessions  # noqa: F401
 from tests.worker.conftest import worker_db as worker_db  # noqa: F401
 
-CHAIN = "robinhood"
+# Matches the market layer's own fixture snapshot, so a snapshot built here
+# is internally coherent and survives the recorder's revalidation rather than
+# only working against stubs.
+CHAIN = "ethereum"
 NETWORK = "mainnet"
 TOKEN = "0x" + "a1" * 20
 QUOTE = "0x" + "b2" * 20
@@ -96,13 +100,34 @@ def observed(now, *, price=SPOT, seconds_ago: int = 30, pair_id: str = PAIR_ID, 
     return PriceObservation(**defaults)  # type: ignore[arg-type]
 
 
-def task_input(now, *, trigger="default", observation="default", pair_id=PAIR_ID) -> PulseTaskInput:
+def task_input(
+    now,
+    *,
+    trigger="default",
+    observation="default",
+    observations=None,
+    truncated=False,
+    latest="default",
+    pair_id=PAIR_ID,
+) -> PulseTaskInput:
+    """One check's view.
+
+    ``observation`` is a convenience for the common single-price case; a window
+    of several is passed through ``observations``. The two are the same thing —
+    a window of one — so tests that care about a single price stay readable.
+    """
+    if observations is None:
+        single = observed(now) if observation == "default" else observation
+        observations = () if single is None else (single,)
+    newest = observations[-1] if observations else None
     return PulseTaskInput(
         trade_case_id=uuid4(),
         task_id=uuid4(),
         market_pair_id=pair_id,
         trigger=watched(now) if trigger == "default" else trigger,
-        observation=observed(now) if observation == "default" else observation,
+        observations=tuple(observations),
+        window_truncated=truncated,
+        latest=newest if latest == "default" else latest,
         policy_version=PULSE_TRIGGER_V1.version,
         evaluated_at=now,
     )
@@ -192,15 +217,87 @@ class StubTradeCase:
 
 
 class StubMarkets:
-    """The one read the context needs, and no write of any kind."""
+    """The two reads the context needs, and no write of any kind."""
 
-    def __init__(self, snapshot=None) -> None:
+    def __init__(self, snapshot=None, window=None) -> None:
         self._snapshot = snapshot
+        # A window of one, unless a test says otherwise: the ordinary case is a
+        # single recorded price, and the interesting cases are several.
+        self._window = window if window is not None else ([] if snapshot is None else [snapshot])
 
     async def latest(self, identity: str, *, include_fixtures: bool = False):
         return self._snapshot
+
+    async def observations(
+        self, identity: str, *, since, until, limit: int, include_fixtures: bool = False
+    ):
+        inside = [item for item in self._window if since <= item.price.observed_at <= until]
+        inside.sort(key=lambda item: (item.price.observed_at, item.id))
+        return tuple(inside[: limit + 1])
 
 
 @pytest.fixture
 def market():
     return market_identity()
+
+
+@pytest.fixture
+async def pulse_db():
+    """A database holding both the workflow and the recorded market stream.
+
+    PULSE is the first worker that reads the market tables and the workflow
+    tables in one check, so it is the first that needs both present. The shared
+    worker fixture applies only the workflow migrations.
+    """
+    import importlib.util
+    import os
+    from pathlib import Path
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from src.data.tables import Base
+
+    url = os.environ.get("TEST_DATABASE_URL")
+    schema = "pulse_test_" + uuid4().hex
+    admin = None
+    if url:
+        admin = create_async_engine(url)
+        async with admin.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        engine = create_async_engine(url, connect_args={"server_settings": {"search_path": schema}})
+    else:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as connection:
+            if url:
+                versions = Path(__file__).parents[2] / "migrations/versions"
+                modules = []
+                for name in (
+                    "0002_market_observations",
+                    "0003_pool_locator",
+                    "0005_trade_case_workflow",
+                    "0006_worker_runtime",
+                ):
+                    spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    modules.append(module)
+
+                def migrate(sync_connection):
+                    with Operations.context(MigrationContext.configure(sync_connection)):
+                        for item in modules:
+                            item.upgrade()
+
+                await connection.run_sync(migrate)
+            else:
+                await connection.run_sync(Base.metadata.create_all)
+        yield engine, async_sessionmaker(engine, expire_on_commit=False)
+    finally:
+        await engine.dispose()
+        if admin:
+            async with admin.begin() as connection:
+                await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+            await admin.dispose()

@@ -34,6 +34,11 @@ class PulseTriggerPolicy:
     # observation timestamped in the future is a fault rather than skew, and a
     # future-dated price must never satisfy a condition.
     max_clock_skew: timedelta
+    # How many recorded observations one check may examine. The window is two
+    # minutes and the market layer records roughly every ninety seconds, so this
+    # is enormous headroom; it exists so that an unexpectedly chatty feed becomes
+    # a visible, typed shortfall rather than a silent partial read.
+    max_observations: int
 
     def __post_init__(self) -> None:
         if self.max_observation_age <= timedelta(0):
@@ -51,6 +56,8 @@ class PulseTriggerPolicy:
             # Checking less often than data goes stale would guarantee that most
             # checks see an observation they must refuse.
             raise ValueError("Polling must be at least as frequent as data goes stale")
+        if not 1 <= self.max_observations <= 500:
+            raise ValueError("An observation window must stay bounded")
 
 
 PULSE_TRIGGER_V1 = PulseTriggerPolicy(
@@ -58,4 +65,5 @@ PULSE_TRIGGER_V1 = PulseTriggerPolicy(
     max_observation_age=timedelta(minutes=2),
     poll_interval=timedelta(seconds=90),
     max_clock_skew=timedelta(seconds=5),
+    max_observations=64,
 )

@@ -54,17 +54,41 @@ the attempt, releases the lease, returns the task to `PENDING` and sets
 is no sleeping inside a lease and no polling loop in the worker process, so a
 thousand waiting cases cost a thousand rows rather than a thousand coroutines.
 
-**A worker proposes, the runtime decides.** The worker suggests a recheck
-interval and `WorkerRuntimePolicy.wait_interval` clamps it between ten seconds
-and fifteen minutes. Without a floor a worker could poll a provider as fast as it
-liked; without a ceiling a watch could go to sleep for hours without saying so.
+**The schedule is the server's, not the worker's.** An audit found the first
+version of this too permissive: a worker named its own recheck interval and the
+runtime merely clamped it, and *any* role could call `report_task_wait` with any
+reason — ATLAS could have postponed its own task by fifteen minutes at a time,
+indefinitely. Cadence is policy.
 
-**A watch is bounded.** `TaskDefinition.max_attempts` becomes a *watch* budget
-rather than a retry budget: 300 claims at PULSE's ninety-second cadence covers
-seven and a half hours, comfortably beyond the four a VECTOR setup may live. In
-practice the setup's own expiry ends the watch first. Running out produces
-`TASK_WATCH_EXHAUSTED` — a system that would watch forever has no way to say it
-has stopped.
+`TaskDefinition.wait` now carries a server-owned `WaitPolicy`: the interval, the
+horizon, the reasons that may be reported, and which of those end a watch rather
+than continue it. A task without one may not wait at all, which is every other
+role — they compute an answer once and have nothing to be patient about. An
+unknown reason is refused rather than recorded, so a worker cannot invent a
+category to wait under.
+
+The one thing a worker may still say about timing is `not_after`, and it can only
+ever **shorten** a wait. A monitor knows when the thing it watches stops being
+watchable, and scheduling a check past that point would queue work that cannot
+succeed. There is no way to express postponement, which is the direction that
+would matter.
+
+**A watch is bounded, and the bound is derived.** The horizon is expressed as a
+duration — five hours — and the permitted number of checks follows from it
+(`horizon / interval`), rather than being a number somebody picked. A test holds
+the horizon against `VECTOR_SETUP_V1.max_setup_lifetime`, so if the longest
+permitted setup ever changes, the relationship fails loudly instead of leaving a
+watch that stops early. Running out produces `TASK_WATCH_EXHAUSTED`; reaching a
+terminal reason produces `TASK_WATCH_ENDED`. Neither ever masquerades as a
+provider failure, a risk rejection or a setup invalidation.
+
+**Waiting and failing have separate budgets.** They were sharing one counter,
+which meant two hundred ordinary rechecks would have consumed the allowance meant
+for things going wrong, and a handful of provider outages could have consumed the
+watch. Both counts are now read from immutable attempt history — waits against
+the watch horizon, failures against `max_attempts` — so neither can spend the
+other. For every one-shot role the failure count is identical to what the claim
+counter previously said, so nothing about their behaviour changed.
 
 The outcome column is `String(40)` with no value whitelist, so none of this
 needed a migration. Alembic head remains `0006`.
@@ -105,6 +129,7 @@ as "not yet" would schedule a patient wait for an answer that can never arrive.
 | `now >= expires_at` | `SETUP_EXPIRED` | wait — the watch is over |
 | `now < valid_from` | `NOT_TRIGGERED` | wait |
 | no usable price | `OBSERVATION_STALE` | wait |
+| window truncated, nothing seen crossed | `OBSERVATION_BUDGET_EXCEEDED` | **fault** |
 | another pool | `OBSERVATION_INVALID` | **fault** |
 | another price unit | `OBSERVATION_INVALID` | **fault** |
 | future-dated beyond skew | `OBSERVATION_INVALID` | **fault** |
@@ -132,6 +157,7 @@ database read time reach nothing.
 | `max_observation_age` | 2 minutes | a trigger asserts the market is at a level *now* |
 | `poll_interval` | 90 seconds | matches the market watcher; faster re-reads the same number |
 | `max_clock_skew` | 5 seconds | two clocks at an instant boundary may differ |
+| `max_observations` | 64 | one check's window; far above the ~2 the cadence implies |
 
 VECTOR's five-minute window is deliberately **not** copied. A setup generator
 reasons about where levels are and tolerates a slightly older picture; a monitor
@@ -143,6 +169,79 @@ refuse).
 **Expiry is exclusive.** A setup expiring at 10:00 is not valid *at* 10:00.
 Pinned by test at the microsecond either side, because leaving it ambiguous would
 put a trade's authority in a rounding question.
+
+## Observation coverage: what a check actually looks at
+
+A follow-up audit found the most serious defect of this phase. PULSE read the
+**latest** recorded observation and nothing else, so a price that crossed the
+level and came back before the next check was invisible:
+
+```
+recorded:  T-80s  1.18      trigger: PRICE_GTE 1.20
+           T-50s  1.22      check at T
+           T-10s  1.17
+```
+
+The system had durably recorded 1.22 during the setup's valid window and would
+have reported that nothing happened. Worse, no read on the market layer could
+reach it: `MarketReader.markets` ranks rows per stream and keeps only the newest,
+which is the right answer for "what is this market doing now" and the wrong one
+for "did this ever happen".
+
+So the market layer gained `MarketReader.observations`: every recorded
+observation for one market inside a closed window, ordered oldest first by the
+market's **own** observation time, capped, with `recorded_at` and `id` breaking
+ties only. A row inserted late never becomes recent, because insertion time
+cannot reorder the window.
+
+Each check now reads the window
+
+```
+since = max(setup.valid_from, now - max_observation_age)
+until = now + max_clock_skew
+```
+
+and scans it oldest first. The **first** qualifying observation is the event, so
+the evidence answers "when did this system first observe the trigger?" with a
+stable fact rather than with whichever row happened to be newest when somebody
+looked. The same applies to the range condition: a band entered and left is still
+a band that was entered.
+
+### What PULSE promises, exactly
+
+It does not watch the market. It watches what the market layer **recorded**:
+
+```
+DEX reality → market watcher → recorded observations → PULSE
+```
+
+Within that stream it will not skip a qualifying observation merely because a
+newer non-qualifying one exists. Outside it, it promises nothing at all.
+Detection latency is bounded by the observation cadence plus the task scheduling
+cadence plus runtime delay — on the order of minutes, not ticks. That is
+acceptable for PAPER and is not claimed to be anything else.
+
+### Freshness is a separate question from coverage
+
+A crossing older than `max_observation_age` is still ignored, deliberately. It
+is a fact about a market that has since moved on, and acting on it now would be
+acting on a price nobody can still see. A crossing *inside* the window is never
+skipped. The two rules do different jobs and both hold.
+
+This makes explicit something worth stating plainly: **a recorded crossing is not
+a standing execution opportunity.** PULSE proves that a configured trigger was
+observed. It does not prove the price is still there. ANCHOR evaluates current
+execution conditions afterwards, and may legitimately refuse a trade whose
+trigger genuinely fired.
+
+### A truncated window is never a confident negative
+
+The read returns one row beyond its limit so truncation is knowable. If more
+observations existed than the bounded read may return and none of the visible
+ones crossed, the check reports `OBSERVATION_BUDGET_EXCEEDED` rather than "not
+yet" — a negative would be a claim about rows nobody looked at. If a crossing
+*was* found among the visible ones it still triggers, because finding one is
+positive evidence regardless of what else was missed.
 
 ## Provider load
 
@@ -222,5 +321,6 @@ what happens next.
 ## Compatibility
 
 `TriggerDetail` is additive and optional, so Phase 2A `TriggerPayload` values
-parse and replay unchanged. `TaskDefinition.max_attempts` is optional and absent
-for every other role. No migration; Alembic head remains `0006`.
+parse and replay unchanged. `TaskDefinition.wait` is optional and absent for
+every other role, and `MarketReader.observations` is a new read rather than a
+change to an existing one. No migration; Alembic head remains `0006`.

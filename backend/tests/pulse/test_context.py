@@ -69,11 +69,25 @@ async def test_no_setup_at_all_leaves_nothing_to_watch(now):
 
 
 async def test_an_unusable_setup_supplies_no_condition(now):
-    """A setup the workflow already considers unusable is not quietly watched."""
+    """A setup the workflow considers unusable on its content is not watched."""
     unknown = setup_envelope(now, status=EvidenceStatus.UNKNOWN)
     assert watched_trigger(unknown, now) is None
-    stale = setup_envelope(now, valid_for=timedelta(minutes=1))
-    assert watched_trigger(stale, now + timedelta(hours=1)) is None
+
+
+async def test_an_expired_setup_still_surfaces_so_the_watch_can_end(now):
+    """Expiry is the deliberate exception to the unusable rule.
+
+    VECTOR ties an envelope's validity to the setup's own expiry, so at that
+    instant the evidence is stale *and* the condition has run out. Hiding it
+    would report "nothing to watch" — which is what a monitor says while waiting
+    for a new setup — and the watch would recheck a window that has closed for
+    good.
+    """
+    envelope = setup_envelope(now, valid_for=timedelta(hours=1))
+    after = now + timedelta(hours=2)
+    trigger = watched_trigger(envelope, after)
+    assert trigger is not None
+    assert trigger.expires_at < after
 
 
 async def test_a_setup_without_a_machine_condition_is_not_guessed_at(now):
@@ -119,10 +133,10 @@ async def test_the_condition_is_copied_rather_than_referenced(now):
 
 async def test_the_recorded_price_becomes_the_observation(now):
     context = await read(now, evidence=(setup_envelope(now),))
-    assert context.observation is not None
-    assert context.observation.price == SPOT
-    assert context.observation.price_basis == "USD_PER_BASE_UNIT"
-    assert context.observation.pair_id == PAIR_ID
+    assert len(context.observations) == 1
+    assert context.observations[0].price == SPOT
+    assert context.observations[0].price_basis == "USD_PER_BASE_UNIT"
+    assert context.observations[0].pair_id == PAIR_ID
 
 
 async def test_an_unknown_price_produces_no_observation(now):
@@ -130,12 +144,14 @@ async def test_an_unknown_price_produces_no_observation(now):
     context = await read(
         now, evidence=(setup_envelope(now),), snapshot=snapshot_for(now, price=None)
     )
-    assert context.observation is None
+    assert context.observations == ()
+    assert context.latest is None
 
 
 async def test_no_market_data_at_all_produces_no_observation(now):
     context = await read(now, evidence=(setup_envelope(now),), snapshot=None)
-    assert context.observation is None
+    assert context.observations == ()
+    assert context.latest is None
 
 
 def test_a_non_positive_price_never_becomes_an_observation(now):
@@ -158,10 +174,10 @@ async def test_a_price_from_another_pool_is_carried_through_to_be_refused(now):
     The mismatch is passed to the evaluator so it becomes an explicit, typed
     refusal that somebody can read.
     """
-    elsewhere = snapshot_for(now, pair_id="robinhood:mainnet:contract_address:0x" + "ff" * 20)
+    elsewhere = snapshot_for(now, pair_id="ethereum:mainnet:contract_address:0x" + "ff" * 20)
     context = await read(now, evidence=(setup_envelope(now),), snapshot=elsewhere)
-    assert context.observation is not None
-    assert context.observation.pair_id != context.market_pair_id
+    assert context.observations
+    assert context.observations[0].pair_id != context.market_pair_id
 
 
 # --------------------------------------------------------- the surface
@@ -176,7 +192,9 @@ async def test_the_view_contains_nothing_it_does_not_need(now):
         "task_id",
         "market_pair_id",
         "trigger",
-        "observation",
+        "observations",
+        "window_truncated",
+        "latest",
         "policy_version",
         "evaluated_at",
     }

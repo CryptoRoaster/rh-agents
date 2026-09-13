@@ -55,7 +55,12 @@ CASE_LIFETIME = timedelta(hours=6)
 
 
 def snapshot_for(now, *, price=SPOT, seconds_ago: int = 30, pair_id: str = PAIR_ID):
-    """A recorded snapshot shaped like the market layer actually stores them."""
+    """A recorded snapshot shaped like the market layer actually stores them.
+
+    Coherent enough to survive the recorder's revalidation: the pair id shares
+    the fixture's own chain and network, so this is a snapshot the system would
+    accept rather than one that only works against a stub.
+    """
     base = fixture_snapshot(now - timedelta(seconds=seconds_ago), uuid4())
     pair = base.pair.model_copy(update={"pair_id": pair_id})
     price_snapshot = base.price.model_copy(
@@ -67,22 +72,23 @@ def snapshot_for(now, *, price=SPOT, seconds_ago: int = 30, pair_id: str = PAIR_
     return base.model_copy(update={"pair": pair, "price": price_snapshot})
 
 
-class StubMarkets:
-    def __init__(self, snapshot=None) -> None:
-        self.snapshot = snapshot
-
-    async def latest(self, identity: str, *, include_fixtures: bool = False):
-        return self.snapshot
+from tests.pulse.conftest import StubMarkets  # noqa: E402
 
 
-def build_stack(sessions, instant, *, price=SPOT, markets=None, seconds_ago=30):
+def build_stack(
+    sessions, instant, *, price=SPOT, markets=None, seconds_ago=30, window=None, policy=None
+):
     clock = FixedClock(instant)
-    cases = TradeCaseService(sessions, clock=clock)
+    cases = (
+        TradeCaseService(sessions, clock=clock)
+        if policy is None
+        else TradeCaseService(sessions, clock=clock, policy=policy)
+    )
     runtime = WorkerRuntimeService(sessions, cases, clock=clock)
     feed = (
         markets
         if markets is not None
-        else StubMarkets(snapshot_for(instant, price=price, seconds_ago=seconds_ago))
+        else StubMarkets(snapshot_for(instant, price=price, seconds_ago=seconds_ago), window=window)
     )
     reader = PulseContextReader(cases=cases, markets=feed, clock=clock, include_fixtures=True)
     return runtime, reader, feed
@@ -168,10 +174,23 @@ def test_pulse_is_required_and_safety_critical():
     assert EvidenceType.TRIGGER in TRADE_CASE_V1.safety_types
 
 
-def test_a_monitor_gets_a_watch_budget_rather_than_a_retry_budget():
-    definition = next(item for item in TRADE_CASE_V1.tasks if item.role == AgentRole.PULSE)
-    assert definition.max_attempts == 300
-    assert definition.max_attempts > WORKER_RUNTIME_V1.max_attempts
+def test_a_monitor_gets_a_watch_budget_separate_from_its_retry_budget():
+    """Derived from the horizon, not a number somebody picked."""
+    from src.agents.vector.policy import VECTOR_SETUP_V1
+
+    definition = TRADE_CASE_V1.task(AgentRole.PULSE, PULSE_TASK_TYPE)
+    assert definition is not None and definition.wait is not None
+    wait = definition.wait
+    # The horizon must cover the longest setup it could ever be asked to watch.
+    # If VECTOR's maximum lifetime changes, this fails rather than silently
+    # leaving a watch that stops early.
+    assert wait.horizon >= VECTOR_SETUP_V1.max_setup_lifetime
+    assert wait.max_waits == -(
+        -int(wait.horizon.total_seconds()) // int(wait.interval.total_seconds())
+    )
+    assert wait.max_waits >= VECTOR_SETUP_V1.max_setup_lifetime / wait.interval
+    # And waiting does not touch the failure allowance.
+    assert definition.max_attempts is None
 
 
 # ------------------------------------------------------ waiting, in the real runtime
@@ -573,32 +592,74 @@ async def test_pulse_may_only_submit_trigger_evidence(worker_db, now, trace):
 # ------------------------------------------------------ the watch is bounded
 
 
-async def test_a_watch_that_runs_out_of_checks_stops(worker_db, now, trace):
-    """Bounded like everything else: a system that watches forever cannot say so."""
+async def test_a_closed_window_ends_the_watch_rather_than_rescheduling_it(worker_db, now, trace):
+    """The realistic terminator. A setup that expired cannot become valid again.
+
+    Rechecking it every ninety minutes until the case expires would be work
+    queued to fail, so the policy names this reason terminal and the runtime
+    stops the watch. The worker reports the fact; what the fact means for the
+    task is the server's decision.
+    """
     _, sessions = worker_db
     runtime, reader, _ = build_stack(sessions, now, price=Decimal("1.00"))
+    trade_case = await open_case(runtime.cases, now, trace, "pulse-window-closed")
+    await surround(runtime.cases, trade_case, now)
+    await record_setup(runtime.cases, trade_case, now)
+
+    # Past the setup's own expiry, still inside the case's.
+    after = now + timedelta(hours=2)
+    later_runtime, later_reader, _ = build_stack(sessions, after, price=Decimal("1.00"))
+    disposition = await run_pulse(later_runtime, later_reader, "pulse-window-closed-worker")
+    assert disposition is not None
+    assert disposition.outcome == TaskAttemptOutcome.WAITING
+    assert disposition.reason_code == "TASK_WATCH_ENDED"
+    assert disposition.retry_scheduled is False
+    assert disposition.next_eligible_at is None
+
+    # Nothing further is claimed, and no trigger was ever produced.
+    even_later = build_stack(sessions, after + timedelta(hours=1), price=Decimal("5.00"))
+    assert await run_pulse(even_later[0], even_later[1], "pulse-window-closed-after") is None
+    assert await trigger_evidence(runtime.cases, trade_case.id) == []
+
+
+async def test_a_watch_that_runs_out_of_checks_stops(worker_db, now, trace):
+    """Bounded like everything else, with a horizon narrowed for the test.
+
+    The shipped horizon affords two hundred checks, so exhausting it honestly
+    means driving a policy that affords two. The termination path is the same
+    one the real budget would reach.
+    """
+    from dataclasses import replace
+
+    _, sessions = worker_db
+    narrow_wait = replace(
+        TRADE_CASE_V1.task(AgentRole.PULSE, PULSE_TASK_TYPE).wait,
+        horizon=timedelta(minutes=3),
+    )
+    narrow = replace(
+        TRADE_CASE_V1,
+        tasks=tuple(
+            replace(item, wait=narrow_wait) if item.role == AgentRole.PULSE else item
+            for item in TRADE_CASE_V1.tasks
+        ),
+    )
+    assert narrow_wait.max_waits == 2
+
+    runtime, reader, _ = build_stack(sessions, now, price=Decimal("1.00"), policy=narrow)
     trade_case = await open_case(runtime.cases, now, trace, "pulse-exhaust")
     await surround(runtime.cases, trade_case, now)
     await record_setup(runtime.cases, trade_case, now)
 
-    task_id = task_id_of(await runtime.cases.tasks(trade_case.id))
-    async with sessions.begin() as session:
-        from src.data.tables import TradeCaseTaskRow
-
-        row = await session.get(TradeCaseTaskRow, task_id)
-        row.max_attempts = 2
-
-    instant = now
-    outcomes = []
+    instant, outcomes = now, []
     for index in range(2):
-        later_runtime, later_reader, _ = build_stack(sessions, instant, price=Decimal("1.00"))
-        disposition = await run_pulse(later_runtime, later_reader, f"pulse-exhaust-{index}")
+        later = build_stack(sessions, instant, price=Decimal("1.00"), policy=narrow)
+        disposition = await run_pulse(later[0], later[1], f"pulse-exhaust-{index}")
         assert disposition is not None
         outcomes.append(disposition.reason_code)
-        instant += PULSE_TRIGGER_V1.poll_interval
+        instant += narrow_wait.interval
 
-    assert outcomes[-1] == "TASK_WATCH_EXHAUSTED"
-    after = build_stack(sessions, instant, price=Decimal("1.00"))
+    assert outcomes == ["CONDITION_NOT_MET", "TASK_WATCH_EXHAUSTED"]
+    after = build_stack(sessions, instant, price=Decimal("1.00"), policy=narrow)
     assert await run_pulse(after[0], after[1], "pulse-exhaust-final") is None
     assert await trigger_evidence(runtime.cases, trade_case.id) == []
 

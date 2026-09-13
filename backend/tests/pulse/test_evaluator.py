@@ -293,7 +293,7 @@ def test_scenario_i_a_price_from_another_market_is_refused(now):
     result = check(
         now,
         observation=observed(
-            now, price=Decimal("1.50"), pair_id="robinhood:mainnet:contract_address:0x" + "ff" * 20
+            now, price=Decimal("1.50"), pair_id="ethereum:mainnet:contract_address:0x" + "ff" * 20
         ),
     )
     assert result.outcome == TriggerOutcome.OBSERVATION_INVALID
@@ -303,7 +303,7 @@ def test_scenario_i_a_price_from_another_market_is_refused(now):
 def test_identity_and_unit_are_checked_before_the_value(now):
     """So a wrong-market price never reads as "the level was not reached"."""
     elsewhere = observed(
-        now, price=Decimal("0.01"), pair_id="robinhood:mainnet:contract_address:0x" + "ff" * 20
+        now, price=Decimal("0.01"), pair_id="ethereum:mainnet:contract_address:0x" + "ff" * 20
     )
     assert check(now, observation=elsewhere).outcome == TriggerOutcome.OBSERVATION_INVALID
 
@@ -397,8 +397,11 @@ def test_an_observation_at_the_exact_expiry_instant_is_outside_the_window(now):
         expires_at - timedelta(microseconds=1),
         PULSE_TRIGGER_V1,
     )
-    assert result.outcome == TriggerOutcome.OBSERVATION_INVALID
-    assert result.reason_code == PulseReasonCode.OBSERVATION_AFTER_SETUP
+    # Passed over rather than refused: a reading outside the window is simply
+    # not part of this check, and with nothing left to compare the answer falls
+    # back to explaining the empty window.
+    assert result.outcome == TriggerOutcome.OBSERVATION_STALE
+    assert result.observed_price is None
 
 
 def test_scenario_r_a_future_dated_price_is_refused(now):

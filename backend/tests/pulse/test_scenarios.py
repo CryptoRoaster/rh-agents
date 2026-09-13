@@ -109,7 +109,7 @@ async def test_the_evidence_records_the_comparison_that_was_made(now):
     assert isinstance(outcome, EvidenceTaskResult)
     detail = outcome.submission.payload.detail
     assert detail is not None
-    trigger, observation = context.trigger, context.observation
+    trigger, observation = context.trigger, context.observations[-1]
     assert detail.trigger_type == "PRICE_GTE"
     assert detail.reference_price == trigger.reference_price
     assert detail.setup_id == trigger.setup_id
@@ -169,7 +169,9 @@ async def test_an_unmet_condition_is_a_wait_not_a_failure(now, observation_price
     assert isinstance(outcome, TaskWaitReport)
     assert not isinstance(outcome, TaskFailureReport)
     assert outcome.reason_code == reason
-    assert outcome.retry_after == PULSE_TRIGGER_V1.poll_interval
+    # Cadence is the runtime's; the report carries only the fact and the moment
+    # after which looking again would be pointless.
+    assert "retry_after" not in TaskWaitReport.model_fields
 
 
 async def test_a_stale_price_is_a_wait(now):
@@ -252,7 +254,7 @@ async def test_an_incomparable_observation_is_an_internal_fault(now, observation
     """Scenarios H, I, Q, R. Waiting for these would wait forever."""
     variants = {
         "wrong_market": observed(
-            now, price=LEVEL, pair_id="robinhood:mainnet:contract_address:0x" + "ff" * 20
+            now, price=LEVEL, pair_id="ethereum:mainnet:contract_address:0x" + "ff" * 20
         ),
         "wrong_basis": observed(now, price=LEVEL).model_copy(
             update={"price_basis": "USD_PER_QUOTE"}
@@ -298,16 +300,25 @@ async def test_a_context_port_returning_the_wrong_shape_is_caught(now):
 # ------------------------------------------------ scheduling the next look
 
 
-async def test_the_next_check_is_never_scheduled_past_the_window(now):
-    """Queueing a check that cannot possibly succeed is pure waste."""
+async def test_a_wait_names_the_moment_after_which_looking_is_pointless(now):
+    """The one timing fact a monitor may state, and it can only shorten a wait.
+
+    Queueing a check past the setup's expiry would be work that cannot succeed;
+    the runtime enforces that, and this is how it learns the bound.
+    """
     closing = watched(now, expires_at=now + timedelta(seconds=20))
     _, outcome = await run(
         now,
         context=task_input(now, trigger=closing, observation=observed(now, price=Decimal("1.19"))),
     )
     assert isinstance(outcome, TaskWaitReport)
-    assert outcome.retry_after == timedelta(seconds=20)
-    assert outcome.retry_after < PULSE_TRIGGER_V1.poll_interval
+    assert outcome.not_after == closing.expires_at
+
+
+async def test_a_wait_with_nothing_to_watch_names_no_bound(now):
+    _, outcome = await run(now, context=task_input(now, trigger=None))
+    assert isinstance(outcome, TaskWaitReport)
+    assert outcome.not_after is None
 
 
 async def test_the_ordinary_cadence_matches_how_often_data_changes(now):
@@ -348,14 +359,18 @@ async def test_a_different_worker_and_attempt_produce_the_same_digest(now):
     [
         {"price": Decimal("1.25")},
         {"observation_id": uuid4()},
-        {"pair_id": "robinhood:mainnet:contract_address:0x" + "dd" * 20},
+        {"pair_id": "ethereum:mainnet:contract_address:0x" + "dd" * 20},
     ],
 )
 async def test_a_different_observation_is_a_different_event(now, change):
     base = task_input(now, observation=observed(now, price=LEVEL))
     moved_observation = observed(now, price=LEVEL).model_copy(update=change)
     moved = base.model_copy(
-        update={"observation": moved_observation, "market_pair_id": moved_observation.pair_id}
+        update={
+            "observations": (moved_observation,),
+            "latest": moved_observation,
+            "market_pair_id": moved_observation.pair_id,
+        }
     )
     first = await run(now, context=base)
     second = await run(now, context=moved)
@@ -385,23 +400,19 @@ def test_the_digest_excludes_who_looked_and_when_they_looked(now):
 
     context = task_input(now, observation=observed(now, price=LEVEL))
     evaluation = evaluate(context, now, PULSE_TRIGGER_V1)
-    baseline = trigger_digest(
-        context, context.trigger, context.observation, evaluation, PULSE_TRIGGER_V1
-    )
+    observation = context.observations[-1]
+    baseline = trigger_digest(context, context.trigger, observation, evaluation, PULSE_TRIGGER_V1)
     # A different task and a different case-level identity for the same crossing.
     elsewhere = context.model_copy(update={"task_id": uuid4()})
     assert (
-        trigger_digest(
-            elsewhere, elsewhere.trigger, elsewhere.observation, evaluation, PULSE_TRIGGER_V1
-        )
+        trigger_digest(elsewhere, elsewhere.trigger, observation, evaluation, PULSE_TRIGGER_V1)
         == baseline
     )
     # And the same crossing noticed a minute later by a slower worker.
     later = evaluate(context, now + timedelta(seconds=60), PULSE_TRIGGER_V1)
     assert later.outcome == evaluation.outcome
     assert (
-        trigger_digest(context, context.trigger, context.observation, later, PULSE_TRIGGER_V1)
-        == baseline
+        trigger_digest(context, context.trigger, observation, later, PULSE_TRIGGER_V1) == baseline
     )
 
 
@@ -435,5 +446,6 @@ def test_every_outcome_is_accounted_for():
         TriggerOutcome.NO_CURRENT_SETUP,
         TriggerOutcome.OBSERVATION_STALE,
         TriggerOutcome.OBSERVATION_PRECEDES_SETUP,
+        TriggerOutcome.OBSERVATION_BUDGET_EXCEEDED,
     }
     assert set(TriggerOutcome) == handled
