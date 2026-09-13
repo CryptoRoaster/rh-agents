@@ -503,3 +503,66 @@ nothing writes nothing at all.
 
 Disabled by default, no migration, no worker started. See [the Phase 2I PULSE
 design](docs/phase-2i.md).
+
+## Phase 2J ANCHOR execution liquidity
+
+PULSE says the moment arrived. ANCHOR asks what the market can actually take.
+
+The easy version of this is one line long and completely wrong:
+
+```python
+max_safe_size = liquidity_usd * 0.01
+```
+
+A pool holding ten million dollars is not a promise that ten thousand can be
+traded through it at a price anyone would accept. The money may be sitting in a
+range the price has left, the trade may have to be split across several venues
+with very different depth, and the number says nothing at all about fees or the
+spread you would cross. Worse, it never fails — it is computed from a figure
+that is always there, so it always produces an answer, and the answer is fiction.
+
+So the question is asked properly instead: quote a hundred dollars, then five
+hundred, then two and a half thousand, and keep going until the market says no.
+A fixed ladder rather than a clever search, because every rung is a real request
+against somebody else's API and a fixed list is one anybody can check afterwards.
+
+What comes out is careful about what it claims. If a size failed, capacity is
+bracketed between the largest that worked and the smallest that did not. If
+*every* size passed, the honest answer is "at least this much" — the top of the
+ladder is the largest amount tried, not a measured ceiling — and the type system
+makes that impossible to confuse with a limit. If nothing was established there
+is no number at all, because a zero would mean "the market supports nothing",
+which is a measurement nobody made.
+
+And whatever comes out is not permission. It says what the market bears. How
+much of that anyone may trade is SENTINEL's to say, and it may well be far less.
+
+Three things that sound alike are kept apart. The **deviation** is what ANCHOR
+measures: how far a quote's real price sits from a current independent one. The
+**provider's impact figure** is the provider's own opinion in its own units,
+recorded when offered and never mixed in. **Slippage** is the gap between a
+quote and an actual fill, and this system has never seen a fill, so it does not
+pretend to know.
+
+Quotes go stale fast. Thirty seconds, timed from when the provider priced it
+rather than when the answer arrived, and the rungs of one ladder have to sit
+within twenty seconds of each other — otherwise you are watching the market move
+and calling it depth.
+
+"No route" and "the provider is down" are different answers and stay different
+all the way through. One is a fact about the market you can act on. The other is
+not knowing, and a retry that then succeeds is not the market recovering.
+
+An optional live check against the real API — off by default, no credentials,
+read-only — found two things reading the documentation had not. The provider
+reports "no route" as an HTTP 400 with the reason in the body, so the first
+version had been filing every genuinely unroutable pair as an outage. And while
+the quote endpoint returns no transaction to sign, it does return the contract a
+swap would be *sent to*. Nothing downstream had ever read it, so it is no longer
+parsed at all.
+
+That is the theme of the whole phase. This is the last stop before something
+builds a real transaction, so it does not carry the parts of one.
+
+Disabled by default, no migration, no worker started. See [the Phase 2J
+execution-liquidity design](docs/phase-2j.md).

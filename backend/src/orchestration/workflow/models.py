@@ -548,7 +548,66 @@ class TriggerPayload(AcceptancePayload):
     detail: "TriggerDetail | None" = None
 
 
+class QuotedLadderPoint(Immutable):
+    """One tested size and what the market said about it.
+
+    Kept whether it passed or failed. "Why did ANCHOR say five hundred?" is
+    answered as much by the size that was refused as by the one that was not, and
+    a digest alone would prove the ladder unchanged without saying what it held.
+    """
+
+    notional: Positive
+    accepted: bool = Field(strict=True)
+    amount_out: int | None = Field(default=None, strict=True, ge=0)
+    effective_price: Positive | None = None
+    execution_deviation_bps: Decimal | None = Field(default=None, allow_inf_nan=False)
+    provider_price_impact_bps: Nonnegative | None = None
+    route_hops: int | None = Field(default=None, strict=True, ge=0)
+    venues: tuple[Identifier, ...] = Field(default=(), max_length=32)
+    quoted_at: AwareDatetime | None = None
+    source_block_number: int | None = Field(default=None, strict=True, ge=0)
+    rejection: Code | None = None
+
+
+class ExecutionAssessmentDetail(Immutable):
+    """What the market was shown to support, and how that was established.
+
+    ``market_capacity_notional`` is what the *market* will bear, never what
+    anyone may trade: SENTINEL decides that, from facts this evidence cannot
+    see. It is meaningless without ``capacity_semantics`` beside it, because a
+    bounded search that passed every size it tried has learned a floor rather
+    than a ceiling — and a reader who mistook the one for the other would size
+    against a number that was never a limit.
+    """
+
+    policy_version: Identifier
+    capacity_semantics: Code
+    reason_code: Code
+    market_capacity_notional: Positive | None = None
+    first_rejected_notional: Positive | None = None
+    reference_price: Positive
+    reference_price_basis: Code
+    reference_observed_at: AwareDatetime
+    effective_price_at_capacity: Positive | None = None
+    execution_deviation_bps_at_capacity: Decimal | None = Field(default=None, allow_inf_nan=False)
+    payment_asset_id: Identifier
+    target_asset_id: Identifier
+    quote_provider: Identifier
+    quote_requests: int = Field(ge=0)
+    ladder: tuple[QuotedLadderPoint, ...] = Field(min_length=1, max_length=12)
+    evaluated_at: AwareDatetime
+    execution_digest: Digest
+
+
 class LiquidityExecutionPayload(AcceptancePayload):
+    """What the executable market supports for one triggered setup.
+
+    Analytical evidence about execution conditions, never an authorisation. It
+    does not say a trade should happen, how large it should be, or that the price
+    will still be there — a future executor must re-quote immediately before
+    acting, because a quote is an offer at a moment and this records the moment.
+    """
+
     kind: Literal["liquidity_execution"] = "liquidity_execution"
     setup_evidence_id: UUID
     trigger_evidence_id: UUID
@@ -556,8 +615,30 @@ class LiquidityExecutionPayload(AcceptancePayload):
     liquidity_usd: Nonnegative | None = None
     estimated_slippage_bps: Nonnegative | None = Field(default=None, le=10000)
     price_impact_bps: Nonnegative | None = Field(default=None, le=10000)
+    # The legacy scalar. It never over-claims — it is a size actually tested and
+    # accepted — but it cannot express that the true capacity may be higher, so
+    # anything reasoning about capacity reads the detail below instead.
     maximum_safe_size_usd: Nonnegative | None = None
     routing_provenance: Identifier | None = None
+    # Absent on evidence written before Phase 2J; present for anything an ANCHOR
+    # worker produced.
+    execution: "ExecutionAssessmentDetail | None" = None
+
+    def acceptance(self) -> EvidenceAcceptance:
+        """Known-bad execution conditions block rather than merely being recorded.
+
+        A market that demonstrably cannot support the trade is a fact, and an
+        available one: the provider answered. Treating it as merely present would
+        let a case proceed to risk on evidence that says execution is impossible.
+        """
+        detail = self.execution
+        if detail is None:
+            return EvidenceAcceptance.ACCEPTED
+        if detail.capacity_semantics == "UNKNOWN":
+            return EvidenceAcceptance.INSUFFICIENT
+        if detail.market_capacity_notional is None:
+            return EvidenceAcceptance.BLOCKED
+        return EvidenceAcceptance.ACCEPTED
 
 
 EvidencePayload = Annotated[
@@ -609,7 +690,18 @@ class EvidenceSubmission(Immutable):
         if self.status == EvidenceStatus.AVAILABLE and isinstance(
             self.payload, LiquidityExecutionPayload
         ):
-            if any(
+            # Available execution evidence must have substance. Originally that
+            # meant all six legacy scalars; a full assessment carries strictly
+            # more — the ladder, the reference it was judged against and the
+            # semantics of its capacity — so it satisfies the same intent.
+            #
+            # This also lets a market that demonstrably cannot be traded be
+            # recorded as available and blocking. Under the scalar-only rule it
+            # could not: there is no quoted price for a route that does not
+            # exist, so a known-bad finding would have had to masquerade as an
+            # unknown one, which is the distinction execution evidence most needs
+            # to keep.
+            if self.payload.execution is None and any(
                 value is None
                 for value in (
                     self.payload.quoted_price,

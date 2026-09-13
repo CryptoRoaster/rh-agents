@@ -132,6 +132,21 @@ class Settings(BaseSettings):
     # may be called current, and a knob that could loosen that is a knob that
     # could manufacture a trigger.
     pulse_worker_enabled: bool = False
+    # Phase 2J ANCHOR. Disabled by default like every other worker. The execution
+    # thresholds, freshness windows and quote ladder are code-defined and
+    # versioned rather than env-mutable: they decide whether an offer to trade is
+    # sane, and a knob that could loosen that is a knob that could manufacture
+    # executable capacity.
+    anchor_worker_enabled: bool = False
+    # Where executable quotes come from. "disabled" fails closed: without a quote
+    # source ANCHOR establishes no capacity at all, which is the correct outcome
+    # rather than a gap to be filled with pool liquidity multiplied by a guess.
+    execution_quote_provider: Literal["disabled", "kyberswap"] = "disabled"
+    # The public aggregator tier needs no credential, so there is no secret here
+    # and nothing a misconfiguration could leak.
+    kyberswap_base_url: str = "https://aggregator-api.kyberswap.com"
+    kyberswap_connect_timeout_seconds: int = Field(default=5, ge=1, le=30)
+    kyberswap_read_timeout_seconds: int = Field(default=10, ge=1, le=60)
 
     @model_validator(mode="after")
     def reasoning_configuration(self) -> "Settings":

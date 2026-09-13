@@ -102,10 +102,15 @@ class PulseContextPort(Protocol):
     async def trigger_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
-class ExecutionAssessmentPort(Protocol):
-    """ANCHOR input: liquidity and routing reads only. Never signs, never sends."""
+class AnchorContextPort(Protocol):
+    """ANCHOR input: one assembled view of the triggered setup and its quotes.
 
-    async def quote(self, market_key: str) -> object: ...
+    The worker never holds a quote provider, an HTTP client or an RPC client. It
+    receives quotes that have already been obtained, so it cannot choose what to
+    ask for, cannot reach another market, and cannot send anything anywhere.
+    """
+
+    async def execution_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
 class ValidatedEvidencePort(Protocol):
@@ -186,7 +191,7 @@ class PulseCapabilities:
 @dataclass(frozen=True)
 class AnchorCapabilities:
     lease: TaskLease
-    execution: ExecutionAssessmentPort
+    context: AnchorContextPort
     submit: EvidenceSubmissionPort
 
 
