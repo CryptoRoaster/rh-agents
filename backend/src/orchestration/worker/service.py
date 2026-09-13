@@ -14,7 +14,7 @@ from datetime import datetime
 from hashlib import sha256
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -29,12 +29,14 @@ from src.data.tables import (
     WorkerTaskAttemptRow,
 )
 from src.orchestration.worker.models import (
+    FAILURE_OUTCOMES,
     EvidenceTaskResult,
     TaskAttempt,
     TaskAttemptOutcome,
     TaskDisposition,
     TaskFailureReport,
     TaskLease,
+    TaskWaitReport,
     WorkerErrorCode,
     WorkerFailure,
     WorkerFailureCategory,
@@ -56,6 +58,7 @@ from src.orchestration.workflow.models import (
     WorkflowErrorCode,
     WorkflowFailure,
 )
+from src.orchestration.workflow.policy import WaitPolicy
 from src.orchestration.workflow.service import TradeCaseService
 
 CLAIMABLE_TASK_STATUSES = (
@@ -511,6 +514,174 @@ class WorkerRuntimeService:
                 retry_scheduled=False,
             )
 
+    async def report_task_wait(self, lease: TaskLease, report: TaskWaitReport) -> TaskDisposition:
+        """Record that an attempt did its work and the world is not yet ready.
+
+        Structurally this is the retry path without the failure: the lease is
+        released, the attempt closes, and the task returns to PENDING with a
+        future eligibility time. What differs is what the record says. The
+        attempt carries WAITING and no failure category, so an operator reading
+        task history sees a monitor doing its job rather than a run of incidents,
+        and nothing downstream can mistake ordinary patience for an error.
+
+        **The schedule is the runtime's.** A worker reports a fact and this
+        derives the next eligibility time from the task's own server-side policy,
+        because a worker able to name its own cadence could postpone a task
+        indefinitely or poll a provider at will. Only tasks whose policy declares
+        a wait may wait at all, and only for the reasons it allows: the rest of
+        the roles compute an answer once and have nothing to be patient about.
+        """
+        report = TaskWaitReport.model_validate_json(report.model_dump_json())
+        async with self.sessions.begin() as session:
+            now = self.clock.now()
+            case_row = await self._locked_case(session, lease.trade_case_id)
+            task = await session.scalar(
+                select(TradeCaseTaskRow)
+                .where(TradeCaseTaskRow.task_id == lease.task_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if task is None:
+                raise WorkerFailure(WorkerErrorCode.TASK_NOT_FOUND)
+            definition = self.cases.policy.task(AgentRole(task.role), task.task_type)
+            policy = None if definition is None else definition.wait
+            if policy is None:
+                # A one-shot specialist has no business postponing itself.
+                raise WorkerFailure(WorkerErrorCode.WAIT_NOT_PERMITTED)
+            if report.reason_code not in policy.reasons:
+                # A worker cannot invent a category to wait under.
+                raise WorkerFailure(WorkerErrorCode.WAIT_REASON_NOT_PERMITTED)
+            attempt = await session.scalar(
+                select(WorkerTaskAttemptRow).where(WorkerTaskAttemptRow.lease_id == lease.lease_id)
+            )
+            if attempt is None or attempt.task_id != lease.task_id:
+                raise WorkerFailure(WorkerErrorCode.LEASE_NOT_FOUND)
+            if attempt.finished_at is not None:
+                # The attempt already reached a durable outcome. Waiting is not a
+                # second answer to a question that has been answered.
+                raise WorkerFailure(WorkerErrorCode.RESULT_CONFLICT)
+            # Fenced exactly like every other authoritative write: a worker whose
+            # lease has gone has no standing to reschedule anything.
+            await self._validate_lease(session, task, lease, now)
+
+            attempt.finished_at = now
+            attempt.outcome = TaskAttemptOutcome.WAITING.value
+            attempt.reason_code = report.reason_code
+            attempt.failure_category = None
+            task.lease_id = None
+            task.worker_instance_id = None
+            task.lease_started_at = None
+            task.lease_expires_at = None
+            task.lease_renewals = 0
+            task.failure_category = None
+            task.attempt += 1
+
+            # Waiting spends its own budget. Failures have theirs, so a monitor
+            # that rechecked two hundred times still has a full allowance for
+            # things actually going wrong, and a handful of provider outages
+            # cannot consume the watch.
+            waits = await self._count_outcomes(
+                session, task.task_id, frozenset({TaskAttemptOutcome.WAITING})
+            )
+            ends = report.reason_code in policy.terminal_reasons
+            exhausted = waits >= policy.max_waits
+            next_eligible_at = self._next_wait(now, policy, report, task)
+            if ends or exhausted or next_eligible_at is None:
+                # A watch is bounded like everything else. Running out of checks,
+                # or reaching the end of what is worth watching, is not a failure
+                # of the market to cooperate; it is this system declining to
+                # watch on.
+                reason = "TASK_WATCH_EXHAUSTED" if exhausted and not ends else "TASK_WATCH_ENDED"
+                task.status = SpecialistTaskStatus.FAILED.value
+                task.completed_at = now
+                task.next_eligible_at = None
+                task.reason_code = reason
+                self._event(
+                    session,
+                    case_row,
+                    reason,
+                    reason,
+                    {
+                        "task_id": str(task.task_id),
+                        "role": task.role,
+                        "attempt_number": attempt.attempt_number,
+                        "waits": waits,
+                    },
+                )
+                return TaskDisposition(
+                    task_id=task.task_id,
+                    trade_case_id=task.trade_case_id,
+                    attempt_number=attempt.attempt_number,
+                    outcome=TaskAttemptOutcome.WAITING,
+                    reason_code=reason,
+                    retry_scheduled=False,
+                )
+            task.status = SpecialistTaskStatus.PENDING.value
+            task.reason_code = report.reason_code
+            task.next_eligible_at = next_eligible_at
+            self._event(
+                session,
+                case_row,
+                "TASK_WAITING",
+                report.reason_code,
+                {
+                    "task_id": str(task.task_id),
+                    "role": task.role,
+                    "attempt_number": attempt.attempt_number,
+                    "next_eligible_at": next_eligible_at.isoformat(),
+                    "waits": waits,
+                },
+            )
+            return TaskDisposition(
+                task_id=task.task_id,
+                trade_case_id=task.trade_case_id,
+                attempt_number=attempt.attempt_number,
+                outcome=TaskAttemptOutcome.WAITING,
+                reason_code=report.reason_code,
+                retry_scheduled=True,
+                next_eligible_at=next_eligible_at,
+            )
+
+    @staticmethod
+    def _next_wait(
+        now: datetime,
+        policy: WaitPolicy,
+        report: TaskWaitReport,
+        task: TradeCaseTaskRow,
+    ) -> datetime | None:
+        """When to look again, or None when there is no point looking again.
+
+        The interval is policy's. ``not_after`` and the task's own expiry can
+        only bring the moment forward, never push it out — a worker may say when
+        the thing it watches stops being watchable, and may not say when it would
+        prefer to be asked.
+        """
+        scheduled = now + policy.interval
+        for bound in (report.not_after, aware(task.expires_at) if task.expires_at else None):
+            if bound is not None and bound < scheduled:
+                scheduled = bound
+        return None if scheduled <= now else scheduled
+
+    @staticmethod
+    async def _count_outcomes(
+        session: AsyncSession, task_id: UUID, outcomes: frozenset[TaskAttemptOutcome]
+    ) -> int:
+        """How many finished attempts of this task ended each way.
+
+        Read from immutable attempt history rather than kept in a counter column,
+        so waits and failures are counted separately without a schema change and
+        without either budget being able to drift from what actually happened.
+        """
+        total = await session.scalar(
+            select(func.count())
+            .select_from(WorkerTaskAttemptRow)
+            .where(
+                WorkerTaskAttemptRow.task_id == task_id,
+                WorkerTaskAttemptRow.outcome.in_([item.value for item in outcomes]),
+            )
+        )
+        return int(total or 0)
+
     async def report_task_failure(
         self, lease: TaskLease, report: TaskFailureReport
     ) -> TaskDisposition:
@@ -534,11 +705,11 @@ class WorkerRuntimeService:
             if attempt.finished_at is not None:
                 return self._finished_disposition(task, attempt)
             await self._validate_lease(session, task, lease, now)
-            return self._apply_failure(
+            return await self._apply_failure(
                 session, case_row, task, attempt, report.category, report.reason_code, now
             )
 
-    def _apply_failure(
+    async def _apply_failure(
         self,
         session: AsyncSession,
         case_row: TradeCaseRow,
@@ -547,8 +718,17 @@ class WorkerRuntimeService:
         category: WorkerFailureCategory,
         reason_code: str,
         now: datetime,
+        recorded_outcome: TaskAttemptOutcome | None = None,
     ) -> TaskDisposition:
-        """Single deterministic place where a failed attempt becomes a task decision."""
+        """Single deterministic place where a failed attempt becomes a task decision.
+
+        ``recorded_outcome`` names what the attempt history should say when that
+        differs from what the task decision is. Lease recovery is the only caller
+        that needs it: the task is retried exactly as a transient failure, while
+        the attempt truthfully records that its lease expired. It is written here
+        rather than afterwards because an attempt is immutable once finished, and
+        the database enforces that.
+        """
         if category == WorkerFailureCategory.TASK_INVALIDATED:
             outcome = TaskAttemptOutcome.SUPERSEDED
         elif self.policy.is_retryable(category):
@@ -556,7 +736,7 @@ class WorkerRuntimeService:
         else:
             outcome = TaskAttemptOutcome.FAILED_PERMANENT
         attempt.finished_at = now
-        attempt.outcome = outcome.value
+        attempt.outcome = (recorded_outcome or outcome).value
         attempt.reason_code = reason_code
         attempt.failure_category = category.value
         # The lease is released in every failure path; a new attempt needs a new one.
@@ -567,7 +747,12 @@ class WorkerRuntimeService:
         task.lease_renewals = 0
         task.failure_category = category.value
         retryable = outcome != TaskAttemptOutcome.FAILED_PERMANENT
-        exhausted = task.attempt >= task.max_attempts
+        # Counted from history rather than from the claim counter, so a monitor's
+        # ordinary waiting never spends the budget meant for things going wrong.
+        # For every one-shot role there are no waits and the count is identical
+        # to what the claim counter said.
+        failures = await self._count_outcomes(session, task.task_id, FAILURE_OUTCOMES)
+        exhausted = failures >= task.max_attempts
         if retryable and not exhausted:
             delay = self.policy.retry_delay(task.attempt)
             task.attempt += 1
@@ -674,7 +859,7 @@ class WorkerRuntimeService:
         )
         if attempt is None or attempt.finished_at is not None:
             return None
-        disposition = self._apply_failure(
+        disposition = await self._apply_failure(
             session,
             case_row,
             task,
@@ -682,8 +867,8 @@ class WorkerRuntimeService:
             WorkerFailureCategory.TRANSIENT,
             "LEASE_EXPIRED",
             now,
+            recorded_outcome=TaskAttemptOutcome.LEASE_EXPIRED,
         )
-        attempt.outcome = TaskAttemptOutcome.LEASE_EXPIRED.value
         self._event(
             session,
             case_row,

@@ -69,6 +69,12 @@ class WorkerRuntimePolicy:
     retry_initial_delay: timedelta
     retry_max_delay: timedelta
     claim_batch: int
+    # Bounds on a monitor's own proposed recheck interval. A worker proposes;
+    # the runtime decides. Without a floor a worker could poll a provider as
+    # fast as it liked, and without a ceiling a task could effectively stop
+    # watching without ever saying so.
+    min_wait_interval: timedelta
+    max_wait_interval: timedelta
 
     def __post_init__(self) -> None:
         if self.lease_duration <= timedelta(0):
@@ -83,6 +89,16 @@ class WorkerRuntimePolicy:
             raise ValueError("Maximum retry delay cannot be below the initial delay")
         if not 1 <= self.claim_batch <= 50:
             raise ValueError("Claim batch must be between 1 and 50")
+        if self.min_wait_interval <= timedelta(0):
+            raise ValueError("A recheck interval must be positive")
+        if self.max_wait_interval < self.min_wait_interval:
+            raise ValueError("The recheck ceiling cannot sit below its floor")
+
+    def wait_interval(self, proposed: timedelta) -> timedelta:
+        """Clamp a worker's proposed recheck into the runtime's own bounds."""
+        if proposed < self.min_wait_interval:
+            return self.min_wait_interval
+        return min(proposed, self.max_wait_interval)
 
     def is_retryable(self, category: WorkerFailureCategory) -> bool:
         return category in RETRYABLE_CATEGORIES
@@ -106,4 +122,9 @@ WORKER_RUNTIME_V1 = WorkerRuntimePolicy(
     retry_initial_delay=timedelta(seconds=15),
     retry_max_delay=timedelta(minutes=10),
     claim_batch=10,
+    # Ten seconds is below any market data cadence this system consumes, so the
+    # floor exists to bound a misbehaving worker rather than to enable fast
+    # polling. The ceiling keeps a watch from silently going to sleep for hours.
+    min_wait_interval=timedelta(seconds=10),
+    max_wait_interval=timedelta(minutes=15),
 )

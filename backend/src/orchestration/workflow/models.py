@@ -494,11 +494,58 @@ class TradeSetupPayload(AcceptancePayload):
     setup: "TradeSetupDetail | None" = None
 
 
+class TriggerDetail(Immutable):
+    """What a monitor actually compared, and to what.
+
+    Enough bounded fact to answer "why did this trigger?" without prose and
+    without a model having been involved: the condition, the price, the moment
+    the market had that price, the market it was, and the deterministic policy
+    that judged it. There is no confidence, no score and no sentiment, because a
+    comparison between two Decimals has none of those things.
+    """
+
+    setup_id: UUID
+    setup_fingerprint: Digest
+    policy_version: Identifier
+    trigger_type: Code
+    price_basis: Code
+    # Present for the threshold conditions, absent for the range.
+    reference_price: Positive | None = None
+    # Present for the range condition, absent for the thresholds.
+    zone_low: Positive | None = None
+    zone_high: Positive | None = None
+    valid_from: AwareDatetime
+    expires_at: AwareDatetime
+    # The market's own account of when it had this price. Never the moment it was
+    # read: a stale price fetched a second ago is still stale.
+    observed_at: AwareDatetime
+    evaluated_at: AwareDatetime
+    observation_id: UUID
+    snapshot_id: UUID
+    pair_id: Identifier
+    chain: Identifier
+    network: Identifier
+    venue: Identifier
+    provider: Identifier
+    is_fixture: bool = Field(strict=True)
+    trigger_digest: Digest
+
+
 class TriggerPayload(AcceptancePayload):
+    """A factual observation that a condition became true.
+
+    Not an authorization and not an opinion. It records that at a stated moment
+    the authoritative setup's condition held against a stated recorded price. What
+    anyone may do about that remains ANCHOR's and SENTINEL's question.
+    """
+
     kind: Literal["trigger"] = "trigger"
     setup_evidence_id: UUID
     observed_price: Positive
     trigger_code: Code
+    # Absent on evidence written before Phase 2I; present for anything a PULSE
+    # monitor produced.
+    detail: "TriggerDetail | None" = None
 
 
 class LiquidityExecutionPayload(AcceptancePayload):

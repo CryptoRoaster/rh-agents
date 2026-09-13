@@ -1,6 +1,6 @@
 """Read-only recorded market view. New unavailable data never falls back to older values."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -86,6 +86,54 @@ class MarketReader:
             identity=identity, include_fixtures=include_fixtures, limit=1
         )
         return snapshots[0] if snapshots else None
+
+    async def observations(
+        self,
+        identity: str,
+        *,
+        since: datetime,
+        until: datetime,
+        limit: int,
+        include_fixtures: bool = False,
+    ) -> tuple[MarketSnapshot, ...]:
+        """Every recorded observation for one market inside a bounded window.
+
+        Distinct from :meth:`markets`, which answers "what is the current state
+        of each market" and therefore keeps only the newest row per stream. That
+        is the right answer for a dashboard and the wrong one for a monitor: a
+        price that crossed a level and came back would be invisible, and the
+        system would report that nothing happened when it had durably recorded
+        that something did.
+
+        Ordered oldest first by the market's **own** observation time, so a
+        caller asking "when did we first see this?" gets a stable answer.
+        ``recorded_at`` and ``id`` break ties only — a row inserted late never
+        becomes recent, because insertion time cannot reorder the window.
+
+        The window is closed at both ends and the result is capped. One extra row
+        beyond ``limit`` is fetched so a caller can tell a full window from a
+        truncated one rather than silently receiving part of the picture.
+        """
+        if limit < 1 or limit > 500:
+            raise ValueError("Observation windows must stay bounded")
+        if since.utcoffset() is None or until.utcoffset() is None:
+            raise ValueError("Observation windows require timezone-aware bounds")
+        statement = (
+            select(Row)
+            .where(
+                or_(Row.asset_id == identity, Row.pair_id == identity),
+                Row.available.is_(True),
+                Row.observed_at >= since,
+                Row.observed_at <= until,
+            )
+            .order_by(Row.observed_at, Row.recorded_at, Row.id)
+            .limit(limit + 1)
+        )
+        if not include_fixtures:
+            statement = statement.where(Row.is_fixture.is_(False))
+        async with self._sessions() as session:
+            rows = (await session.scalars(statement)).all()
+        return tuple(MarketSnapshot.model_validate(row.payload) for row in rows)
 
     async def candidates(
         self,

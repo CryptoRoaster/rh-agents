@@ -25,7 +25,6 @@ from src.orchestration.workflow.models import (
     EvidenceEnvelope,
     SpecialistTask,
     TradeCase,
-    TradeSetupPayload,
 )
 
 
@@ -91,10 +90,16 @@ class SetupContextPort(Protocol):
     async def setup_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
-class TriggerFeedPort(Protocol):
-    """PULSE input: the exact current setup plus a permitted realtime feed."""
+class PulseContextPort(Protocol):
+    """PULSE input: the authoritative setup and one current market observation.
 
-    async def current_setup(self, trade_case_id: UUID) -> TradeSetupPayload | None: ...
+    A monitor is given the condition to watch and the observation to judge it
+    against, both already assembled. It holds no market provider client, cannot
+    choose what to query, and cannot reach a second market to find a price it
+    prefers.
+    """
+
+    async def trigger_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
 class ExecutionAssessmentPort(Protocol):
@@ -174,7 +179,7 @@ class VectorCapabilities:
 @dataclass(frozen=True)
 class PulseCapabilities:
     lease: TaskLease
-    triggers: TriggerFeedPort
+    context: PulseContextPort
     submit: EvidenceSubmissionPort
 
 
