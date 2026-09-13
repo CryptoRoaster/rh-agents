@@ -12,17 +12,20 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import pytest
 
+from src.agents.anchor.context import tokens_for_usd
 from src.agents.anchor.models import (
     AnchorMarketContext,
     AnchorTaskInput,
+    QuoteAssetValuation,
     QuoteAttempt,
     ReferenceMarket,
 )
 from src.agents.anchor.policy import ANCHOR_EXECUTION_V1
 from src.core.models import AgentRole, Side
+from src.core.numbers import quantize
 from src.markets.fake_quotes import FixtureQuoteSource
-from src.markets.models import MarketIdentity
-from src.markets.quotes import QuoteUnavailable, to_base_units
+from src.markets.models import Availability, MarketIdentity
+from src.markets.quotes import QuoteUnavailable
 from src.orchestration.workflow.models import (
     EvidenceEnvelope,
     EvidenceProvenance,
@@ -102,6 +105,19 @@ def reference(now, *, price=REFERENCE, seconds_ago: int = 10) -> ReferenceMarket
     )
 
 
+def valuation(now, *, usd_per_token=Decimal(1), seconds_ago: int = 10) -> QuoteAssetValuation:
+    """The payment asset's own USD price, as a recorded observation of it."""
+    return QuoteAssetValuation(
+        asset_id=f"{CHAIN}:{NETWORK}:{QUOTE_TOKEN}",
+        observation_id=stable_id("payment-price"),
+        snapshot_id=stable_id("payment-snapshot"),
+        provider="geckoterminal",
+        usd_per_token=usd_per_token,
+        observed_at=now - timedelta(seconds=seconds_ago),
+        age_seconds=seconds_ago,
+    )
+
+
 def source(now, **overrides) -> FixtureQuoteSource:
     defaults: dict[str, object] = dict(
         reference_price=REFERENCE,
@@ -111,12 +127,14 @@ def source(now, **overrides) -> FixtureQuoteSource:
     return FixtureQuoteSource(**defaults)  # type: ignore[arg-type]
 
 
-async def ladder_from(quotes: FixtureQuoteSource, market=None, steps=None):
+async def ladder_from(quotes: FixtureQuoteSource, market=None, steps=None, usd_per_token=None):
     """Build a ladder the way the context reader would, for evaluator tests."""
     market = market or anchor_market()
+    price = Decimal(1) if usd_per_token is None else usd_per_token
     attempts = []
-    for notional in steps or ANCHOR_EXECUTION_V1.ladder_notional:
-        amount_in = to_base_units(notional, market.quote_decimals)
+    for target in steps or ANCHOR_EXECUTION_V1.ladder_notional:
+        tokens, amount_in = tokens_for_usd(target, price, market.quote_decimals)
+        notional = quantize(tokens * price)
         try:
             quote = await quotes.quote_exact_input(
                 chain=market.chain,
@@ -129,14 +147,28 @@ async def ladder_from(quotes: FixtureQuoteSource, market=None, steps=None):
             )
         except QuoteUnavailable as error:
             attempts.append(
-                QuoteAttempt(notional=notional, amount_in=amount_in, failure=error.failure)
+                QuoteAttempt(
+                    notional_usd=notional,
+                    amount_in_tokens=tokens,
+                    amount_in=amount_in,
+                    failure=error.failure,
+                )
             )
             break
-        attempts.append(QuoteAttempt(notional=notional, amount_in=amount_in, quote=quote))
+        attempts.append(
+            QuoteAttempt(
+                notional_usd=notional,
+                amount_in_tokens=tokens,
+                amount_in=amount_in,
+                quote=quote,
+            )
+        )
     return tuple(attempts)
 
 
-def task_input(now, *, ladder=(), market=None, ref="default", requests=None) -> AnchorTaskInput:
+def task_input(
+    now, *, ladder=(), market=None, ref="default", requests=None, value="default"
+) -> AnchorTaskInput:
     return AnchorTaskInput(
         trade_case_id=uuid4(),
         task_id=uuid4(),
@@ -146,6 +178,7 @@ def task_input(now, *, ladder=(), market=None, ref="default", requests=None) -> 
         trigger_evidence_id=stable_id("trigger-evidence"),
         market=market or anchor_market(),
         reference=reference(now) if ref == "default" else ref,
+        quote_asset_valuation=valuation(now) if value == "default" else value,
         ladder=ladder,
         quote_requests=len(ladder) if requests is None else requests,
         policy_version=ANCHOR_EXECUTION_V1.version,
@@ -218,11 +251,44 @@ class StubTradeCase:
 
 
 class StubMarkets:
-    def __init__(self, snapshot=None) -> None:
+    """Recorded markets, keyed by identity.
+
+    The payment asset's price is a *separate* observation from the pair's, and
+    the stub keeps them separate on purpose: one that answered every identity
+    with the same snapshot would hand back the traded asset's price as the
+    payment asset's, and every USD figure derived from it would be wrong by
+    whatever the two happen to differ by.
+    """
+
+    def __init__(self, snapshot=None, *, payment="default") -> None:
         self._snapshot = snapshot
+        self._payment = payment_snapshot(snapshot) if payment == "default" and snapshot else payment
 
     async def latest(self, identity: str, *, include_fixtures: bool = False):
+        if self._snapshot is not None and identity == f"{CHAIN}:{NETWORK}:{QUOTE_TOKEN}":
+            return self._payment
         return self._snapshot
+
+
+def payment_snapshot(pair_snapshot, usd_per_token=Decimal(1)):
+    """An observation of the payment asset itself, priced in USD."""
+    if pair_snapshot is None:
+        return None
+    # Independently priced and independently available. The payment asset is a
+    # different market, so a pair that cannot be priced says nothing about
+    # whether its payment asset can be.
+    return pair_snapshot.model_copy(
+        update={
+            "id": uuid4(),
+            "price": pair_snapshot.price.model_copy(
+                update={
+                    "id": uuid4(),
+                    "value_usd": usd_per_token,
+                    "status": Availability.AVAILABLE,
+                }
+            ),
+        }
+    )
 
 
 def evidence_envelope(now, evidence_type, role, payload, **kw):

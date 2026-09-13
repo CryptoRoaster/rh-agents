@@ -177,7 +177,6 @@ def test_the_package_depends_only_on_quote_contracts():
     "forbidden",
     [
         "position_size",
-        "notional_usd",
         "quantity",
         "portfolio_fraction",
         "risk_outcome",
@@ -199,10 +198,21 @@ def test_no_anchor_schema_has_a_field_for_authority_or_a_capability(schema, forb
 
 
 def test_capacity_is_named_so_it_cannot_be_read_as_permission():
-    """The field says what the market bears, never what anyone may trade."""
-    assert "market_capacity_notional" in ExecutionAssessment.model_fields
-    assert "position_size_limit_usd" not in ExecutionAssessment.model_fields
-    assert "max_additional_notional_usd" not in ExecutionAssessment.model_fields
+    """The field says what the market bears, never what anyone may trade.
+
+    It carries its unit and its provenance in the name: USD because SENTINEL
+    sizes in USD and a bare number would invite the reader to assume it, and
+    "tested acceptable" because a ladder that passed is not a market maximum.
+    What it must never be is one of SENTINEL's own names.
+    """
+    assert "largest_tested_acceptable_notional_usd" in ExecutionAssessment.model_fields
+    for forbidden in (
+        "position_size_limit_usd",
+        "max_additional_notional_usd",
+        "max_safe_size",
+        "approved_notional_usd",
+    ):
+        assert forbidden not in ExecutionAssessment.model_fields
 
 
 def test_anchor_cannot_force_a_trade_case_status():

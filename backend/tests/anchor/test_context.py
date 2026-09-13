@@ -200,7 +200,7 @@ async def test_the_reference_is_not_the_setup_entry_or_the_trigger_level(now):
 async def test_the_ladder_walks_the_policys_sizes(now):
     quotes = source(now, deviation_bps_per_step=Decimal(1))
     context = await read(now, quotes=quotes)
-    assert [attempt.notional for attempt in context.ladder] == list(
+    assert [attempt.notional_usd for attempt in context.ladder] == list(
         ANCHOR_EXECUTION_V1.ladder_notional
     )
     assert context.quote_requests == len(ANCHOR_EXECUTION_V1.ladder_notional)

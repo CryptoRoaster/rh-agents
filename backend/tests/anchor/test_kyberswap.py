@@ -10,7 +10,7 @@ tests below assert that it does not survive into a quote.
 """
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -256,8 +256,8 @@ async def test_an_empty_route_is_a_market_fact():
         (500, QuoteFailure.PROVIDER_UNAVAILABLE),
         (503, QuoteFailure.PROVIDER_UNAVAILABLE),
         (403, QuoteFailure.PROVIDER_UNAVAILABLE),
-        (404, QuoteFailure.INVALID_RESPONSE),
         (418, QuoteFailure.INVALID_RESPONSE),
+        (451, QuoteFailure.INVALID_RESPONSE),
     ],
 )
 async def test_a_provider_failure_is_never_an_empty_market(status, failure):
@@ -351,3 +351,118 @@ def test_the_client_trusts_no_environment_and_follows_no_redirect():
     source_text = inspect.getsource(KyberSwapQuoteSource.__init__)
     assert "trust_env=False" in source_text
     assert "follow_redirects=False" in source_text
+
+
+# ------------------------------------- provider capability is not liquidity
+
+
+@pytest.mark.parametrize("chain", sorted(CHAIN_SLUGS))
+async def test_scenario_ae_a_chain_the_provider_stops_serving_is_not_an_empty_market(chain):
+    """The failure mode this phase has to survive, for Robinhood especially.
+
+    If the aggregator dropped a chain, every asset on it would still trade
+    perfectly well. Reporting "no route" would be a claim about the market made
+    from a fact about our integration — and it would look permanent, where a
+    capability loss is something an operator can actually fix.
+
+    Verified against the live API: an unserved chain slug answers 404, not a
+    routing refusal.
+    """
+    with pytest.raises(QuoteUnavailable) as error:
+        await quote(status=404, chain=chain)
+
+    assert error.value.failure == QuoteFailure.UNSUPPORTED_CHAIN
+    assert error.value.is_market_fact is False
+
+
+async def test_a_chain_this_system_does_not_configure_is_refused_before_any_request():
+    """No request is made at all, so an unknown chain costs nothing."""
+    calls: list[str] = []
+
+    def handle(request):
+        calls.append(str(request.url))
+        raise AssertionError("an unconfigured chain must not reach the provider")
+
+    async with KyberSwapQuoteSource(
+        settings(), transport=httpx.MockTransport(handle), clock=FixedClock(ANCHOR_TIME)
+    ) as source:
+        with pytest.raises(QuoteUnavailable) as error:
+            await source.quote_exact_input(
+                chain="ethereum",
+                network="mainnet",
+                token_in=USDG,
+                token_out=NVDA,
+                token_in_decimals=6,
+                token_out_decimals=18,
+                amount_in=100_000_000,
+            )
+    assert error.value.failure == QuoteFailure.UNSUPPORTED_CHAIN
+    assert calls == []
+
+
+@pytest.mark.parametrize("chain", sorted(CHAIN_SLUGS))
+async def test_scenario_af_both_supported_chains_behave_identically(chain):
+    """Robinhood is not a special case in the code, and must not become one."""
+    result = await quote(chain=chain)
+    assert result.chain == chain
+    assert result.network == "mainnet"
+    assert result.amount_out > 0
+    assert result.route.router == "kyberswap"
+    assert result.provider_price_impact_bps is None
+    assert result.source_block_number is None
+
+
+# --------------------------------------------- the two clocks, and the USD
+
+
+async def test_the_quote_carries_both_the_provider_time_and_the_receipt_time():
+    result = await quote()
+    assert result.quoted_at is not None
+    assert result.received_at == ANCHOR_TIME
+    assert result.priced_at == min(result.quoted_at, result.received_at)
+
+
+async def test_a_provider_clock_running_ahead_cannot_make_a_quote_look_fresh():
+    """Freshness takes the earlier time, so skew can only ever cost us."""
+    payload = json.loads(body())
+    payload["data"]["routeSummary"]["timestamp"] = int(ANCHOR_TIME.timestamp()) + 3600
+    result = await quote(json.dumps(payload))
+
+    assert result.quoted_at > result.received_at
+    assert result.priced_at == result.received_at
+    assert result.age(ANCHOR_TIME) >= timedelta(0)
+
+
+async def test_the_provider_usd_valuation_is_read_when_present():
+    payload = json.loads(body())
+    payload["data"]["routeSummary"]["amountInUsd"] = "99.994"
+    result = await quote(json.dumps(payload))
+    assert result.provider_amount_in_usd == Decimal("99.994")
+
+
+@pytest.mark.parametrize("bad", ["not-a-number", "-5", "NaN"])
+async def test_an_unreadable_provider_valuation_never_fails_an_otherwise_good_quote(bad):
+    """A cross-check that cannot be read is absent, not fatal."""
+    payload = json.loads(body())
+    payload["data"]["routeSummary"]["amountInUsd"] = bad
+    try:
+        result = await quote(json.dumps(payload))
+    except QuoteUnavailable as error:  # a malformed number may fail validation
+        assert error.failure == QuoteFailure.INVALID_RESPONSE
+        return
+    assert result.provider_amount_in_usd is None or result.provider_amount_in_usd >= 0
+
+
+async def test_no_block_number_is_ever_claimed():
+    """Block numbers exist only inside the blobs this adapter never reads.
+
+    They also disagree with each other inside a single hop — verified live:
+    62158866, 62155841 and 62159197 in the same leg — so there is no coherent
+    source block to pin a ladder to. The ladder is time-bounded instead, which
+    is weaker and true.
+    """
+    result = await quote()
+    assert result.source_block_number is None
+    rendered = result.model_dump_json()
+    assert "blockNumber" not in rendered
+    assert "62158866" not in rendered

@@ -56,6 +56,12 @@ class AnchorExecutionPolicy:
     # fit inside it or this policy refuses to exist, which is what makes the
     # bound a fact about the configuration rather than a runtime branch.
     max_quote_requests: int
+    # How far our USD valuation of an order may sit from the provider's own
+    # before the quote's economics are treated as unreadable. This is not a
+    # market bound: a material disagreement means somebody is wrong about
+    # decimals, about which token this is, or about the price of the payment
+    # asset, and none of those produce a number worth comparing.
+    max_usd_valuation_skew_bps: Decimal
 
     def __post_init__(self) -> None:
         if self.max_quote_age <= timedelta(0):
@@ -88,6 +94,8 @@ class AnchorExecutionPolicy:
             raise ValueError("The request budget must cover the ladder it is asked to test")
         if self.max_quote_requests > 32:
             raise ValueError("One assessment may not become a provider load test")
+        if not Decimal(0) < self.max_usd_valuation_skew_bps <= Decimal(10000):
+            raise ValueError("Valuation skew bound must be a positive basis-point figure")
 
 
 # Provisional PAPER-mode policy.
@@ -124,4 +132,10 @@ ANCHOR_EXECUTION_V1 = AnchorExecutionPolicy(
         Decimal(50000),
     ),
     max_quote_requests=8,
+    # Five percent. Wide enough that two honest valuations of the same order —
+    # ours from a recorded observation, the provider's from its own feed, taken
+    # moments apart — never collide, and narrow enough that a decimals error or
+    # a wrong token cannot hide inside it: those are wrong by factors, not by
+    # percents. Live measurement put the two within four basis points.
+    max_usd_valuation_skew_bps=Decimal(500),
 )

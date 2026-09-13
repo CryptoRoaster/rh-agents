@@ -86,6 +86,68 @@ the intent behind it.
 
 ---
 
+## What "$500" means
+
+The ladder is written in dollars because SENTINEL sizes in dollars. The provider
+is asked in base units of whatever the market is paid in. **Those are the same
+number only when the payment asset happens to trade at a dollar**, and nothing
+here is allowed to assume it does.
+
+The first implementation did assume it. It sent the ladder value straight into
+`to_base_units` against the payment asset's decimals, so the rung labelled $500
+asked for 500 *tokens*. Against a payment asset worth $600 that is a $300,000
+order — six hundred times the size it claimed — and every quote would have come
+back looking perfectly reasonable. The capacity written into evidence would have
+been wrong by that factor, under a field name ending in `_usd`.
+
+So a USD rung becomes an order in three explicit steps:
+
+1. **Value the payment asset.** A recorded observation of that asset's own USD
+   price, fresh within the reference window. Never a peg, never a symbol match,
+   never "it has USD in the name". There is no stablecoin special case anywhere
+   in this system, which is why a stablecoin observed at $0.97 buys 1,000 tokens
+   for $970 rather than 970.
+2. **Divide, and truncate downward** to the token's own smallest unit. The
+   division rarely lands exactly, and rounding up would test a larger order than
+   intended. The truncation is not silent: the rung records the USD value of the
+   amount *actually sent*, so what was tested is what was quoted.
+3. **Convert to base units** using the pair's authoritative decimals.
+
+### When the payment asset cannot be valued
+
+ANCHOR refuses, with `QUOTE_ASSET_USD_VALUE_UNAVAILABLE`, **before making a
+single provider request**. It does not fall back to a token-denominated ladder.
+
+That is a deliberate choice between the two available architectures. A
+quote-asset-denominated ladder would be internally consistent, but SENTINEL's
+capacities are USD and nothing downstream could safely read the result — so the
+evidence would exist and be unusable, which is worse than absent. Spending
+provider requests to build it would compound the mistake.
+
+### The provider's own valuation is a check, not the source
+
+KyberSwap returns `amountInUsd` alongside the answer. Because it arrives *with*
+the answer it cannot say how much to send — using it that way would be circular
+— so it is used only to cross-check the conversion afterwards. If the two
+valuations disagree by more than 500 basis points the rung is rejected as
+`USD_VALUATION_DISAGREEMENT`, because a material gap means somebody has the
+decimals wrong, has the wrong token, or is pricing from a stale feed, and none
+of those produce economics worth comparing. Neither side is trusted over the
+other; the quote is simply unreadable. Live measurement puts the two within 0.1
+to 4.6 basis points.
+
+### The deviation is a dollar comparison
+
+The reference price is USD per unit of the asset being bought. A quote's
+effective price is *payment-asset units* per unit bought. Subtracting one from
+the other unconverted would produce a number measuring the payment asset's own
+price rather than the cost of trading — with a $250 payment asset it would have
+reported a deviation near minus one hundred percent on a perfectly ordinary
+quote. The valuation converts the effective price into USD before any comparison
+happens.
+
+---
+
 ## The quote ladder
 
 A fixed, ascending, deduplicated ladder of notionals is tested — currently
@@ -115,6 +177,20 @@ The single most important type in this phase.
 | `AT_LEAST` | Every size tested passed. | The largest size *tried*. The real capacity is at or above it. |
 | `NONE` | Even the smallest size failed on its merits. | None. |
 | `UNKNOWN` | Capacity could not be established. | None. |
+
+A bracket claims less than it might appear to. If $500 passed and $2,500 failed,
+what is known is exactly that: those two sizes were tested and those were the
+answers. Nothing proves $2,499 would fail, nothing proves $501 would pass, and
+nothing proves $500 is the market's maximum. The field names carry this —
+`largest_tested_acceptable_notional_usd` and `first_tested_rejected_notional_usd`
+— rather than leaving a reader to infer it, and nothing interpolates between the
+two. Risk may safely cap at the size that passed; that is conservative and
+correct.
+
+The walk also stops at the first refusal, so a market that refused $500 but would
+have accepted $2,500 is reported as supporting $100 — not as having a maximum of
+$100. No monotonicity is claimed, and the untested rungs are simply absent from
+the ladder.
 
 A ladder that passed every rung has learned a lower bound and nothing else.
 Reporting the top of that ladder as a limit would understate the market, and —
@@ -186,6 +262,15 @@ is worth very little a minute after it was made. The quote window is thirty
 seconds, measured from the provider's own account of when it priced, never from
 when the answer arrived.
 
+Two times are recorded for every quote: the provider's own account of when it
+priced, and when the answer arrived by the trusted clock. Freshness uses
+whichever is **earlier**, so a provider clock running ahead of ours can only ever
+make a quote look staler than it is — never fresher. This matters because the
+meaning of KyberSwap's `timestamp` is not documented; observed behaviour is that
+it tracks request handling (about a second before receipt, and it advances with
+wall-clock time between calls) rather than pinning a pool or block state, so it
+is treated as a weak claim held against a second one rather than as authority.
+
 The ladder's own points must also sit close together — twenty seconds — because
 several quotes taken minutes apart do not describe one market state, and
 treating them as one curve would read the market *moving* as the market having
@@ -223,14 +308,30 @@ an absence of evidence rather than being promoted to a claim about liquidity.
 Both supported chains had to work. That is a real constraint rather than a
 formality: most aggregators cover BNB Smart Chain and not Robinhood Chain.
 
-| Provider | Robinhood (4663) | BSC (56) | Auth | Calldata in quote | Block context |
+"Worked today" and "the provider says it supports this" are different claims,
+so they are separate columns. A live success is evidence about one moment; a
+documented listing is a statement about intent. Neither implies the other, and
+collapsing them would let an empirical result read as a contract.
+
+| Provider | Chain | Documented | Live verified | Auth | Calldata in quote |
 |---|---|---|---|---|---|
-| **KyberSwap** `/routes` | verified | verified | none | no | per-hop |
-| ParaSwap `/prices` | verified | verified | none | `contractMethod`, proxy | top-level `blockNumber` |
-| 0x | — | — | key required (401) | yes | — |
-| 1inch | — | — | key required (401) | yes | — |
-| OpenOcean | 403 | 403 | blocked | — | — |
-| Odos | unreachable | — | — | — | — |
+| **KyberSwap** `/routes` | BSC (56) | yes — "BNB Chain (56)" | yes | none | no |
+| **KyberSwap** `/routes` | Robinhood (4663) | yes — "Robinhood (4663)", Aggregator | yes | none | no |
+| ParaSwap `/prices` | both | not checked | yes | none | `contractMethod`, proxy |
+| 0x | — | — | no — 401 | key required | yes |
+| 1inch | — | — | no — 401 | key required | yes |
+| OpenOcean | both | — | no — 403 | blocked | — |
+| Odos | Robinhood | — | no — unreachable | — | — |
+
+Robinhood's status was re-checked during this audit against the current official
+supported-networks documentation, which lists **Robinhood (4663)** with
+Aggregator support alongside BNB Chain (56). An earlier working assumption that
+Robinhood was live-verified but undocumented is therefore wrong and is recorded
+here as corrected rather than quietly dropped.
+
+Documentation can still change, and a listing is not a guarantee, so the
+integration does not lean on it: an unserved chain fails closed as a capability
+loss (below) and the opt-in live smoke is where a silent change surfaces.
 
 KyberSwap was chosen because both chains genuinely answer, the public tier needs
 no credential — so there is no secret to leak — and, decisively, **the quote
@@ -289,6 +390,17 @@ conclusion that the market is thin.
 
 ---
 
+## The two endpoints, and which one exists here
+
+`GET /{chain}/api/v1/routes` returns a route preview: amounts, a route, a
+timestamp. That is the only endpoint this system calls.
+
+`POST /{chain}/api/v1/route/build` is the separate step that produces encoded
+transaction data. It is not called from anywhere, there is no method on the
+adapter that could call it, and the quote port has no shape that would allow it.
+
+---
+
 ## The re-quote invariant (documented, not implemented)
 
 **A future EXECUTOR must obtain its own fresh quote immediately before
@@ -337,11 +449,19 @@ execution.
 
 Stated rather than papered over.
 
-* **No block context.** KyberSwap's route endpoint states no block number, so
-  none is recorded. A fabricated one would be worse than its absence.
-* **No provider impact figure.** The same endpoint publishes none, so the
-  provider-impact bound is presently unexercised against this provider. It
-  exists because the contract supports providers that do publish one.
+* **No block context, and the ladder is not block-pinned.** Block numbers do
+  appear in the response, but only inside the `poolExtra` and `extra` blobs this
+  adapter never reads — the same blobs that carry router, permit and hook
+  addresses — and they disagree with one another inside a single hop (62158866,
+  62155841 and 62159197 in one leg, measured). There is therefore no coherent
+  source block, none is recorded, and the ladder's coherence rests on time
+  alone. That is a weaker guarantee than block-pinning and it is the true one.
+* **No provider impact figure.** The endpoint publishes no `priceImpact` on
+  either chain, verified live, so `provider_price_impact_bps` is always absent
+  for this provider and the impact bound is presently unexercised against it.
+  The bound and the percent-to-basis-point normalisation exist for providers
+  that do publish one; absent is never replaced by zero and never replaced by
+  the deviation computed here.
 * **One provider.** A second would allow cross-checking a quote rather than
   trusting it. Not in this phase.
 * **A quote is an offer, not a fill.** Nothing in this system has observed an
@@ -349,6 +469,52 @@ Stated rather than papered over.
 * **The ladder is coarse.** It brackets capacity between two tested sizes and
   never interpolates between them, because an interpolated figure would be a
   number nobody measured.
+
+---
+
+## The legacy scalars are empty, on purpose
+
+Phase 2A's `LiquidityExecutionPayload` carries `estimated_slippage_bps` and
+`price_impact_bps`. An ANCHOR worker leaves both `None`.
+
+An earlier version filled them with the nearest-looking numbers: the execution
+deviation into the slippage field, and the same deviation into the impact field
+whenever the provider published none. Both were wrong, and wrong in the
+direction that matters — a reader of a field named for slippage would act on a
+figure nobody measured.
+
+* `estimated_slippage_bps` means **a realisable fill cost** in this repository.
+  Its sibling on a market snapshot is what the paper executor uses to move a
+  fill price and then records as `realized_slippage_bps`, and the risk engine
+  gates on it. An execution deviation is not that: it is a quote's distance from
+  a reference, bundling depth, fees, spread and elapsed time, and no execution
+  has happened. Left absent.
+* `price_impact_bps` means **the provider's own figure**. A provider that
+  publishes none leaves it absent rather than lending its name to a number this
+  system computed itself. KyberSwap publishes none.
+
+The evidence is still substantive without them, because a complete execution
+assessment is substance. That required relaxing the pre-existing invariant that
+only legacy scalars could satisfy the requirement — the alternative was to
+manufacture a scalar in order to pass a predicate, which is how a lie acquires a
+reason to exist.
+
+Older payloads still parse and replay unchanged, and nothing reinterprets their
+scalars as the new quantities.
+
+---
+
+## Capability loss is not illiquidity
+
+If KyberSwap ever stops serving a chain this system depends on — Robinhood is
+the one to watch, being the less common of the two — every asset on that chain
+still trades perfectly well. Reporting `NO_ROUTE` would be a claim about the
+market derived from a fact about our integration, and it would look permanent,
+where a capability loss is something an operator can actually fix.
+
+An unserved chain slug answers **HTTP 404**, verified live, and maps to
+`UNSUPPORTED_CHAIN` — not a market fact. A chain this system does not configure
+is refused before any request is made.
 
 ---
 

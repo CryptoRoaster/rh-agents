@@ -80,6 +80,9 @@ class RouteSummary(DTO):
     amountOut: Text  # noqa: N815 - provider field name
     route: list[list[Hop]] = Field(max_length=64)
     timestamp: int = Field(strict=True, gt=0)
+    # The provider's own USD valuation of the input. Read as a cross-check on our
+    # conversion, never as its source: it arrives with the answer.
+    amountInUsd: Decimal | None = None  # noqa: N815 - provider field name
 
 
 class RouteData(DTO):
@@ -99,6 +102,18 @@ class RouteResponse(DTO):
 # Provider response codes that describe the market rather than a failure to
 # answer. Anything else is an absence of evidence.
 NO_ROUTE_CODES = frozenset({4005, 4008, 4011})
+
+
+def _usd(raw: Decimal | None) -> Decimal | None:
+    """The provider's USD valuation, or nothing. Never a reason to fail a quote.
+
+    A cross-check that cannot be read is simply absent; refusing an otherwise
+    valid quote because its optional annotation was malformed would turn a
+    convenience into a liability.
+    """
+    if raw is None or not raw.is_finite() or raw < 0:
+        return None
+    return raw
 
 
 def _amount(raw: str) -> int:
@@ -165,6 +180,9 @@ class KyberSwapQuoteSource:
             f"/{slug}/api/v1/routes",
             {"tokenIn": token_in, "tokenOut": token_out, "amountIn": str(amount_in)},
         )
+        # Read after the answer lands, so the name is true. Freshness takes the
+        # earlier of this and the provider's own timestamp.
+        received_at = self._clock.now()
         try:
             response = RouteResponse.model_validate(payload)
         except ValidationError:
@@ -213,12 +231,21 @@ class KyberSwapQuoteSource:
                 amount_in=amount_in,
                 amount_out=_amount(summary.amountOut),
                 route=route,
-                # The provider's own account of when it priced this, never the
-                # moment the answer arrived here.
+                # The provider's own account of when it priced this, kept
+                # beside the moment the answer arrived rather than instead of it.
                 quoted_at=datetime.fromtimestamp(summary.timestamp, UTC),
-                # This endpoint states no block, so none is recorded. A fabricated
-                # one would be worse than its absence.
+                received_at=received_at,
+                provider_amount_in_usd=_usd(summary.amountInUsd),
+                # No coherent source block exists to record. Block numbers appear
+                # only inside the `poolExtra` and `extra` blobs this adapter
+                # never reads, they disagree with each other within a single hop,
+                # and the same blobs carry router and permit addresses. Pinning a
+                # ladder to a block we cannot coherently read would be a stronger
+                # claim than the data supports, so the ladder is time-bounded.
                 source_block_number=None,
+                # This provider publishes no price-impact figure on either
+                # supported chain, verified live. None means absent, and it is
+                # never replaced by a number computed elsewhere.
                 provider_price_impact_bps=None,
             )
         except ValidationError:
@@ -239,6 +266,12 @@ class KyberSwapQuoteSource:
                 # in the body rather than the status. Refusing it here on the
                 # status alone would turn every market fact into an outage, so
                 # the body is read and the caller classifies the typed code.
+                if status == 404:
+                    # The chain slug is not served. A capability we do not have
+                    # (or have lost) is never a statement about the market: an
+                    # aggregator dropping a chain would otherwise read as every
+                    # asset on it having no liquidity.
+                    raise QuoteUnavailable(QuoteFailure.UNSUPPORTED_CHAIN)
                 if status not in (200, 400):
                     raise QuoteUnavailable(QuoteFailure.INVALID_RESPONSE)
                 body = bytearray()

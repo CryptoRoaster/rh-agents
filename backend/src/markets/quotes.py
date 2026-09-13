@@ -67,6 +67,23 @@ def to_base_units(amount: Decimal, decimals: int) -> int:
     return int(scaled)
 
 
+def percent_to_bps(percent: Decimal) -> Decimal:
+    """Normalise a provider's percentage figure into basis points.
+
+    Providers publish price impact in their own units and the unit is rarely
+    stated in the response. A value of ``0.04`` from an endpoint documented in
+    percent is four basis points, not `0.04` of them, and reading it the wrong
+    way understates a cost by a factor of a hundred.
+
+    The sign is preserved rather than normalised here: what a negative means is
+    the provider's own semantics, and an adapter that knows its provider decides
+    that. Magnitude comparison happens at the policy, so a five percent cost
+    expressed as ``-5`` can never pass a three percent bound by being smaller
+    than it.
+    """
+    return percent * Decimal(100)
+
+
 class QuoteFailure(StrEnum):
     """Why no quote exists, kept apart because they mean different things.
 
@@ -79,6 +96,10 @@ class QuoteFailure(StrEnum):
     """
 
     NOT_CONFIGURED = "NOT_CONFIGURED"
+    # The provider does not serve this chain — either it never did, or it has
+    # stopped. Deliberately not a market fact: a chain the aggregator dropped is
+    # a capability we lost, and calling it "no route" would report an empty
+    # market for an asset that trades perfectly well.
     UNSUPPORTED_CHAIN = "UNSUPPORTED_CHAIN"
     # Facts about the market.
     NO_ROUTE = "NO_ROUTE"
@@ -175,7 +196,18 @@ class ExecutionQuote(Contract):
     amount_in: BaseUnits = Field(gt=0)
     amount_out: BaseUnits
     route: ExecutionRoute
+    # The provider's own account of when it priced this.
     quoted_at: AwareDatetime
+    # When the answer arrived here, by the trusted clock. Kept beside the
+    # provider's timestamp rather than instead of it, because the meaning of a
+    # provider timestamp is rarely documented and a clock we do not control can
+    # run ahead of ours. Freshness uses whichever is older, so provider skew can
+    # only ever make a quote look staler than it is.
+    received_at: AwareDatetime
+    # The provider's own USD valuation of the input amount, when it publishes
+    # one. A cross-check on our conversion and never the source of it: it
+    # arrives with the answer, so it cannot say how much to send.
+    provider_amount_in_usd: HumanAmount | None = None
     # Present when the provider states which chain state it priced against.
     # Absent is honest; a fabricated block number would be worse than none.
     source_block_number: int | None = Field(default=None, strict=True, ge=0)
@@ -219,10 +251,19 @@ class ExecutionQuote(Contract):
             context.prec = 60
             return self.amount_in_human / out
 
+    @property
+    def priced_at(self) -> datetime:
+        """The time freshness is judged from: the earlier of the two we hold.
+
+        A provider clock running ahead of ours would otherwise make a stale
+        quote look fresh, which is the one direction of error that costs money.
+        """
+        return min(self.quoted_at, self.received_at)
+
     def age(self, now: datetime) -> timedelta:
         if now.utcoffset() is None:
             raise ValueError("Quote freshness requires timezone-aware time")
-        return now - self.quoted_at
+        return now - self.priced_at
 
 
 class ExecutionQuoteSource(Protocol):

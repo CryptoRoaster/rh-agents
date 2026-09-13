@@ -43,15 +43,15 @@ async def test_scenario_a_a_failing_size_brackets_the_capacity(now):
     result = await run(now)
     assert result.semantics == CapacitySemantics.BOUNDED
     assert result.reason_code == AnchorReasonCode.CAPACITY_BRACKETED
-    assert result.market_capacity_notional == Decimal(2500)
-    assert result.first_rejected_notional == Decimal(10000)
+    assert result.largest_tested_acceptable_notional_usd == Decimal(2500)
+    assert result.first_tested_rejected_notional_usd == Decimal(10000)
     assert result.is_executable is True
 
 
 async def test_the_ladder_records_why_each_size_passed_or_failed(now):
     """ "Why did ANCHOR say 2500?" is answered by the rejection as much as the pass."""
     result = await run(now)
-    by_size = {point.notional: point for point in result.ladder}
+    by_size = {point.notional_usd: point for point in result.ladder}
     assert by_size[Decimal(500)].accepted is True
     # Base units are integers, so the quoted output truncates and the deviation
     # recovered from it is not exactly the figure the fixture priced at. That is
@@ -68,21 +68,21 @@ async def test_the_ladder_records_why_each_size_passed_or_failed(now):
 async def test_the_ladder_stops_at_the_first_failure(now):
     """Capacity is monotone in intent, so continuing would spend requests to learn nothing."""
     result = await run(now)
-    assert [point.notional for point in result.ladder] == [
+    assert [point.notional_usd for point in result.ladder] == [
         Decimal(100),
         Decimal(500),
         Decimal(2500),
         Decimal(10000),
     ]
-    assert Decimal(50000) not in {point.notional for point in result.ladder}
+    assert Decimal(50000) not in {point.notional_usd for point in result.ladder}
 
 
 async def test_nothing_is_interpolated_between_the_bracket(now):
     """The answer is two tested facts, not a guess at what lies between them."""
     result = await run(now)
-    tested = {point.notional for point in result.ladder}
-    assert result.market_capacity_notional in tested
-    assert result.first_rejected_notional in tested
+    tested = {point.notional_usd for point in result.ladder}
+    assert result.largest_tested_acceptable_notional_usd in tested
+    assert result.first_tested_rejected_notional_usd in tested
 
 
 # ------------------------------------- B: everything passed is not a maximum
@@ -99,9 +99,9 @@ async def test_scenario_b_a_ladder_that_never_failed_reports_a_floor(now):
     result = await run(now, shallow)
     assert result.semantics == CapacitySemantics.AT_LEAST
     assert result.reason_code == AnchorReasonCode.CAPACITY_AT_LEAST_TESTED_CEILING
-    assert result.market_capacity_notional == max(ANCHOR_EXECUTION_V1.ladder_notional)
+    assert result.largest_tested_acceptable_notional_usd == max(ANCHOR_EXECUTION_V1.ladder_notional)
     # Nothing was rejected, so nothing brackets it.
-    assert result.first_rejected_notional is None
+    assert result.first_tested_rejected_notional_usd is None
     assert all(point.accepted for point in result.ladder)
 
 
@@ -110,18 +110,19 @@ def test_an_at_least_capacity_can_never_carry_a_rejected_size(now):
     from src.agents.anchor.models import ExecutionAssessment, QuotedPoint
 
     point = QuotedPoint(
-        notional=Decimal(100),
+        notional_usd=Decimal(100),
+        amount_in_tokens=Decimal(100),
         accepted=True,
         amount_out=1,
-        effective_price=REFERENCE,
+        effective_price_usd=REFERENCE,
     )
     with pytest.raises(ValueError):
         ExecutionAssessment(
             policy_version="anchor-execution-v1",
             semantics=CapacitySemantics.AT_LEAST,
             reason_code=AnchorReasonCode.CAPACITY_AT_LEAST_TESTED_CEILING,
-            market_capacity_notional=Decimal(100),
-            first_rejected_notional=Decimal(500),
+            largest_tested_acceptable_notional_usd=Decimal(100),
+            first_tested_rejected_notional_usd=Decimal(500),
             reference_price=REFERENCE,
             ladder=(point,),
             quote_requests=1,
@@ -133,14 +134,18 @@ def test_a_bracketed_capacity_must_name_the_size_that_failed(now):
     from src.agents.anchor.models import ExecutionAssessment, QuotedPoint
 
     point = QuotedPoint(
-        notional=Decimal(100), accepted=True, amount_out=1, effective_price=REFERENCE
+        notional_usd=Decimal(100),
+        amount_in_tokens=Decimal(100),
+        accepted=True,
+        amount_out=1,
+        effective_price_usd=REFERENCE,
     )
     with pytest.raises(ValueError):
         ExecutionAssessment(
             policy_version="anchor-execution-v1",
             semantics=CapacitySemantics.BOUNDED,
             reason_code=AnchorReasonCode.CAPACITY_BRACKETED,
-            market_capacity_notional=Decimal(100),
+            largest_tested_acceptable_notional_usd=Decimal(100),
             reference_price=REFERENCE,
             ladder=(point,),
             quote_requests=1,
@@ -152,15 +157,19 @@ def test_a_rejected_size_must_sit_above_the_supported_one(now):
     from src.agents.anchor.models import ExecutionAssessment, QuotedPoint
 
     point = QuotedPoint(
-        notional=Decimal(500), accepted=True, amount_out=1, effective_price=REFERENCE
+        notional_usd=Decimal(500),
+        amount_in_tokens=Decimal(500),
+        accepted=True,
+        amount_out=1,
+        effective_price_usd=REFERENCE,
     )
     with pytest.raises(ValueError):
         ExecutionAssessment(
             policy_version="anchor-execution-v1",
             semantics=CapacitySemantics.BOUNDED,
             reason_code=AnchorReasonCode.CAPACITY_BRACKETED,
-            market_capacity_notional=Decimal(500),
-            first_rejected_notional=Decimal(100),
+            largest_tested_acceptable_notional_usd=Decimal(500),
+            first_tested_rejected_notional_usd=Decimal(100),
             reference_price=REFERENCE,
             ladder=(point,),
             quote_requests=1,
@@ -182,7 +191,7 @@ async def test_scenario_c_a_market_that_fails_the_smallest_size_supports_nothing
     result = await run(now, steep)
     assert result.semantics == CapacitySemantics.NONE
     assert result.reason_code == AnchorReasonCode.NO_EXECUTABLE_CAPACITY
-    assert result.market_capacity_notional is None
+    assert result.largest_tested_acceptable_notional_usd is None
     assert result.is_executable is False
     assert len(result.ladder) == 1
 
@@ -190,14 +199,19 @@ async def test_scenario_c_a_market_that_fails_the_smallest_size_supports_nothing
 def test_no_capacity_may_be_reported_with_a_figure(now):
     from src.agents.anchor.models import ExecutionAssessment, QuotedPoint
 
-    point = QuotedPoint(notional=Decimal(100), accepted=False, rejection=RejectionReason.NO_ROUTE)
+    point = QuotedPoint(
+        notional_usd=Decimal(100),
+        amount_in_tokens=Decimal(100),
+        accepted=False,
+        rejection=RejectionReason.NO_ROUTE,
+    )
     for semantics in (CapacitySemantics.NONE, CapacitySemantics.UNKNOWN):
         with pytest.raises(ValueError):
             ExecutionAssessment(
                 policy_version="anchor-execution-v1",
                 semantics=semantics,
                 reason_code=AnchorReasonCode.NO_EXECUTABLE_CAPACITY,
-                market_capacity_notional=Decimal(100),
+                largest_tested_acceptable_notional_usd=Decimal(100),
                 reference_price=REFERENCE,
                 ladder=(point,),
                 quote_requests=1,
@@ -221,14 +235,14 @@ async def test_a_market_that_runs_out_of_depth_brackets_rather_than_collapses(no
     thin = source(now, fails_above=Decimal(2500), failure_above=QuoteFailure.INSUFFICIENT_LIQUIDITY)
     result = await run(now, thin)
     assert result.semantics == CapacitySemantics.BOUNDED
-    assert result.market_capacity_notional == Decimal(500)
-    assert result.first_rejected_notional == Decimal(2500)
+    assert result.largest_tested_acceptable_notional_usd == Decimal(500)
+    assert result.first_tested_rejected_notional_usd == Decimal(2500)
     assert result.ladder[-1].rejection == RejectionReason.INSUFFICIENT_LIQUIDITY
 
 
 async def test_a_quote_that_buys_nothing_is_rejected(now):
     result = await run(now, source(now, empty_above=Decimal(500)))
-    assert result.market_capacity_notional == Decimal(100)
+    assert result.largest_tested_acceptable_notional_usd == Decimal(100)
     assert result.ladder[-1].rejection == RejectionReason.NO_OUTPUT
 
 
@@ -420,7 +434,7 @@ async def test_the_same_ladder_always_yields_the_same_assessment(now):
     answers = {
         (
             assess(context, now).semantics,
-            assess(context, now).market_capacity_notional,
+            assess(context, now).largest_tested_acceptable_notional_usd,
         )
         for _ in range(20)
     }

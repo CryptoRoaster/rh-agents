@@ -12,9 +12,18 @@ with no meaning. Freshness comes next, because a stale quote's price says what
 the market *was*. Only then does the cost of trading matter.
 
 The ladder is walked from the smallest size up and stops at the first rejection.
-Capacity is monotone in intent — if the market cannot absorb a thousand dollars
-it will not absorb ten — and continuing past a failure would spend provider
-requests to learn nothing while inviting an interpolation nobody asked for.
+Continuing past a failure would spend provider requests on a curve nobody asked
+for, and the conservative reading — that support was demonstrated up to the last
+size that passed, and not beyond — needs no further evidence. That reading does
+not claim the market's true maximum was found, nor that every untested size in
+between behaves the same way; it claims only what was tested.
+
+**Everything economic is compared in USD.** A quote's effective price is in
+payment-asset units per unit bought; the reference is USD per unit bought. Those
+are different quantities, and subtracting one from the other would produce a
+figure measuring the payment asset's own price rather than the cost of trading.
+The quote-asset valuation converts the first into the second before any
+comparison happens, so the deviation means what its name says.
 """
 
 from datetime import datetime
@@ -25,6 +34,7 @@ from src.agents.anchor.models import (
     AnchorTaskInput,
     CapacitySemantics,
     ExecutionAssessment,
+    QuoteAttempt,
     QuotedPoint,
     RejectionReason,
 )
@@ -41,6 +51,13 @@ MARKET_REJECTIONS: dict[QuoteFailure, RejectionReason] = {
     QuoteFailure.NO_ROUTE: RejectionReason.NO_ROUTE,
     QuoteFailure.INSUFFICIENT_LIQUIDITY: RejectionReason.INSUFFICIENT_LIQUIDITY,
 }
+
+
+def valuation_skew_bps(ours: Decimal, theirs: Decimal) -> Decimal:
+    """Absolute disagreement between two USD valuations of the same order."""
+    if ours <= 0:
+        raise ValueError("An intended notional must be positive to compare against")
+    return quantize(abs(theirs - ours) / ours * BPS)
 
 
 def execution_deviation_bps(effective: Decimal, reference: Decimal) -> Decimal:
@@ -63,18 +80,21 @@ def _reject(point: "QuotedPoint", reason: RejectionReason) -> QuotedPoint:
 
 
 def _point_from_quote(
-    notional: Decimal,
+    attempt: QuoteAttempt,
     quote: ExecutionQuote,
     reference: Decimal,
+    usd_per_token: Decimal,
     now: datetime,
     policy: AnchorExecutionPolicy,
 ) -> QuotedPoint:
     """Judge one quote, or say precisely why it cannot be judged."""
     base = QuotedPoint(
-        notional=notional,
+        notional_usd=attempt.notional_usd,
+        amount_in_tokens=attempt.amount_in_tokens,
         accepted=False,
         rejection=RejectionReason.NO_OUTPUT,
         amount_out=quote.amount_out,
+        provider_amount_in_usd=quote.provider_amount_in_usd,
         route_hops=quote.route.hop_count,
         venues=tuple(sorted(quote.route.venues))[:32],
         quoted_at=quote.quoted_at,
@@ -89,14 +109,28 @@ def _point_from_quote(
     if quote.route.hop_count > policy.max_route_hops:
         return _reject(base, RejectionReason.ROUTE_TOO_COMPLEX)
 
+    # Our valuation of the order against the provider's own, when it published
+    # one. They should agree closely; a material gap means one of us is wrong
+    # about decimals, about which token this is, or about what it costs — and a
+    # quote whose size we cannot agree on has no readable economics.
+    theirs = quote.provider_amount_in_usd
+    if theirs is not None:
+        skew = valuation_skew_bps(attempt.notional_usd, theirs)
+        if skew > policy.max_usd_valuation_skew_bps:
+            return _reject(base, RejectionReason.USD_VALUATION_DISAGREEMENT)
+
     raw_price = quote.effective_price()
-    effective = None if raw_price is None else quantize(raw_price)
-    if effective is None:
+    if raw_price is None:
         # The market offered nothing for the money. A real answer, not an error.
+        return _reject(base, RejectionReason.NO_OUTPUT)
+    # Payment-asset units per unit bought, converted into USD per unit bought so
+    # the comparison below is between two of the same kind of number.
+    effective = quantize(raw_price * usd_per_token)
+    if effective <= 0:
         return _reject(base, RejectionReason.NO_OUTPUT)
     deviation = execution_deviation_bps(effective, reference)
     priced = base.model_copy(
-        update={"effective_price": effective, "execution_deviation_bps": deviation}
+        update={"effective_price_usd": effective, "execution_deviation_bps": deviation}
     )
     if deviation > policy.max_execution_deviation_bps:
         return _reject(priced, RejectionReason.EXECUTION_DEVIATION_TOO_HIGH)
@@ -155,6 +189,13 @@ def assess(
         # A fresh quote against a stale reference yields a deviation that
         # measures elapsed time rather than the cost of trading.
         return AnchorReasonCode.REFERENCE_TOO_STALE
+    valuation = task_input.quote_asset_valuation
+    if valuation is None:
+        # Without it nothing here is denominated in anything, so nothing here
+        # can be compared or reported.
+        return AnchorReasonCode.QUOTE_ASSET_USD_VALUE_UNAVAILABLE
+    if valuation.age_seconds > policy.max_reference_age.total_seconds():
+        return AnchorReasonCode.QUOTE_ASSET_USD_VALUE_UNAVAILABLE
     if not task_input.ladder:
         return AnchorReasonCode.QUOTES_UNAVAILABLE
 
@@ -170,8 +211,15 @@ def assess(
                 # Not a statement about the market. Nothing here can distinguish
                 # a rate limit from an empty order book, so nothing here tries.
                 return AnchorReasonCode.QUOTES_UNAVAILABLE
-            points.append(QuotedPoint(notional=attempt.notional, accepted=False, rejection=reason))
-            rejected_at = attempt.notional
+            points.append(
+                QuotedPoint(
+                    notional_usd=attempt.notional_usd,
+                    amount_in_tokens=attempt.amount_in_tokens,
+                    accepted=False,
+                    rejection=reason,
+                )
+            )
+            rejected_at = attempt.notional_usd
             break
 
         quote = attempt.quote
@@ -180,7 +228,8 @@ def assess(
         if problem is not None:
             points.append(
                 QuotedPoint(
-                    notional=attempt.notional,
+                    notional_usd=attempt.notional_usd,
+                    amount_in_tokens=attempt.amount_in_tokens,
                     accepted=False,
                     rejection=problem,
                     amount_out=quote.amount_out,
@@ -194,13 +243,15 @@ def assess(
                 task_input, reference.price, points, now, AnchorReasonCode.LADDER_INCOHERENT
             )
 
-        point = _point_from_quote(attempt.notional, quote, reference.price, now, policy)
+        point = _point_from_quote(
+            attempt, quote, reference.price, valuation.usd_per_token, now, policy
+        )
         points.append(point)
         if point.accepted:
-            supported = attempt.notional
+            supported = attempt.notional_usd
             accepted_point = point
             continue
-        rejected_at = attempt.notional
+        rejected_at = attempt.notional_usd
         break
 
     if not _ladder_coherent(points, policy):
@@ -278,14 +329,19 @@ def _assessment(
     first_rejected: Decimal | None = None,
     accepted: QuotedPoint | None = None,
 ) -> ExecutionAssessment:
+    valuation = task_input.quote_asset_valuation
+    assert valuation is not None
     return ExecutionAssessment(
         policy_version=task_input.policy_version,
         semantics=semantics,
         reason_code=reason,
-        market_capacity_notional=capacity,
-        first_rejected_notional=first_rejected if semantics == CapacitySemantics.BOUNDED else None,
+        largest_tested_acceptable_notional_usd=capacity,
+        first_tested_rejected_notional_usd=(
+            first_rejected if semantics == CapacitySemantics.BOUNDED else None
+        ),
         reference_price=reference,
-        effective_price_at_capacity=None if accepted is None else accepted.effective_price,
+        quote_asset_usd_price=valuation.usd_per_token,
+        effective_price_usd_at_capacity=None if accepted is None else accepted.effective_price_usd,
         execution_deviation_bps_at_capacity=(
             None if accepted is None else accepted.execution_deviation_bps
         ),

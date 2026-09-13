@@ -556,10 +556,19 @@ class QuotedLadderPoint(Immutable):
     a digest alone would prove the ladder unchanged without saying what it held.
     """
 
-    notional: Positive
+    # The USD size actually tested, and the payment-asset amount actually sent
+    # for it. Both are kept because the second is what the provider was asked
+    # and the first is what it means, and re-deriving either later would need a
+    # price that has since moved.
+    notional_usd: Positive
+    amount_in_tokens: Positive
     accepted: bool = Field(strict=True)
     amount_out: int | None = Field(default=None, strict=True, ge=0)
-    effective_price: Positive | None = None
+    # The provider's own USD valuation of the input, when it published one.
+    # Recorded so the cross-check that was performed is auditable.
+    provider_amount_in_usd: Nonnegative | None = None
+    # USD per unit bought, so it is comparable with the reference price.
+    effective_price_usd: Positive | None = None
     execution_deviation_bps: Decimal | None = Field(default=None, allow_inf_nan=False)
     provider_price_impact_bps: Nonnegative | None = None
     route_hops: int | None = Field(default=None, strict=True, ge=0)
@@ -583,12 +592,22 @@ class ExecutionAssessmentDetail(Immutable):
     policy_version: Identifier
     capacity_semantics: Code
     reason_code: Code
-    market_capacity_notional: Positive | None = None
-    first_rejected_notional: Positive | None = None
+    # The largest size tested and accepted, in USD. The name states both facts
+    # it depends on: the unit, and that it was *tested* rather than measured.
+    # Nothing here proves the market's true maximum, and nothing proves anything
+    # about the untested sizes between this and the rejected one below.
+    largest_tested_acceptable_notional_usd: Positive | None = None
+    first_tested_rejected_notional_usd: Positive | None = None
     reference_price: Positive
     reference_price_basis: Code
     reference_observed_at: AwareDatetime
-    effective_price_at_capacity: Positive | None = None
+    # What the payment asset was worth when this was assessed, and where that
+    # came from. The USD figures above are only as good as this one, so it
+    # travels with them rather than being left implicit.
+    quote_asset_usd_price: Positive
+    quote_asset_usd_observed_at: AwareDatetime
+    quote_asset_usd_provider: Identifier
+    effective_price_usd_at_capacity: Positive | None = None
     execution_deviation_bps_at_capacity: Decimal | None = Field(default=None, allow_inf_nan=False)
     payment_asset_id: Identifier
     target_asset_id: Identifier
@@ -613,11 +632,23 @@ class LiquidityExecutionPayload(AcceptancePayload):
     trigger_evidence_id: UUID
     quoted_price: Positive | None = None
     liquidity_usd: Nonnegative | None = None
+    # Legacy scalars from Phase 2A, retained so older evidence still parses.
+    #
+    # An ANCHOR worker leaves both empty, and that is a decision rather than an
+    # omission. `estimated_slippage_bps` means a realisable fill cost here — the
+    # sibling field on a market snapshot is what the paper executor uses to move
+    # a fill price and then reports as `realized_slippage_bps` — and an
+    # execution deviation is not that. `price_impact_bps` means the provider's
+    # own figure, and a provider that publishes none leaves it absent rather
+    # than lending its name to a number computed elsewhere.
+    #
+    # Both are therefore `None` on anything ANCHOR produces. The separated,
+    # correctly named figures live in `execution`.
     estimated_slippage_bps: Nonnegative | None = Field(default=None, le=10000)
     price_impact_bps: Nonnegative | None = Field(default=None, le=10000)
-    # The legacy scalar. It never over-claims — it is a size actually tested and
-    # accepted — but it cannot express that the true capacity may be higher, so
-    # anything reasoning about capacity reads the detail below instead.
+    # The legacy capacity scalar. It never over-claims — it is a size actually
+    # tested and accepted, in USD — but it cannot express that the true capacity
+    # may be higher, so anything reasoning about capacity reads `execution`.
     maximum_safe_size_usd: Nonnegative | None = None
     routing_provenance: Identifier | None = None
     # Absent on evidence written before Phase 2J; present for anything an ANCHOR
@@ -636,7 +667,7 @@ class LiquidityExecutionPayload(AcceptancePayload):
             return EvidenceAcceptance.ACCEPTED
         if detail.capacity_semantics == "UNKNOWN":
             return EvidenceAcceptance.INSUFFICIENT
-        if detail.market_capacity_notional is None:
+        if detail.largest_tested_acceptable_notional_usd is None:
             return EvidenceAcceptance.BLOCKED
         return EvidenceAcceptance.ACCEPTED
 

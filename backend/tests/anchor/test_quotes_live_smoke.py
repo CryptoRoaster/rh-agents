@@ -31,12 +31,13 @@ Budget: at most six requests per chain.
 import os
 from decimal import Decimal
 
+import httpx
 import pytest
 
 from src.agents.anchor.assessment import execution_deviation_bps
 from src.core.config import Settings
 from src.markets.kyberswap.source import CHAIN_SLUGS, KyberSwapQuoteSource
-from src.markets.quotes import QuoteUnavailable, to_base_units
+from src.markets.quotes import QuoteFailure, QuoteUnavailable, to_base_units
 
 LIVE = os.environ.get("RH_AGENTS_LIVE_QUOTE_SMOKE") == "1"
 
@@ -168,6 +169,52 @@ async def test_the_quote_endpoint_returns_no_transaction_to_sign(chain):
     assert "routerAddress" in envelope
     assert envelope["routerAddress"].lower() not in quote.model_dump_json().lower()
     assert quote.route.router == "kyberswap"
+
+    # Block numbers exist, but only inside the blobs this adapter never reads,
+    # and they disagree with each other inside a single hop. Recorded here so
+    # that if a coherent top-level block ever appears, this is where we notice.
+    hop = envelope["routeSummary"]["route"][0][0]
+    assert "blockNumber" not in hop
+    assert quote.source_block_number is None
+
+
+@pytest.mark.parametrize("chain", sorted(CHAIN_SLUGS))
+async def test_the_provider_publishes_no_price_impact_and_one_usd_valuation(chain):
+    """Two assumptions the assessment depends on, neither documented.
+
+    If a `priceImpact` field ever appears, the impact bound stops being
+    unexercised and the adapter must normalise its unit rather than pass it
+    through. If `amountInUsd` disappears, the valuation cross-check silently
+    stops happening. Both are worth failing loudly over.
+    """
+    async with KyberSwapQuoteSource(settings()) as source:
+        quote = await quote_for(source, chain, Decimal(100))
+
+    assert quote.provider_price_impact_bps is None
+    assert quote.provider_amount_in_usd is not None
+    intended = Decimal(100)
+    skew = abs(quote.provider_amount_in_usd - intended) / intended * Decimal(10000)
+    print(f"\n{chain}: provider valued $100 at {quote.provider_amount_in_usd} ({skew:.1f} bps)")
+    assert skew < Decimal(500)
+
+
+@pytest.mark.parametrize("chain", sorted(CHAIN_SLUGS))
+async def test_an_unserved_chain_is_a_capability_loss_not_an_empty_market(chain):
+    """What must happen if the aggregator ever drops a chain we depend on.
+
+    Robinhood is the one to watch. Reporting no liquidity for a chain that
+    simply stopped being served would be a claim about the market made from a
+    fact about our integration.
+    """
+    async with KyberSwapQuoteSource(settings()) as source:
+        source._client.base_url = httpx.URL(  # noqa: SLF001 - exercising a 404 path
+            "https://aggregator-api.kyberswap.com"
+        )
+        with pytest.raises(QuoteUnavailable) as raised:
+            await source._get("/no-such-chain/api/v1/routes", {})  # noqa: SLF001
+
+    assert raised.value.failure == QuoteFailure.UNSUPPORTED_CHAIN
+    assert raised.value.is_market_fact is False
 
 
 @pytest.mark.parametrize("chain", sorted(CHAIN_SLUGS))

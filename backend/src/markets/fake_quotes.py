@@ -29,8 +29,14 @@ from src.markets.quotes import (
 class FixtureQuoteSource:
     """One configurable market. Every knob corresponds to a real failure mode."""
 
+    # USD per unit of the asset being bought, matching the reference the
+    # assessment compares against.
     reference_price: Decimal
     quoted_at: datetime
+    # USD per unit of the payment asset. One by default so a fixture reads like
+    # a dollar market, and settable so the non-dollar case can be exercised —
+    # which is the case the real system has to get right.
+    quote_asset_usd_price: Decimal = Decimal(1)
     # Basis points of cost added per whole multiple of `depth_notional` traded.
     # A crude monotone stand-in for depth, not a model of one.
     deviation_bps_per_step: Decimal = Decimal(20)
@@ -52,7 +58,11 @@ class FixtureQuoteSource:
     # Hops grow with size, as a real aggregator's splits do.
     hops_per_step: int = 1
     max_hops: int = 8
-    block_number: int | None = 1_000_000
+    block_number: int | None = None
+    # Provider-published USD valuation of the input. `None` mirrors KyberSwap,
+    # which publishes none; a factor scales it to exercise the cross-check.
+    quote_usd_skew: Decimal | None = None
+    received_at: datetime | None = None
     calls: list[int] = field(default_factory=list)
 
     async def quote_exact_input(
@@ -69,20 +79,24 @@ class FixtureQuoteSource:
         self.calls.append(amount_in)
         if self.always_fails is not None:
             raise QuoteUnavailable(self.always_fails)
-        notional = to_human(amount_in, token_in_decimals)
+        tokens = to_human(amount_in, token_in_decimals)
+        # Every knob below is USD-denominated, because that is the vocabulary of
+        # the ladder being exercised.
+        notional = tokens * self.quote_asset_usd_price
         if self.fails_above is not None and notional >= self.fails_above:
             raise QuoteUnavailable(self.failure_above)
 
         steps = notional / self.depth_notional
-        effective = self.reference_price * (
+        effective_usd = self.reference_price * (
             Decimal(1) + (self.deviation_bps_per_step * steps) / Decimal(10000)
         )
         if self.empty_above is not None and notional >= self.empty_above:
             out_units = 0
         else:
-            out_units = int(notional / effective * (Decimal(10) ** token_out_decimals))
+            out_units = int(notional / effective_usd * (Decimal(10) ** token_out_decimals))
         hops = min(self.max_hops, max(1, int(steps) * self.hops_per_step or 1))
         quoted_at = self.quoted_at + self.skew_per_quote * len(self.calls)
+        provider_usd = None if self.quote_usd_skew is None else notional * self.quote_usd_skew
         out_token = self.override_token_out or token_out
         return ExecutionQuote(
             chain=self.override_chain or chain,
@@ -95,7 +109,10 @@ class FixtureQuoteSource:
             amount_in=amount_in,
             amount_out=out_units,
             route=ExecutionRoute(
-                router="0x" + "ab" * 20,
+                # A name, never an address: the real adapters discard the router
+                # contract, so a fixture that carried one would let a test pass
+                # that the production path could not.
+                router="fixture-router",
                 # Intermediate legs pass through distinct synthetic tokens, so a
                 # multi-hop route never trades a token for itself.
                 hops=tuple(
@@ -111,6 +128,8 @@ class FixtureQuoteSource:
                 ),
             ),
             quoted_at=quoted_at,
+            received_at=self.received_at or quoted_at,
+            provider_amount_in_usd=provider_usd,
             source_block_number=self.block_number,
             provider_price_impact_bps=self.provider_price_impact_bps,
         )

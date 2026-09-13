@@ -41,6 +41,7 @@ from src.orchestration.workflow.models import (
 from src.orchestration.workflow.policy import TRADE_CASE_V1
 from src.orchestration.workflow.service import TradeCaseService
 from tests.anchor.conftest import (
+    StubMarkets,
     market_identity,
     setup_payload,
     source,
@@ -51,14 +52,6 @@ from tests.anchor.test_context import snapshot_for
 from tests.worker.conftest import atlas_payload, signal_payload, submission
 
 CASE_LIFETIME = timedelta(hours=6)
-
-
-class StubMarkets:
-    def __init__(self, snapshot) -> None:
-        self.snapshot = snapshot
-
-    async def latest(self, identity: str, *, include_fixtures: bool = False):
-        return self.snapshot
 
 
 def build_stack(sessions, instant, *, quotes=None, snapshot=None):
@@ -184,8 +177,8 @@ async def test_a_bracketed_capacity_becomes_evidence_and_reaches_the_risk_stage(
     detail = envelope.payload.execution
     assert detail is not None
     assert detail.capacity_semantics == "BOUNDED"
-    assert detail.market_capacity_notional == Decimal(2500)
-    assert detail.first_rejected_notional == Decimal(10000)
+    assert detail.largest_tested_acceptable_notional_usd == Decimal(2500)
+    assert detail.first_tested_rejected_notional_usd == Decimal(10000)
     assert len(detail.ladder) == 4
 
     # The case now waits for risk, which is SENTINEL's question and not ANCHOR's.
@@ -217,7 +210,7 @@ async def test_the_legacy_scalar_never_over_claims(worker_db, now, trace):
     await run_anchor(runtime, reader, "anchor-legacy-worker")
 
     payload = (await execution_evidence(runtime.cases, trade_case.id))[0].payload
-    assert payload.maximum_safe_size_usd == payload.execution.market_capacity_notional
+    assert payload.maximum_safe_size_usd == payload.execution.largest_tested_acceptable_notional_usd
     # And anything reasoning about capacity has the semantics beside the figure.
     assert payload.execution.capacity_semantics in {"BOUNDED", "AT_LEAST", "NONE", "UNKNOWN"}
 
@@ -548,7 +541,7 @@ async def test_a_context_port_returning_the_wrong_shape_is_caught(now, trace):
 
     class WrongShape:
         async def execution_context(self, trade_case_id, task_id):
-            return {"market_capacity_notional": "1000000"}
+            return {"largest_tested_acceptable_notional_usd": "1000000"}
 
     context = task_input(now)
     lease = _lease(SimpleNamespace(id=context.trade_case_id), context, now, trace)

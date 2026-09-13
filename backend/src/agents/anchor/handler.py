@@ -25,7 +25,6 @@ quote is an offer at a moment.
 
 import json
 from dataclasses import dataclass
-from decimal import Decimal
 from hashlib import sha256
 
 from src.agents.anchor.assessment import assess
@@ -98,22 +97,27 @@ def execution_digest(task_input: AnchorTaskInput, assessment: ExecutionAssessmen
             "payment_asset": task_input.market.quote_asset_id,
             "target_asset": task_input.market.base_asset_id,
             "reference_price": canonical_decimal(assessment.reference_price),
+            # The valuation is part of the identity of this assessment: the same
+            # ladder priced through a different payment-asset price is a
+            # different conclusion and must not resolve to the same evidence.
+            "quote_asset_usd_price": canonical_decimal(assessment.quote_asset_usd_price),
             "semantics": assessment.semantics.value,
-            "capacity": (
+            "capacity_usd": (
                 None
-                if assessment.market_capacity_notional is None
-                else canonical_decimal(assessment.market_capacity_notional)
+                if assessment.largest_tested_acceptable_notional_usd is None
+                else canonical_decimal(assessment.largest_tested_acceptable_notional_usd)
             ),
             "policy_version": assessment.policy_version,
             "ladder": [
                 {
-                    "notional": canonical_decimal(point.notional),
+                    "notional_usd": canonical_decimal(point.notional_usd),
+                    "amount_in_tokens": canonical_decimal(point.amount_in_tokens),
                     "accepted": point.accepted,
                     "amount_out": point.amount_out,
-                    "effective_price": (
+                    "effective_price_usd": (
                         None
-                        if point.effective_price is None
-                        else canonical_decimal(point.effective_price)
+                        if point.effective_price_usd is None
+                        else canonical_decimal(point.effective_price_usd)
                     ),
                     "deviation_bps": (
                         None
@@ -188,18 +192,32 @@ class AnchorWorkerHandler:
         """Build the envelope from runtime facts. Nothing here is a judgement."""
         reference = task_input.reference
         assert reference is not None
+        valuation = task_input.quote_asset_valuation
+        assert valuation is not None
         digest = execution_digest(task_input, assessment)
-        capacity = assessment.market_capacity_notional
-        # The Phase 2A scalars, filled with their closest honest meanings so a
-        # reader of the older vocabulary is not left empty-handed. They are
-        # approximations by construction: `estimated_slippage_bps` is this
-        # assessment's measured execution deviation, which is an estimate of
-        # execution cost and never a realised figure, and `price_impact_bps` is
-        # the provider's own number when it publishes one and that same
-        # deviation when it does not. The precise, separated figures live in the
-        # detail below, which is what anything reasoning about execution reads.
-        deviation = assessment.execution_deviation_bps_at_capacity
-        cost_estimate = None if deviation is None else max(Decimal(0), deviation)
+        capacity = assessment.largest_tested_acceptable_notional_usd
+
+        # The Phase 2A scalars are left empty rather than filled with the
+        # nearest-looking number, and that is the point.
+        #
+        # `estimated_slippage_bps` means a realisable fill cost in this
+        # repository: its sibling on a market snapshot is what the paper
+        # executor uses to move a fill price and then records as
+        # `realized_slippage_bps`. This assessment has no such figure. It has an
+        # execution deviation — a quote's distance from a reference, mixing
+        # depth, fees, spread and elapsed time — and writing that into a field
+        # named for slippage would put a number nobody measured in front of a
+        # reader who would reasonably act on it.
+        #
+        # `price_impact_bps` means the provider's own impact figure. KyberSwap
+        # publishes none on either supported chain, verified live, so the honest
+        # value is absent. Substituting the deviation would manufacture provider
+        # provenance for a number this system computed itself.
+        #
+        # Both are None by design. The separated, correctly named figures live
+        # in the detail below, which is what anything reasoning about execution
+        # reads — and which is why the evidence is still substantive without
+        # them.
         accepted = next((point for point in assessment.ladder if point.accepted), None)
         provider_impact = None if accepted is None else accepted.provider_price_impact_bps
         return EvidenceTaskResult(
@@ -228,24 +246,29 @@ class AnchorWorkerHandler:
                 payload=LiquidityExecutionPayload(
                     setup_evidence_id=task_input.setup_evidence_id,
                     trigger_evidence_id=task_input.trigger_evidence_id,
-                    quoted_price=assessment.effective_price_at_capacity,
+                    quoted_price=assessment.effective_price_usd_at_capacity,
                     liquidity_usd=reference.liquidity_usd,
-                    estimated_slippage_bps=cost_estimate,
-                    price_impact_bps=(
-                        provider_impact if provider_impact is not None else cost_estimate
-                    ),
+                    estimated_slippage_bps=None,
+                    price_impact_bps=provider_impact,
                     maximum_safe_size_usd=capacity,
                     routing_provenance=self.quote_provider,
                     execution=ExecutionAssessmentDetail(
                         policy_version=assessment.policy_version,
                         capacity_semantics=assessment.semantics.value,
                         reason_code=assessment.reason_code.value,
-                        market_capacity_notional=capacity,
-                        first_rejected_notional=assessment.first_rejected_notional,
+                        largest_tested_acceptable_notional_usd=capacity,
+                        first_tested_rejected_notional_usd=(
+                            assessment.first_tested_rejected_notional_usd
+                        ),
                         reference_price=reference.price,
                         reference_price_basis=reference.price_basis,
                         reference_observed_at=reference.observed_at,
-                        effective_price_at_capacity=assessment.effective_price_at_capacity,
+                        quote_asset_usd_price=assessment.quote_asset_usd_price,
+                        quote_asset_usd_observed_at=valuation.observed_at,
+                        quote_asset_usd_provider=valuation.provider,
+                        effective_price_usd_at_capacity=(
+                            assessment.effective_price_usd_at_capacity
+                        ),
                         execution_deviation_bps_at_capacity=(
                             assessment.execution_deviation_bps_at_capacity
                         ),
@@ -255,10 +278,12 @@ class AnchorWorkerHandler:
                         quote_requests=assessment.quote_requests,
                         ladder=tuple(
                             QuotedLadderPoint(
-                                notional=point.notional,
+                                notional_usd=point.notional_usd,
+                                amount_in_tokens=point.amount_in_tokens,
                                 accepted=point.accepted,
                                 amount_out=point.amount_out,
-                                effective_price=point.effective_price,
+                                provider_amount_in_usd=point.provider_amount_in_usd,
+                                effective_price_usd=point.effective_price_usd,
                                 execution_deviation_bps=point.execution_deviation_bps,
                                 provider_price_impact_bps=point.provider_price_impact_bps,
                                 route_hops=point.route_hops,

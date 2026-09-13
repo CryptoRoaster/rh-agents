@@ -83,6 +83,10 @@ class RejectionReason(StrEnum):
     CHAIN_MISMATCH = "CHAIN_MISMATCH"
     NO_ROUTE = "NO_ROUTE"
     INSUFFICIENT_LIQUIDITY = "INSUFFICIENT_LIQUIDITY"
+    # Our USD valuation of the input and the provider's own disagree by more
+    # than the policy tolerates. That points at wrong decimals, a wrong token or
+    # a stale price — all of which make the quote's economics unreadable.
+    USD_VALUATION_DISAGREEMENT = "USD_VALUATION_DISAGREEMENT"
 
 
 class AnchorReasonCode(StrEnum):
@@ -96,6 +100,9 @@ class AnchorReasonCode(StrEnum):
     LADDER_INCOHERENT = "LADDER_INCOHERENT"
     REFERENCE_UNAVAILABLE = "REFERENCE_UNAVAILABLE"
     REFERENCE_TOO_STALE = "REFERENCE_TOO_STALE"
+    # No authoritative USD value for the payment asset, so a USD capacity figure
+    # cannot be produced. Reported rather than approximated.
+    QUOTE_ASSET_USD_VALUE_UNAVAILABLE = "QUOTE_ASSET_USD_VALUE_UNAVAILABLE"
 
 
 class QuotedPoint(Immutable):
@@ -106,11 +113,24 @@ class QuotedPoint(Immutable):
     would prove the ladder was the same without saying what it contained.
     """
 
-    notional: Notional
+    # The USD size this rung actually tested. Not the policy's target: the
+    # payment asset has a smallest unit, so the amount that could be sent is
+    # recorded rather than the amount that was wanted.
+    notional_usd: Notional
+    # The exact payment-asset amount the provider was asked for, in human units.
+    # Kept because "why did ANCHOR send that number?" must be answerable without
+    # re-deriving it from a price that has since moved.
+    amount_in_tokens: Notional
     accepted: bool = Field(strict=True)
     # Present when a quote was obtained; absent when the provider refused.
     amount_out: int | None = Field(default=None, strict=True, ge=0)
-    effective_price: Price | None = None
+    # The provider's own USD valuation of the input, when published. A
+    # cross-check that was made, recorded so the check is auditable.
+    provider_amount_in_usd: Decimal | None = Field(default=None, ge=0, allow_inf_nan=False)
+    # USD per unit of the asset being bought, so it is comparable with the
+    # reference. The provider answers in payment-asset units; the valuation
+    # above is what makes the two the same kind of number.
+    effective_price_usd: Price | None = None
     execution_deviation_bps: Bps | None = None
     provider_price_impact_bps: Bps | None = None
     route_hops: int | None = Field(default=None, strict=True, ge=0)
@@ -125,7 +145,7 @@ class QuotedPoint(Immutable):
             raise ValueError("An accepted point cannot also carry a rejection")
         if not self.accepted and self.rejection is None:
             raise ValueError("A rejected point must say why")
-        if self.accepted and (self.effective_price is None or self.amount_out is None):
+        if self.accepted and (self.effective_price_usd is None or self.amount_out is None):
             raise ValueError("An accepted point must record what it was quoted")
         return self
 
@@ -142,14 +162,19 @@ class ExecutionAssessment(Immutable):
     policy_version: Identifier
     semantics: CapacitySemantics
     reason_code: AnchorReasonCode
-    # The capacity figure. Absent when nothing was established, because a zero
-    # would read as "the market supports nothing", which is a different claim.
-    market_capacity_notional: Notional | None = None
-    # The smallest size that failed, when one did. Together with the capacity
-    # this brackets the answer without interpolating between the two.
-    first_rejected_notional: Notional | None = None
+    # The largest size that was *tested and accepted*, in USD. Named that way
+    # because that is all it is: nothing here proves the market's maximum, and
+    # nothing proves anything about the untested sizes in between. Absent when
+    # nothing was established, because a zero would read as "the market supports
+    # nothing", which is a different claim.
+    largest_tested_acceptable_notional_usd: Notional | None = None
+    # The smallest size that was *tested and rejected*, when one was. Together
+    # with the figure above this brackets the answer without interpolating
+    # between the two or claiming either is a boundary.
+    first_tested_rejected_notional_usd: Notional | None = None
     reference_price: Price
-    effective_price_at_capacity: Price | None = None
+    quote_asset_usd_price: Price
+    effective_price_usd_at_capacity: Price | None = None
     execution_deviation_bps_at_capacity: Bps | None = None
     ladder: tuple[QuotedPoint, ...] = Field(min_length=1, max_length=12)
     quote_requests: int = Field(ge=0)
@@ -161,21 +186,25 @@ class ExecutionAssessment(Immutable):
         # both must be reported without one: a zero capacity would read as a
         # measurement of an empty market rather than the absence of a measurement.
         if self.semantics in (CapacitySemantics.UNKNOWN, CapacitySemantics.NONE):
-            if self.market_capacity_notional is not None:
+            if self.largest_tested_acceptable_notional_usd is not None:
                 raise ValueError("No capacity was established, so none may be reported")
-        elif self.market_capacity_notional is None:
+        elif self.largest_tested_acceptable_notional_usd is None:
             raise ValueError("An established capacity must carry its figure")
         if (
             self.semantics == CapacitySemantics.AT_LEAST
-            and self.first_rejected_notional is not None
+            and self.first_tested_rejected_notional_usd is not None
         ):
             raise ValueError("Nothing was rejected, so the capacity is not bracketed")
-        if self.semantics == CapacitySemantics.BOUNDED and self.first_rejected_notional is None:
+        if (
+            self.semantics == CapacitySemantics.BOUNDED
+            and self.first_tested_rejected_notional_usd is None
+        ):
             raise ValueError("A bracketed capacity must name the size that failed")
         if (
-            self.market_capacity_notional is not None
-            and self.first_rejected_notional is not None
-            and self.first_rejected_notional <= self.market_capacity_notional
+            self.largest_tested_acceptable_notional_usd is not None
+            and self.first_tested_rejected_notional_usd is not None
+            and self.first_tested_rejected_notional_usd
+            <= self.largest_tested_acceptable_notional_usd
         ):
             raise ValueError("The rejected size must sit above the supported one")
         return self
@@ -183,7 +212,7 @@ class ExecutionAssessment(Immutable):
     @property
     def is_executable(self) -> bool:
         """Whether the market was shown to support anything at all."""
-        return self.market_capacity_notional is not None
+        return self.largest_tested_acceptable_notional_usd is not None
 
 
 class QuoteAttempt(Immutable):
@@ -195,7 +224,8 @@ class QuoteAttempt(Immutable):
     is looking at.
     """
 
-    notional: Notional
+    notional_usd: Notional
+    amount_in_tokens: Notional
     amount_in: int = Field(strict=True, gt=0)
     quote: object | None = None
     failure: QuoteFailure | None = None
@@ -232,6 +262,29 @@ class ReferenceMarket(Immutable):
     age_seconds: int = Field(ge=0)
 
 
+class QuoteAssetValuation(Immutable):
+    """What one unit of the payment asset is worth in USD, from an observation.
+
+    This is the bridge between the two units this system speaks, and it exists
+    because nothing else could supply it honestly. The ladder is expressed in
+    USD because SENTINEL sizes in USD; the provider is asked in base units of
+    the payment asset; and the two are the same number only when that asset
+    happens to trade at a dollar.
+
+    It is always a recorded observation of the asset, never a peg, never a guess
+    from a symbol, and never the provider's own valuation of the order — that
+    one arrives with the answer and so cannot say how much to send.
+    """
+
+    asset_id: Identifier
+    observation_id: UUID
+    snapshot_id: UUID
+    provider: Identifier
+    usd_per_token: Price
+    observed_at: AwareDatetime
+    age_seconds: int = Field(ge=0)
+
+
 class AnchorMarketContext(Immutable):
     """The exact market, assets and decimals an assessment is bound to."""
 
@@ -264,6 +317,9 @@ class AnchorTaskInput(Immutable):
     trigger_evidence_id: UUID
     market: AnchorMarketContext
     reference: ReferenceMarket | None = None
+    # Absent only when no quote could be requested at all, which is itself the
+    # reason the assessment cannot be made.
+    quote_asset_valuation: QuoteAssetValuation | None = None
     ladder: tuple[QuoteAttempt, ...] = Field(default=(), max_length=12)
     quote_requests: int = Field(default=0, ge=0)
     policy_version: Identifier
