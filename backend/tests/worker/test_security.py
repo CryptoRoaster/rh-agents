@@ -199,7 +199,7 @@ ROLE_PORT = {
     AgentRole.SIGNAL: ("sentiment", {"context", "lease", "submit"}),
     AgentRole.VECTOR: ("setup", {"context", "lease", "submit"}),
     AgentRole.PULSE: ("pulse", {"context", "lease", "submit"}),
-    AgentRole.ANCHOR: ("execution", {"execution", "lease", "submit"}),
+    AgentRole.ANCHOR: ("anchor", {"context", "lease", "submit"}),
     AgentRole.FUSE: ("evidence", {"evidence", "lease"}),
     AgentRole.COMMANDER: ("workflow", {"workflow", "lease"}),
 }

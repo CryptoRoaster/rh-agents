@@ -14,11 +14,11 @@ from uuid import UUID, uuid4
 from src.core.models import AgentRole
 from src.orchestration.worker.capabilities import (
     AnchorCapabilities,
+    AnchorContextPort,
     AtlasCapabilities,
     CommanderCapabilities,
     DiscoveryContextPort,
     EvidenceSubmissionPort,
-    ExecutionAssessmentPort,
     FuseCapabilities,
     OnchainContextPort,
     OrbitCapabilities,
@@ -116,7 +116,7 @@ class CapabilityProvider:
     sentiment: SentimentPort | None = None
     setup: SetupContextPort | None = None
     pulse: PulseContextPort | None = None
-    execution: ExecutionAssessmentPort | None = None
+    anchor: AnchorContextPort | None = None
     evidence: ValidatedEvidencePort | None = None
     workflow: WorkflowStatePort | None = None
 
@@ -133,8 +133,8 @@ class CapabilityProvider:
                 return VectorCapabilities(lease=lease, context=self.setup, submit=submit)
             case AgentRole.PULSE if self.pulse is not None:
                 return PulseCapabilities(lease=lease, context=self.pulse, submit=submit)
-            case AgentRole.ANCHOR if self.execution is not None:
-                return AnchorCapabilities(lease=lease, execution=self.execution, submit=submit)
+            case AgentRole.ANCHOR if self.anchor is not None:
+                return AnchorCapabilities(lease=lease, context=self.anchor, submit=submit)
             case AgentRole.FUSE if self.evidence is not None:
                 return FuseCapabilities(lease=lease, evidence=self.evidence)
             case AgentRole.COMMANDER if self.workflow is not None:

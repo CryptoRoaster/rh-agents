@@ -503,3 +503,112 @@ nothing writes nothing at all.
 
 Disabled by default, no migration, no worker started. See [the Phase 2I PULSE
 design](docs/phase-2i.md).
+
+## Phase 2J ANCHOR execution liquidity
+
+PULSE says the moment arrived. ANCHOR asks what the market can actually take.
+
+The easy version of this is one line long and completely wrong:
+
+```python
+max_safe_size = liquidity_usd * 0.01
+```
+
+A pool holding ten million dollars is not a promise that ten thousand can be
+traded through it at a price anyone would accept. The money may be sitting in a
+range the price has left, the trade may have to be split across several venues
+with very different depth, and the number says nothing at all about fees or the
+spread you would cross. Worse, it never fails — it is computed from a figure
+that is always there, so it always produces an answer, and the answer is fiction.
+
+So the question is asked properly instead: quote a hundred dollars, then five
+hundred, then two and a half thousand, and keep going until the market says no.
+A fixed ladder rather than a clever search, because every rung is a real request
+against somebody else's API and a fixed list is one anybody can check afterwards.
+
+Then there is the question of what "$500" actually is.
+
+The ladder is in dollars, because that is the language risk speaks. The exchange
+wants to be told a number of tokens. Those are only the same thing if the token
+you are paying with happens to be worth a dollar — and the first version of this
+quietly assumed it was. The rung labelled $500 asked for 500 tokens. Pay in
+something worth $600 and that is a $300,000 order wearing a $500 label, every
+quote comes back looking sensible, and the number that lands in the evidence is
+six hundred times too big in a field whose name ends in `_usd`.
+
+So the dollars are converted first, through an actual observed price of the
+thing you are paying with. No pegs. No "it has USD in the name, call it a
+dollar" — a stablecoin trading at $0.97 buys a thousand tokens for $970, because
+that is what $970 buys. And if there is no trustworthy price for the payment
+asset, ANCHOR stops there and says so, before asking the provider anything. A
+capacity figure nobody downstream can read is worse than no figure at all.
+
+What comes out is careful about what it claims. If a size failed, capacity is
+bracketed between the largest that worked and the smallest that did not. If
+*every* size passed, the honest answer is "at least this much" — the top of the
+ladder is the largest amount tried, not a measured ceiling — and the type system
+makes that impossible to confuse with a limit. If nothing was established there
+is no number at all, because a zero would mean "the market supports nothing",
+which is a measurement nobody made.
+
+It is also careful about the gap between the rungs. If $500 worked and $2,500
+did not, the honest statement is "those two sizes were tried, and those were the
+answers" — not that $500 is the ceiling, and not that anything in between was
+tested. Nothing guesses at the middle.
+
+And whatever comes out is not permission. It says what the market bears. How
+much of that anyone may trade is SENTINEL's to say, and it may well be far less.
+
+Three things that sound alike are kept apart. The **deviation** is what ANCHOR
+measures: how far a quote's real price sits from a current independent one. The
+**provider's impact figure** is the provider's own opinion in its own units,
+recorded when offered and never mixed in. **Slippage** is the gap between a
+quote and an actual fill, and this system has never seen a fill, so it does not
+pretend to know.
+
+Quotes go stale fast. Thirty seconds, timed from when the provider priced it
+rather than when the answer arrived, and the rungs of one ladder have to sit
+within twenty seconds of each other — otherwise you are watching the market move
+and calling it depth.
+
+"No route" and "the provider is down" are different answers and stay different
+all the way through. One is a fact about the market you can act on. The other is
+not knowing, and a retry that then succeeds is not the market recovering.
+
+There are two older fields on this evidence — one named for slippage, one for
+price impact — and the tempting thing is to put the nearest-looking number in
+them. The deviation is *nearly* slippage. It is not slippage: slippage is what a
+real fill costs you, and nothing here has ever done a fill. In this codebase that
+field name already means a realisable cost; something else reads it and moves a
+price with it. So it stays empty. The impact field stays empty too, because it
+means *the provider's* number and this provider doesn't publish one. Borrowing
+its name for a figure we worked out ourselves would be a small, convenient lie.
+
+An optional live check against the real API — off by default, no credentials,
+read-only — found two things reading the documentation had not. The provider
+reports "no route" as an HTTP 400 with the reason in the body, so the first
+version had been filing every genuinely unroutable pair as an outage. And while
+the quote endpoint returns no transaction to sign, it does return the contract a
+swap would be *sent to*. Nothing downstream had ever read it, so it is no longer
+parsed at all.
+
+A later pass found two more things worth knowing. The provider's own timestamp
+is undocumented and tracks when it handled the request rather than any pinned
+chain state, so freshness now uses whichever is older — its clock or ours — and
+a clock running fast can only ever count against a quote. And the block numbers
+in the response live inside blobs this code deliberately never opens, where three
+of them in a single hop disagreed with each other. So the ladder is held together
+by time, not by a block. That is a weaker promise, and it is the one the data
+actually supports.
+
+One correction to an earlier note: Robinhood *is* listed in KyberSwap's official
+supported-networks documentation. An earlier version of this page said it worked
+but wasn't documented. It is both, and the table now keeps "works today" and
+"the provider says it supports this" in separate columns, because they are
+different claims and only one of them is a promise.
+
+That is the theme of the whole phase. This is the last stop before something
+builds a real transaction, so it does not carry the parts of one.
+
+Disabled by default, no migration, no worker started. See [the Phase 2J
+execution-liquidity design](docs/phase-2j.md).
