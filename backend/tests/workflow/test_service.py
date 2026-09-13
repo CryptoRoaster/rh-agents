@@ -738,25 +738,6 @@ async def test_wrong_role_case_and_supersession_reject(workflow_service, now, tr
     assert caught.value.code == WorkflowErrorCode.EVIDENCE_SUPERSESSION
 
 
-async def test_fuse_receives_only_valid_expected_evidence(workflow_service, now, trace):
-    trade_case = await open_case(workflow_service, now, trace, "fuse-case")
-    with pytest.raises(WorkflowFailure):
-        await workflow_service.evidence_for_fuse(trade_case.id)
-    await workflow_service.record_evidence(trade_case.id, atlas(trade_case, now, key="fuse-atlas"))
-    await workflow_service.record_evidence(
-        trade_case.id, signal(trade_case, now, key="fuse-signal")
-    )
-    await workflow_service.record_evidence(trade_case.id, setup(trade_case, now, key="fuse-setup"))
-    evidence = await workflow_service.evidence_for_fuse(trade_case.id)
-    assert [item.producer_role for item in evidence] == [
-        AgentRole.ORBIT,
-        AgentRole.ATLAS,
-        AgentRole.SIGNAL,
-        AgentRole.VECTOR,
-    ]
-    assert all(item.effective_status(now) == EvidenceStatus.AVAILABLE for item in evidence)
-
-
 async def test_expired_setup_and_stale_trigger_cannot_progress(workflow_db, now, trace):
     _, sessions = workflow_db
     service = TradeCaseService(sessions, clock=FixedClock(now))

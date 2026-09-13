@@ -112,6 +112,7 @@ def submission(
     status=EvidenceStatus.AVAILABLE,
     supersedes_id=None,
     valid_until=None,
+    reason_codes=None,
 ):
     return EvidenceSubmission(
         idempotency_key=key,
@@ -121,7 +122,13 @@ def submission(
         observed_at=now,
         valid_until=valid_until or now + timedelta(minutes=30),
         status=status,
-        reason_codes=() if status == EvidenceStatus.AVAILABLE else ("SOURCE_NOT_VERIFIED",),
+        reason_codes=(
+            reason_codes
+            if reason_codes is not None
+            else ()
+            if status == EvidenceStatus.AVAILABLE
+            else ("SOURCE_NOT_VERIFIED",)
+        ),
         payload=payload,
         correlation_id=trade_case.correlation_id,
         supersedes_id=supersedes_id,

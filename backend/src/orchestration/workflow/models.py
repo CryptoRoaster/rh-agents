@@ -133,6 +133,7 @@ class EvidenceType(StrEnum):
     TRADE_SETUP = "TRADE_SETUP_EVIDENCE"
     TRIGGER = "TRIGGER_EVIDENCE"
     LIQUIDITY_EXECUTION = "LIQUIDITY_EXECUTION_EVIDENCE"
+    SYNTHESIS = "SYNTHESIS_EVIDENCE"
 
 
 class EvidenceProvenance(Immutable):
@@ -672,13 +673,104 @@ class LiquidityExecutionPayload(AcceptancePayload):
         return EvidenceAcceptance.ACCEPTED
 
 
+class SynthesisSource(Immutable):
+    """One envelope a synthesis was built from, by identity and fingerprint.
+
+    The fingerprint is what makes the reference checkable: it says not merely
+    "ATLAS evidence" but "that exact ATLAS finding", so a synthesis can never be
+    read as describing a later one.
+    """
+
+    role: AgentRole
+    evidence_type: EvidenceType
+    evidence_id: UUID
+    submission_fingerprint: Digest
+    status: Code
+    acceptance: Code
+    observed_at: AwareDatetime
+    valid_until: AwareDatetime
+    required: bool = Field(strict=True)
+    safety_critical: bool = Field(strict=True)
+
+
+class SynthesisFinding(Immutable):
+    """One blocker, gap or factor, attributed to the evidence that produced it."""
+
+    code: Code
+    role: AgentRole
+    evidence_type: EvidenceType
+    origin: Code
+    statement: Annotated[str, Field(min_length=1, max_length=300)]
+    evidence_id: UUID | None = None
+    safety_critical: bool | None = Field(default=None, strict=True)
+
+
+class SynthesisDetail(Immutable):
+    """The structured reading of a case's admissible evidence.
+
+    There is no score here, and its absence is deliberate. A composite number
+    over four incommensurable specialist findings would be false precision — it
+    would look calibrated, invite comparison between cases, and encode weights
+    nobody chose. What is recorded instead is what was found, attributed to who
+    found it, in four lists that a reader can check.
+    """
+
+    policy_version: Identifier
+    disposition: Code
+    hard_blockers: tuple[SynthesisFinding, ...] = Field(default=(), max_length=24)
+    unresolved_gaps: tuple[SynthesisFinding, ...] = Field(default=(), max_length=24)
+    support_factors: tuple[SynthesisFinding, ...] = Field(default=(), max_length=16)
+    caution_factors: tuple[SynthesisFinding, ...] = Field(default=(), max_length=16)
+    sources: tuple[SynthesisSource, ...] = Field(min_length=1, max_length=12)
+    input_digest: Digest
+    synthesis_fingerprint: Digest
+    evaluated_at: AwareDatetime
+
+
+class SynthesisPayload(AcceptancePayload):
+    """FUSE's reading of the evidence. Analytical only, and authoritative over nothing.
+
+    It does not approve a trade, size one, or clear anything another specialist
+    recorded. SENTINEL continues to read the canonical safety evidence directly;
+    this summarises that evidence and changes nothing about what it says.
+
+    Deliberately carries no position size, notional, slippage, route or risk
+    outcome — not merely unset, but absent from the schema, so a synthesis that
+    tried to grow trade authority would fail to validate rather than succeed
+    quietly.
+    """
+
+    kind: Literal["synthesis"] = "synthesis"
+    disposition: Code
+    source_evidence_ids: tuple[UUID, ...] = Field(min_length=1, max_length=12)
+    synthesis: "SynthesisDetail | None" = None
+
+    def acceptance(self) -> EvidenceAcceptance:
+        """Honest about its own reading, and gating nothing.
+
+        FUSE evidence is optional and not safety-critical, so this never moves a
+        case on its own — the evaluator reads the canonical sources for that.
+        What it does is keep the record truthful: a synthesis that found a
+        blocker is not an accepted one, however convenient that would be.
+        """
+        detail = self.synthesis
+        if detail is None:
+            return EvidenceAcceptance.ACCEPTED
+        if detail.hard_blockers:
+            return EvidenceAcceptance.BLOCKED
+        if detail.unresolved_gaps:
+            return EvidenceAcceptance.INSUFFICIENT
+        return EvidenceAcceptance.ACCEPTED
+
+
 EvidencePayload = Annotated[
     DiscoveryPayload
     | OnchainPayload
     | SentimentPayload
     | TradeSetupPayload
     | TriggerPayload
-    | LiquidityExecutionPayload,
+    | LiquidityExecutionPayload
+    | SynthesisPayload,
     Field(discriminator="kind"),
 ]
 
@@ -690,6 +782,7 @@ PAYLOAD_KIND = {
     EvidenceType.TRADE_SETUP: "trade_setup",
     EvidenceType.TRIGGER: "trigger",
     EvidenceType.LIQUIDITY_EXECUTION: "liquidity_execution",
+    EvidenceType.SYNTHESIS: "synthesis",
 }
 
 

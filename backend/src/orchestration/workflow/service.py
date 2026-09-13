@@ -982,27 +982,6 @@ class TradeCaseService:
             ).all()
             return tuple(evidence_from_row(row) for row in rows)
 
-    async def evidence_for_fuse(self, trade_case_id: UUID) -> tuple[EvidenceEnvelope, ...]:
-        """Return only current, fresh, role-bound pre-trigger evidence."""
-        trade_case = await self.get_trade_case(trade_case_id)
-        evidence = await self.evidence(trade_case_id)
-        current = active_evidence(evidence)
-        result: list[EvidenceEnvelope] = []
-        for requirement in self.policy.requirements:
-            if not requirement.before_trigger or not requirement.required:
-                continue
-            item = current.get(requirement.evidence_type)
-            if (
-                item is None
-                or item.producer_role != requirement.role
-                or item.effective_status(self.clock.now()) != EvidenceStatus.AVAILABLE
-            ):
-                raise WorkflowFailure(WorkflowErrorCode.EVIDENCE_BINDING)
-            result.append(item)
-        if trade_case.status == TradeCaseStatus.BLOCKED:
-            raise WorkflowFailure(WorkflowErrorCode.EVIDENCE_BINDING)
-        return tuple(result)
-
     async def tasks(self, trade_case_id: UUID) -> tuple[SpecialistTask, ...]:
         async with self.sessions() as session:
             await self._require_case(session, trade_case_id)

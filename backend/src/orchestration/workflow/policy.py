@@ -131,6 +131,30 @@ TRADE_CASE_V1 = WorkflowPolicy(
             True,
             False,
         ),
+        # FUSE synthesis: optional, not safety-critical, before the trigger.
+        #
+        # Both flags are load-bearing and neither is timidity.
+        #
+        # Not safety-critical, because `safety_types` is exactly what
+        # `risk_input_digest` hashes. A safety-critical synthesis would put its
+        # own fingerprint into the risk snapshot, and that fingerprint covers
+        # SENTIMENT facts — so a change in social data would silently invalidate
+        # a risk authorization through the back door. Phase 2F decided
+        # deliberately that SENTIMENT gates the workflow without binding risk,
+        # and a summariser must not be able to overturn that decision by
+        # summarising.
+        #
+        # Not required, because a synthesis is a reading of the evidence rather
+        # than a fact the case needs. Requiring it would let a synthesizer
+        # outage block cases whose canonical evidence is complete, which would
+        # make the commentary layer load-bearing.
+        #
+        # The consequence is that FUSE evidence is recorded, superseded and
+        # audited like everything else, and gates nothing. That is the correct
+        # weight for commentary.
+        EvidenceRequirement(
+            AgentRole.FUSE, EvidenceType.SYNTHESIS, "SYNTHESIZE_EVIDENCE", False, False, True
+        ),
     ),
     tasks=(
         # A discovery worker verifies the candidate the case was opened from, so
