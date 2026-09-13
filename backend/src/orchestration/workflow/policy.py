@@ -22,6 +22,11 @@ class TaskDefinition:
     task_type: str
     required: bool
     completed_on_open: bool = False
+    # How many times this slot may be claimed before the runtime stops. For a
+    # one-shot specialist this is a retry budget and three is generous. For a
+    # monitor it is a *watch* budget, because every unmet check is another claim,
+    # and three would stop the watch a couple of minutes after it began.
+    max_attempts: int | None = None
 
 
 @dataclass(frozen=True)
@@ -75,7 +80,14 @@ TRADE_CASE_V1 = WorkflowPolicy(
         TaskDefinition(AgentRole.SIGNAL, "ASSESS_SENTIMENT", True),
         TaskDefinition(AgentRole.VECTOR, "DEFINE_TRADE_SETUP", True),
         TaskDefinition(AgentRole.FUSE, "SYNTHESIZE_EVIDENCE", False),
-        TaskDefinition(AgentRole.PULSE, "WAIT_FOR_TRIGGER", True),
+        # A trigger monitor re-claims its slot on every check. At the PULSE
+        # policy's ninety-second cadence, 300 claims cover seven and a half hours
+        # of watching — comfortably beyond the four hours a VECTOR setup may
+        # live, so in practice the setup's own expiry ends the watch and this is
+        # the outer bound rather than the operative one. It is deliberately not
+        # unlimited: a system that would watch forever has no way to say it has
+        # stopped.
+        TaskDefinition(AgentRole.PULSE, "WAIT_FOR_TRIGGER", True, max_attempts=300),
         TaskDefinition(AgentRole.ANCHOR, "ASSESS_EXECUTION", True),
     ),
 )

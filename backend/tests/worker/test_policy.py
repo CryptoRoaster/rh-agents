@@ -132,6 +132,12 @@ def test_backoff_rejects_invalid_attempt_numbers():
         ("retry_initial_delay", timedelta(seconds=-1)),
         ("claim_batch", 0),
         ("claim_batch", 51),
+        # A monitor's recheck bounds must hold together too: a non-positive
+        # floor, or a ceiling under the floor, would let a watch schedule
+        # itself into nonsense.
+        ("min_wait_interval", timedelta(0)),
+        ("min_wait_interval", timedelta(seconds=-1)),
+        ("max_wait_interval", timedelta(seconds=1)),
     ],
 )
 def test_invalid_runtime_policy_is_rejected(field, value):
@@ -143,6 +149,8 @@ def test_invalid_runtime_policy_is_rejected(field, value):
         "retry_initial_delay": timedelta(seconds=1),
         "retry_max_delay": timedelta(seconds=60),
         "claim_batch": 5,
+        "min_wait_interval": timedelta(seconds=10),
+        "max_wait_interval": timedelta(minutes=5),
     }
     with pytest.raises(ValueError):
         WorkerRuntimePolicy(**{**base, field: value})
@@ -158,4 +166,6 @@ def test_maximum_delay_below_initial_is_rejected():
             retry_initial_delay=timedelta(seconds=60),
             retry_max_delay=timedelta(seconds=1),
             claim_batch=5,
+            min_wait_interval=timedelta(seconds=10),
+            max_wait_interval=timedelta(minutes=5),
         )

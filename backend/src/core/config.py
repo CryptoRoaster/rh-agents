@@ -126,6 +126,12 @@ class Settings(BaseSettings):
     # There is deliberately no "fake" option — synthetic candles must not be
     # reachable from a production configuration.
     vector_history_provider: Literal["disabled", "geckoterminal"] = "disabled"
+    # Phase 2I PULSE. Disabled by default like every other worker. The monitor's
+    # freshness window, poll cadence and clock-skew tolerance are code-defined
+    # and versioned rather than env-mutable: they decide whether an observation
+    # may be called current, and a knob that could loosen that is a knob that
+    # could manufacture a trigger.
+    pulse_worker_enabled: bool = False
 
     @model_validator(mode="after")
     def reasoning_configuration(self) -> "Settings":

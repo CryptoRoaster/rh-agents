@@ -5,7 +5,7 @@ grants authority; it only describes the identities, leases and results the
 deterministic runtime services validate before accepting any effect.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 from uuid import UUID
@@ -59,6 +59,11 @@ class WorkerInstanceStatus(StrEnum):
 
 class TaskAttemptOutcome(StrEnum):
     SUCCEEDED = "SUCCEEDED"
+    # An attempt that did its work correctly and found the world not yet ready.
+    # A monitor whose condition has not become true has not failed at anything,
+    # and recording it as a failure would make ordinary operation look like an
+    # incident and spend a retry budget meant for things going wrong.
+    WAITING = "WAITING"
     FAILED_RETRYABLE = "FAILED_RETRYABLE"
     FAILED_PERMANENT = "FAILED_PERMANENT"
     LEASE_EXPIRED = "LEASE_EXPIRED"
@@ -67,6 +72,10 @@ class TaskAttemptOutcome(StrEnum):
 
 
 TERMINAL_ATTEMPT_OUTCOMES = frozenset(TaskAttemptOutcome)
+
+# Outcomes that record work done rather than work gone wrong. Neither may carry
+# a failure category, and neither is an error for an operator to look at.
+NON_FAILURE_OUTCOMES = frozenset({TaskAttemptOutcome.SUCCEEDED, TaskAttemptOutcome.WAITING})
 
 
 class WorkerFailureCategory(StrEnum):
@@ -145,8 +154,8 @@ class TaskAttempt(Immutable):
             raise ValueError("An attempt is finished exactly when it carries an outcome")
         if self.finished_at is not None and self.finished_at < self.started_at:
             raise ValueError("An attempt cannot finish before it starts")
-        if self.failure_category is not None and self.outcome == TaskAttemptOutcome.SUCCEEDED:
-            raise ValueError("A succeeded attempt cannot carry a failure category")
+        if self.failure_category is not None and self.outcome in NON_FAILURE_OUTCOMES:
+            raise ValueError("A succeeded or waiting attempt cannot carry a failure category")
         return self
 
 
@@ -173,7 +182,33 @@ class TaskFailureReport(Immutable):
     reason_code: Code
 
 
-TaskOutcomeReport = Annotated[EvidenceTaskResult | TaskFailureReport, Field(discriminator="kind")]
+class TaskWaitReport(Immutable):
+    """The work was done and the answer is "not yet".
+
+    A monitor needs a third answer. Reporting a wait as success would complete a
+    task whose job is not finished; reporting it as failure would spend the retry
+    budget on ordinary operation and fill an audit trail with incidents that
+    never happened.
+
+    ``retry_after`` is the worker's proposal, not its decision. The runtime
+    clamps it, because a worker that could name its own schedule could poll a
+    provider as fast as it liked.
+    """
+
+    kind: Literal["wait"] = "wait"
+    reason_code: Code
+    retry_after: timedelta
+
+    @model_validator(mode="after")
+    def forward(self) -> Self:
+        if self.retry_after <= timedelta(0):
+            raise ValueError("A wait must schedule the next check in the future")
+        return self
+
+
+TaskOutcomeReport = Annotated[
+    EvidenceTaskResult | TaskFailureReport | TaskWaitReport, Field(discriminator="kind")
+]
 
 
 class TaskDisposition(Immutable):

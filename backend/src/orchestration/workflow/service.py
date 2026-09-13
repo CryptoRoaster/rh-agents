@@ -324,6 +324,11 @@ class TradeCaseService:
                     correlation_id=row.correlation_id,
                     reason_code="COMPLETED_ON_OPEN" if completed else "TASK_CREATED",
                     idempotency_key=f"{row.id}:{definition.role.value}:{definition.task_type}:1",
+                    **(
+                        {}
+                        if definition.max_attempts is None
+                        else {"max_attempts": definition.max_attempts}
+                    ),
                 )
             )
             self._event(

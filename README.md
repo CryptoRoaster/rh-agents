@@ -444,3 +444,41 @@ market has no history — and never an internal error in our own code.
 
 Disabled by default, no migration, no worker started. See [the Phase 2H VECTOR
 design](docs/phase-2h.md).
+
+
+## Phase 2I PULSE trigger monitor
+
+VECTOR says what to wait for. PULSE waits for it.
+
+It is the first specialist with no model at all. Every one before it had to
+interpret something — a token, a chain, a crowd, a market. This one compares two
+numbers. A model here would add cost, latency and variance to a question with a
+single correct answer, and would leave nobody able to say afterwards why the
+system acted, so the package contains no prompt and imports no provider.
+
+Only the grammar VECTOR already wrote is evaluated: at or above a level, at or
+below one, or inside a band. Exact decimals, inclusive boundaries because the
+contract says inclusive, and no epsilon. There is no smoothing, no averaging and
+no "wait for two ticks to be sure" — each of those is a trading opinion dressed
+as caution, and none of them is in the setup being watched.
+
+The hard part was not the comparison. A monitor's normal answer is "not yet",
+possibly for hours, and the worker runtime could previously only say "done" or
+"failed". Reporting patience as failure would have burned a three-attempt budget
+in minutes and filled the permanent record with incidents that never happened.
+So waiting became a real answer: the attempt closes honestly, the task is
+rescheduled in the database, and nobody is paged. One check per claim, so a
+thousand waiting cases are a thousand rows rather than a thousand loops.
+
+A price from the wrong pool, or in the wrong unit, is not a price that has failed
+to reach a level — it is incomparable, and saying "not yet" would mean waiting
+patiently for something that can never happen. Those are faults. Being too old is
+not; the feed may catch up. Freshness is judged by when the market had the price,
+never by when we read it.
+
+Evidence is written only when the condition actually held, and records the
+comparison that was made rather than any account of it. A check that found
+nothing writes nothing at all.
+
+Disabled by default, no migration, no worker started. See [the Phase 2I PULSE
+design](docs/phase-2i.md).

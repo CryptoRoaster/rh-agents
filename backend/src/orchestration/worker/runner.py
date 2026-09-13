@@ -23,10 +23,10 @@ from src.orchestration.worker.capabilities import (
     OnchainContextPort,
     OrbitCapabilities,
     PulseCapabilities,
+    PulseContextPort,
     SentimentPort,
     SetupContextPort,
     SignalCapabilities,
-    TriggerFeedPort,
     ValidatedEvidencePort,
     VectorCapabilities,
     WorkflowStatePort,
@@ -37,6 +37,7 @@ from src.orchestration.worker.models import (
     TaskFailureReport,
     TaskLease,
     TaskOutcomeReport,
+    TaskWaitReport,
     WorkerErrorCode,
     WorkerFailure,
     WorkerFailureCategory,
@@ -114,7 +115,7 @@ class CapabilityProvider:
     onchain: OnchainContextPort | None = None
     sentiment: SentimentPort | None = None
     setup: SetupContextPort | None = None
-    triggers: TriggerFeedPort | None = None
+    pulse: PulseContextPort | None = None
     execution: ExecutionAssessmentPort | None = None
     evidence: ValidatedEvidencePort | None = None
     workflow: WorkflowStatePort | None = None
@@ -130,8 +131,8 @@ class CapabilityProvider:
                 return SignalCapabilities(lease=lease, context=self.sentiment, submit=submit)
             case AgentRole.VECTOR if self.setup is not None:
                 return VectorCapabilities(lease=lease, context=self.setup, submit=submit)
-            case AgentRole.PULSE if self.triggers is not None:
-                return PulseCapabilities(lease=lease, triggers=self.triggers, submit=submit)
+            case AgentRole.PULSE if self.pulse is not None:
+                return PulseCapabilities(lease=lease, context=self.pulse, submit=submit)
             case AgentRole.ANCHOR if self.execution is not None:
                 return AnchorCapabilities(lease=lease, execution=self.execution, submit=submit)
             case AgentRole.FUSE if self.evidence is not None:
@@ -213,6 +214,10 @@ class WorkerRunner:
             )
         if isinstance(report, TaskFailureReport):
             return await self.service.report_task_failure(lease, report)
+        if isinstance(report, TaskWaitReport):
+            # A monitor that found nothing yet. Durable reschedule, not a retry:
+            # the loop lives in the task table rather than inside this process.
+            return await self.service.report_task_wait(lease, report)
         try:
             return await self.service.submit_task_result(lease, report)
         except WorkerFailure as error:

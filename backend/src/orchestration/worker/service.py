@@ -35,6 +35,7 @@ from src.orchestration.worker.models import (
     TaskDisposition,
     TaskFailureReport,
     TaskLease,
+    TaskWaitReport,
     WorkerErrorCode,
     WorkerFailure,
     WorkerFailureCategory,
@@ -509,6 +510,111 @@ class WorkerRuntimeService:
                 outcome=TaskAttemptOutcome.SUCCEEDED,
                 reason_code="RESULT_ACCEPTED",
                 retry_scheduled=False,
+            )
+
+    async def report_task_wait(self, lease: TaskLease, report: TaskWaitReport) -> TaskDisposition:
+        """Record that an attempt did its work and the world is not yet ready.
+
+        Structurally this is the retry path without the failure: the lease is
+        released, the attempt closes, and the task returns to PENDING with a
+        future eligibility time. What differs is what the record says. The
+        attempt carries WAITING and no failure category, so an operator reading
+        task history sees a monitor doing its job rather than a run of incidents,
+        and nothing downstream can mistake ordinary patience for an error.
+
+        The schedule is the runtime's to set. A worker proposes an interval and
+        this clamps it, because a worker that could name its own cadence could
+        poll a provider as fast as it liked.
+        """
+        report = TaskWaitReport.model_validate_json(report.model_dump_json())
+        async with self.sessions.begin() as session:
+            now = self.clock.now()
+            case_row = await self._locked_case(session, lease.trade_case_id)
+            task = await session.scalar(
+                select(TradeCaseTaskRow)
+                .where(TradeCaseTaskRow.task_id == lease.task_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if task is None:
+                raise WorkerFailure(WorkerErrorCode.TASK_NOT_FOUND)
+            attempt = await session.scalar(
+                select(WorkerTaskAttemptRow).where(WorkerTaskAttemptRow.lease_id == lease.lease_id)
+            )
+            if attempt is None or attempt.task_id != lease.task_id:
+                raise WorkerFailure(WorkerErrorCode.LEASE_NOT_FOUND)
+            if attempt.finished_at is not None:
+                # The attempt already reached a durable outcome. Waiting is not a
+                # second answer to a question that has been answered.
+                raise WorkerFailure(WorkerErrorCode.RESULT_CONFLICT)
+            # Fenced exactly like every other authoritative write: a worker whose
+            # lease has gone has no standing to reschedule anything.
+            await self._validate_lease(session, task, lease, now)
+
+            attempt.finished_at = now
+            attempt.outcome = TaskAttemptOutcome.WAITING.value
+            attempt.reason_code = report.reason_code
+            attempt.failure_category = None
+            task.lease_id = None
+            task.worker_instance_id = None
+            task.lease_started_at = None
+            task.lease_expires_at = None
+            task.lease_renewals = 0
+            task.failure_category = None
+
+            exhausted = task.attempt >= task.max_attempts
+            if exhausted:
+                # A watch is bounded like everything else. Running out of checks
+                # is not a failure of the market to cooperate; it is this system
+                # declining to watch forever.
+                task.status = SpecialistTaskStatus.FAILED.value
+                task.completed_at = now
+                task.next_eligible_at = None
+                task.reason_code = "TASK_WATCH_EXHAUSTED"
+                self._event(
+                    session,
+                    case_row,
+                    "TASK_WATCH_EXHAUSTED",
+                    "TASK_WATCH_EXHAUSTED",
+                    {
+                        "task_id": str(task.task_id),
+                        "role": task.role,
+                        "attempt_number": attempt.attempt_number,
+                    },
+                )
+                return TaskDisposition(
+                    task_id=task.task_id,
+                    trade_case_id=task.trade_case_id,
+                    attempt_number=attempt.attempt_number,
+                    outcome=TaskAttemptOutcome.WAITING,
+                    reason_code="TASK_WATCH_EXHAUSTED",
+                    retry_scheduled=False,
+                )
+            next_eligible_at = now + self.policy.wait_interval(report.retry_after)
+            task.attempt += 1
+            task.status = SpecialistTaskStatus.PENDING.value
+            task.reason_code = report.reason_code
+            task.next_eligible_at = next_eligible_at
+            self._event(
+                session,
+                case_row,
+                "TASK_WAITING",
+                report.reason_code,
+                {
+                    "task_id": str(task.task_id),
+                    "role": task.role,
+                    "attempt_number": attempt.attempt_number,
+                    "next_eligible_at": next_eligible_at.isoformat(),
+                },
+            )
+            return TaskDisposition(
+                task_id=task.task_id,
+                trade_case_id=task.trade_case_id,
+                attempt_number=attempt.attempt_number,
+                outcome=TaskAttemptOutcome.WAITING,
+                reason_code=report.reason_code,
+                retry_scheduled=True,
+                next_eligible_at=next_eligible_at,
             )
 
     async def report_task_failure(
