@@ -210,6 +210,77 @@ class OnchainAdvisoryFinding(Immutable):
     referenced_addresses: tuple[Identifier, ...] = Field(default=(), max_length=8)
 
 
+# The optional holder block, and the rule for payloads written before it existed.
+#
+# Evidence is append-only and its fingerprints are stored, so adding a field to
+# a payload is a change to bytes already in the database: an absent key is not
+# the same as a key holding `null`, and emitting one for a row that never had it
+# breaks replay while parsing perfectly. The shape as read is therefore
+# remembered and reproduced — the same mechanism `ExecutionAssessmentDetail` and
+# `SynthesisDetail` use for their legacy timestamp, applied once more rather
+# than generalised into a serialisation layer nobody could reason about.
+HOLDER_FACTS_KEY = "holders"
+
+
+def _holder_facts_present(data: Any) -> bool:
+    """Whether a payload arrived carrying the holder block at all."""
+    if isinstance(data, Mapping):
+        return HOLDER_FACTS_KEY in data
+    return bool(getattr(data, "_holder_facts_key_present", False))
+
+
+class HolderDistributionFacts(Immutable):
+    """The measured holder distribution, and everything needed to trust it.
+
+    A verdict is not a metric. ``holder_integrity == "PASS"`` says the holder
+    domain met its data-quality prerequisites; it says nothing about how
+    concentrated the token is, and a reader that needed a number could not get
+    one from it. These are the numbers, recorded beside the verdict rather than
+    in place of it.
+
+    The measure is named rather than implied. ``top_ten_fraction`` is the sum of
+    the ten largest balances over **on-chain total supply**, unadjusted — the
+    same figure ATLAS's own concentration policy judges. The burn-adjusted
+    variant divides by circulating supply instead and travels separately,
+    because a large position must never be hidden by an adjustment and the two
+    are not interchangeable inputs to a threshold.
+
+    ``provider_excluded_addresses`` names rows the provider removed before we
+    ever saw them. They change no figure here — a row that never arrived cannot
+    be added back — but they make the top-ten numerator a lower bound, so a
+    reader applying a limit must treat the metric as unproven rather than
+    passing. That judgement belongs to the reader; this records the fact.
+    """
+
+    # The measure, stated so no later reader has to infer it from a field name.
+    measurement: Literal["TOP_TEN_OVER_TOTAL_SUPPLY"] = "TOP_TEN_OVER_TOTAL_SUPPLY"
+    source: Identifier
+    # The source's own account of when this holder state was true, never when we
+    # fetched it. What that instant actually refers to is `observation_basis`.
+    observed_at: AwareDatetime
+    observation_basis: Code
+    completeness: Code
+    snapshot_block: int | None = Field(default=None, strict=True, ge=0)
+    # Chain block minus holder snapshot block. Signed: the pinned contract block
+    # trails the head by the confirmation lag while an indexer tracks the head.
+    holder_block_delta: int | None = Field(default=None, strict=True)
+    # The provider's own count of holders. Not derived from the rows we received
+    # and not verifiable from them, which is why its basis is recorded beside it.
+    holder_count: int | None = Field(default=None, strict=True, ge=0)
+    holder_count_basis: Code = "PROVIDER_REPORTED"
+    # The denominator actually divided by, as text: a uint256 supply exceeds what
+    # a JSON number can carry back unharmed in every reader.
+    total_supply_raw: Annotated[str, Field(pattern=r"^[0-9]{1,78}$")] | None = None
+    top_one_fraction: Share | None = None
+    top_five_fraction: Share | None = None
+    top_ten_fraction: Share | None = None
+    # Top ten over *circulating* supply with proven burn holdings removed. A
+    # different measure against a different denominator, never a substitute.
+    top_ten_fraction_excluding_burn: Share | None = None
+    burned_fraction: Share | None = None
+    provider_excluded_addresses: tuple[Identifier, ...] = Field(default=(), max_length=8)
+
+
 class OnchainIntelligence(Immutable):
     """The deterministic record behind an on-chain verdict.
 
@@ -232,6 +303,26 @@ class OnchainIntelligence(Immutable):
     reasoning_model: Identifier | None = None
     prompt_version: Identifier | None = None
     prompt_hash: Digest | None = None
+    # Absent on evidence written before the holder metrics were carried, and
+    # omitted rather than serialised as `null` for exactly those rows.
+    holders: "HolderDistributionFacts | None" = None
+
+    _holder_facts_key_present: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _remember_holder_shape(cls, data: Any, handler: Any) -> Any:
+        present = _holder_facts_present(data)
+        model = handler(data)
+        object.__setattr__(model, "_holder_facts_key_present", present)
+        return model
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        emitted: dict[str, Any] = handler(self)
+        if self._holder_facts_key_present:
+            return emitted
+        return {key: value for key, value in emitted.items() if key != HOLDER_FACTS_KEY}
 
 
 class OnchainPayload(AcceptancePayload):
