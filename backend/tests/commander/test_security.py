@@ -198,12 +198,20 @@ def test_the_package_never_mutates_workflow_state_directly():
 
 def test_the_only_authoritative_write_is_opening_a_case():
     """One mutation, through the existing service, with a derived identity."""
-    reachable = package_identifiers()
-    assert "open_trade_case" in reachable
     source = "".join(path.read_text() for path in sorted(PACKAGE.glob("*.py")))
-    assert source.count("self.cases.") == source.count("self.cases.open_trade_case") + source.count(
-        "self.cases.get_trade_case"
-    ) + source.count("self.cases.evidence") + source.count("self.cases.tasks")
+    # Exactly one authoritative write, reached only through the workflow service.
+    assert "open_trade_case_in_session" in source
+    calls = {
+        line.split("self.cases.")[1].split("(")[0]
+        for line in source.split("\n")
+        if "self.cases." in line
+    }
+    assert calls == {
+        "open_trade_case_in_session",
+        "get_trade_case",
+        "evidence",
+        "tasks",
+    }
 
 
 # ---------------------------------------------------- no risk authority
@@ -351,4 +359,5 @@ def test_the_pause_reader_reads_and_never_writes():
 
     assert {item.name for item in fields(AccountPauseReader)} == {"sessions", "account_id"}
     surface = {name for name in dir(AccountPauseReader) if not name.startswith("_")}
-    assert surface == {"account_id", "system_paused"}
+    # Two reads and no setter: a snapshot for a view, a locked read for a gate.
+    assert surface == {"account_id", "system_paused", "locked_paused"}

@@ -23,7 +23,7 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.clock import Clock, SystemClock
@@ -40,6 +40,10 @@ from src.orchestration.workflow.models import (
 from src.orchestration.workflow.service import TradeCaseService
 
 logger = logging.getLogger(__name__)
+
+
+class SystemPaused(Exception):
+    """A stop was in force when the opening transaction reached it."""
 
 
 class IntakeRefusal(StrEnum):
@@ -171,24 +175,26 @@ class CommanderIntakeService:
             if refusal is not None:
                 refused.append((candidate.pair_id, refusal))
                 continue
-            # Re-checked immediately before the one write this service performs.
-            # A stop that came into force while candidates were being read had
-            # previously already been passed: the gate was at the top of the
-            # cycle and nothing looked again. The window cannot be closed by
-            # reading earlier — only by reading last.
-            if await self._halted():
+            try:
+                case, created = await self._open(candidate, now, predecessor)
+            except SystemPaused:
+                # The stop was in force when the transaction reached it.
                 refused.append((candidate.pair_id, IntakeRefusal.SYSTEM_PAUSED))
                 continue
-            try:
-                case = await self._open(candidate, now, predecessor)
             except WorkflowFailure:
                 # One candidate the workflow declined must not end the cycle.
-                # The previous implementation let an idempotency conflict escape
+                # An earlier implementation let an idempotency conflict escape
                 # and take every remaining candidate down with it.
                 refused.append((candidate.pair_id, IntakeRefusal.OPEN_REFUSED))
                 continue
             if case is None:
                 refused.append((candidate.pair_id, IntakeRefusal.MARKET_UNAVAILABLE))
+                continue
+            if not created:
+                # Another worker created it while this one was still preparing.
+                # Reporting it as opened made two workers claim one case between
+                # them and spend two units of a budget that bounds *new* cases.
+                refused.append((candidate.pair_id, IntakeRefusal.ALREADY_OPENED))
                 continue
             opened.append(case)
         return IntakeOutcome(opened=tuple(opened), refused=tuple(refused))
@@ -289,7 +295,7 @@ class CommanderIntakeService:
 
     async def _open(
         self, candidate: MarketCandidate, now: datetime, predecessor: UUID | None
-    ) -> TradeCase | None:
+    ) -> tuple[TradeCase | None, bool]:
         """Open one case from a candidate whose snapshot is still readable.
 
         The snapshot is re-read rather than reconstructed from the candidate:
@@ -302,18 +308,60 @@ class CommanderIntakeService:
             candidate.pair_id, include_fixtures=self.policy.allow_fixtures
         )
         if snapshot is None:
-            return None
-        return await self.cases.open_trade_case(
-            snapshot.pair.market_identity,
-            originating_discovery_reference=candidate.id,
-            correlation_id=self.intake_correlation(candidate, predecessor),
-            idempotency_key=self.intake_key(candidate, predecessor),
-            # Measured from the observation that produced this candidate rather
-            # than from now, for the same reason as the correlation: two workers
-            # reading the same candidate a second apart must compute the same
-            # expiry, or their open fingerprints differ and neither wins.
-            expires_at=candidate.observed_at + self.policy.case_lifetime,
-        )
+            return None, False
+
+        # One transaction, in one order: take the pause lock, then open.
+        #
+        # Checking the stop beforehand cannot be made safe by checking it later,
+        # however late. Between any read and the insert there is a window, and a
+        # pause committed inside it is one this cycle has already passed. Holding
+        # the writer's own lock across the insert removes the window rather than
+        # narrowing it: whichever transaction takes the lock first wins, and the
+        # loser observes the winner's committed state.
+        #
+        # Lock order is paper account, then trade case. See `locked_paused`.
+        async with self.sessions.begin() as session:
+            if self.kill_switch or self.pause is None:
+                raise SystemPaused
+            if await self.pause.locked_paused(session):
+                raise SystemPaused
+            await self._serialize_on_key(session, self.intake_key(candidate, predecessor))
+            return await self.cases.open_trade_case_in_session(
+                session,
+                snapshot.pair.market_identity,
+                originating_discovery_reference=candidate.id,
+                correlation_id=self.intake_correlation(candidate, predecessor),
+                idempotency_key=self.intake_key(candidate, predecessor),
+                # Measured from the observation that produced this candidate
+                # rather than from now, for the same reason as the correlation:
+                # two workers reading the same candidate a second apart must
+                # compute the same expiry, or their open fingerprints differ and
+                # neither wins.
+                expires_at=candidate.observed_at + self.policy.case_lifetime,
+            )
+
+    @staticmethod
+    async def _serialize_on_key(session: AsyncSession, key: str) -> None:
+        """Hold a transaction-scoped lock on this exact intake generation.
+
+        Deliberately not a reliance on the pause lock. That one happens to
+        serialise intake as a side effect, but only when a real account row is
+        being locked — so the guarantee would quietly disappear wherever the
+        pause source were stubbed or absent, which is precisely how an injected
+        boolean port can look like a concurrency solution without being one.
+
+        Locking the key itself is the intent: two transactions opening the same
+        generation queue, and the second observes the first's committed row and
+        reports a replay instead of colliding on the primary key. A conflict
+        inside a caller-owned transaction cannot be recovered from, because the
+        transaction is already poisoned by the time it surfaces.
+
+        PostgreSQL is the authoritative database; SQLite has no advisory lock and
+        the light test suite runs no concurrent intake.
+        """
+        if session.bind is None or session.bind.dialect.name != "postgresql":
+            return
+        await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key})
 
     async def _halted(self) -> bool:
         """Whether any system-wide stop is in force.

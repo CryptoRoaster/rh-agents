@@ -375,6 +375,57 @@ content is still detected as different.
 
 ---
 
+## Second review round
+
+Four further defects were reproduced and closed.
+
+**A pause arriving mid-cycle still opened a case.** Moving the check later only
+narrowed the window; it could not close it, because between any read and the
+insert there is a gap and a pause committed inside it has already been passed.
+The opening now happens in one transaction that first takes the same account
+row lock the paper service takes before setting the pause, so the database
+orders the two rather than timing doing it. **Lock order is paper account, then
+trade case** — safe because the workflow locks trade cases and never touches the
+account, and the paper service locks the account and never touches a trade case,
+so no cycle is introduced.
+
+Opening is additionally serialised on the intake key itself, with a
+transaction-scoped advisory lock. Relying on the account lock alone would have
+been a guarantee that quietly disappeared wherever the pause source was stubbed
+or absent — which is exactly how an injected boolean port can look like a
+concurrency solution without being one. The proofs use the real account-backed
+reader against a schema carrying the accounting tables, not a stub.
+
+**Historical payloads stopped parsing.** Removing `evaluated_at` from two models
+that forbid extra fields made every row written before the change unreadable,
+and evidence is append-only. The field is restored as `legacy_evaluated_at`,
+optional, accepted under both spellings and never written by any code path — so
+new submissions stay deterministic, which is what made removing it necessary,
+while stored ones keep what they were recorded with. A blanket `extra="ignore"`
+would have achieved the parsing and lost the contract: every typo would vanish
+with it. Reading, round-tripping, new-versus-new replay and a genuine content
+change are tested separately, with fixtures written as the previous model
+produced them rather than as the current one emits.
+
+**Two workers claimed one case between them.** Opening is idempotent by key, so
+a caller receiving only the case cannot tell a creation from a replay — and the
+loser of a race counted the winner's case as its own opening, spending two units
+of a budget that bounds new cases. The session-joining open now reports whether
+it created, and only creations are counted. Tested on the sum rather than on the
+set of case ids, which is what made the original miscount invisible.
+
+**A decision could be made from a context that had aged out.** The context
+freezes every temporal fact at read time, so `expired=False` stayed false
+forever and a later decision repeated a verdict about a moment that had passed.
+A context now carries the earliest *future* expiry among the case, the
+authorization, each envelope and the setup's own horizon, and a decision made
+past it is refused as `STALE_CONTEXT` — demanding a fresh server-built view
+rather than extending anything. Expiries already past when the view was built
+are excluded, since they have already changed what the case means and that
+change is what the view records.
+
+---
+
 ## Compatibility
 
 No migration. Alembic head remains `0006`, and none of `0001`–`0006` is altered.

@@ -287,16 +287,16 @@ async def test_a_workflow_refusal_does_not_abort_the_remaining_candidates(worker
 
         raise WorkflowFailure(WorkflowErrorCode.IDEMPOTENCY_CONFLICT)
 
-    original = service.cases.open_trade_case
+    original = service.cases.open_trade_case_in_session
     calls: list[str] = []
 
-    async def selective(identity, **kwargs):
+    async def selective(session, identity, **kwargs):
         calls.append(identity.pair_id)
         if identity.pair_id == broken[0].pair_id:
             return await refuse()
-        return await original(identity, **kwargs)
+        return await original(session, identity, **kwargs)
 
-    service.cases.open_trade_case = selective  # type: ignore[method-assign]
+    service.cases.open_trade_case_in_session = selective  # type: ignore[method-assign]
     outcome = await service.run_cycle()
 
     assert len(calls) == 2, "the cycle continued past the refusal"

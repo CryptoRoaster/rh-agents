@@ -213,7 +213,9 @@ def test_a_pause_port_can_only_be_observed_never_lifted():
         for name in dir(SystemPausePort)
         if not name.startswith("_") and callable(getattr(SystemPausePort, name, None))
     }
-    assert methods == {"system_paused"}
+    # Two reads and no setter: a snapshot for building a view, and a
+    # transactional read for gating a write.
+    assert methods == {"system_paused", "locked_paused"}
 
 
 # --------------------------------- H, K, R: risk verdicts and terminal cases
@@ -235,6 +237,9 @@ def synthetic(status, *, risk=None, controls=None, digest="a" * 64):
         or SystemControls(kill_switch=False, account_paused=False, trading_mode="PAPER"),
         risk=risk,
         observed_at=NOW_FOR_SYNTHETIC,
+        # Comfortably ahead, so these cases exercise the branch under test
+        # rather than the staleness guard that precedes all of them.
+        valid_until=NOW_FOR_SYNTHETIC + timedelta(hours=6),
         context_digest=digest,
     )
 

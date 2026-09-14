@@ -7,7 +7,14 @@ from hashlib import sha256
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AliasChoices,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_validator,
+)
 
 from src.core.models import AgentRole, RiskOutcome, Side
 from src.markets.models import MarketIdentity
@@ -624,6 +631,24 @@ class ExecutionAssessmentDetail(Immutable):
     quote_requests: int = Field(ge=0)
     ladder: tuple[QuotedLadderPoint, ...] = Field(min_length=1, max_length=12)
     execution_digest: Digest
+    # Legacy only, and never written.
+    #
+    # Evidence is append-only, so payloads recorded before this field was
+    # dropped are still in the database and must stay readable — and both these
+    # models forbid extra fields, so removing it outright made historical rows
+    # unparseable. It is therefore restored as optional and left `None` by every
+    # code path: new submissions are deterministic, which is what made removing
+    # it necessary, while stored ones keep the value they were written with.
+    #
+    # A blanket `extra="ignore"` would have achieved the parsing and lost the
+    # contract: every other unknown field would silently vanish too, including
+    # typos in fields that matter.
+    legacy_evaluated_at: AwareDatetime | None = Field(
+        default=None,
+        # Accepts the historical spelling and its own, so a payload survives a
+        # read-and-write round trip as well as a first read.
+        validation_alias=AliasChoices("evaluated_at", "legacy_evaluated_at"),
+    )
 
 
 class LiquidityExecutionPayload(AcceptancePayload):
@@ -740,6 +765,24 @@ class SynthesisDetail(Immutable):
     sources: tuple[SynthesisSource, ...] = Field(min_length=1, max_length=12)
     input_digest: Digest
     synthesis_fingerprint: Digest
+    # Legacy only, and never written.
+    #
+    # Evidence is append-only, so payloads recorded before this field was
+    # dropped are still in the database and must stay readable — and both these
+    # models forbid extra fields, so removing it outright made historical rows
+    # unparseable. It is therefore restored as optional and left `None` by every
+    # code path: new submissions are deterministic, which is what made removing
+    # it necessary, while stored ones keep the value they were written with.
+    #
+    # A blanket `extra="ignore"` would have achieved the parsing and lost the
+    # contract: every other unknown field would silently vanish too, including
+    # typos in fields that matter.
+    legacy_evaluated_at: AwareDatetime | None = Field(
+        default=None,
+        # Accepts the historical spelling and its own, so a payload survives a
+        # read-and-write round trip as well as a first read.
+        validation_alias=AliasChoices("evaluated_at", "legacy_evaluated_at"),
+    )
 
 
 class SynthesisPayload(AcceptancePayload):

@@ -80,6 +80,9 @@ STATEMENTS: dict[CommanderReason, str] = {
         "SENTINEL rejected this case; coordination does not reconsider that."
     ),
     CommanderReason.TRADE_CASE_TERMINAL: "The case is finished; nothing progresses it.",
+    CommanderReason.CONTEXT_STALE: (
+        "This view was read before something in it expired; a fresh one is required."
+    ),
     CommanderReason.SYSTEM_PAUSED: "A system-wide stop is in force.",
     CommanderReason.OBSERVE_MODE: (
         "The deployment is in OBSERVE mode: it watches and does not act."
@@ -93,7 +96,7 @@ def decide(
     policy: CommanderControlPolicy,
 ) -> CommanderDecision:
     """What coordination should do about this case, and why."""
-    disposition, reason = _conclude(context)
+    disposition, reason = _conclude(context, now)
     return CommanderDecision(
         policy_version=policy.version,
         trade_case_id=context.trade_case_id,
@@ -107,8 +110,21 @@ def decide(
 
 def _conclude(
     context: CommanderContext,
+    now: datetime,
 ) -> tuple[CommanderDisposition, CommanderReason]:
-    # A system-wide stop outranks every case-level eligibility. Checked first so
+    # A view that has aged out cannot support any conclusion, so this is checked
+    # before every other branch.
+    #
+    # The context froze each temporal fact at read time — an authorization that
+    # was valid then carries `expired=False` forever — so a decision made later
+    # from the same view would repeat a verdict about a moment that has passed.
+    # `now` is therefore not decoration: it is what decides whether this reading
+    # may still be used at all. Refusing here demands a fresh server-built
+    # context rather than extending anything.
+    if not context.is_current_at(now):
+        return CommanderDisposition.STALE_CONTEXT, CommanderReason.CONTEXT_STALE
+
+    # A system-wide stop outranks every case-level eligibility. Checked next so
     # no later branch can reach past it.
     if context.controls.halted:
         reason = (

@@ -53,6 +53,9 @@ class CommanderDisposition(StrEnum):
     do, which is a different question from what the case *is*.
     """
 
+    # The view this decision would rest on has aged out. Nothing is concluded
+    # about the case; a fresh server-built context is required first.
+    STALE_CONTEXT = "STALE_CONTEXT"
     # Something the workflow requires has not been produced yet. Specialists are
     # the ones who produce it, and waiting is the correct coordination.
     AWAIT_SPECIALISTS = "AWAIT_SPECIALISTS"
@@ -92,6 +95,9 @@ class CommanderReason(StrEnum):
     RISK_AUTHORIZATION_CURRENT = "RISK_AUTHORIZATION_CURRENT"
     RISK_REJECTED = "RISK_REJECTED"
     TRADE_CASE_TERMINAL = "TRADE_CASE_TERMINAL"
+    # The view was read before something in it expired. Not a statement about
+    # the case: a statement that this reading can no longer support one.
+    CONTEXT_STALE = "CONTEXT_STALE"
     SYSTEM_PAUSED = "SYSTEM_PAUSED"
     # The deployment observes and does not act. Not a fault and not a stop:
     # a stated posture that coordination has to honour rather than narrate.
@@ -245,8 +251,25 @@ class CommanderContext(Immutable):
     advisory: AdvisorySynthesis | None = None
     controls: SystemControls
     current_risk_input_digest: Digest | None = None
-    observed_at: AwareDatetime
+    observed_at: (
+        AwareDatetime  # The instant after which this view may no longer describe the case, or
+    )
+    # `None` when nothing it rests on expires any later than it was read.
+    #
+    # A context is a snapshot, and a snapshot of facts that expire has a shelf
+    # life: the earliest *future* expiry among the case, the authorization, each
+    # current envelope and the setup's own horizon. Expiries already past when
+    # the view was built are excluded — they have already changed what the case
+    # means, and that change is what the view records.
+    #
+    # Carrying it is what lets a decision refuse to be made from a reading that
+    # has aged out, rather than repeating a verdict frozen at read time.
+    valid_until: AwareDatetime | None = None
     context_digest: Digest
+
+    def is_current_at(self, instant: AwareDatetime) -> bool:
+        """Whether conclusions drawn from this view still hold at `instant`."""
+        return self.valid_until is None or instant < self.valid_until
 
     @model_validator(mode="after")
     def one_per_type(self) -> Self:

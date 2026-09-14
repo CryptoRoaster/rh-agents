@@ -23,6 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.clock import Clock, SystemClock
+from src.data.repository import aware
 from src.data.tables import AccountRow, TradeCaseRiskBindingRow
 from src.orchestration.commander.models import (
     AdvisorySynthesis,
@@ -44,6 +45,8 @@ from src.orchestration.workflow.models import (
     EvidenceType,
     RiskBinding,
     SynthesisPayload,
+    TradeCase,
+    TradeSetupPayload,
     WorkflowErrorCode,
     WorkflowFailure,
 )
@@ -54,11 +57,19 @@ from src.orchestration.workflow.service import TradeCaseService, risk_from_row
 class SystemPausePort(Protocol):
     """Whether a durable system-wide stop is in force.
 
-    One question, no setter. A control plane may observe a pause and must never
-    be able to lift one.
+    Two reads, no setter — a control plane may observe a pause and must never be
+    able to lift one.
+
+    ``system_paused`` is the unsynchronised read, for building a view. It is
+    inherently a snapshot and is never sufficient on its own to gate a write:
+    any check-then-act leaves a window, and moving the check later only narrows
+    it. ``locked_paused`` is the read that closes it, by taking the same lock
+    the writer takes inside the caller's own transaction.
     """
 
     async def system_paused(self) -> bool: ...
+
+    async def locked_paused(self, session: AsyncSession) -> bool: ...
 
 
 class SystemPauseUnavailable(Exception):
@@ -83,10 +94,32 @@ class AccountPauseReader:
     account_id: int = 1
 
     async def system_paused(self) -> bool:
+        """A snapshot, for building a view. Never a gate on a write."""
         async with self.sessions() as session:
             paused = await session.scalar(
                 select(AccountRow.paused).where(AccountRow.id == self.account_id)
             )
+        if paused is None:
+            raise SystemPauseUnavailable("PAUSE_STATE_UNAVAILABLE")
+        return bool(paused)
+
+    async def locked_paused(self, session: AsyncSession) -> bool:
+        """Take the writer's own lock, in the caller's transaction, and answer.
+
+        `PaperTradingService` sets the pause after selecting this row
+        ``FOR UPDATE``. Taking the same lock here means the two transactions are
+        ordered by the database rather than by timing: whichever acquires it
+        first wins, and the loser sees the winner's committed state.
+
+        **Lock order: paper account, then trade case.** Safe because nothing in
+        this system acquires them the other way round — the workflow locks trade
+        cases and never touches the account, and the paper service locks the
+        account and never touches a trade case. Establishing this order
+        introduces no cycle, and every future caller must keep it.
+        """
+        paused = await session.scalar(
+            select(AccountRow.paused).where(AccountRow.id == self.account_id).with_for_update()
+        )
         if paused is None:
             raise SystemPauseUnavailable("PAUSE_STATE_UNAVAILABLE")
         return bool(paused)
@@ -280,6 +313,7 @@ class CommanderContextReader:
         )
 
         digest = risk_input_digest(trade_case, current, self.workflow)
+        shelf_life = _shelf_life(trade_case, current, binding_row, now)
         risk = None if binding_row is None else _risk_state(risk_from_row(binding_row), digest, now)
         controls = await self._controls()
         advisory = _advisory(current, now)
@@ -300,6 +334,7 @@ class CommanderContextReader:
             controls=controls,
             current_risk_input_digest=digest,
             observed_at=now,
+            valid_until=shelf_life,
             context_digest=context_digest(
                 trade_case_id=trade_case_id,
                 workflow_version=trade_case.workflow_version,
@@ -368,6 +403,44 @@ class CommanderContextReader:
             # field describe an intention rather than the deployment.
             trading_mode=self.trading_mode,
         )
+
+
+def _shelf_life(
+    trade_case: TradeCase,
+    current: dict[EvidenceType, EvidenceEnvelope],
+    binding_row: TradeCaseRiskBindingRow | None,
+    now: datetime,
+) -> datetime | None:
+    """The first instant at which this view could stop describing the case.
+
+    The earliest expiry that is still ahead. A view is only as current as the
+    soonest thing in it left to lapse, and the alternative — no shelf life — is
+    what let a frozen reading claim a validity it had lost.
+
+    Expiries already past are deliberately excluded. They have already changed
+    what the case means, and that change is exactly what this view records: an
+    authorization that lapsed before the read arrives as `expired`, and the
+    recomputed status reflects it. Counting it again would make every fresh
+    reading of a case with any lapsed fact instantly unusable.
+
+    `None` means nothing it rests on expires any later than the read, so no
+    later instant can invalidate it.
+
+    The setup's own horizon is read alongside the envelope's. That is a temporal
+    fact rather than a finding: the control plane still forms no view about what
+    the setup says, only about when it stops saying it.
+    """
+    horizons = [trade_case.expires_at] if trade_case.expires_at is not None else []
+    horizons.extend(item.valid_until for item in current.values())
+    if binding_row is not None:
+        horizons.append(aware(binding_row.expires_at))
+    setup = current.get(EvidenceType.TRADE_SETUP)
+    if setup is not None and isinstance(setup.payload, TradeSetupPayload):
+        detail = setup.payload.setup
+        if detail is not None:
+            horizons.append(detail.expires_at)
+    ahead = [horizon for horizon in horizons if horizon > now]
+    return min(ahead) if ahead else None
 
 
 def _risk_state(binding: RiskBinding, digest: str, now: datetime) -> RiskState:

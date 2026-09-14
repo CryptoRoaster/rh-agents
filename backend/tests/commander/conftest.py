@@ -4,7 +4,10 @@ Most questions here are about what COMMANDER declines to do, so the fixtures
 build whole cases at particular workflow stages rather than isolated objects.
 """
 
+from decimal import Decimal
 from uuid import uuid4
+
+import pytest
 
 from src.core.clock import FixedClock
 from src.core.models import AgentRole
@@ -31,6 +34,16 @@ class RunningSystem:
         self.paused = paused
 
     async def system_paused(self) -> bool:
+        return self.paused
+
+    async def locked_paused(self, session) -> bool:
+        """The transactional read, standing in for the account-row lock.
+
+        A stub cannot provide the ordering a real lock does — that is exactly
+        what the PostgreSQL concurrency tests exercise against the real reader.
+        What it can do is answer the same question at the same point in the
+        transaction, so every other test runs through the real code path.
+        """
         return self.paused
 
 
@@ -147,3 +160,91 @@ def intake_service(sessions, instant, *, candidates=(), snapshots=None, **overri
         clock=clock,
         **overrides,
     )
+
+
+@pytest.fixture
+async def commander_db():
+    """A schema carrying accounting *and* workflow, as a real deployment does.
+
+    The worker fixture applies only the workflow migrations, which is the right
+    slice for everything that never touches the paper account. The transactional
+    pause proofs do: they need the real `AccountPauseReader` taking the real row
+    lock, because an injected boolean port cannot provide ordering and a test
+    built on one would prove nothing about the race it claims to close.
+
+    `paper_accounts` has been in the regular Alembic chain since 0001.
+    """
+    import importlib.util
+    import os
+    from pathlib import Path
+    from uuid import uuid4
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("PostgreSQL required for transactional pause proofs")
+
+    schema = "commander_test_" + uuid4().hex
+    admin = create_async_engine(url)
+    async with admin.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(url, connect_args={"server_settings": {"search_path": schema}})
+    try:
+        versions = Path(__file__).parents[2] / "migrations/versions"
+        modules = []
+        for name in ("0001_foundation", "0005_trade_case_workflow", "0006_worker_runtime"):
+            spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            modules.append(module)
+
+        def migrate(sync_connection):
+            with Operations.context(MigrationContext.configure(sync_connection)):
+                for item in modules:
+                    item.upgrade()
+
+        async with engine.begin() as connection:
+            await connection.run_sync(migrate)
+        yield engine, async_sessionmaker(engine, expire_on_commit=False)
+    finally:
+        await engine.dispose()
+        async with admin.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin.dispose()
+
+
+async def seed_account(sessions, *, paused: bool = False):
+    """Ensure the single authoritative paper account exists and set its pause.
+
+    Migration 0001 seeds the row, so this updates rather than inserts — the
+    `single_paper_account` constraint means there is exactly one, which is the
+    identity the pause reader addresses.
+    """
+    from sqlalchemy import select, update
+
+    from src.data.tables import AccountRow
+
+    async with sessions.begin() as session:
+        existing = await session.scalar(select(AccountRow.id).where(AccountRow.id == 1))
+        if existing is None:
+            from datetime import date
+
+            session.add(
+                AccountRow(
+                    id=1,
+                    cash_usd=Decimal("10000"),
+                    initial_cash_usd=Decimal("10000"),
+                    fees_paid_usd=Decimal("0"),
+                    loss_day=date(2026, 9, 9),
+                    realized_loss_today_usd=Decimal("0"),
+                    paused=paused,
+                )
+            )
+        else:
+            await session.execute(
+                update(AccountRow).where(AccountRow.id == 1).values(paused=paused)
+            )
