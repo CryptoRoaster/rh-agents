@@ -709,3 +709,96 @@ not running — same as every agent before it.
 
 Disabled by default, no migration, no worker started. See [the Phase 2K
 synthesis design](docs/phase-2k.md).
+
+## Phase 2L COMMANDER orchestration
+
+Seven agents each answer their own question. COMMANDER asks a different kind of
+question entirely: given everything they've said, what is the system allowed to
+do next?
+
+It is the easiest place in this codebase to accidentally build something
+dangerous. It sees every stage, so every shortcut looks reasonable from where it
+stands — a way to unstick a stalled case, a way to record what is obviously
+true, a number to get things moving. Each one alone would be defensible. All of
+them together would be a second system that answers to nobody.
+
+So most of what follows is about what it doesn't do.
+
+It doesn't decide anything the others decided. The workflow engine already knows
+whether a case is blocked, waiting, or ready — COMMANDER reads that answer
+rather than working it out again. Two things that compute the same answer only
+have to disagree once, and the usual way they start disagreeing is that somebody
+updates one of them.
+
+It doesn't look at prices, doesn't request quotes, doesn't judge safety. When a
+case is waiting for a trigger, the answer is "PULSE owns that". When it's
+waiting on liquidity, "ANCHOR owns that". That's the whole of it.
+
+It doesn't write. There's no way to set a status, retry a task, or nudge
+anything along. The earlier placeholder had a couple of those; they're gone. A
+test checks that watching a case five times leaves the case's revision number
+untouched.
+
+### The number that doesn't exist
+
+Here's what the audit turned up, and it's the interesting part.
+
+To ask the risk engine about a trade, you have to tell it how big the trade is.
+Nothing in this system produces that number. Not one thing.
+
+VECTOR *can't* — its output schema rejects any field that looks like a size, on
+purpose, so trying to propose one is a parse error rather than something a
+downstream reader might pick up. ANCHOR reports the largest amount it could
+successfully quote, which is a fact about the market and not a suggestion.
+SENTINEL reports a ceiling, which is a limit and not an instruction.
+
+Those last two are the trap. They're dollar amounts. They're already validated.
+They sit exactly where a trade size would go. Using either would have made this
+component into a position-sizing strategy — and a reckless one, since both
+numbers are maximums.
+
+So it stops and says so. A test drives a real case all the way through every
+agent and asserts that at the point where risk evaluation would happen, the
+answer is an explicit "there is no requested size" rather than a number somebody
+made up.
+
+That's the thing standing between this and autonomous paper trading. Deciding
+how big a trade should be is a strategy question, which is exactly why it
+doesn't belong in the component whose job is coordination.
+
+### Getting started at all
+
+One real gap did get closed. Until now, a TradeCase could only be created by
+test code — there was no route, no job, nothing. An autonomous system had no way
+to begin.
+
+Intake now opens cases from recorded market candidates. What it will not do is
+choose between them: no ranking by liquidity, no momentum, no hype. ORBIT exists
+to judge whether a candidate is worth pursuing, and a coordinator quietly
+filtering on market grounds would be a second opinion nobody could see.
+
+The hard part was two workers seeing the same candidate at the same instant. The
+duplicate check doesn't save you — both workers pass it. What saves you is that
+the case's identity is computed from the candidate, so the second insert hits a
+unique constraint and lands on the first worker's case.
+
+That only works if *everything* feeding that identity comes from the candidate.
+The first version got it wrong: each worker made up its own correlation ID and
+used its own clock for the expiry, so two workers produced two different
+fingerprints and crashed into each other instead of agreeing. The concurrency
+test caught it. Idempotency that only works when one process is running isn't
+idempotency.
+
+### Still not running
+
+Implemented, tested, and switched off. Nothing starts a worker, nothing runs an
+intake cycle, and having the config present doesn't change that.
+
+There's deliberately no per-case COMMANDER job either. The runtime has no way
+for a task to succeed without submitting evidence, and a coordinator has no
+evidence to submit — it has no findings of its own, which is rather the point.
+Inventing an evidence type just to make the plumbing work would be building a
+mechanism before there's a job for it to do.
+
+Disabled by default, no migration, no worker started. See [the Phase 2L control
+plane design](docs/phase-2l.md).

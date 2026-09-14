@@ -436,7 +436,6 @@ def test_an_execution_detail_alone_satisfies_the_substance_requirement(now):
                 effective_price_usd=REFERENCE,
             ),
         ),
-        evaluated_at=now,
         execution_digest="a" * 64,
     )
     payload = LiquidityExecutionPayload(

@@ -233,10 +233,18 @@ class AnchorWorkerHandler:
                     source_version=self.policy.version,
                 ),
                 observed_at=reference.observed_at,
-                # Execution conditions age quickly. The evidence stops being
-                # current on the same horizon the quotes were judged against, so
-                # nothing downstream can treat a stale offer as a live one.
-                valid_until=task_input.evaluated_at + self.policy.max_reference_age,
+                # Execution conditions age quickly, and the horizon runs from the
+                # reference observation rather than from this run.
+                #
+                # Anchoring it to the run was the same laundering FUSE was
+                # corrected for in Phase 2K: re-assessing the same quotes would
+                # extend the evidence's life without any of the facts getting
+                # newer, so a stale offer could be kept alive indefinitely by
+                # simply looking at it again. It also made two assessments of
+                # identical quotes produce different submission fingerprints
+                # under one idempotency key, which the runtime refuses as a
+                # conflict rather than accepting as the replay it is.
+                valid_until=reference.observed_at + self.policy.max_reference_age,
                 status=(
                     EvidenceStatus.UNKNOWN
                     if assessment.semantics == CapacitySemantics.UNKNOWN
@@ -296,7 +304,6 @@ class AnchorWorkerHandler:
                             )
                             for point in assessment.ladder
                         ),
-                        evaluated_at=assessment.evaluated_at,
                         execution_digest=digest,
                     ),
                 ),

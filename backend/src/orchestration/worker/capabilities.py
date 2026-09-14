@@ -21,10 +21,6 @@ from uuid import UUID
 from src.core.models import AgentRole
 from src.markets.models import MarketCandidate, MarketSnapshot
 from src.orchestration.worker.models import TaskLease
-from src.orchestration.workflow.models import (
-    SpecialistTask,
-    TradeCase,
-)
 
 
 class MarketDiscoveryPort(Protocol):
@@ -125,20 +121,22 @@ class FuseContextPort(Protocol):
     async def synthesis_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
-class WorkflowStatePort(Protocol):
-    """COMMANDER input plus deterministic orchestration requests.
+class CommanderContextPort(Protocol):
+    """COMMANDER input: one assembled view of authoritative orchestration state.
 
-    ``evaluate`` asks the deterministic evaluator to recompute state. It cannot
-    choose the resulting state, and there is no status setter or force transition.
+    The server decides what is current before the worker sees anything. There is
+    no method here to query another case, to create or retry a task, to choose
+    which evidence counts, or to ask the evaluator for a recomputation — a
+    coordinator that could administer tasks would hold more authority than the
+    specialists it coordinates.
+
+    Phase 2L narrowed this deliberately. The placeholder carried
+    ``create_required_tasks`` and ``evaluate_trade_case``; the first is dead
+    weight because every task is created when the case opens, and the second let
+    a worker trigger an authoritative recomputation on its own schedule.
     """
 
-    async def get_trade_case(self, trade_case_id: UUID) -> TradeCase: ...
-
-    async def tasks(self, trade_case_id: UUID) -> tuple[SpecialistTask, ...]: ...
-
-    async def create_required_tasks(self, trade_case_id: UUID) -> tuple[SpecialistTask, ...]: ...
-
-    async def evaluate_trade_case(self, trade_case_id: UUID) -> TradeCase: ...
+    async def commander_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
 class EvidenceSubmissionPort(Protocol):
@@ -215,11 +213,16 @@ class FuseCapabilities:
 
 @dataclass(frozen=True)
 class CommanderCapabilities:
-    """Coordination only. No specialist submission port, so COMMANDER cannot file
-    evidence on another role's behalf."""
+    """Read authoritative state. Nothing else.
+
+    No submission port, so COMMANDER cannot file evidence on any role's behalf —
+    and `authorized_evidence_type(COMMANDER)` is `None`, so the runtime would
+    refuse one even if the port existed. No task administration, no status
+    setter, no evaluator trigger, no risk construction, no provider.
+    """
 
     lease: TaskLease
-    workflow: WorkflowStatePort
+    context: CommanderContextPort
 
 
 CAPABILITY_TYPES: dict[AgentRole, type] = {

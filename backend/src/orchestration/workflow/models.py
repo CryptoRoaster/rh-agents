@@ -1,13 +1,23 @@
 """Immutable workflow contracts and typed evidence payloads."""
 
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AliasChoices,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    model_serializer,
+    model_validator,
+)
 
 from src.core.models import AgentRole, RiskOutcome, Side
 from src.markets.models import MarketIdentity
@@ -549,6 +559,61 @@ class TriggerPayload(AcceptancePayload):
     detail: "TriggerDetail | None" = None
 
 
+# The four shapes this system has written for the same optional timestamp, and
+# the rule for reproducing each. Evidence is append-only and fingerprints are
+# stored, so the serialised form is a contract with rows already in the
+# database — and these four differ in ways that a single nullable field cannot
+# express, because *absence* and *an explicitly stored null* are different bytes
+# that mean the same thing.
+#
+#   9515b49   "evaluated_at": "<value>"              before execution_digest / last
+#   094cad3   (no key at all)
+#   c760266   "legacy_evaluated_at": null            last
+#   c760266   "legacy_evaluated_at": "<value>"       last  (a rewritten 9515b49 row)
+#   current   (no key at all)                        for anything newly computed
+#
+# So the key *as read* is remembered and reproduced: its name decides both what
+# is emitted and where. The historical name keeps the position the field was
+# originally declared at; the interim name always came last, in both models.
+LEGACY_TIMESTAMP_KEYS = ("evaluated_at", "legacy_evaluated_at")
+INTERIM_TIMESTAMP_KEY = "legacy_evaluated_at"
+HISTORICAL_TIMESTAMP_KEY = "evaluated_at"
+
+
+def _observed_legacy_key(data: Any) -> str | None:
+    """Which spelling of the optional timestamp a payload arrived with, if any."""
+    if isinstance(data, Mapping):
+        for key in LEGACY_TIMESTAMP_KEYS:
+            if key in data:
+                return key
+        return None
+    # Already a model instance: carry whatever it recorded.
+    return getattr(data, "_legacy_timestamp_key", None)
+
+
+def _restore_legacy_shape(data: dict[str, Any], observed: str | None) -> dict[str, Any]:
+    """Re-emit the optional timestamp exactly as it was read, or not at all.
+
+    Order matters as much as the name: the key's position is part of the bytes
+    the submission fingerprint was taken over, so it is rebuilt in iteration
+    order rather than popped and re-appended.
+    """
+    value = data.get(INTERIM_TIMESTAMP_KEY)
+    without = {key: item for key, item in data.items() if key != INTERIM_TIMESTAMP_KEY}
+    if observed is None:
+        # Never stored, or newly computed. Newly computed results deliberately
+        # carry no run metadata at all.
+        return without
+    if observed == INTERIM_TIMESTAMP_KEY:
+        # The interim shape always came last, including its explicit null.
+        return {**without, INTERIM_TIMESTAMP_KEY: value}
+    # The original shape, at the position it was declared in.
+    return {
+        (HISTORICAL_TIMESTAMP_KEY if key == INTERIM_TIMESTAMP_KEY else key): item
+        for key, item in data.items()
+    }
+
+
 class QuotedLadderPoint(Immutable):
     """One tested size and what the market said about it.
 
@@ -581,6 +646,14 @@ class QuotedLadderPoint(Immutable):
 
 class ExecutionAssessmentDetail(Immutable):
     """What the market was shown to support, and how that was established.
+
+    Deliberately carries no evaluation timestamp, for the same reason the
+    synthesis detail carries none: the submission fingerprint is computed over
+    this payload, so a field moving with the wall clock made two assessments of
+    identical quotes produce one idempotency key with two fingerprints — which
+    the runtime correctly reports as a conflict rather than the replay it is.
+    When the work happened is already on the envelope as `created_at` and
+    `recorded_at`, and each ladder point carries its own `quoted_at`.
 
     ``market_capacity_notional`` is what the *market* will bear, never what
     anyone may trade: SENTINEL decides that, from facts this evidence cannot
@@ -615,8 +688,43 @@ class ExecutionAssessmentDetail(Immutable):
     quote_provider: Identifier
     quote_requests: int = Field(ge=0)
     ladder: tuple[QuotedLadderPoint, ...] = Field(min_length=1, max_length=12)
-    evaluated_at: AwareDatetime
+    # Legacy only, and never written.
+    #
+    # Evidence is append-only and fingerprints are stored, so the serialised
+    # form of a payload is a contract with rows already in the database. Three
+    # generations exist: one that wrote `evaluated_at`, one that wrote no such
+    # key at all, and this one. All three must read *and re-serialise* to
+    # exactly the bytes they were stored as, because the submission fingerprint
+    # is taken over the whole JSON and replay compares against the fingerprint
+    # recorded at the time.
+    #
+    # So the field is declared at the position the original occupied, emitted
+    # under the original name, and omitted entirely when absent — which is what
+    # `_without_absent_legacy_timestamp` below does. Renaming it or adding a
+    # `null` would each change the bytes and break replay while parsing
+    # perfectly, which is how the previous attempt passed its own tests.
+    #
+    # A blanket `extra="ignore"` would have achieved the parsing and lost the
+    # contract: every other unknown field would vanish with it.
+    legacy_evaluated_at: AwareDatetime | None = Field(
+        default=None,
+        validation_alias=AliasChoices("evaluated_at", "legacy_evaluated_at"),
+    )
     execution_digest: Digest
+
+    _legacy_timestamp_key: str | None = PrivateAttr(default=None)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _remember_legacy_shape(cls, data: Any, handler: Any) -> Any:
+        observed = _observed_legacy_key(data)
+        model = handler(data)
+        object.__setattr__(model, "_legacy_timestamp_key", observed)
+        return model
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        return _restore_legacy_shape(handler(self), self._legacy_timestamp_key)
 
 
 class LiquidityExecutionPayload(AcceptancePayload):
@@ -708,6 +816,15 @@ class SynthesisFinding(Immutable):
 class SynthesisDetail(Immutable):
     """The structured reading of a case's admissible evidence.
 
+    Deliberately carries no evaluation timestamp. A synthesis is a function of
+    the evidence it read, and the submission fingerprint is computed over this
+    payload — so a field that moved with the wall clock made two recomputations
+    of identical evidence produce the same idempotency key with different
+    fingerprints, which the runtime correctly reports as a conflict. When the
+    work *did* happen is already recorded authoritatively on the envelope as
+    `created_at` and `recorded_at`; repeating it here bought nothing and cost
+    replay.
+
     There is no score here, and its absence is deliberate. A composite number
     over four incommensurable specialist findings would be false precision — it
     would look calibrated, invite comparison between cases, and encode weights
@@ -724,7 +841,42 @@ class SynthesisDetail(Immutable):
     sources: tuple[SynthesisSource, ...] = Field(min_length=1, max_length=12)
     input_digest: Digest
     synthesis_fingerprint: Digest
-    evaluated_at: AwareDatetime
+    # Legacy only, and never written.
+    #
+    # Evidence is append-only and fingerprints are stored, so the serialised
+    # form of a payload is a contract with rows already in the database. Three
+    # generations exist: one that wrote `evaluated_at`, one that wrote no such
+    # key at all, and this one. All three must read *and re-serialise* to
+    # exactly the bytes they were stored as, because the submission fingerprint
+    # is taken over the whole JSON and replay compares against the fingerprint
+    # recorded at the time.
+    #
+    # So the field is declared at the position the original occupied, emitted
+    # under the original name, and omitted entirely when absent — which is what
+    # `_without_absent_legacy_timestamp` below does. Renaming it or adding a
+    # `null` would each change the bytes and break replay while parsing
+    # perfectly, which is how the previous attempt passed its own tests.
+    #
+    # A blanket `extra="ignore"` would have achieved the parsing and lost the
+    # contract: every other unknown field would vanish with it.
+    legacy_evaluated_at: AwareDatetime | None = Field(
+        default=None,
+        validation_alias=AliasChoices("evaluated_at", "legacy_evaluated_at"),
+    )
+
+    _legacy_timestamp_key: str | None = PrivateAttr(default=None)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _remember_legacy_shape(cls, data: Any, handler: Any) -> Any:
+        observed = _observed_legacy_key(data)
+        model = handler(data)
+        object.__setattr__(model, "_legacy_timestamp_key", observed)
+        return model
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        return _restore_legacy_shape(handler(self), self._legacy_timestamp_key)
 
 
 class SynthesisPayload(AcceptancePayload):

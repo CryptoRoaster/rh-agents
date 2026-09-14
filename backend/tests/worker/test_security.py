@@ -201,7 +201,7 @@ ROLE_PORT = {
     AgentRole.PULSE: ("pulse", {"context", "lease", "submit"}),
     AgentRole.ANCHOR: ("anchor", {"context", "lease", "submit"}),
     AgentRole.FUSE: ("fuse", {"context", "lease", "submit"}),
-    AgentRole.COMMANDER: ("workflow", {"workflow", "lease"}),
+    AgentRole.COMMANDER: ("commander", {"context", "lease"}),
 }
 
 

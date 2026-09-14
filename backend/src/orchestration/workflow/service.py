@@ -209,6 +209,102 @@ class TradeCaseService:
         self.policy = policy
         self.evaluator = TradeCaseEvaluator(policy)
 
+    async def open_trade_case_in_session(
+        self,
+        session: AsyncSession,
+        market: MarketIdentity,
+        *,
+        originating_discovery_reference: UUID,
+        correlation_id: UUID,
+        idempotency_key: str,
+        expires_at: datetime,
+        strategy_policy_id: str | None = None,
+    ) -> tuple[TradeCase, bool]:
+        """Open a case inside a caller-owned transaction, saying whether it was new.
+
+        Mirrors ``record_evidence_in_session``: a caller that must make opening a
+        case atomic with something else — a lock it already holds, a condition it
+        has already checked — joins this transaction rather than reimplementing
+        any workflow rule.
+
+        The boolean is the part a separate call cannot supply. Opening is
+        idempotent by key, so a caller that only receives the case cannot tell a
+        creation from a replay, and asking afterwards is a second unsynchronised
+        read of exactly the state the transaction exists to pin down.
+        """
+        market = MarketIdentity.model_validate_json(market.model_dump_json())
+        now = self.clock.now()
+        if expires_at.utcoffset() is None or expires_at <= now:
+            raise ValueError("TradeCase must be opened before its expiry")
+        fingerprint = canonical_digest(
+            {
+                "market": market.model_dump(mode="json"),
+                "originating_discovery_reference": str(originating_discovery_reference),
+                "correlation_id": str(correlation_id),
+                "expires_at": expires_at.isoformat(),
+                "strategy_policy_id": strategy_policy_id,
+                "workflow_version": self.policy.version,
+            }
+        )
+        existing = await session.scalar(
+            select(TradeCaseRow).where(TradeCaseRow.open_idempotency_key == idempotency_key)
+        )
+        if existing is not None:
+            return self._verify_open_replay(existing, fingerprint), False
+        row = self._new_case_row(
+            market,
+            now=now,
+            expires_at=expires_at,
+            originating_discovery_reference=originating_discovery_reference,
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key,
+            fingerprint=fingerprint,
+            strategy_policy_id=strategy_policy_id,
+        )
+        session.add(row)
+        await session.flush()
+        self._event(
+            session, row, "CASE_OPENED", "CASE_OPENED", {"workflow_version": self.policy.version}
+        )
+        await self._create_tasks(session, row)
+        await self._record_discovery(session, row)
+        await self._stabilize(session, row)
+        return case_from_row(row), True
+
+    def _new_case_row(
+        self,
+        market: MarketIdentity,
+        *,
+        now: datetime,
+        expires_at: datetime,
+        originating_discovery_reference: UUID,
+        correlation_id: UUID,
+        idempotency_key: str,
+        fingerprint: str,
+        strategy_policy_id: str | None,
+    ) -> TradeCaseRow:
+        return TradeCaseRow(
+            id=uuid5(NAMESPACE_URL, f"rh-agents:trade-case:{idempotency_key}"),
+            workflow_version=self.policy.version,
+            market_key=market.pair_id,
+            chain=market.chain,
+            network=market.network,
+            status=TradeCaseStatus.DISCOVERED.value,
+            opened_at=now,
+            updated_at=now,
+            expires_at=expires_at,
+            originating_discovery_reference=originating_discovery_reference,
+            strategy_policy_id=strategy_policy_id,
+            revision=1,
+            reason_code="CASE_OPENED",
+            blockers=[],
+            risk_input_digest=None,
+            correlation_id=correlation_id,
+            open_idempotency_key=idempotency_key,
+            open_fingerprint=fingerprint,
+            market_payload=market.model_dump(mode="json"),
+        )
+
     async def open_trade_case(
         self,
         market: MarketIdentity,

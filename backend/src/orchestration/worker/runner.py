@@ -17,6 +17,7 @@ from src.orchestration.worker.capabilities import (
     AnchorContextPort,
     AtlasCapabilities,
     CommanderCapabilities,
+    CommanderContextPort,
     DiscoveryContextPort,
     EvidenceSubmissionPort,
     FuseCapabilities,
@@ -29,7 +30,6 @@ from src.orchestration.worker.capabilities import (
     SetupContextPort,
     SignalCapabilities,
     VectorCapabilities,
-    WorkflowStatePort,
 )
 from src.orchestration.worker.models import (
     EvidenceTaskResult,
@@ -59,11 +59,21 @@ def new_registration_key() -> str:
     return f"runtime:{uuid4()}"
 
 
+# Refusals a worker can expect at the submission boundary, and how each must be
+# recorded. A refusal absent from this table propagates instead — which ends the
+# polling loop and leaves the task claimed until its lease expires, so anything
+# the server can legitimately answer with belongs here.
 REFUSAL_CATEGORIES = {
     WorkerErrorCode.ROLE_NOT_AUTHORIZED: WorkerFailureCategory.CAPABILITY_DENIED,
     WorkerErrorCode.EVIDENCE_TYPE_NOT_AUTHORIZED: WorkerFailureCategory.CAPABILITY_DENIED,
     WorkerErrorCode.TASK_SUPERSEDED: WorkerFailureCategory.TASK_INVALIDATED,
     WorkerErrorCode.RESULT_CONFLICT: WorkerFailureCategory.INVALID_RESULT,
+    # The work outlived its own inputs. Transient rather than superseding on
+    # purpose: a fresh attempt reads fresh inputs and may well succeed, but the
+    # attempt still spends the retry budget, so a worker that is persistently
+    # too slow stops rather than retrying forever. A superseded outcome would
+    # not be counted at all, which is the unbounded version of the same idea.
+    WorkerErrorCode.EVIDENCE_STALE: WorkerFailureCategory.TRANSIENT,
 }
 
 
@@ -118,7 +128,7 @@ class CapabilityProvider:
     pulse: PulseContextPort | None = None
     anchor: AnchorContextPort | None = None
     fuse: FuseContextPort | None = None
-    workflow: WorkflowStatePort | None = None
+    commander: CommanderContextPort | None = None
 
     def build(self, lease: TaskLease) -> object:
         submit: EvidenceSubmissionPort = BoundEvidenceSubmission(lease, self.service)
@@ -137,8 +147,8 @@ class CapabilityProvider:
                 return AnchorCapabilities(lease=lease, context=self.anchor, submit=submit)
             case AgentRole.FUSE if self.fuse is not None:
                 return FuseCapabilities(lease=lease, context=self.fuse, submit=submit)
-            case AgentRole.COMMANDER if self.workflow is not None:
-                return CommanderCapabilities(lease=lease, workflow=self.workflow)
+            case AgentRole.COMMANDER if self.commander is not None:
+                return CommanderCapabilities(lease=lease, context=self.commander)
             case _:
                 raise WorkerFailure(WorkerErrorCode.ROLE_NOT_AUTHORIZED)
 

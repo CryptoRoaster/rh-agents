@@ -143,6 +143,23 @@ class Settings(BaseSettings):
     # structured verdicts the specialists already committed to, so there is
     # nothing here for a model to interpret and no credential to configure.
     fuse_worker_enabled: bool = False
+    # Phase 2L COMMANDER. Disabled by default, and there is no provider setting
+    # beside it because the control plane is deterministic: it reads state other
+    # components already decided, so there is nothing here for a model.
+    commander_worker_enabled: bool = False
+    # Autonomous case intake. Separate from the worker flag because opening
+    # cases is the one thing COMMANDER does that changes the world, and it
+    # should be possible to run the control plane read-only.
+    commander_intake_enabled: bool = False
+    # A COMMANDER-local stop, and deliberately described as nothing more.
+    #
+    # `RiskLimits.kill_switch` is a different field that SENTINEL honours, and
+    # this one is not wired to it — so setting this stops the control plane from
+    # opening cases and progressing them, and changes nothing about what any
+    # risk verdict would say. Calling it a global kill switch would promise a
+    # reach it does not have; wiring the two together is a deliberate decision
+    # nobody has taken yet.
+    commander_kill_switch: bool = False
     # Where executable quotes come from. "disabled" fails closed: without a quote
     # source ANCHOR establishes no capacity at all, which is the correct outcome
     # rather than a gap to be filled with pool liquidity multiplied by a guess.

@@ -695,3 +695,74 @@ def test_the_other_specialists_are_untouched():
     )
     assert VECTOR_PROMPT_VERSION == "vector-v2"
     assert PULSE_TRIGGER_V1.version == "pulse-trigger-v1"
+
+
+async def test_an_identical_assessment_recomputed_later_replays_rather_than_conflicting(
+    worker_db, now, trace
+):
+    """The same defect an independent review found in FUSE, in this worker too.
+
+    `ExecutionAssessmentDetail` carried its own evaluation timestamp, which is
+    run metadata rather than part of the assessment — so two assessments of
+    identical quotes produced one idempotency key with two submission
+    fingerprints, which the runtime correctly refuses as a conflict. It was not
+    reported here, and it was the same root cause.
+    """
+    _, sessions = worker_db
+    quotes = source(now)
+    runtime, _ = build_stack(sessions, now, quotes=quotes)
+    trade_case = await open_case(runtime.cases, now, trace, "anchor-replay-identical")
+    await triggered_case(runtime.cases, trade_case, now)
+
+    # One fixed market observation for both runs. Letting the fixture derive a
+    # snapshot from each reader's clock would vary the *inputs*, which is a
+    # different experiment from recomputing the same assessment.
+    fixed_snapshot = snapshot_for(now)
+
+    async def assess_at(instant):
+        _, reader = build_stack(sessions, instant, quotes=source(now), snapshot=fixed_snapshot)
+        context = await reader.execution_context(trade_case.id, uuid4())
+        lease = _lease(trade_case, context, instant, trace)
+        report = await AnchorWorkerHandler(quote_provider="fixture:quotes").handle(
+            lease, AnchorCapabilities(lease=lease, context=_Fixed(context), submit=_NoSubmit())
+        )
+        assert isinstance(report, EvidenceTaskResult)
+        return report.submission
+
+    first = await assess_at(now)
+    second = await assess_at(now + timedelta(seconds=1))
+
+    assert first.idempotency_key == second.idempotency_key
+    assert first.fingerprint() == second.fingerprint()
+
+    await runtime.cases.record_evidence(trade_case.id, first)
+    await runtime.cases.record_evidence(trade_case.id, second)
+    stored = [
+        item
+        for item in await runtime.cases.evidence(trade_case.id)
+        if item.producer_role == AgentRole.ANCHOR
+    ]
+    assert len(stored) == 1
+
+
+async def test_a_genuinely_different_assessment_is_still_a_different_result(worker_db, now, trace):
+    """The control: removing run metadata must not hide a real change."""
+    _, sessions = worker_db
+    runtime, _ = build_stack(sessions, now, quotes=source(now))
+    trade_case = await open_case(runtime.cases, now, trace, "anchor-replay-different")
+    await triggered_case(runtime.cases, trade_case, now)
+
+    async def assess_with(quotes):
+        _, reader = build_stack(sessions, now, quotes=quotes)
+        context = await reader.execution_context(trade_case.id, uuid4())
+        lease = _lease(trade_case, context, now, trace)
+        report = await AnchorWorkerHandler(quote_provider="fixture:quotes").handle(
+            lease, AnchorCapabilities(lease=lease, context=_Fixed(context), submit=_NoSubmit())
+        )
+        assert isinstance(report, EvidenceTaskResult)
+        return report.submission
+
+    shallow = await assess_with(source(now, fails_above=Decimal(2500)))
+    deep = await assess_with(source(now))
+    assert shallow.idempotency_key != deep.idempotency_key
+    assert shallow.fingerprint() != deep.fingerprint()
