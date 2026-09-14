@@ -48,6 +48,7 @@ from src.orchestration.workflow.models import (
     TradeCaseStatus,
     WorkflowFailure,
 )
+from src.orchestration.workflow.policy import TRADE_CASE_V1, WorkflowPolicy
 
 MEANINGS: dict[RiskFactKind, str] = {
     RiskFactKind.REFERENCE_PRICE: "USD_PER_BASE_UNIT",
@@ -98,6 +99,12 @@ class RiskDataReader:
     # component cannot decide for itself what costs are assumed.
     costs: PaperCostReading
     policy: RiskDataPolicy = RISK_DATA_V1
+    # The workflow's own requirement table, read-only. It already decides which
+    # evidence is safety-critical, and that decision is what may produce a risk
+    # blocker — restating it here would create a second authority on one
+    # question, and the cheapest way for two to disagree is for one to be
+    # updated.
+    workflow: WorkflowPolicy = TRADE_CASE_V1
     clock: Clock = SystemClock()
     # Supplied by a deployment that also runs the accounting subsystem, which is
     # where the durable stop lives. Absent means unreadable, and unreadable is
@@ -133,7 +140,7 @@ class RiskDataReader:
         _cost_facts(self.costs, facts, gaps)
         _routing_fact(current.get(EvidenceType.LIQUIDITY_EXECUTION), now, facts, gaps)
         _onchain_facts(current.get(EvidenceType.ONCHAIN), base_asset_id, now, facts, gaps, blockers)
-        _established_blockers(current, now, blockers)
+        _established_blockers(current, now, self.workflow.safety_types, blockers)
         _control_blockers(trade_case, paused, pause_readable, blockers)
 
         horizons = [item.valid_until for item in facts if item.valid_until is not None]
@@ -241,14 +248,23 @@ def _market_facts(
     elif metadata.asset_id != base_asset_id:
         _gap(gaps, RiskFactKind.TOKEN_METADATA, RiskDataGapCode.WRONG_ASSET, origin)
     else:
-        _add(
-            facts,
-            RiskFactKind.TOKEN_METADATA,
-            origin,
-            source=metadata.source_provider,
-            asset_id=metadata.asset_id,
-            observed_at=metadata.source_observed_at,
-        )
+        # Judged on the asset observation's *own* instant. The enclosing
+        # snapshot may be seconds old while the pair metadata inside it was
+        # observed a day earlier, and reading the snapshot's time here would
+        # make the older fact look as fresh as the newer one it travelled with.
+        code = _freshness(metadata.source_observed_at, now, policy.max_token_metadata_age)
+        if code is not None:
+            _gap(gaps, RiskFactKind.TOKEN_METADATA, code, origin)
+        else:
+            _add(
+                facts,
+                RiskFactKind.TOKEN_METADATA,
+                origin,
+                source=metadata.source_provider,
+                asset_id=metadata.asset_id,
+                observed_at=metadata.source_observed_at,
+                valid_until=metadata.source_observed_at + policy.max_token_metadata_age,
+            )
 
     liquidity = snapshot.liquidity
     if liquidity.status != Availability.AVAILABLE or liquidity.value_usd is None:
@@ -470,15 +486,27 @@ def _holder_facts(
 def _established_blockers(
     current: dict[EvidenceType, EvidenceEnvelope],
     now: datetime,
+    safety_types: frozenset[EvidenceType],
     blockers: list[RiskDataBlocker],
 ) -> None:
-    """Negative evidence the specialists actually established.
+    """Negative evidence the canonical safety sources actually established.
 
     Reported whether or not anything is missing. A case can be simultaneously
     incompletely measured and known to be dangerous, and collapsing the second
     into the first would let a data gap look like the only problem.
+
+    Only the evidence types the workflow policy marks safety-critical
+    participate, and that restriction is load-bearing rather than tidiness. An
+    advisory synthesis reaches `BLOCKED` acceptance from its own reading of
+    evidence that may be entirely unchanged, and SENTIMENT gates the workflow
+    without binding risk by an explicit Phase 2F decision. Letting either
+    produce a risk blocker would hand the advisory layer exactly the authority
+    it is kept out of the risk-input digest to deny it — and it would do so
+    indirectly, where nobody would look for it.
     """
     for evidence_type, item in sorted(current.items(), key=lambda pair: pair[0].value):
+        if evidence_type not in safety_types:
+            continue
         if item.effective_status(now) != EvidenceStatus.AVAILABLE:
             continue
         if item.payload.acceptance() is EvidenceAcceptance.BLOCKED:

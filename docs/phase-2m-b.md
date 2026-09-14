@@ -119,7 +119,8 @@ is not this reader's subject.
 
 Every reported fact carries its canonical asset, its unit and semantics in one
 code, its source, when it was true according to that source, and when it stops
-being usable. A configured assumption carries no observation time and no expiry,
+being usable. Token metadata is judged on the asset observation's **own**
+instant, not the enclosing snapshot's, under its own stated bound. A configured assumption carries no observation time and no expiry,
 because it was not observed at any instant and does not go stale.
 
 **Incomplete is not rejected.** A missing fact produces a typed gap naming the
@@ -129,8 +130,11 @@ where a metric should be. The reading stops there. It never becomes a SENTINEL
 verdict.
 
 **A gap is not a blocker.** Established negative evidence is reported alongside,
-in both outcomes: blocked evidence, ATLAS's own blocker codes, a terminal or
-rejected case, and the system stop. An unreadable stop is reported as a blocker
+in both outcomes: blocked evidence from the **canonical safety sources**,
+ATLAS's own blocker codes, a terminal or rejected case, and the system stop.
+Which evidence is safety-critical is read from the workflow policy rather than
+restated here, so the advisory layer cannot reach the blocker list — see the
+hardening round below. An unreadable stop is reported as a blocker
 rather than as silence, because unknown is not permission. A case can be both
 incompletely measured and known to be dangerous, and the two are never collapsed.
 
@@ -167,6 +171,45 @@ The proof fixtures were produced by running the model as it stood at `779261d`,
 the merge this branch is based on. Unknown fields are still refused:
 compatibility is about reproducing what was written, never about accepting more.
 
+## Hardening round
+
+Two defects, each reproduced against `215b56e` before being fixed.
+
+**An advisory opinion arrived as a risk blocker.** The blocker collection walked
+every evidence type, so a FUSE synthesis carrying hard blockers produced
+`FUSE_EVIDENCE_BLOCKED` while the canonical safety sources were entirely
+unchanged. That is precisely the authority the advisory layer is kept out of the
+risk-input digest to deny it, granted indirectly where nobody would look for it.
+
+The collection is now bound to `WorkflowPolicy.safety_types` — the requirement
+table that already decides the question — rather than to a second list of its
+own. SYNTHESIS, SENTIMENT and DISCOVERY are absent from it, so neither FUSE nor
+SIGNAL can produce a risk blocker, while ATLAS's blocker codes and a measured
+on-chain violation still get through unchanged.
+
+**Token metadata was carried without an age check.** `_market_facts` accepted
+the base asset's symbol and decimals with no freshness test and no
+`valid_until`, so a snapshot with a fresh price and fresh liquidity but
+day-old asset metadata reported `RISK_DATA_COMPLETE` with no gap. That is a
+valid market model, not a contrived one: a nested observation may be older than
+its parent, and reading the snapshot's own instant made the older fact look as
+fresh as the newer one it travelled with.
+
+`RiskDataPolicy` now states `max_token_metadata_age` as its own field, judged on
+`source_observed_at`, feeding a `valid_until` that enters the reading's own
+validity. The bound is deliberately a separate field rather than a reuse:
+SENTINEL checks the token snapshot's age independently of the market snapshot's,
+and a bound inherited by accident would be a contract nobody chose. Its value
+matches the price bound because the market layer re-observes pair metadata as
+part of the same snapshot at the same cadence, so a tighter one would refuse
+every reading the recorder can produce rather than catch anything.
+
+It is **necessary and not sufficient**: SENTINEL applies its own configurable
+`max_snapshot_age_seconds`, tighter by default, when it evaluates. A complete
+reading here is not a promise that a later evaluation will accept the same data;
+what it guarantees is the other direction, that nothing stale by the recorder's
+own cadence is reported as present.
+
 ## Test evidence
 
 85 tests in `tests/riskdata/`, none of them an identifier scan:
@@ -186,7 +229,13 @@ compatibility is about reproducing what was written, never about accepting more.
 - known blockers reported together with data gaps;
 - cost assumptions bounded, PAPER-only, configured, and unreachable from ANCHOR;
 - a complete reading writing nothing: no status change, no evidence, no risk
-  binding.
+  binding;
+- the hardening round: identical gaps and blockers with a negative advisory
+  synthesis present and absent, no indirect SIGNAL effect, the blocker scope
+  proved to be *read* from the workflow policy by narrowing that policy and
+  watching the blocker disappear, direct safety blockers surviving it, and
+  metadata freshness on valid market models — own source time, the boundary
+  before, on and after expiry, a future observation, and validity propagation.
 
 ## Remaining gaps
 
@@ -198,6 +247,10 @@ compatibility is about reproducing what was written, never about accepting more.
 - **Shared system stops** must be wired before the first integrated fill.
   Nothing in the TradeCase flow can currently *set* `paper_accounts.paused`; this
   reader can only observe it.
+- **The metadata bound is looser than SENTINEL's default.** Ninety seconds
+  against thirty: data can be complete here and still be refused at evaluation.
+  Tightening it would require the market layer to re-observe pair metadata more
+  often than it records snapshots, which no configuration available today does.
 - **`holder_count` remains provider-reported.** Nothing verifies it against the
   rows received, and with `TOP_N_ONLY` coverage nothing could.
 - **`RESPONSE_TIME` holder provenance** is accepted by the current ATLAS policy

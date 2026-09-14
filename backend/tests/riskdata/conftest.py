@@ -92,9 +92,21 @@ def recorded_snapshot(
     liquidity: Decimal | None = LIQUIDITY,
     decimals: int | None = 18,
     base_asset_id: str = BASE_ASSET,
+    metadata_age: timedelta | None = None,
 ) -> MarketSnapshot:
-    """One observation of the ATLAS market, shaped as the recorder stores them."""
+    """One observation of the ATLAS market, shaped as the recorder stores them.
+
+    `metadata_age` ages the base and quote asset observations independently of
+    the enclosing snapshot. The result is still a **valid** market model: the
+    contracts require a nested observation to be no newer than its parent, so
+    older asset metadata inside a fresh snapshot is exactly the shape the
+    recorder can legitimately produce — and precisely the case a freshness check
+    that read the snapshot's own time would miss.
+    """
     observed_at = now - age
+    metadata_at = observed_at if metadata_age is None else now - metadata_age
+    if metadata_at > observed_at:
+        raise ValueError("Nested asset metadata cannot be newer than its snapshot")
     meta = dict(
         observed_at=observed_at,
         provider="geckoterminal",
@@ -103,11 +115,12 @@ def recorded_snapshot(
         correlation_id=stable_id("market"),
         is_fixture=False,
     )
+    asset_meta = {**meta, "observed_at": metadata_at}
     base = AssetIdentity(
-        **meta, id=stable_id("base"), asset_id=base_asset_id, symbol="TKN", decimals=decimals
+        **asset_meta, id=stable_id("base"), asset_id=base_asset_id, symbol="TKN", decimals=decimals
     )
     quote = AssetIdentity(
-        **{**meta, "asset_id": f"{CHAIN}:{NETWORK}:{QUOTE}"},
+        **{**asset_meta, "asset_id": f"{CHAIN}:{NETWORK}:{QUOTE}"},
         id=stable_id("quote"),
         symbol="USDC",
         decimals=6,
@@ -207,6 +220,84 @@ def anchor_payload(setup_id: UUID, trigger_id: UUID) -> LiquidityExecutionPayloa
         price_impact_bps=Decimal("20"),
         maximum_safe_size_usd=Decimal("2500"),
         routing_provenance="quoted-route-v1",
+    )
+
+
+def synthesis_payload(sources, *, blocking: bool):
+    """FUSE's reading of evidence that may be entirely unchanged.
+
+    Advisory by construction: optional, not safety-critical, and authoritative
+    over nothing. A blocking one exists to prove it stays that way.
+    """
+    from src.orchestration.workflow.models import (
+        SynthesisDetail,
+        SynthesisFinding,
+        SynthesisPayload,
+        SynthesisSource,
+    )
+
+    finding = SynthesisFinding(
+        code="ADVISORY_CONCERN",
+        role=AgentRole.ATLAS,
+        evidence_type=EvidenceType.ONCHAIN,
+        origin="EVIDENCE",
+        statement="an advisory reading, authoritative over nothing",
+    )
+    return SynthesisPayload(
+        disposition="NOT_READY" if blocking else "COHERENT",
+        source_evidence_ids=tuple(item.evidence_id for item in sources),
+        synthesis=SynthesisDetail(
+            policy_version="fuse-synthesis-v1",
+            disposition="NOT_READY" if blocking else "COHERENT",
+            hard_blockers=(finding,) if blocking else (),
+            sources=tuple(
+                SynthesisSource(
+                    role=item.producer_role,
+                    evidence_type=item.evidence_type,
+                    evidence_id=item.evidence_id,
+                    submission_fingerprint=item.submission_fingerprint,
+                    status="AVAILABLE",
+                    acceptance="ACCEPTED",
+                    observed_at=item.observed_at,
+                    valid_until=item.valid_until,
+                    required=True,
+                    safety_critical=True,
+                )
+                for item in sources
+            ),
+            input_digest="c" * 64,
+            synthesis_fingerprint="b" * 64,
+        ),
+    )
+
+
+async def record_synthesis(cases, trade_case, now, *, blocking: bool):
+    current = await cases.evidence(trade_case.id)
+    sources = [item for item in current if item.evidence_type is EvidenceType.TRADE_SETUP]
+    payload = synthesis_payload(sources, blocking=blocking)
+    return await record(
+        cases,
+        trade_case,
+        now,
+        AgentRole.FUSE,
+        EvidenceType.SYNTHESIS,
+        payload,
+        key=f"riskdata-fuse-{trade_case.id}",
+        reason_codes=("SAFETY_EVIDENCE_BLOCKED",) if blocking else (),
+    )
+
+
+async def record_sentiment(cases, trade_case, now, assessment="NEGATIVE"):
+    from src.orchestration.workflow.models import SentimentPayload
+
+    return await record(
+        cases,
+        trade_case,
+        now,
+        AgentRole.SIGNAL,
+        EvidenceType.SENTIMENT,
+        SentimentPayload(assessment=assessment),
+        key=f"riskdata-signal-{trade_case.id}",
     )
 
 
