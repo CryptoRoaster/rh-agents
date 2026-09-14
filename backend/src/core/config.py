@@ -1,13 +1,37 @@
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import unquote, urlsplit
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import BeforeValidator, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
 from src.core.models import TradingMode
+
+
+def exact_amount(value: object) -> object:
+    """Refuse binary floating point wherever money is configured.
+
+    A float cannot represent a tenth, so `0.1` arriving here would already be a
+    slightly different amount than the one somebody typed — and every figure
+    derived from it, including the hash that identifies the reading, would
+    describe that other amount instead. Environment values arrive as strings and
+    convert exactly; a Python caller passing a float is refused rather than
+    silently rounded.
+    """
+    if isinstance(value, (float, bool)):
+        raise ValueError("Configure monetary amounts as decimal strings, never floats")
+    return value
+
+
+# A configured USD amount, held to the ledger's own `Numeric(38, 18)` envelope
+# so a value that could never be stored fails at boot rather than at use.
+ConfiguredUsd = Annotated[
+    Decimal,
+    BeforeValidator(exact_amount),
+    Field(gt=0, allow_inf_nan=False, max_digits=38, decimal_places=18),
+]
 
 
 class Settings(BaseSettings):
@@ -160,6 +184,17 @@ class Settings(BaseSettings):
     # reach it does not have; wiring the two together is a deliberate decision
     # nobody has taken yet.
     commander_kill_switch: bool = False
+    # Phase 2M-A PAPER entry sizing. `None` is the default and the only honest
+    # default there is: an unset amount means nobody has said how large an entry
+    # should be, which is reported as `AUTONOMOUS_SIZING_INPUT_MISSING` and is
+    # not a gap a system may fill for itself. There is deliberately no portfolio
+    # fraction beside it — that is a strategy, and a strategy that arrived as a
+    # default nobody chose is the worst kind.
+    #
+    # The amount is the notional *before* fees, gas and slippage. It is not a
+    # guaranteed maximum cash debit: the paper executor adds costs on top of the
+    # fill, and SENTINEL computes its own worst case from its own limits.
+    paper_requested_notional_usd: ConfiguredUsd | None = None
     # Where executable quotes come from. "disabled" fails closed: without a quote
     # source ANCHOR establishes no capacity at all, which is the correct outcome
     # rather than a gap to be filled with pool liquidity multiplied by a guess.
