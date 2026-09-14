@@ -143,6 +143,18 @@ class Settings(BaseSettings):
     # structured verdicts the specialists already committed to, so there is
     # nothing here for a model to interpret and no credential to configure.
     fuse_worker_enabled: bool = False
+    # Phase 2L COMMANDER. Disabled by default, and there is no provider setting
+    # beside it because the control plane is deterministic: it reads state other
+    # components already decided, so there is nothing here for a model.
+    commander_worker_enabled: bool = False
+    # Autonomous case intake. Separate from the worker flag because opening
+    # cases is the one thing COMMANDER does that changes the world, and it
+    # should be possible to run the control plane read-only.
+    commander_intake_enabled: bool = False
+    # The deterministic stop SENTINEL already honours, surfaced so the control
+    # plane refuses to open new cases under the same condition that would make
+    # every risk verdict a system pause.
+    commander_kill_switch: bool = False
     # Where executable quotes come from. "disabled" fails closed: without a quote
     # source ANCHOR establishes no capacity at all, which is the correct outcome
     # rather than a gap to be filled with pool liquidity multiplied by a guess.

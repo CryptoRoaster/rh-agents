@@ -17,6 +17,7 @@ from src.orchestration.worker.capabilities import (
     AnchorContextPort,
     AtlasCapabilities,
     CommanderCapabilities,
+    CommanderContextPort,
     DiscoveryContextPort,
     EvidenceSubmissionPort,
     FuseCapabilities,
@@ -29,7 +30,6 @@ from src.orchestration.worker.capabilities import (
     SetupContextPort,
     SignalCapabilities,
     VectorCapabilities,
-    WorkflowStatePort,
 )
 from src.orchestration.worker.models import (
     EvidenceTaskResult,
@@ -118,7 +118,7 @@ class CapabilityProvider:
     pulse: PulseContextPort | None = None
     anchor: AnchorContextPort | None = None
     fuse: FuseContextPort | None = None
-    workflow: WorkflowStatePort | None = None
+    commander: CommanderContextPort | None = None
 
     def build(self, lease: TaskLease) -> object:
         submit: EvidenceSubmissionPort = BoundEvidenceSubmission(lease, self.service)
@@ -137,8 +137,8 @@ class CapabilityProvider:
                 return AnchorCapabilities(lease=lease, context=self.anchor, submit=submit)
             case AgentRole.FUSE if self.fuse is not None:
                 return FuseCapabilities(lease=lease, context=self.fuse, submit=submit)
-            case AgentRole.COMMANDER if self.workflow is not None:
-                return CommanderCapabilities(lease=lease, workflow=self.workflow)
+            case AgentRole.COMMANDER if self.commander is not None:
+                return CommanderCapabilities(lease=lease, context=self.commander)
             case _:
                 raise WorkerFailure(WorkerErrorCode.ROLE_NOT_AUTHORIZED)
 
