@@ -426,6 +426,57 @@ change is what the view records.
 
 ---
 
+## Third review round
+
+Two defects remained, and the first was the previous round's own fix falling
+short of what it claimed.
+
+**Reading a historical payload is not reproducing it.** The submission
+fingerprint is taken over the whole serialised JSON, and replay compares against
+the fingerprint recorded at the time — so a shim that parses perfectly while
+renaming a key or adding a `null` breaks replay invisibly. That is exactly what
+`AliasChoices` alone did: payloads from `9515b49` re-serialised
+`evaluated_at` as `legacy_evaluated_at`, and payloads from `094cad3`, which
+carried no such key at all, gained `legacy_evaluated_at: null`. All four
+combinations produced a different fingerprint, and an unchanged historical FUSE
+submission raised `IDEMPOTENCY_CONFLICT` against its own stored value.
+
+The contract is now stated plainly: **the stored JSON is the contract.** A
+payload read and re-serialised must be byte-identical to what was written, for
+every generation. Three things achieve it, and each was necessary:
+
+* the legacy field is declared at the position the original occupied — key order
+  is part of the bytes the hash is taken over;
+* it is emitted under the original name, renamed in place rather than popped and
+  re-added, so the position survives;
+* it is omitted entirely when absent, because a `null` is a key the generation
+  that wrote no timestamp never had.
+
+New computations still carry no run metadata, so the key is simply absent and
+matches `094cad3` byte for byte.
+
+The proof fixtures were produced by **running the predecessor commits** in
+throwaway worktrees and capturing what that code actually serialised, together
+with the fingerprints it computed. Building them with the current model would
+have put it on both sides of the comparison, which is how the previous round's
+test passed while the defect stood. The earlier, misleading test is replaced and
+now says what it actually checks.
+
+**An advisory synthesis could shorten the decision window.** `_shelf_life`
+included every current envelope, so a FUSE envelope with a shorter validity
+lowered the context's `valid_until` — same canonical sources, same context
+digest, and a decision that flipped from `AWAIT_TRIGGER` to `STALE_CONTEXT`
+purely because an advisory reading had aged.
+
+That is authority the advisory layer does not have: it would let FUSE force
+re-derivation of decisions it has no say in — the same power it is kept out of
+the context digest to deny it. `SYNTHESIS` is now excluded from the window,
+while its own freshness continues to be reported separately and inertly on
+`advisory`. Every canonical horizon — case, authorization, evidence and the
+setup's own — still binds at exactly its boundary.
+
+---
+
 ## Compatibility
 
 No migration. Alembic head remains `0006`, and none of `0001`–`0006` is altered.

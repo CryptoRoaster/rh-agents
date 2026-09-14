@@ -8,6 +8,7 @@ a decision made later from a context read earlier.
 """
 
 import asyncio
+import json
 from datetime import timedelta
 from decimal import Decimal
 from uuid import uuid4
@@ -268,21 +269,26 @@ def test_the_contract_still_refuses_genuinely_unknown_fields(now):
             model.model_validate({**payload, "capacity_sematics": "AT_LEAST"})
 
 
-def test_a_historical_envelope_replays_against_its_stored_fingerprint(worker_db, now, trace):
-    """Exact historical replay: the fingerprint recorded then still matches.
+def test_a_historical_detail_reserialises_to_the_bytes_it_was_given(now):
+    """Round-trip fidelity of the detail itself.
 
-    Distinct from merely parsing. A stored envelope carries the fingerprint it
-    was written with, and replay compares against that — so a compatibility
-    shim that changed serialisation would break replay while parsing perfectly.
+    This is deliberately *not* a replay proof, and an earlier version of it
+    claimed to be one. Re-validating a model's own output and comparing the two
+    puts the current model on both sides, so it passes whatever the model does
+    to a historical key — which is exactly how a shim that renamed one looked
+    correct here while breaking replay. The real proof lives in
+    `test_r3.py`, against fixtures produced by running the predecessor commits
+    and carrying the fingerprints that code actually computed.
     """
     from src.orchestration.workflow.models import ExecutionAssessmentDetail
 
-    historical = previous_anchor_detail(now)
-    parsed = ExecutionAssessmentDetail.model_validate(historical)
-    # Re-validating the dumped form reproduces the same object, so a fingerprint
-    # taken over the payload then and now agrees.
-    again = ExecutionAssessmentDetail.model_validate(parsed.model_dump(mode="json"))
-    assert again.model_dump_json() == parsed.model_dump_json()
+    given = previous_anchor_detail(now)
+    parsed = ExecutionAssessmentDetail.model_validate(given)
+    dumped = json.loads(parsed.model_dump_json())
+    # Same instant, emitted under the historical key rather than the field name.
+    assert parsed.legacy_evaluated_at == now
+    assert "evaluated_at" in dumped
+    assert "legacy_evaluated_at" not in dumped
 
 
 async def test_new_results_computed_at_different_times_still_replay(worker_db, now, trace):

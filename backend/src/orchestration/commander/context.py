@@ -431,7 +431,14 @@ def _shelf_life(
     the setup says, only about when it stops saying it.
     """
     horizons = [trade_case.expires_at] if trade_case.expires_at is not None else []
-    horizons.extend(item.valid_until for item in current.values())
+    # Canonical evidence only. An advisory synthesis must not shorten the window
+    # in which a decision may be made: it is authoritative over nothing, and
+    # letting its envelope age the view would hand the advisory layer a way to
+    # force re-derivation of decisions it has no say in. Its own freshness is
+    # reported separately and inertly, on `advisory`.
+    horizons.extend(
+        item.valid_until for kind, item in current.items() if kind is not EvidenceType.SYNTHESIS
+    )
     if binding_row is not None:
         horizons.append(aware(binding_row.expires_at))
     setup = current.get(EvidenceType.TRADE_SETUP)

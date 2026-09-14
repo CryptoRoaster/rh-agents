@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 from uuid import UUID
 
 from pydantic import (
@@ -13,6 +13,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    model_serializer,
     model_validator,
 )
 
@@ -556,6 +557,29 @@ class TriggerPayload(AcceptancePayload):
     detail: "TriggerDetail | None" = None
 
 
+def _without_absent_legacy_timestamp(data: dict[str, Any]) -> dict[str, Any]:
+    """Restore the historical shape of the legacy timestamp key.
+
+    The wrap handler emits field names, so the key arrives as
+    ``legacy_evaluated_at``. Two corrections are needed and both change bytes:
+    it is renamed to the name it was stored under, and dropped entirely when
+    absent — serialising `null` would add a key the generation that wrote no
+    timestamp never had.
+
+    Position is preserved by rebuilding in iteration order rather than popping
+    and re-adding, because the key's place in the JSON is part of the bytes the
+    fingerprint was taken over.
+    """
+    if "legacy_evaluated_at" not in data:
+        return data
+    if data["legacy_evaluated_at"] is None:
+        return {key: value for key, value in data.items() if key != "legacy_evaluated_at"}
+    return {
+        ("evaluated_at" if key == "legacy_evaluated_at" else key): value
+        for key, value in data.items()
+    }
+
+
 class QuotedLadderPoint(Immutable):
     """One tested size and what the market said about it.
 
@@ -630,25 +654,33 @@ class ExecutionAssessmentDetail(Immutable):
     quote_provider: Identifier
     quote_requests: int = Field(ge=0)
     ladder: tuple[QuotedLadderPoint, ...] = Field(min_length=1, max_length=12)
-    execution_digest: Digest
     # Legacy only, and never written.
     #
-    # Evidence is append-only, so payloads recorded before this field was
-    # dropped are still in the database and must stay readable — and both these
-    # models forbid extra fields, so removing it outright made historical rows
-    # unparseable. It is therefore restored as optional and left `None` by every
-    # code path: new submissions are deterministic, which is what made removing
-    # it necessary, while stored ones keep the value they were written with.
+    # Evidence is append-only and fingerprints are stored, so the serialised
+    # form of a payload is a contract with rows already in the database. Three
+    # generations exist: one that wrote `evaluated_at`, one that wrote no such
+    # key at all, and this one. All three must read *and re-serialise* to
+    # exactly the bytes they were stored as, because the submission fingerprint
+    # is taken over the whole JSON and replay compares against the fingerprint
+    # recorded at the time.
+    #
+    # So the field is declared at the position the original occupied, emitted
+    # under the original name, and omitted entirely when absent — which is what
+    # `_without_absent_legacy_timestamp` below does. Renaming it or adding a
+    # `null` would each change the bytes and break replay while parsing
+    # perfectly, which is how the previous attempt passed its own tests.
     #
     # A blanket `extra="ignore"` would have achieved the parsing and lost the
-    # contract: every other unknown field would silently vanish too, including
-    # typos in fields that matter.
+    # contract: every other unknown field would vanish with it.
     legacy_evaluated_at: AwareDatetime | None = Field(
         default=None,
-        # Accepts the historical spelling and its own, so a payload survives a
-        # read-and-write round trip as well as a first read.
         validation_alias=AliasChoices("evaluated_at", "legacy_evaluated_at"),
     )
+    execution_digest: Digest
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        return _without_absent_legacy_timestamp(handler(self))
 
 
 class LiquidityExecutionPayload(AcceptancePayload):
@@ -767,22 +799,30 @@ class SynthesisDetail(Immutable):
     synthesis_fingerprint: Digest
     # Legacy only, and never written.
     #
-    # Evidence is append-only, so payloads recorded before this field was
-    # dropped are still in the database and must stay readable — and both these
-    # models forbid extra fields, so removing it outright made historical rows
-    # unparseable. It is therefore restored as optional and left `None` by every
-    # code path: new submissions are deterministic, which is what made removing
-    # it necessary, while stored ones keep the value they were written with.
+    # Evidence is append-only and fingerprints are stored, so the serialised
+    # form of a payload is a contract with rows already in the database. Three
+    # generations exist: one that wrote `evaluated_at`, one that wrote no such
+    # key at all, and this one. All three must read *and re-serialise* to
+    # exactly the bytes they were stored as, because the submission fingerprint
+    # is taken over the whole JSON and replay compares against the fingerprint
+    # recorded at the time.
+    #
+    # So the field is declared at the position the original occupied, emitted
+    # under the original name, and omitted entirely when absent — which is what
+    # `_without_absent_legacy_timestamp` below does. Renaming it or adding a
+    # `null` would each change the bytes and break replay while parsing
+    # perfectly, which is how the previous attempt passed its own tests.
     #
     # A blanket `extra="ignore"` would have achieved the parsing and lost the
-    # contract: every other unknown field would silently vanish too, including
-    # typos in fields that matter.
+    # contract: every other unknown field would vanish with it.
     legacy_evaluated_at: AwareDatetime | None = Field(
         default=None,
-        # Accepts the historical spelling and its own, so a payload survives a
-        # read-and-write round trip as well as a first read.
         validation_alias=AliasChoices("evaluated_at", "legacy_evaluated_at"),
     )
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        return _without_absent_legacy_timestamp(handler(self))
 
 
 class SynthesisPayload(AcceptancePayload):
