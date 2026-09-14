@@ -18,6 +18,7 @@ from src.orchestration.worker.policy import (
     role_evidence_matrix,
 )
 from src.orchestration.workflow.models import EvidenceType
+from src.orchestration.workflow.policy import TRADE_CASE_V1
 
 EXPECTED_MATRIX = {
     AgentRole.ORBIT: EvidenceType.DISCOVERY,
@@ -26,6 +27,7 @@ EXPECTED_MATRIX = {
     AgentRole.VECTOR: EvidenceType.TRADE_SETUP,
     AgentRole.PULSE: EvidenceType.TRIGGER,
     AgentRole.ANCHOR: EvidenceType.LIQUIDITY_EXECUTION,
+    AgentRole.FUSE: EvidenceType.SYNTHESIS,
 }
 
 
@@ -42,10 +44,34 @@ def test_each_role_has_exactly_one_authorized_evidence_type(role, evidence):
     assert [other for other in EXPECTED_MATRIX.values()].count(evidence) == 1
 
 
-@pytest.mark.parametrize("role", [AgentRole.FUSE, AgentRole.COMMANDER])
-def test_fuse_and_commander_have_no_evidence_authority(role):
-    assert authorized_evidence_type(role) is None
-    assert authorized_task_type(role) is None
+def test_commander_has_no_evidence_authority():
+    """COMMANDER coordinates; it never files evidence on anyone's behalf."""
+    assert authorized_evidence_type(AgentRole.COMMANDER) is None
+    assert authorized_task_type(AgentRole.COMMANDER) is None
+
+
+def test_fuse_files_synthesis_and_nothing_else():
+    """FUSE gained an evidence type in Phase 2K, and exactly one.
+
+    It may record its reading of the case. It may not record anyone else's
+    finding, which is what one authorized type per role guarantees.
+    """
+    assert authorized_evidence_type(AgentRole.FUSE) == EvidenceType.SYNTHESIS
+    assert authorized_task_type(AgentRole.FUSE) == "SYNTHESIZE_EVIDENCE"
+
+
+def test_fuse_evidence_is_neither_required_nor_safety_critical():
+    """The two flags that keep a summariser from acquiring authority.
+
+    Not safety-critical, so its fingerprint stays out of `risk_input_digest` —
+    otherwise SENTIMENT, which Phase 2F deliberately kept out of risk binding,
+    would re-enter it through a synthesis that mentions it. Not required, so a
+    synthesizer outage cannot block a case whose canonical evidence is complete.
+    """
+    requirement = TRADE_CASE_V1.requirement(EvidenceType.SYNTHESIS)
+    assert requirement.required is False
+    assert requirement.safety_critical is False
+    assert EvidenceType.SYNTHESIS not in TRADE_CASE_V1.safety_types
 
 
 def test_deterministic_services_are_not_worker_roles():

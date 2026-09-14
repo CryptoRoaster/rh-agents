@@ -934,17 +934,34 @@ class WorkerRuntimeService:
         authorization layer refuses to record it at all, so a superseded trigger
         never enters history.
         """
-        references = {
-            name: getattr(submission.payload, name, None)
+        singular = [
+            getattr(submission.payload, name, None)
             for name in ("setup_evidence_id", "trigger_evidence_id")
-        }
-        if all(value is None for value in references.values()):
+        ]
+        # A synthesis names every envelope it read, so all of them are checked.
+        # Without this a FUSE reading of setup A could be recorded after VECTOR
+        # replaced it with B, and the record would show a current-looking
+        # synthesis of a setup nobody is trading any more.
+        plural = list(getattr(submission.payload, "source_evidence_ids", ()) or ())
+        references = [value for value in [*singular, *plural] if value is not None]
+        if not references:
             return
         evidence = await self.cases.evidence(task.trade_case_id)
         superseded = {item.supersedes_id for item in evidence if item.supersedes_id is not None}
-        for value in references.values():
-            if value is not None and value in superseded:
+        for value in references:
+            if value in superseded:
                 raise WorkerFailure(WorkerErrorCode.TASK_SUPERSEDED)
+
+        # Identity is not freshness, and a derived result needs both.
+        #
+        # The references above can all still be current while the work was slow
+        # enough that one of them aged out during it — no supersession happened,
+        # so nothing above notices, and the result would be recorded claiming a
+        # currency its inputs no longer have. A submission that has already
+        # expired by the time it arrives is therefore refused rather than stored
+        # and left for a reader to catch.
+        if submission.valid_until <= self.clock.now():
+            raise WorkerFailure(WorkerErrorCode.EVIDENCE_STALE)
 
     async def _replayed(
         self,

@@ -200,7 +200,7 @@ ROLE_PORT = {
     AgentRole.VECTOR: ("setup", {"context", "lease", "submit"}),
     AgentRole.PULSE: ("pulse", {"context", "lease", "submit"}),
     AgentRole.ANCHOR: ("anchor", {"context", "lease", "submit"}),
-    AgentRole.FUSE: ("evidence", {"evidence", "lease"}),
+    AgentRole.FUSE: ("fuse", {"context", "lease", "submit"}),
     AgentRole.COMMANDER: ("workflow", {"workflow", "lease"}),
 }
 
@@ -213,7 +213,9 @@ async def test_every_role_receives_exactly_its_own_composed_capability(runtime, 
     reachable = {name for name in dir(capabilities) if not name.startswith("__")}
     assert reachable == expected
     # Only the six evidence roles get a write port at all.
-    assert ("submit" in reachable) == (role not in {AgentRole.FUSE, AgentRole.COMMANDER})
+    # COMMANDER coordinates and files nothing. Every other role, FUSE included
+    # since Phase 2K, may record exactly one evidence type of its own.
+    assert ("submit" in reachable) == (role is not AgentRole.COMMANDER)
     # No role reaches an attribute that belongs only to some other role. ORBIT and
     # ATLAS both name their read port "context", so compare surfaces rather than
     # assuming the provider field and the capability attribute share a name.

@@ -433,6 +433,7 @@ class TradeCaseService:
         self._mutable(row, expected_revision)
         envelope = await self._insert_evidence(session, row, submission)
         await self._complete_evidence_task(session, row, submission.evidence_type)
+        await self._rearm_derived_tasks(session, row, submission.evidence_type)
         await self._stabilize(session, row)
         return envelope
 
@@ -593,6 +594,101 @@ class TradeCaseService:
             "EVIDENCE_SUBMITTED",
             {"task_id": str(task.task_id)},
         )
+
+    async def _rearm_derived_tasks(
+        self, session: AsyncSession, row: TradeCaseRow, evidence_type: EvidenceType
+    ) -> None:
+        """Re-arm a completed derived task when one of its inputs is replaced.
+
+        A derived result is a view over other evidence. The moment one of those
+        inputs is superseded the view describes an evidence set the case has
+        left behind — so the task that produced it becomes claimable again and a
+        fresh result is derived for the new set. Without this the view would be
+        written once and then quietly disagree with the case forever.
+
+        Four things bound it, and each is doing real work.
+
+        **Only derived tasks.** `derived_from` is empty for everything that
+        observes rather than derives, so ATLAS finishing does not make SIGNAL
+        runnable again. Re-running every completed task on any evidence change
+        would turn one supersession into an unbounded cascade.
+
+        **Only on an input.** Recording the derived output itself is not an
+        input to it, so a synthesis cannot re-arm its own task and loop. The set
+        of inputs is declared by the policy rather than inferred.
+
+        **Only before the stage closes.** Once a trigger exists the case has
+        moved past the pre-trigger question this task answers, and an advisory
+        refresh of that question would be work queued to describe a stage nobody
+        is at.
+
+        **Only a live case.** A terminal case cannot be re-derived into.
+
+        Re-arming reuses the task's own row and bumps its attempt counter, so a
+        case keeps one slot per role rather than accumulating one per revision.
+        """
+        definitions = self.policy.derived_tasks(evidence_type)
+        if not definitions:
+            return
+        if TradeCaseStatus(row.status) in TERMINAL_CASE_STATUSES:
+            return
+        rows = (
+            await session.scalars(
+                select(TradeCaseEvidenceRow).where(TradeCaseEvidenceRow.trade_case_id == row.id)
+            )
+        ).all()
+        evidence = tuple(evidence_from_row(item) for item in rows)
+        if EvidenceType.TRIGGER in active_evidence(evidence):
+            # The pre-trigger stage is over. Nothing re-derives into it.
+            return
+
+        now = self.clock.now()
+        for definition in definitions:
+            task = await session.scalar(
+                select(TradeCaseTaskRow).where(
+                    TradeCaseTaskRow.trade_case_id == row.id,
+                    TradeCaseTaskRow.role == definition.role.value,
+                    TradeCaseTaskRow.task_type == definition.task_type,
+                )
+            )
+            if task is None:
+                continue
+            if SpecialistTaskStatus(task.status) != SpecialistTaskStatus.SUCCEEDED:
+                # Still pending, running or permanently finished. A task that has
+                # not yet produced anything needs no second chance, and one that
+                # failed terminally is not resurrected by an input changing.
+                continue
+            if task.expires_at is not None and now >= aware(task.expires_at):
+                continue
+            task.status = SpecialistTaskStatus.PENDING.value
+            task.attempt += 1
+            task.started_at = None
+            task.completed_at = None
+            task.failure_category = None
+            task.next_eligible_at = None
+            # The finished attempt's lease has no claim on the new one. Leaving
+            # it would make the re-armed task look busy until that lease's own
+            # expiry, which is a delay measured in whatever the lease duration
+            # happens to be rather than in anything meaningful.
+            task.lease_id = None
+            task.worker_instance_id = None
+            task.lease_started_at = None
+            task.lease_expires_at = None
+            task.lease_renewals = 0
+            task.reason_code = "DERIVED_INPUT_CHANGED"
+            self._event(
+                session,
+                row,
+                "TASK_STATUS_CHANGED",
+                "DERIVED_INPUT_CHANGED",
+                {
+                    "task_id": str(task.task_id),
+                    "role": task.role,
+                    "to": SpecialistTaskStatus.PENDING.value,
+                    "attempt": task.attempt,
+                    "changed_evidence_type": evidence_type.value,
+                },
+            )
 
     async def transition_task(
         self,
@@ -981,27 +1077,6 @@ class TradeCaseService:
                 )
             ).all()
             return tuple(evidence_from_row(row) for row in rows)
-
-    async def evidence_for_fuse(self, trade_case_id: UUID) -> tuple[EvidenceEnvelope, ...]:
-        """Return only current, fresh, role-bound pre-trigger evidence."""
-        trade_case = await self.get_trade_case(trade_case_id)
-        evidence = await self.evidence(trade_case_id)
-        current = active_evidence(evidence)
-        result: list[EvidenceEnvelope] = []
-        for requirement in self.policy.requirements:
-            if not requirement.before_trigger or not requirement.required:
-                continue
-            item = current.get(requirement.evidence_type)
-            if (
-                item is None
-                or item.producer_role != requirement.role
-                or item.effective_status(self.clock.now()) != EvidenceStatus.AVAILABLE
-            ):
-                raise WorkflowFailure(WorkflowErrorCode.EVIDENCE_BINDING)
-            result.append(item)
-        if trade_case.status == TradeCaseStatus.BLOCKED:
-            raise WorkflowFailure(WorkflowErrorCode.EVIDENCE_BINDING)
-        return tuple(result)
 
     async def tasks(self, trade_case_id: UUID) -> tuple[SpecialistTask, ...]:
         async with self.sessions() as session:

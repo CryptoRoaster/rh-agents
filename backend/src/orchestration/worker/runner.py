@@ -20,6 +20,7 @@ from src.orchestration.worker.capabilities import (
     DiscoveryContextPort,
     EvidenceSubmissionPort,
     FuseCapabilities,
+    FuseContextPort,
     OnchainContextPort,
     OrbitCapabilities,
     PulseCapabilities,
@@ -27,7 +28,6 @@ from src.orchestration.worker.capabilities import (
     SentimentPort,
     SetupContextPort,
     SignalCapabilities,
-    ValidatedEvidencePort,
     VectorCapabilities,
     WorkflowStatePort,
 )
@@ -117,7 +117,7 @@ class CapabilityProvider:
     setup: SetupContextPort | None = None
     pulse: PulseContextPort | None = None
     anchor: AnchorContextPort | None = None
-    evidence: ValidatedEvidencePort | None = None
+    fuse: FuseContextPort | None = None
     workflow: WorkflowStatePort | None = None
 
     def build(self, lease: TaskLease) -> object:
@@ -135,8 +135,8 @@ class CapabilityProvider:
                 return PulseCapabilities(lease=lease, context=self.pulse, submit=submit)
             case AgentRole.ANCHOR if self.anchor is not None:
                 return AnchorCapabilities(lease=lease, context=self.anchor, submit=submit)
-            case AgentRole.FUSE if self.evidence is not None:
-                return FuseCapabilities(lease=lease, evidence=self.evidence)
+            case AgentRole.FUSE if self.fuse is not None:
+                return FuseCapabilities(lease=lease, context=self.fuse, submit=submit)
             case AgentRole.COMMANDER if self.workflow is not None:
                 return CommanderCapabilities(lease=lease, workflow=self.workflow)
             case _:

@@ -81,7 +81,7 @@ async def test_unknown_and_inactive_workers_cannot_claim(runtime, now, trace):
     assert caught.value.code == WorkerErrorCode.WORKER_NOT_ACTIVE
 
 
-@pytest.mark.parametrize("role", [AgentRole.FUSE, AgentRole.COMMANDER])
+@pytest.mark.parametrize("role", [AgentRole.COMMANDER])
 async def test_roles_without_evidence_authority_cannot_claim(runtime, now, trace, role):
     await open_case(runtime.cases, now, trace)
     worker = await register(runtime, role, key=f"{role.value}-1")

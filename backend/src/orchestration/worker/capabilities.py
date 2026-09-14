@@ -22,7 +22,6 @@ from src.core.models import AgentRole
 from src.markets.models import MarketCandidate, MarketSnapshot
 from src.orchestration.worker.models import TaskLease
 from src.orchestration.workflow.models import (
-    EvidenceEnvelope,
     SpecialistTask,
     TradeCase,
 )
@@ -113,14 +112,17 @@ class AnchorContextPort(Protocol):
     async def execution_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
-class ValidatedEvidencePort(Protocol):
-    """FUSE input: current, fresh, role-bound evidence only.
+class FuseContextPort(Protocol):
+    """FUSE input: one assembled view of what the case currently admits.
 
-    There is no method to change an evidence status, clear a blocker or turn an
-    UNKNOWN into an AVAILABLE.
+    The server decides what is current, what is usable and what is missing
+    before the worker sees anything. There is no method here to query evidence
+    by id, by type, or for another case — so a synthesizer cannot choose the
+    inputs that suit its conclusion — and none to change an evidence status,
+    clear a blocker, or turn an UNKNOWN into an AVAILABLE.
     """
 
-    async def evidence_for_fuse(self, trade_case_id: UUID) -> tuple[EvidenceEnvelope, ...]: ...
+    async def synthesis_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
 class WorkflowStatePort(Protocol):
@@ -197,11 +199,18 @@ class AnchorCapabilities:
 
 @dataclass(frozen=True)
 class FuseCapabilities:
-    """Read-only. FUSE has no submission port in Phase 2B: it may summarize valid
-    evidence, never restate it as new specialist evidence."""
+    """Read the admissible evidence, record one synthesis of it, nothing else.
+
+    Phase 2K gave FUSE a submission port, and exactly one authorized evidence
+    type to use it with. It may state its own reading; it cannot restate another
+    specialist's finding, revise one, or clear one. The surface is identical to
+    every other specialist's, which is the point: a synthesizer is a worker like
+    the rest, not a supervisor of them.
+    """
 
     lease: TaskLease
-    evidence: ValidatedEvidencePort
+    context: FuseContextPort
+    submit: EvidenceSubmissionPort
 
 
 @dataclass(frozen=True)

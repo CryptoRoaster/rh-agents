@@ -138,6 +138,11 @@ class Settings(BaseSettings):
     # sane, and a knob that could loosen that is a knob that could manufacture
     # executable capacity.
     anchor_worker_enabled: bool = False
+    # Phase 2K FUSE. Disabled by default like every other worker. There is no
+    # provider setting beside it because the synthesis is deterministic: it reads
+    # structured verdicts the specialists already committed to, so there is
+    # nothing here for a model to interpret and no credential to configure.
+    fuse_worker_enabled: bool = False
     # Where executable quotes come from. "disabled" fails closed: without a quote
     # source ANCHOR establishes no capacity at all, which is the correct outcome
     # rather than a gap to be filled with pool liquidity multiplied by a guess.

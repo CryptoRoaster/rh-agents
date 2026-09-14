@@ -612,3 +612,100 @@ builds a real transaction, so it does not carry the parts of one.
 
 Disabled by default, no migration, no worker started. See [the Phase 2J
 execution-liquidity design](docs/phase-2j.md).
+
+## Phase 2K FUSE evidence synthesis
+
+Five specialists have each answered their own question. FUSE says what the
+answers add up to.
+
+The obvious way to build this is also the wrong one:
+
+```python
+score = 0.3 * orbit + 0.2 * signal + 0.3 * vector + 0.2 * atlas
+```
+
+Those four numbers are not measurements of the same thing. One is about how
+interesting a token looked, one about what people are posting, one about where
+the price is, one about whether the contract can rug you. Averaging them
+produces a number that looks precise, encodes weights nobody argued for, and —
+the actual danger — lets three cheerful opinions cancel one piece of bad news.
+
+So there is no score. There is no count, no weighting, and no way to add one:
+the schema has no field a score could live in, so trying to record one fails
+rather than being quietly ignored.
+
+What comes out instead is four lists. What blocks the case. What is missing.
+What supports it. What to be careful about. Each item says which evidence it
+came from.
+
+Blockers come from the specialists themselves — ATLAS decided a failed holder
+check was disqualifying, and FUSE does not get a second opinion on that. It
+cannot remove one either. A summary that claims everything is fine while
+carrying a blocker won't save, and deleting the blocker to match doesn't help,
+because the evidence it points at still says otherwise.
+
+Missing is kept separate from bad, as everywhere else in this system. "We
+measured the holders and they're concentrated" and "we couldn't measure the
+holders" are different sentences, and only one of them is about the token. The
+second one stops the case just as firmly. There is no path where the other
+agents looking positive makes a missing safety check acceptable.
+
+Nuance survives too. A very positive social reading that came from twenty
+accounts posting the same thing produces *both* a supporting note and three
+cautions, all at once. Averaging those into "neutral" would delete the only part
+worth reading.
+
+Being a summary of other things gives it a lifecycle that the other agents don't
+have. ATLAS looks at a contract and that answer stays true until someone looks
+again. A summary stops being true the moment one of the things it summarises
+gets replaced.
+
+The first version only handled half of that. If the evidence changed while the
+summary was still being written, it was correctly thrown away. But once a
+summary had been *saved*, the job was marked done forever — so no new summary
+could ever be written, and the old one sat there looking perfectly valid while
+pointing at evidence the case had already replaced. That was found by trying it
+rather than by reading the code: swap the sentiment evidence, and the stored
+summary still reports itself as current.
+
+Now the job re-arms when one of its inputs is replaced, writes a fresh summary,
+and that one replaces the old one. With guards, because "redo work when
+something changes" is how you accidentally build an infinite loop: only this one
+job re-arms, only its declared inputs count (a summary isn't an input to itself),
+only before the case has moved on to waiting for its trigger, and only while the
+case is alive.
+
+One quiet rule matters more than it looks. A summary is only as fresh as the
+oldest thing it summarises. If that were not true — if writing a new summary
+made old facts look current — then re-running this would be a way to launder
+stale evidence into fresh evidence, which is about the worst thing a summariser
+could do.
+
+Being late matters too, and in a way that's easy to miss. Checking "is this
+still the same evidence?" doesn't catch evidence that simply got old while the
+work was happening — nobody replaced it, so nothing looks wrong. A summary that
+has already expired by the time it arrives is now rejected rather than filed.
+
+And a summary decides nothing. It doesn't approve a trade, doesn't size one,
+doesn't clear anything, and deliberately doesn't feed the risk layer: SENTINEL
+still reads the original evidence directly. That last part took the most care.
+Making FUSE part of the safety chain would have dragged social sentiment into
+risk authorization through the back door — because a summary mentions sentiment,
+and the risk snapshot hashes whatever it's given. An earlier phase decided
+sentiment shouldn't bind risk. A summary shouldn't get to overturn that by
+mentioning it.
+
+No model here, unusually. Everything it reads is already a structured answer
+someone else worked out; running a second opinion over settled answers would add
+variance and leave nobody able to say which answer the system acted on. Being
+deterministic also means it can't invent an evidence reference, can't be talked
+out of a blocker by text hidden inside the evidence it reads, and gives the same
+answer twice — so a retry is a retry, not a second opinion.
+
+Worth being precise about what "done" means here: the job is created and a
+worker can claim it, so this isn't dead code waiting on some future component.
+But nothing starts a worker on its own, and the flag is off. Built and ready,
+not running — same as every agent before it.
+
+Disabled by default, no migration, no worker started. See [the Phase 2K
+synthesis design](docs/phase-2k.md).

@@ -43,7 +43,10 @@ async def test_worker_runtime_reports_a_disabled_posture_without_inventing_agent
     assert body["policy_version"] == "worker-runtime-v1"
     assert body["role_evidence"]["ATLAS"] == "ONCHAIN_EVIDENCE"
     assert "SENTINEL" not in body["role_evidence"]
-    assert "FUSE" not in body["role_evidence"]
+    # FUSE gained a synthesis evidence type in Phase 2K; COMMANDER has none and
+    # SENTINEL is not a worker role at all.
+    assert body["role_evidence"]["FUSE"] == "SYNTHESIS_EVIDENCE"
+    assert "COMMANDER" not in body["role_evidence"]
 
 
 async def test_read_only_worker_views(worker_client):
