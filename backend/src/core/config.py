@@ -33,6 +33,15 @@ ConfiguredUsd = Annotated[
     Field(gt=0, allow_inf_nan=False, max_digits=38, decimal_places=18),
 ]
 
+# A configured basis-point figure. Zero is permitted and meaningful — an
+# operator may deliberately assume a venue charges nothing — which is why the
+# absence of a value, not a zero, is what signals a missing cost basis.
+ConfiguredBps = Annotated[
+    Decimal,
+    BeforeValidator(exact_amount),
+    Field(ge=0, le=10000, allow_inf_nan=False, max_digits=38, decimal_places=18),
+]
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="../.env", extra="ignore", hide_input_in_errors=True)
@@ -195,6 +204,17 @@ class Settings(BaseSettings):
     # guaranteed maximum cash debit: the paper executor adds costs on top of the
     # fill, and SENTINEL computes its own worst case from its own limits.
     paper_requested_notional_usd: ConfiguredUsd | None = None
+    # Phase 2M-B PAPER cost assumptions. Both default to `None`, and `None` means
+    # there is no cost basis at all rather than a free trade: a simulation that
+    # priced fills without being told what trading costs would be optimistic by
+    # construction, which is the one direction a paper result must never err in.
+    #
+    # These are assumptions an operator states, never observations. They are not
+    # ANCHOR's execution deviation, not a provider's price impact, not tested
+    # capacity, and not a realised fill cost — see `src/orchestration/costs`.
+    # Configuring them authorises nothing.
+    paper_fee_bps: ConfiguredBps | None = None
+    paper_slippage_bps: ConfiguredBps | None = None
     # Where executable quotes come from. "disabled" fails closed: without a quote
     # source ANCHOR establishes no capacity at all, which is the correct outcome
     # rather than a gap to be filled with pool liquidity multiplied by a guess.

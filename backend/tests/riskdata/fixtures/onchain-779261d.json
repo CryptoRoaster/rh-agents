@@ -1,0 +1,10 @@
+{
+  "with_intelligence": {
+    "fingerprint": "942a7c4e6fff465200ea2a1f76848e7412cb78195b5de665e9fcdb01e09e5700",
+    "submission_raw": "{\"idempotency_key\":\"onchain-compat\",\"producer_role\":\"ATLAS\",\"evidence_type\":\"ONCHAIN_EVIDENCE\",\"schema_version\":1,\"provenance\":{\"source\":\"atlas:evm-rpc\",\"reference_id\":\"ca434fb3-fac1-5f7a-96b7-465cccb8c12c\",\"source_version\":null},\"observed_at\":\"2026-09-14T12:00:00Z\",\"valid_until\":\"2026-09-14T12:10:00Z\",\"status\":\"AVAILABLE\",\"confidence\":null,\"reason_codes\":[],\"payload\":{\"kind\":\"onchain\",\"holder_integrity\":\"PASS\",\"dev_wallet_integrity\":\"PASS\",\"contract_integrity\":\"PASS\",\"intelligence\":{\"verdict\":\"CLEAR\",\"policy_version\":\"atlas-policy-v2\",\"blockers\":[],\"data_gaps\":[],\"domain_status\":{\"CONTRACT\":\"AVAILABLE\",\"HOLDERS\":\"AVAILABLE\"},\"chain_id\":4663,\"block_number\":1000000,\"snapshot_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"advisory_summary\":null,\"advisory_findings\":[],\"reasoning_provider\":null,\"reasoning_model\":null,\"prompt_version\":null,\"prompt_hash\":null}},\"correlation_id\":\"2b41c256-f229-5652-a61f-8671ce3b2212\",\"supersedes_id\":null}"
+  },
+  "without_intelligence": {
+    "fingerprint": "66a22ff211f7e8119a6c062cca6c9143ad210540e40e4f0465fb2e1176d57096",
+    "submission_raw": "{\"idempotency_key\":\"onchain-compat\",\"producer_role\":\"ATLAS\",\"evidence_type\":\"ONCHAIN_EVIDENCE\",\"schema_version\":1,\"provenance\":{\"source\":\"atlas:evm-rpc\",\"reference_id\":\"ca434fb3-fac1-5f7a-96b7-465cccb8c12c\",\"source_version\":null},\"observed_at\":\"2026-09-14T12:00:00Z\",\"valid_until\":\"2026-09-14T12:10:00Z\",\"status\":\"AVAILABLE\",\"confidence\":null,\"reason_codes\":[],\"payload\":{\"kind\":\"onchain\",\"holder_integrity\":\"PASS\",\"dev_wallet_integrity\":\"PASS\",\"contract_integrity\":\"PASS\",\"intelligence\":null},\"correlation_id\":\"2b41c256-f229-5652-a61f-8671ce3b2212\",\"supersedes_id\":null}"
+  }
+}
