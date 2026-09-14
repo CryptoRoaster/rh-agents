@@ -26,7 +26,7 @@ from src.data.tables import (
     TradeCaseTransitionRow,
 )
 from src.markets.models import MarketIdentity
-from src.orchestration.workflow.engine import TradeCaseEvaluator, active_evidence
+from src.orchestration.workflow.engine import Evaluation, TradeCaseEvaluator, active_evidence
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
     TERMINAL_TASK_STATUSES,
@@ -836,6 +836,51 @@ class TradeCaseService:
             await self._expire_tasks(session, row)
             await self._stabilize(session, row)
             return case_from_row(row)
+
+    async def evaluate_in_session(
+        self, session: AsyncSession, row: TradeCaseRow, now: datetime
+    ) -> Evaluation:
+        """What the case is *at this instant*, read-only, inside a caller's transaction.
+
+        A stored status is a snapshot of the last write, and time moves without
+        writes: a case whose own lifetime or whose safety evidence lapsed keeps
+        a stale row until something touches it. Callers that must not act on a
+        case that has gone ineligible therefore need the recomputed answer
+        rather than the recorded one — and need it before they act, not as a
+        side effect of writing.
+
+        Deliberately the *same* evaluator, over the same evidence and binding
+        reads `_stabilize` performs. There is one requirement table, one
+        transition matrix and one freshness rule, and this reads them at the
+        instant given instead of trusting a row written at an earlier one.
+        Nothing here writes, so the caller decides what the answer means.
+        """
+        trade_case = case_from_row(row)
+        evidence = tuple(
+            evidence_from_row(item)
+            for item in (
+                await session.scalars(
+                    select(TradeCaseEvidenceRow)
+                    .where(TradeCaseEvidenceRow.trade_case_id == row.id)
+                    .order_by(
+                        TradeCaseEvidenceRow.recorded_at,
+                        TradeCaseEvidenceRow.evidence_id,
+                    )
+                )
+            ).all()
+        )
+        binding_row = await session.scalar(
+            select(TradeCaseRiskBindingRow)
+            .where(TradeCaseRiskBindingRow.trade_case_id == row.id)
+            .order_by(
+                TradeCaseRiskBindingRow.case_revision.desc(),
+                TradeCaseRiskBindingRow.recorded_at.desc(),
+                TradeCaseRiskBindingRow.binding_id.desc(),
+            )
+            .limit(1)
+        )
+        binding = risk_from_row(binding_row) if binding_row is not None else None
+        return self.evaluator.evaluate(trade_case, evidence, binding, now)
 
     async def _stabilize(self, session: AsyncSession, row: TradeCaseRow) -> None:
         for _ in range(12):

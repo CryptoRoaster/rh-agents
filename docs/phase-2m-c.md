@@ -134,7 +134,7 @@ here rather than left for whoever writes the execution path to infer.
 
 ## Test evidence
 
-38 tests in `tests/riskrequest/`, on a schema carrying accounting *and* workflow.
+53 tests in `tests/riskrequest/`, on a schema carrying accounting *and* workflow.
 The production path runs throughout: the real workflow service against a real
 database, the real completeness check, the real sizing calculation and
 `src.risk.engine.evaluate` itself.
@@ -163,6 +163,49 @@ reading the first's committed cash.
 And the control: no `ExecutionRow`, no trade, no position and no cash movement
 from a risk check.
 
+## Hardening round
+
+Two defects, each reproduced against `5736391` before being fixed.
+
+**A stored status is not current eligibility.** The service checked
+`trade_case.status`, which is a snapshot of the last write — and time moves
+without writes. A case whose own lifetime lapsed, or whose trigger aged out,
+keeps `READY_FOR_RISK` until something touches the row, and `_stabilize` runs
+*after* the binding is written, which is far too late to be a precondition. A
+complete reproduction asked SENTINEL about an expired case, recorded an
+`APPROVE`, wrote the binding, spent the case's one request, and only then moved
+the case to `EXPIRED`.
+
+The fix asks the central evaluator, read-only, at the final decision instant and
+under the locks already held: `TradeCaseService.evaluate_in_session` reuses the
+same evaluator over the same evidence and binding reads `_stabilize` performs.
+No second workflow engine, and nothing written from a refusal path. The recorded
+safety digest is compared against the recomputed one for the same reason.
+
+The basis is checked at that instant too. Both readings are taken before the
+locks settle, and each carries the horizon its own sources give it; one that
+lapsed in between is refused as `DECISION_BASIS_EXPIRED` rather than extended.
+Source times are untouched and no limit is loosened.
+
+Either refusal writes nothing — no `TradeCaseRiskRequestRow`, no binding — so an
+ineligible moment cannot consume what a later valid one needs. Replay of a
+stored verdict is unaffected: it comes back marked `replayed`, re-evaluates
+nothing, and still authorises nothing.
+
+**The evaluated snapshot was not kept.** `_basis` recorded the completeness
+reading, which carries provenance rather than values, so the typed
+`MarketSnapshot` that `evaluate` was actually given existed only in memory. The
+decision's own `market_fingerprint` and `market_snapshot_id` could therefore
+never be checked again, and learning what SENTINEL was shown would have meant
+re-reading sources that had since moved.
+
+The snapshot is now stored whole in the basis, along with identity and
+fingerprint references to each canonical envelope the values came out of. Both
+enter `risk_request_digest`, because a stored basis nothing hashed could be
+edited without trace. After a commit and a reload the snapshot reconstructs from
+the row alone — proved against a feed that raises on any market read — and its
+fingerprint and id match the decision exactly.
+
 ## Remaining execution limits
 
 - **No fill.** The durable case-to-order-to-fill link still does not exist. An
@@ -175,4 +218,7 @@ from a risk check.
   is no public write API and no autonomous loop.
 - `holder_count` remains provider-reported, and `RESPONSE_TIME` holder
   provenance is still accepted by the current ATLAS policy.
+- A refusal on stale eligibility leaves the stored status stale, deliberately:
+  it is a read-only path, and the next write that touches the case corrects the
+  row through the existing stabilisation.
 - Exits, live execution, signing and broadcast remain out of scope entirely.

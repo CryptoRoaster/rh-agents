@@ -301,13 +301,13 @@ async def record_sentiment(cases, trade_case, now, assessment="NEGATIVE"):
     )
 
 
-async def open_case(cases, now, trace, key="riskdata-case"):
+async def open_case(cases, now, trace, key="riskdata-case", lifetime=timedelta(hours=1)):
     return await cases.open_trade_case(
         IDENTITY,
         originating_discovery_reference=uuid4(),
         correlation_id=trace,
         idempotency_key=key,
-        expires_at=now + timedelta(hours=1),
+        expires_at=now + lifetime,
     )
 
 

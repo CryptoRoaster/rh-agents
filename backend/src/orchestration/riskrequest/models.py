@@ -77,6 +77,14 @@ class RiskRequestRefusal(StrEnum):
     RISK_REQUEST_ALREADY_EXISTS = "RISK_REQUEST_ALREADY_EXISTS"
     # The caller named a revision or a safety digest the case has since left.
     SOURCE_CHANGED_DURING_REQUEST = "SOURCE_CHANGED_DURING_REQUEST"
+    # Recomputed at the decision instant, the case is no longer eligible: its
+    # own lifetime lapsed, or a safety envelope aged out. The stored status said
+    # otherwise only because nothing had touched the row since.
+    TRADE_CASE_NO_LONGER_ELIGIBLE = "TRADE_CASE_NO_LONGER_ELIGIBLE"
+    # The completeness reading or the sizing assessment expired between being
+    # taken and being used. Both are read before the locks settle, and a basis
+    # that has aged out in between is not the basis of anything.
+    DECISION_BASIS_EXPIRED = "DECISION_BASIS_EXPIRED"
     # The same key arrived with a different basis. Never silently recomputed.
     RISK_REQUEST_CONFLICT = "RISK_REQUEST_CONFLICT"
 

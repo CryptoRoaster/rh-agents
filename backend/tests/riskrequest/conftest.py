@@ -148,13 +148,22 @@ def fresh_onchain(now, **overrides):
     return onchain_payload(now, **{**arguments, **overrides})
 
 
-async def ready_case(cases, now, trace, *, onchain=None, key="riskrequest-case", anchor=True):
+async def ready_case(
+    cases,
+    now,
+    trace,
+    *,
+    onchain=None,
+    key="riskrequest-case",
+    anchor=True,
+    lifetime=timedelta(hours=1),
+):
     """A case the evaluator publishes as READY_FOR_RISK.
 
     Every required envelope, in order: ORBIT's discovery arrives at open, then
     ATLAS, SIGNAL and VECTOR before the trigger, then PULSE and ANCHOR.
     """
-    trade_case = await open_case(cases, now, trace, key)
+    trade_case = await open_case(cases, now, trace, key, lifetime=lifetime)
     await record_onchain(cases, trade_case, now, onchain or fresh_onchain(now))
     await record(
         cases,

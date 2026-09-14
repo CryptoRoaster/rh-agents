@@ -123,6 +123,8 @@ class CanonicalInputs:
     snapshot: RecordedMarket
     onchain: EvidenceEnvelope
     anchor: EvidenceEnvelope
+    # Every current envelope, keyed by evidence type, for the audit record.
+    canonical_evidence: dict[str, EvidenceEnvelope]
 
 
 @dataclass(frozen=True)
@@ -200,6 +202,37 @@ class RiskRequestService:
             now = self.clock.now()
             roll_loss_day(account, now)
 
+            # What the case *is* at the decision instant, not what the last
+            # write recorded. A stored status is a snapshot and time moves
+            # without writes: a case whose lifetime lapsed or whose trigger aged
+            # out keeps READY_FOR_RISK until something touches the row, and
+            # `_stabilize` runs after the binding is written — far too late to
+            # be a precondition. The same central evaluator answers, read-only,
+            # under the locks already held.
+            effective = await self.cases.evaluate_in_session(session, row, now)
+            if effective.status is not TradeCaseStatus.READY_FOR_RISK:
+                return _refused(
+                    trade_case,
+                    RiskRequestRefusal.TRADE_CASE_NO_LONGER_ELIGIBLE,
+                    assessed.readiness,
+                    detail=effective.status.value,
+                )
+            if effective.risk_input_digest != trade_case.risk_input_digest:
+                return _refused(
+                    trade_case,
+                    RiskRequestRefusal.SOURCE_CHANGED_DURING_REQUEST,
+                    assessed.readiness,
+                )
+            # And whether the basis itself survived the reads. Both readings were
+            # taken before the locks settled; each carries the horizon its own
+            # sources give it, and neither is extended here.
+            if not assessed.readiness.is_current_at(now) or not assessed.sizing.is_current_at(now):
+                return _refused(
+                    trade_case,
+                    RiskRequestRefusal.DECISION_BASIS_EXPIRED,
+                    assessed.readiness,
+                )
+
             market = _risk_market(assessed, trade_case, request_key)
             stale = _too_old_for(market, now, self.limits)
             if stale is not None:
@@ -256,7 +289,9 @@ class RiskRequestService:
                 # Nothing here ever clears it.
                 account.paused = True
 
-            basis = _basis(request_key, trade_case, assessed, limits, state, intent, decision)
+            basis = _basis(
+                request_key, trade_case, assessed, limits, state, intent, decision, market
+            )
             digest = risk_request_digest(basis)
             request_id = uuid5(NAMESPACE_URL, f"rh-agents:risk-request:{request_key}")
             authorization = classify_decision(decision)
@@ -378,6 +413,7 @@ class RiskRequestService:
             snapshot=snapshot,
             onchain=onchain,
             anchor=anchor,
+            canonical_evidence={kind.value: item for kind, item in current.items()},
         )
 
 
@@ -599,6 +635,7 @@ def _basis(
     state: PortfolioState,
     intent: TradeIntent,
     decision: Any,
+    market: MarketSnapshot,
 ) -> dict[str, Any]:
     """The whole decision basis, persisted beside the verdict.
 
@@ -624,6 +661,25 @@ def _basis(
             "daily_loss_usd": canonical_amount(state.context.daily_loss_usd),
             "accounting": state.context.accounting.value,
             "unmarked_assets": list(state.unmarked_assets),
+        },
+        # The typed snapshot `evaluate` was actually given, whole. The
+        # completeness reading records provenance rather than values, so without
+        # this the only way to learn what SENTINEL was shown would be to re-read
+        # sources that have since moved — and the decision's own
+        # `market_fingerprint` could never be checked again.
+        "market_snapshot": market.model_dump(mode="json"),
+        # The canonical envelopes the values came out of, by identity and
+        # fingerprint, so each figure can be traced back to the exact row that
+        # carried it rather than to a role that has produced many.
+        "evidence": {
+            kind: {
+                "evidence_id": str(item.evidence_id),
+                "producer_role": item.producer_role.value,
+                "submission_fingerprint": item.submission_fingerprint,
+                "observed_at": item.observed_at.isoformat(),
+                "valid_until": item.valid_until.isoformat(),
+            }
+            for kind, item in sorted(inputs.canonical_evidence.items(), key=lambda pair: pair[0])
         },
         "intent": intent.model_dump(mode="json"),
         "intent_fingerprint": intent.fingerprint(),
