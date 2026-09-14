@@ -936,74 +936,106 @@ class TradeCaseService:
         risk_input_digest: str,
         expected_revision: int | None = None,
     ) -> TradeCase:
-        decision = RiskDecision.model_validate_json(decision.model_dump_json())
         async with self.sessions.begin() as session:
             row = await self._locked_case(session, trade_case_id)
-            payload = decision.model_dump(mode="json")
-            existing = await session.scalar(
-                select(TradeCaseRiskBindingRow).where(
-                    TradeCaseRiskBindingRow.risk_decision_id == decision.id
-                )
-            )
-            if existing is not None:
-                binding = risk_from_row(existing)
-                if (
-                    binding.trade_case_id != trade_case_id
-                    or binding.risk_input_digest != risk_input_digest
-                    or binding.decision_payload != payload
-                ):
-                    raise WorkflowFailure(WorkflowErrorCode.IDEMPOTENCY_CONFLICT)
-                await self._stabilize(session, row)
-                return case_from_row(row)
-            self._mutable(row, expected_revision)
-            if (
-                row.status != TradeCaseStatus.READY_FOR_RISK.value
-                or row.risk_input_digest != risk_input_digest
-                or decision.correlation_id != row.correlation_id
-                or decision.evaluated_at > self.clock.now()
-                or self.clock.now() >= decision.expires_at
-            ):
-                raise WorkflowFailure(WorkflowErrorCode.RISK_BINDING)
-            recorded_at = self.clock.now()
-            authorization = classify_decision(decision)
-            session.add(
-                TradeCaseRiskBindingRow(
-                    binding_id=uuid5(
-                        NAMESPACE_URL,
-                        f"rh-agents:trade-case-risk:{trade_case_id}:{decision.id}",
-                    ),
-                    trade_case_id=trade_case_id,
-                    risk_decision_id=decision.id,
-                    case_revision=row.revision,
-                    risk_input_digest=risk_input_digest,
-                    outcome=decision.outcome.value,
-                    authorization=authorization.value,
-                    reason_codes=list(decision.reason_codes),
-                    position_size_limit_usd=decision.position_size_limit_usd,
-                    max_additional_notional_usd=decision.max_additional_notional_usd,
-                    max_slippage_bps=decision.max_slippage_bps,
-                    evaluated_at=decision.evaluated_at,
-                    expires_at=decision.expires_at,
-                    recorded_at=recorded_at,
-                    correlation_id=decision.correlation_id,
-                    payload=payload,
-                )
-            )
-            self._event(
+            await self.record_risk_decision_in_session(
                 session,
                 row,
-                "RISK_DECISION_BOUND",
-                "SENTINEL_DECISION_BOUND",
-                {
-                    "risk_decision_id": str(decision.id),
-                    "risk_input_digest": risk_input_digest,
-                    "outcome": decision.outcome.value,
-                    "authorization": authorization.value,
-                },
+                decision,
+                risk_input_digest=risk_input_digest,
+                expected_revision=expected_revision,
             )
-            await session.flush()
-            await self._stabilize(session, row)
             return case_from_row(row)
+
+    async def record_risk_decision_in_session(
+        self,
+        session: AsyncSession,
+        row: TradeCaseRow,
+        decision: RiskDecision,
+        *,
+        risk_input_digest: str,
+        expected_revision: int | None = None,
+    ) -> UUID:
+        """Bind one SENTINEL decision inside a transaction the caller owns.
+
+        Exists because a decision and the state it was reached from have to
+        commit together. A caller that has already locked the paper account and
+        assembled a portfolio cannot hand the write to a service that opens its
+        own transaction: the two would commit independently, and a crash between
+        them would leave a decision bound to a portfolio nobody can reconstruct.
+
+        The caller must already hold the case row locked, which is what the
+        row argument makes visible. Lock order stays paper account, then trade
+        case.
+        """
+        decision = RiskDecision.model_validate_json(decision.model_dump_json())
+        trade_case_id = row.id
+        payload = decision.model_dump(mode="json")
+        existing = await session.scalar(
+            select(TradeCaseRiskBindingRow).where(
+                TradeCaseRiskBindingRow.risk_decision_id == decision.id
+            )
+        )
+        if existing is not None:
+            binding = risk_from_row(existing)
+            if (
+                binding.trade_case_id != trade_case_id
+                or binding.risk_input_digest != risk_input_digest
+                or binding.decision_payload != payload
+            ):
+                raise WorkflowFailure(WorkflowErrorCode.IDEMPOTENCY_CONFLICT)
+            await self._stabilize(session, row)
+            return binding.binding_id
+        self._mutable(row, expected_revision)
+        if (
+            row.status != TradeCaseStatus.READY_FOR_RISK.value
+            or row.risk_input_digest != risk_input_digest
+            or decision.correlation_id != row.correlation_id
+            or decision.evaluated_at > self.clock.now()
+            or self.clock.now() >= decision.expires_at
+        ):
+            raise WorkflowFailure(WorkflowErrorCode.RISK_BINDING)
+        recorded_at = self.clock.now()
+        authorization = classify_decision(decision)
+        binding_id = uuid5(
+            NAMESPACE_URL,
+            f"rh-agents:trade-case-risk:{trade_case_id}:{decision.id}",
+        )
+        session.add(
+            TradeCaseRiskBindingRow(
+                binding_id=binding_id,
+                trade_case_id=trade_case_id,
+                risk_decision_id=decision.id,
+                case_revision=row.revision,
+                risk_input_digest=risk_input_digest,
+                outcome=decision.outcome.value,
+                authorization=authorization.value,
+                reason_codes=list(decision.reason_codes),
+                position_size_limit_usd=decision.position_size_limit_usd,
+                max_additional_notional_usd=decision.max_additional_notional_usd,
+                max_slippage_bps=decision.max_slippage_bps,
+                evaluated_at=decision.evaluated_at,
+                expires_at=decision.expires_at,
+                recorded_at=recorded_at,
+                correlation_id=decision.correlation_id,
+                payload=payload,
+            )
+        )
+        self._event(
+            session,
+            row,
+            "RISK_DECISION_BOUND",
+            "SENTINEL_DECISION_BOUND",
+            {
+                "risk_decision_id": str(decision.id),
+                "risk_input_digest": risk_input_digest,
+                "outcome": decision.outcome.value,
+                "authorization": authorization.value,
+            },
+        )
+        await session.flush()
+        await self._stabilize(session, row)
+        return binding_id
 
     async def expire_trade_case(self, trade_case_id: UUID) -> TradeCase:
         async with self.sessions.begin() as session:

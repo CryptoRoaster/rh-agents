@@ -331,6 +331,53 @@ class TradeCaseRiskBindingRow(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
 
 
+class TradeCaseRiskRequestRow(Base):
+    """One durable trade request per TradeCase, and the whole basis it rested on.
+
+    Written only when SENTINEL actually ran. A refusal — incomplete data, a
+    stale source, a stop in force — records nothing, so an attempt that never
+    reached a verdict cannot permanently consume the case's one request.
+
+    The unique constraint on ``trade_case_id`` is the contract: a case gets one
+    canonical trade request, and a changed data situation is not by itself
+    permission for another. When a second request may legitimately be made is an
+    open question this phase deliberately does not answer.
+    """
+
+    __tablename__ = "trade_case_risk_requests"
+    __table_args__ = (
+        CheckConstraint("case_revision >= 1", name="trade_case_risk_request_revision_positive"),
+        CheckConstraint(
+            "requested_notional_usd > 0", name="trade_case_risk_request_notional_positive"
+        ),
+        CheckConstraint("quantity > 0", name="trade_case_risk_request_quantity_positive"),
+        UniqueConstraint("trade_case_id", name="uq_trade_case_risk_request_case"),
+        Index("ix_trade_case_risk_requests_case_time", "trade_case_id", "recorded_at"),
+        Index("ix_trade_case_risk_requests_correlation", "correlation_id"),
+    )
+    request_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    trade_case_id: Mapped[UUID] = mapped_column(ForeignKey("trade_cases.id", ondelete="CASCADE"))
+    request_key: Mapped[str] = mapped_column(String(200), unique=True)
+    case_revision: Mapped[int] = mapped_column(Integer)
+    # The safety-evidence digest as it stood, copied rather than recomputed.
+    risk_input_digest: Mapped[str] = mapped_column(String(64))
+    # Sizing, intent, portfolio, limits, cost assumptions and their sources.
+    # Separate from the safety digest so neither redefines the other.
+    risk_request_digest: Mapped[str] = mapped_column(String(64))
+    intent_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    intent_fingerprint: Mapped[str] = mapped_column(String(64))
+    requested_notional_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    quantity: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    risk_decision_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    binding_id: Mapped[UUID] = mapped_column(Uuid)
+    outcome: Mapped[str] = mapped_column(String(40))
+    authorization: Mapped[str] = mapped_column("risk_authorization", String(40))
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    correlation_id: Mapped[UUID] = mapped_column(Uuid)
+    basis: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+
+
 class TradeCaseTransitionRow(Base):
     __tablename__ = "trade_case_transitions"
     __table_args__ = (

@@ -29,7 +29,11 @@ from src.orchestration.workflow.models import (
 )
 from src.orchestration.workflow.service import TradeCaseService
 
-MIGRATIONS = ("0005_trade_case_workflow", "0006_worker_runtime")
+MIGRATIONS = (
+    "0005_trade_case_workflow",
+    "0006_worker_runtime",
+    "0007_trade_case_risk_requests",
+)
 
 
 @pytest.fixture
