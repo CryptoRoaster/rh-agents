@@ -22,6 +22,7 @@ from src.orchestration.sizing.calculator import assess_paper_sizing
 from src.orchestration.sizing.models import (
     BaseAssetMetadata,
     ReferencePrice,
+    SizingPolicySnapshot,
     SizingReading,
     SizingRefusal,
     SizingRefused,
@@ -76,7 +77,6 @@ class PaperSizingReader:
     include_fixtures: bool = False
 
     async def sizing(self, trade_case_id: UUID) -> SizingReading:
-        now = self.clock.now()
         try:
             trade_case = await self.cases.get_trade_case(trade_case_id)
         except WorkflowFailure:
@@ -105,6 +105,15 @@ class PaperSizingReader:
                 trade_case_id, base_asset_id, SizingRefusal.SIZING_MARKET_NOT_RECORDED
             )
 
+        # The instant is read *after* every await, never before them.
+        #
+        # Reading it first measured freshness at the moment the work started
+        # rather than at the moment it finished, so an eighty-nine-second-old
+        # price stayed acceptable across a database read and a market read that
+        # together took two seconds — and the assessment came back already past
+        # its own `valid_until`. Nothing here extends a deadline; the deadline
+        # is simply compared against the time it is actually being used at.
+        now = self.clock.now()
         return assess_paper_sizing(
             trade_case_id=trade_case_id,
             base_asset_id=base_asset_id,
@@ -127,7 +136,7 @@ class PaperSizingReader:
     ) -> SizingRefused:
         return SizingRefused(
             reason=reason,
-            policy_version=self.policy.version,
+            policy=SizingPolicySnapshot.of(self.policy),
             trade_case_id=trade_case_id,
             base_asset_id=base_asset_id,
         )

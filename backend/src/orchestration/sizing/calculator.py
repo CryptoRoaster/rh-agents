@@ -19,6 +19,7 @@ from src.orchestration.sizing.models import (
     BaseAssetMetadata,
     ReferencePrice,
     SizingAssessment,
+    SizingPolicySnapshot,
     SizingReading,
     SizingRefusal,
     SizingRefused,
@@ -60,7 +61,10 @@ def assess_paper_sizing(
     with no configured amount would report the knob rather than the stop, and an
     operator would fix the wrong thing.
     """
-    refused = _refusal(trade_case_id, base_asset_id, policy)
+    # Read once, so the content bound into the identity and the content the
+    # refusals were measured against are provably the same object's.
+    bound = SizingPolicySnapshot.of(policy)
+    refused = _refusal(trade_case_id, base_asset_id, bound)
 
     if trading_mode not in policy.supported_modes:
         return refused(SizingRefusal.SIZING_MODE_NOT_SUPPORTED)
@@ -85,7 +89,13 @@ def assess_paper_sizing(
         # A source that reports the future is not merely stale. Sizing against
         # it would mean trusting a recorder about when anything happened.
         return refused(SizingRefusal.SIZING_PRICE_NOT_YET_OBSERVED)
-    if now - price.observed_at > policy.max_price_age:
+    valid_until = price.observed_at + policy.max_price_age
+    if now >= valid_until:
+        # Half-open, so that a successful reading is never one that is already
+        # unusable. The boundary instant belongs to the expired side here for
+        # the same reason it does for an evidence envelope and for a COMMANDER
+        # context: `valid_until` is the first instant at which the reading has
+        # stopped describing the market, not the last at which it still does.
         return refused(SizingRefusal.SIZING_PRICE_STALE)
 
     if base_asset is None:
@@ -124,7 +134,7 @@ def assess_paper_sizing(
         return refused(SizingRefusal.SIZING_BELOW_MINIMUM_UNIT)
 
     return SizingAssessment(
-        policy_version=policy.version,
+        policy=bound,
         trade_case_id=trade_case_id,
         base_asset_id=base_asset_id,
         setup_evidence_id=setup_evidence_id,
@@ -139,9 +149,9 @@ def assess_paper_sizing(
         # Anchored to the observation, never to this call. Reading a source
         # again does not make it younger, and a validity that renewed itself on
         # every read would describe nothing.
-        valid_until=price.observed_at + policy.max_price_age,
+        valid_until=valid_until,
         input_digest=sizing_input_digest(
-            policy_version=policy.version,
+            policy=bound,
             trade_case_id=trade_case_id,
             base_asset_id=base_asset_id,
             setup_evidence_id=setup_evidence_id,
@@ -177,12 +187,12 @@ def _floor_quantity(notional: Decimal, price: Decimal, unit: Decimal) -> Decimal
 
 
 def _refusal(
-    trade_case_id: UUID, base_asset_id: str | None, policy: PaperSizingPolicy
+    trade_case_id: UUID, base_asset_id: str | None, policy: SizingPolicySnapshot
 ) -> Callable[[SizingRefusal], SizingRefused]:
     def build(reason: SizingRefusal) -> SizingRefused:
         return SizingRefused(
             reason=reason,
-            policy_version=policy.version,
+            policy=policy,
             trade_case_id=trade_case_id,
             base_asset_id=base_asset_id,
         )

@@ -124,7 +124,7 @@ def test_the_digest_does_not_contain_the_quantity_it_explains(now):
     """
     reading = assess(now)
     recomputed = sizing_input_digest(
-        policy_version=reading.policy_version,
+        policy=reading.policy,
         trade_case_id=reading.trade_case_id,
         base_asset_id=reading.base_asset_id,
         setup_evidence_id=reading.setup_evidence_id,

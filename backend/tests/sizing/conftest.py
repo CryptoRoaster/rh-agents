@@ -66,6 +66,37 @@ class RecordedMarkets:
         return self._snapshot
 
 
+class MovingClock:
+    """A trusted clock a test can advance, without any real sleeping.
+
+    Time moving during an await is the situation being reproduced, and a real
+    sleep would prove it slowly and flakily instead of exactly.
+    """
+
+    def __init__(self, instant) -> None:
+        self.instant = instant
+
+    def now(self):
+        return self.instant
+
+    def advance(self, delta: timedelta) -> None:
+        self.instant = self.instant + delta
+
+
+class DelayedMarkets(RecordedMarkets):
+    """A market port whose answer takes time to arrive."""
+
+    def __init__(self, snapshot, clock: MovingClock, delay: timedelta) -> None:
+        super().__init__(snapshot)
+        self._clock = clock
+        self._delay = delay
+
+    async def latest(self, identity: str, *, include_fixtures: bool = False):
+        result = await super().latest(identity, include_fixtures=include_fixtures)
+        self._clock.advance(self._delay)
+        return result
+
+
 def recorded_snapshot(
     now,
     *,

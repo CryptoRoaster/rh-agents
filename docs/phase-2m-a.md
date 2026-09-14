@@ -122,10 +122,25 @@ set a number that changes nothing.
 ## Identity and replay
 
 `input_digest` is a canonical SHA-256 over exactly the inputs a quantity follows
-from: policy version, case, base asset, setup evidence, side, mode, requested
-notional, the price *and its provenance*, the decimals *and their provenance*,
-and the decimal places used. Sorted keys, fixed separators, ASCII, one
-unambiguous textual form per `Decimal`, one per instant.
+from: the policy's full content, case, base asset, setup evidence, side, mode,
+requested notional, the price *and its provenance*, the decimals *and their
+provenance*, and the decimal places used. Sorted keys, fixed separators, ASCII,
+one unambiguous textual form per `Decimal`, one per instant.
+
+`Decimal` values go through `lossless_decimal` rather than the shared
+`canonical_decimal`. The shared helper normalises inside a context of precision
+seventy-eight, which is ample for the amounts it was written for and not for a
+recorded price, which may carry a hundred coefficient digits. The local
+formatter performs no arithmetic at all — it reads sign, digits and exponent,
+strips trailing zeros by moving the exponent, and writes plain positional text —
+so equal values written differently still hash alike and unequal values never
+collide, whatever precision a caller happens to have set globally.
+
+The policy is bound by content, not by name. A version string is a label and a
+label can be reused, so `SizingPolicySnapshot` carries every parameter that can
+change a result or a validity — version, freshness bound in whole microseconds,
+supported sides and modes, and the two quantity-envelope limits — and travels on
+the reading as well as into the hash.
 
 What is absent is as load-bearing as what is present. No read time, no generated
 identifier, no worker instance, no attempt number — anything that moved between
@@ -135,7 +150,18 @@ reason: a digest containing its own output could never expose a computation that
 changed while its inputs did not.
 
 `valid_until` is anchored to the price's observation time, never to the call.
-Reading a source again does not make it younger. An earlier phase of this system
+Reading a source again does not make it younger. The window is half-open: the
+boundary instant belongs to the expired side, exactly as an evidence envelope is
+`STALE` at `now >= valid_until` and a COMMANDER context is current only while
+`instant < valid_until`. `SizingAssessment.is_current_at` states it, and the
+freshness check refuses there, so a successful reading is never one that is
+already unusable.
+
+Freshness is measured after the input reads, not before them. The trusted clock
+is read once, following every `await`, and the result is evaluated against that
+instant. No deadline is extended; the deadline is simply compared against the
+time it is actually being used at. The reader takes no clock from its caller —
+`sizing()` accepts a case id and nothing else. An earlier phase of this system
 found exactly that defect in ANCHOR, where a validity anchored to run time let a
 stale reference launder itself into a current one on every recomputation.
 
@@ -178,6 +204,36 @@ that declare it, like every other phase flag here.
 No migration. Alembic head remains `0006` and nothing persists a sizing reading.
 Without configuration the behaviour of the whole system is byte-for-byte what it
 was.
+
+---
+
+## Hardening round
+
+Three contract defects, each reproduced against `42b002c` before being fixed.
+
+**A digest that could not tell two different prices apart.** One dollar of
+notional against a token priced `1 - 10^-90` sizes to `1.000000000000000000`;
+against `1 + 10^-90` it sizes to `0.999999999999999999`. Two different
+quantities, and one identical `input_digest` — because `canonical_decimal`
+normalises at precision seventy-eight and both ninety-one-digit prices
+canonicalised to `"1"`. The fix is the lossless formatter above, kept local
+rather than replacing the shared helper: that helper feeds digests inside stored
+specialist evidence, and evidence is append-only with its fingerprints recorded,
+so changing how it serialises is a compatibility question of its own rather than
+a side effect of fixing sizing.
+
+**Freshness measured before the reads rather than after them.** The reader took
+`now` first and then performed two awaits. An eighty-nine-second-old price with
+two seconds of database and market reads in between therefore passed a
+ninety-second bound and returned an assessment whose own `valid_until` had
+already gone by. The clock is now read after every input read. Reproduced with a
+controlled clock and a delaying market port; no test sleeps.
+
+**A policy bound by name while its content decided the answer.** Two policies
+both called `paper-sizing-v1`, one tolerating ninety seconds and one a hundred
+and eighty, produced identical digests and validity windows ninety seconds
+apart. The full policy content is now hashed and recorded, so a policy change is
+either a different identity or nothing at all — never an undetected substitution.
 
 ---
 

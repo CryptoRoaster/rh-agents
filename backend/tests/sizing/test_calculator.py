@@ -121,21 +121,41 @@ def test_the_price_is_usd_per_whole_base_token(now):
 # ------------------------------------------------------------------- freshness
 
 
-def test_a_price_exactly_at_the_freshness_boundary_is_still_usable(now):
-    """The boundary is inclusive, matching every other freshness rule here."""
-    reading = assess(now, price=reference_price(now, age=PAPER_SIZING_V1.max_price_age))
-    assert reading.kind == "sizing_assessment"
-
-
 def test_a_price_just_inside_the_boundary_is_usable(now):
     edge = PAPER_SIZING_V1.max_price_age - timedelta(microseconds=1)
-    assert assess(now, price=reference_price(now, age=edge)).kind == "sizing_assessment"
+    reading = assess(now, price=reference_price(now, age=edge))
+    assert reading.kind == "sizing_assessment"
+    assert reading.is_current_at(now)
+
+
+def test_a_price_exactly_at_the_freshness_boundary_is_already_stale(now):
+    """The boundary instant belongs to the expired side.
+
+    Half-open, like every other validity in this system: an evidence envelope
+    is `STALE` at `now >= valid_until`, and a COMMANDER context is current only
+    while `instant < valid_until`. Succeeding here would have produced a reading
+    whose own `valid_until` equalled the instant it was made at — an assessment
+    and a usability check contradicting each other at the same moment.
+    """
+    reading = assess(now, price=reference_price(now, age=PAPER_SIZING_V1.max_price_age))
+    assert reading.reason == SizingRefusal.SIZING_PRICE_STALE
 
 
 def test_a_price_just_past_the_boundary_is_stale(now):
     edge = PAPER_SIZING_V1.max_price_age + timedelta(microseconds=1)
     reading = assess(now, price=reference_price(now, age=edge))
     assert reading.reason == SizingRefusal.SIZING_PRICE_STALE
+
+
+@pytest.mark.parametrize("microseconds", [0, 1, 1000, 30_000_000, 89_999_999])
+def test_a_successful_reading_is_always_still_usable_when_it_is_made(now, microseconds):
+    """Success and usability may never disagree, at any age inside the window."""
+    age = timedelta(microseconds=microseconds)
+    reading = assess(now, price=reference_price(now, age=age))
+    assert reading.kind == "sizing_assessment"
+    assert reading.is_current_at(now)
+    assert not reading.is_current_at(reading.valid_until)
+    assert reading.is_current_at(reading.valid_until - timedelta(microseconds=1))
 
 
 def test_a_price_observed_in_the_future_is_not_merely_stale(now):

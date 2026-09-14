@@ -39,8 +39,9 @@ from pydantic import (
 )
 
 from src.core.models import Side, TradingMode
-from src.core.numbers import canonical_decimal
 from src.markets.models import exact_number, market_decimal_bounds
+from src.orchestration.sizing.canonical import lossless_decimal
+from src.orchestration.sizing.policy import PaperSizingPolicy
 
 Identifier = Annotated[str, Field(min_length=1, max_length=200, pattern=r"^\S(?:.*\S)?$")]
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -118,6 +119,59 @@ class SizingRefusal(StrEnum):
     SIZING_CASE_UNAVAILABLE = "SIZING_CASE_UNAVAILABLE"
 
 
+class SizingPolicySnapshot(Immutable):
+    """Every policy parameter a result or its validity depends on.
+
+    Carried on the reading and hashed into its identity, because a version
+    string is a label and a label can be reused. Two policies both calling
+    themselves `paper-sizing-v1` while tolerating different price ages produce
+    different validity windows, and binding only the name made that difference
+    invisible: identical digests, and an assessment that expired ninety seconds
+    apart depending on which object happened to be configured.
+
+    The freshness bound is held in whole microseconds rather than as a float
+    number of seconds, so the value that reaches the hash is exactly the value
+    the policy holds.
+    """
+
+    version: Identifier
+    max_price_age_microseconds: int = Field(strict=True, gt=0)
+    supported_sides: tuple[Side, ...] = Field(min_length=1)
+    supported_modes: tuple[TradingMode, ...] = Field(min_length=1)
+    max_quantity_decimal_places: int = Field(strict=True, ge=0, le=18)
+    max_quantity_total_digits: int = Field(strict=True, ge=1, le=38)
+
+    @classmethod
+    def of(cls, policy: PaperSizingPolicy) -> "SizingPolicySnapshot":
+        """Read a policy into the form that travels with a reading.
+
+        Sets are ordered on the way in, so the same policy always produces the
+        same bytes regardless of how a frozenset happened to iterate.
+        """
+        age = policy.max_price_age
+        return cls(
+            version=policy.version,
+            max_price_age_microseconds=(age.days * 86400 + age.seconds) * 1_000_000
+            + age.microseconds,
+            supported_sides=tuple(sorted(policy.supported_sides, key=lambda item: item.value)),
+            supported_modes=tuple(sorted(policy.supported_modes, key=lambda item: item.value)),
+            max_quantity_decimal_places=policy.max_quantity_decimal_places,
+            max_quantity_total_digits=policy.max_quantity_total_digits,
+        )
+
+    @property
+    def canonical(self) -> dict[str, object]:
+        """The policy as hashable content, in one fixed shape."""
+        return {
+            "version": self.version,
+            "max_price_age_microseconds": self.max_price_age_microseconds,
+            "supported_sides": [item.value for item in self.supported_sides],
+            "supported_modes": [item.value for item in self.supported_modes],
+            "max_quantity_decimal_places": self.max_quantity_decimal_places,
+            "max_quantity_total_digits": self.max_quantity_total_digits,
+        }
+
+
 class ReferencePrice(Immutable):
     """One recorded observation of what one base token is worth in USD.
 
@@ -162,7 +216,7 @@ class SizingAssessment(Immutable):
 
     kind: Literal["sizing_assessment"] = "sizing_assessment"
     outcome: Literal[SizingOutcome.SIZING_INPUT_AVAILABLE] = SizingOutcome.SIZING_INPUT_AVAILABLE
-    policy_version: Identifier
+    policy: SizingPolicySnapshot
     trade_case_id: UUID
     base_asset_id: Identifier
     setup_evidence_id: UUID
@@ -192,6 +246,21 @@ class SizingAssessment(Immutable):
     valid_until: AwareDatetime
     input_digest: Digest
 
+    @property
+    def policy_version(self) -> str:
+        return self.policy.version
+
+    def is_current_at(self, instant: datetime) -> bool:
+        """Whether this reading still describes the market at `instant`.
+
+        Half-open, exactly like every other validity in this system: an evidence
+        envelope is `STALE` at `now >= valid_until` and a COMMANDER context is
+        current only while `instant < valid_until`. The boundary instant belongs
+        to the expired side, so a successful reading is never one that is
+        already unusable — see `assess_paper_sizing`, which refuses there.
+        """
+        return instant < self.valid_until
+
     @model_validator(mode="after")
     def coherent(self) -> Self:
         if self.reference_price.asset_id != self.base_asset_id:
@@ -220,9 +289,17 @@ class SizingRefused(Immutable):
 
     kind: Literal["sizing_refused"] = "sizing_refused"
     reason: SizingRefusal
-    policy_version: Identifier
+    # The policy the refusal was reached under, whole. Several reasons depend on
+    # its content rather than only on its name — a price is stale against a
+    # tolerance, a side is unsupported against a set — so a refusal that carried
+    # only a version label would not say what it was measured against.
+    policy: SizingPolicySnapshot
     trade_case_id: UUID
     base_asset_id: Identifier | None = None
+
+    @property
+    def policy_version(self) -> str:
+        return self.policy.version
 
 
 SizingReading = SizingAssessment | SizingRefused
@@ -230,7 +307,7 @@ SizingReading = SizingAssessment | SizingRefused
 
 def sizing_input_digest(
     *,
-    policy_version: str,
+    policy: SizingPolicySnapshot,
     trade_case_id: UUID,
     base_asset_id: str,
     setup_evidence_id: UUID,
@@ -260,20 +337,20 @@ def sizing_input_digest(
     """
     canonical = json.dumps(
         {
-            "policy_version": policy_version,
+            "policy": policy.canonical,
             "trade_case_id": str(trade_case_id),
             "base_asset_id": base_asset_id,
             "setup_evidence_id": str(setup_evidence_id),
             "side": side.value,
             "trading_mode": trading_mode.value,
-            "requested_notional_usd": canonical_decimal(requested_notional_usd),
+            "requested_notional_usd": lossless_decimal(requested_notional_usd),
             "reference_price": {
                 "snapshot_id": str(price.snapshot_id),
                 "observation_id": str(price.observation_id),
                 "provider": price.provider,
                 "asset_id": price.asset_id,
                 "price_basis": price.price_basis,
-                "usd_per_base_unit": canonical_decimal(price.usd_per_base_unit),
+                "usd_per_base_unit": lossless_decimal(price.usd_per_base_unit),
                 "observed_at": _instant(price.observed_at),
             },
             "base_asset": {

@@ -6,6 +6,7 @@ against a recorded price, and a reading permits nothing.
 """
 
 from src.orchestration.sizing.calculator import assess_paper_sizing
+from src.orchestration.sizing.canonical import lossless_decimal
 from src.orchestration.sizing.context import (
     PaperSizingReader,
     SizingCaseSource,
@@ -16,6 +17,7 @@ from src.orchestration.sizing.models import (
     ReferencePrice,
     SizingAssessment,
     SizingOutcome,
+    SizingPolicySnapshot,
     SizingReading,
     SizingRefusal,
     SizingRefused,
@@ -33,9 +35,11 @@ __all__ = [
     "SizingCaseSource",
     "SizingMarketInput",
     "SizingOutcome",
+    "SizingPolicySnapshot",
     "SizingReading",
     "SizingRefusal",
     "SizingRefused",
     "assess_paper_sizing",
+    "lossless_decimal",
     "sizing_input_digest",
 ]
