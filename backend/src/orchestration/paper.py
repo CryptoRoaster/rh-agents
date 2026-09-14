@@ -1,7 +1,6 @@
 """Trusted internal entry point: serialize risk + fill + ledger in one DB transaction."""
 
 import logging
-from datetime import UTC
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -12,12 +11,9 @@ from src.core.models import (
     ExecutionResult,
     MarketSnapshot,
     OrderIntent,
-    Position,
-    RiskContext,
     RiskDecision,
     RiskLimits,
     RiskOutcome,
-    SafetyStatus,
     TradeIntent,
     TradingMode,
 )
@@ -25,6 +21,7 @@ from src.data.repository import append, read_position, save_position
 from src.data.tables import AccountRow, ExecutionRow, IntentRow, PositionRow, RiskRow
 from src.execution.paper import PaperExecutor
 from src.ledger.accounting import apply_fill, calculate_pnl
+from src.ledger.portfolio import portfolio_state, roll_loss_day
 from src.risk.engine import evaluate
 
 logger = logging.getLogger(__name__)
@@ -99,59 +96,26 @@ class PaperTradingService:
             # Read time after acquiring the lock and loading the portfolio: time
             # spent waiting must count toward freshness and the UTC loss day.
             now = self._clock.now()
-            prices = {market.asset_id: market.price_usd}
-            valid_marks = True
-            for holding in positions:
-                if holding.quantity == 0 or holding.asset_id == market.asset_id:
-                    continue
-                mark = (marks or {}).get(holding.asset_id)
-                if (
-                    mark is None
-                    or mark.asset_id != holding.asset_id
-                    or not 0
-                    <= (now - mark.observed_at).total_seconds()
-                    <= self.limits.max_snapshot_age_seconds
-                ):
-                    valid_marks = False
-                    continue
-                prices[holding.asset_id] = mark.price_usd
+            roll_loss_day(account, now)
+            # One implementation of "what does the account hold, valued?", shared
+            # with the case-bound risk request. Two would eventually disagree
+            # about money, and which was right would be decided by whichever ran.
+            state = portfolio_state(
+                cash_usd=account.cash_usd,
+                realized_loss_today_usd=account.realized_loss_today_usd,
+                positions=positions,
+                asset_id=intent.asset_id,
+                price_usd=market.price_usd,
+                marks=marks,
+                now=now,
+                max_snapshot_age_seconds=self.limits.max_snapshot_age_seconds,
+                correlation_id=intent.correlation_id,
+            )
+            for mark in state.marks_used:
                 await append(session, mark)
-            position = next((p for p in positions if p.asset_id == intent.asset_id), None)
-            if position is None:
-                position = Position(
-                    source="LEDGER",
-                    correlation_id=intent.correlation_id,
-                    asset_id=intent.asset_id,
-                    created_at=now,
-                    updated_at=now,
-                )
-            exposure = sum(
-                (p.quantity * prices.get(p.asset_id, Decimal("0")) for p in positions), Decimal("0")
-            )
-            unrealized_loss = sum(
-                (
-                    max(
-                        Decimal("0"),
-                        p.cost_basis_usd - p.quantity * prices.get(p.asset_id, Decimal("0")),
-                    )
-                    for p in positions
-                ),
-                Decimal("0"),
-            )
-            loss_day = now.astimezone(UTC).date()
-            if account.loss_day != loss_day:
-                account.loss_day, account.realized_loss_today_usd = loss_day, Decimal("0")
+            position, prices, context = state.position, state.prices, state.context
             limits = self.limits.model_copy(
                 update={"kill_switch": self.limits.kill_switch or account.paused}
-            )
-            context = RiskContext(
-                cash_usd=account.cash_usd,
-                exposure_usd=exposure if valid_marks else None,
-                position_quantity=position.quantity,
-                daily_loss_usd=account.realized_loss_today_usd + unrealized_loss
-                if valid_marks
-                else None,
-                accounting=SafetyStatus.PASS if valid_marks else SafetyStatus.UNKNOWN,
             )
             risk = evaluate(intent, market, context, limits, now=now)
             await append(session, market)

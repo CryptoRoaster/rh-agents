@@ -89,21 +89,22 @@ def test_sizing_builds_nothing_that_could_be_executed(forbidden):
     assert forbidden not in package_identifiers()
 
 
-def test_the_source_tree_still_produces_no_trade_intent():
-    """The assertion this phase deliberately leaves standing.
+def test_sizing_itself_still_produces_no_trade_intent():
+    """Sizing computes a size. Something else turns one into a request.
 
-    A requested size now exists, and that is the whole of 2M-A. Turning it into
-    a `TradeIntent` needs a durable identity that survives a crash between the
-    request and the fill, and that identity is not designed yet.
+    Phase 2M-C settled the durable identity that was missing and built the
+    intent in one narrow server-side service. This package is deliberately not
+    that service, and the separation is asserted rather than assumed.
     """
     found = subprocess.run(
-        ["git", "grep", "-n", "TradeIntent(", "--", "backend/src/"],
+        ["git", "grep", "-l", "--untracked", "TradeIntent(", "--", "backend/src/"],
         capture_output=True,
         text=True,
         cwd="..",
-    ).stdout.strip()
-    lines = [line for line in found.split("\n") if line and "class TradeIntent(" not in line]
-    assert lines == [], f"a trade intent is now constructed: {lines}"
+    ).stdout.split()
+    assert "backend/src/orchestration/sizing/models.py" not in found
+    assert "backend/src/orchestration/sizing/context.py" not in found
+    assert "backend/src/orchestration/riskrequest/service.py" in found
 
 
 @pytest.mark.parametrize(

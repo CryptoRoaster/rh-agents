@@ -143,24 +143,27 @@ def test_the_package_never_constructs_a_trade_intent():
         assert forbidden not in identifiers
 
 
-def test_nothing_in_the_source_tree_produces_a_requested_trade_size():
-    """The architecture gap, asserted where a future edit would have to pass it.
+def test_only_the_risk_request_service_produces_a_requested_trade_size():
+    """The gap this file recorded is closed, and the assertion is inverted.
 
-    If some component ever starts constructing a `TradeIntent`, this fails — and
-    that is the signal that the control plane's honest stop can finally become a
-    risk request rather than a reported gap.
+    It said a `TradeIntent` constructor appearing anywhere would be the signal
+    that the control plane's honest stop could finally become a risk request.
+    That happened in Phase 2M-C, so the test now pins *where* — exactly one
+    server-side service may build the object that carries a size into a risk
+    evaluation, and nothing in the control plane may.
     """
     import subprocess
 
     found = subprocess.run(
-        ["git", "grep", "-n", "TradeIntent(", "--", "backend/src/"],
+        ["git", "grep", "-l", "--untracked", "TradeIntent(", "--", "backend/src/"],
         capture_output=True,
         text=True,
         cwd="..",
-    ).stdout.strip()
-    # Only the class definition itself, never a construction.
-    lines = [line for line in found.split("\n") if line and "class TradeIntent(" not in line]
-    assert lines == [], f"a requested trade size now exists: {lines}"
+    ).stdout.split()
+    assert sorted(found) == [
+        "backend/src/core/models.py",
+        "backend/src/orchestration/riskrequest/service.py",
+    ]
 
 
 def test_no_sizing_number_appears_in_the_policy():

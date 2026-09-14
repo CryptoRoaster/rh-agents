@@ -6,6 +6,7 @@ execution capabilities.
 """
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -26,7 +27,7 @@ from src.data.tables import (
     TradeCaseTransitionRow,
 )
 from src.markets.models import MarketIdentity
-from src.orchestration.workflow.engine import TradeCaseEvaluator, active_evidence
+from src.orchestration.workflow.engine import Evaluation, TradeCaseEvaluator, active_evidence
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
     TERMINAL_TASK_STATUSES,
@@ -119,6 +120,20 @@ CASE_TRANSITIONS: dict[TradeCaseStatus, frozenset[TradeCaseStatus]] = {
     TradeCaseStatus.RISK_APPROVED: COMMON_BACKTRACKS,
     TradeCaseStatus.RISK_LIMITED: COMMON_BACKTRACKS,
 }
+
+
+@dataclass(frozen=True)
+class WorkflowInputs:
+    """Everything the central evaluator reads, loaded once and held.
+
+    Exists so loading and judging can happen at two clearly separated moments:
+    the reads under the caller's locks, then one clock read, then a synchronous
+    verdict on exactly what was loaded.
+    """
+
+    trade_case: TradeCase
+    evidence: tuple[EvidenceEnvelope, ...]
+    risk_binding: RiskBinding | None
 
 
 def canonical_digest(value: object) -> str:
@@ -837,6 +852,63 @@ class TradeCaseService:
             await self._stabilize(session, row)
             return case_from_row(row)
 
+    async def workflow_inputs_in_session(
+        self, session: AsyncSession, row: TradeCaseRow
+    ) -> WorkflowInputs:
+        """Load everything an evaluation needs, inside a caller's transaction.
+
+        Separated from the evaluation itself so a caller can read its clock
+        *after* the last of these reads. An instant taken before them describes
+        the moment the loading started, not the moment the answer is used, and a
+        case can lapse in between — which is exactly the window this split
+        closes.
+
+        Read-only, and the same reads `_stabilize` performs.
+        """
+        trade_case = case_from_row(row)
+        evidence = tuple(
+            evidence_from_row(item)
+            for item in (
+                await session.scalars(
+                    select(TradeCaseEvidenceRow)
+                    .where(TradeCaseEvidenceRow.trade_case_id == row.id)
+                    .order_by(
+                        TradeCaseEvidenceRow.recorded_at,
+                        TradeCaseEvidenceRow.evidence_id,
+                    )
+                )
+            ).all()
+        )
+        binding_row = await session.scalar(
+            select(TradeCaseRiskBindingRow)
+            .where(TradeCaseRiskBindingRow.trade_case_id == row.id)
+            .order_by(
+                TradeCaseRiskBindingRow.case_revision.desc(),
+                TradeCaseRiskBindingRow.recorded_at.desc(),
+                TradeCaseRiskBindingRow.binding_id.desc(),
+            )
+            .limit(1)
+        )
+        return WorkflowInputs(
+            trade_case=trade_case,
+            evidence=evidence,
+            risk_binding=risk_from_row(binding_row) if binding_row is not None else None,
+        )
+
+    def evaluate_inputs(self, inputs: WorkflowInputs, now: datetime) -> Evaluation:
+        """What the case is at `now`, computed without touching the database.
+
+        Synchronous on purpose: nothing between a caller's last clock read and
+        this answer may await, or the instant the answer describes drifts again.
+
+        Deliberately the *same* evaluator `_stabilize` uses. There is one
+        requirement table, one transition matrix and one freshness rule, and
+        this reads them at the instant given instead of trusting a row written
+        at an earlier one. Nothing here writes, so the caller decides what the
+        answer means.
+        """
+        return self.evaluator.evaluate(inputs.trade_case, inputs.evidence, inputs.risk_binding, now)
+
     async def _stabilize(self, session: AsyncSession, row: TradeCaseRow) -> None:
         for _ in range(12):
             trade_case = case_from_row(row)
@@ -936,74 +1008,106 @@ class TradeCaseService:
         risk_input_digest: str,
         expected_revision: int | None = None,
     ) -> TradeCase:
-        decision = RiskDecision.model_validate_json(decision.model_dump_json())
         async with self.sessions.begin() as session:
             row = await self._locked_case(session, trade_case_id)
-            payload = decision.model_dump(mode="json")
-            existing = await session.scalar(
-                select(TradeCaseRiskBindingRow).where(
-                    TradeCaseRiskBindingRow.risk_decision_id == decision.id
-                )
-            )
-            if existing is not None:
-                binding = risk_from_row(existing)
-                if (
-                    binding.trade_case_id != trade_case_id
-                    or binding.risk_input_digest != risk_input_digest
-                    or binding.decision_payload != payload
-                ):
-                    raise WorkflowFailure(WorkflowErrorCode.IDEMPOTENCY_CONFLICT)
-                await self._stabilize(session, row)
-                return case_from_row(row)
-            self._mutable(row, expected_revision)
-            if (
-                row.status != TradeCaseStatus.READY_FOR_RISK.value
-                or row.risk_input_digest != risk_input_digest
-                or decision.correlation_id != row.correlation_id
-                or decision.evaluated_at > self.clock.now()
-                or self.clock.now() >= decision.expires_at
-            ):
-                raise WorkflowFailure(WorkflowErrorCode.RISK_BINDING)
-            recorded_at = self.clock.now()
-            authorization = classify_decision(decision)
-            session.add(
-                TradeCaseRiskBindingRow(
-                    binding_id=uuid5(
-                        NAMESPACE_URL,
-                        f"rh-agents:trade-case-risk:{trade_case_id}:{decision.id}",
-                    ),
-                    trade_case_id=trade_case_id,
-                    risk_decision_id=decision.id,
-                    case_revision=row.revision,
-                    risk_input_digest=risk_input_digest,
-                    outcome=decision.outcome.value,
-                    authorization=authorization.value,
-                    reason_codes=list(decision.reason_codes),
-                    position_size_limit_usd=decision.position_size_limit_usd,
-                    max_additional_notional_usd=decision.max_additional_notional_usd,
-                    max_slippage_bps=decision.max_slippage_bps,
-                    evaluated_at=decision.evaluated_at,
-                    expires_at=decision.expires_at,
-                    recorded_at=recorded_at,
-                    correlation_id=decision.correlation_id,
-                    payload=payload,
-                )
-            )
-            self._event(
+            await self.record_risk_decision_in_session(
                 session,
                 row,
-                "RISK_DECISION_BOUND",
-                "SENTINEL_DECISION_BOUND",
-                {
-                    "risk_decision_id": str(decision.id),
-                    "risk_input_digest": risk_input_digest,
-                    "outcome": decision.outcome.value,
-                    "authorization": authorization.value,
-                },
+                decision,
+                risk_input_digest=risk_input_digest,
+                expected_revision=expected_revision,
             )
-            await session.flush()
-            await self._stabilize(session, row)
             return case_from_row(row)
+
+    async def record_risk_decision_in_session(
+        self,
+        session: AsyncSession,
+        row: TradeCaseRow,
+        decision: RiskDecision,
+        *,
+        risk_input_digest: str,
+        expected_revision: int | None = None,
+    ) -> UUID:
+        """Bind one SENTINEL decision inside a transaction the caller owns.
+
+        Exists because a decision and the state it was reached from have to
+        commit together. A caller that has already locked the paper account and
+        assembled a portfolio cannot hand the write to a service that opens its
+        own transaction: the two would commit independently, and a crash between
+        them would leave a decision bound to a portfolio nobody can reconstruct.
+
+        The caller must already hold the case row locked, which is what the
+        row argument makes visible. Lock order stays paper account, then trade
+        case.
+        """
+        decision = RiskDecision.model_validate_json(decision.model_dump_json())
+        trade_case_id = row.id
+        payload = decision.model_dump(mode="json")
+        existing = await session.scalar(
+            select(TradeCaseRiskBindingRow).where(
+                TradeCaseRiskBindingRow.risk_decision_id == decision.id
+            )
+        )
+        if existing is not None:
+            binding = risk_from_row(existing)
+            if (
+                binding.trade_case_id != trade_case_id
+                or binding.risk_input_digest != risk_input_digest
+                or binding.decision_payload != payload
+            ):
+                raise WorkflowFailure(WorkflowErrorCode.IDEMPOTENCY_CONFLICT)
+            await self._stabilize(session, row)
+            return binding.binding_id
+        self._mutable(row, expected_revision)
+        if (
+            row.status != TradeCaseStatus.READY_FOR_RISK.value
+            or row.risk_input_digest != risk_input_digest
+            or decision.correlation_id != row.correlation_id
+            or decision.evaluated_at > self.clock.now()
+            or self.clock.now() >= decision.expires_at
+        ):
+            raise WorkflowFailure(WorkflowErrorCode.RISK_BINDING)
+        recorded_at = self.clock.now()
+        authorization = classify_decision(decision)
+        binding_id = uuid5(
+            NAMESPACE_URL,
+            f"rh-agents:trade-case-risk:{trade_case_id}:{decision.id}",
+        )
+        session.add(
+            TradeCaseRiskBindingRow(
+                binding_id=binding_id,
+                trade_case_id=trade_case_id,
+                risk_decision_id=decision.id,
+                case_revision=row.revision,
+                risk_input_digest=risk_input_digest,
+                outcome=decision.outcome.value,
+                authorization=authorization.value,
+                reason_codes=list(decision.reason_codes),
+                position_size_limit_usd=decision.position_size_limit_usd,
+                max_additional_notional_usd=decision.max_additional_notional_usd,
+                max_slippage_bps=decision.max_slippage_bps,
+                evaluated_at=decision.evaluated_at,
+                expires_at=decision.expires_at,
+                recorded_at=recorded_at,
+                correlation_id=decision.correlation_id,
+                payload=payload,
+            )
+        )
+        self._event(
+            session,
+            row,
+            "RISK_DECISION_BOUND",
+            "SENTINEL_DECISION_BOUND",
+            {
+                "risk_decision_id": str(decision.id),
+                "risk_input_digest": risk_input_digest,
+                "outcome": decision.outcome.value,
+                "authorization": authorization.value,
+            },
+        )
+        await session.flush()
+        await self._stabilize(session, row)
+        return binding_id
 
     async def expire_trade_case(self, trade_case_id: UUID) -> TradeCase:
         async with self.sessions.begin() as session:
