@@ -34,6 +34,8 @@ from src.orchestration.commander.policy import COMMANDER_CONTROL_V1, CommanderCo
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
     TradeCase,
+    TradeCaseStatus,
+    WorkflowFailure,
 )
 from src.orchestration.workflow.service import TradeCaseService
 
@@ -49,8 +51,18 @@ class IntakeRefusal(StrEnum):
     MARKET_UNAVAILABLE = "MARKET_UNAVAILABLE"
     IDENTITY_INVALID = "IDENTITY_INVALID"
     ACTIVE_CASE_EXISTS = "ACTIVE_CASE_EXISTS"
+    # This exact intake generation has already been opened. A replay, not a new
+    # case — and reporting it as opened is what made a cancelled predecessor
+    # look like fresh work.
+    ALREADY_OPENED = "ALREADY_OPENED"
+    # SENTINEL rejected the most recent case for this market. Re-observing a
+    # market is not new information about risk, and must not launder a refusal.
+    RISK_REJECTED_FOR_MARKET = "RISK_REJECTED_FOR_MARKET"
     CYCLE_LIMIT_REACHED = "CYCLE_LIMIT_REACHED"
     SYSTEM_PAUSED = "SYSTEM_PAUSED"
+    # The open was refused by the workflow itself. Recorded per candidate so one
+    # bad candidate cannot abort a whole cycle.
+    OPEN_REFUSED = "OPEN_REFUSED"
 
 
 @dataclass(frozen=True)
@@ -97,17 +109,35 @@ class CommanderIntakeService:
     # Supplied only by a deployment that also runs Phase 0 accounting.
     pause: SystemPausePort | None = None
 
-    def intake_key(self, candidate: MarketCandidate) -> str:
+    def intake_key(self, candidate: MarketCandidate, predecessor: UUID | None) -> str:
         """The deterministic identity of the case this candidate would open.
 
-        Derived from the canonical market identity — never from a ticker, symbol
-        or display name, which are not identities and are not unique. Two workers
-        handling the same candidate compute the same key and therefore address
-        the same case.
-        """
-        return f"commander-intake:{self.policy.version}:{candidate.pair_id}"
+        Three requirements pull in different directions and this is the smallest
+        shape that satisfies all of them.
 
-    def intake_correlation(self, candidate: MarketCandidate) -> UUID:
+        *Replay must converge.* Two workers handling the same candidate, and the
+        same worker retrying, must address one case — so the key cannot contain
+        anything per-worker or per-observation.
+
+        *One active case per market.* So the key cannot be unique per candidate
+        either; that would open a case per observation.
+
+        *A terminal predecessor must not block the market forever.* A key that is
+        constant per market does exactly that: once the first case ends, every
+        later observation either replays the dead case or collides with it.
+
+        So the key is scoped to the **generation**: the market, plus the case
+        that last ended for it. Everyone computing it sees the same predecessor
+        and derives the same key, and the key changes exactly once per
+        generation — never per observation and never per worker.
+
+        The market identity is canonical throughout. Never a ticker, symbol or
+        display name, which are not identities and are not unique.
+        """
+        generation = "initial" if predecessor is None else str(predecessor)
+        return f"commander-intake:{self.policy.version}:{candidate.pair_id}:{generation}"
+
+    def intake_correlation(self, candidate: MarketCandidate, predecessor: UUID | None) -> UUID:
         """The correlation two racing workers must agree on.
 
         Derived rather than generated, and that is not a detail. `open_trade_case`
@@ -117,11 +147,11 @@ class CommanderIntakeService:
         collide as a conflict instead of converging on one case. Idempotency that
         only holds when one process runs is not idempotency.
         """
-        return uuid5(NAMESPACE_URL, f"rh-agents:{self.intake_key(candidate)}")
+        return uuid5(NAMESPACE_URL, f"rh-agents:{self.intake_key(candidate, predecessor)}")
 
     async def run_cycle(self) -> IntakeOutcome:
         """One bounded pass over recorded candidates."""
-        if self.kill_switch or await self._paused():
+        if await self._halted():
             return IntakeOutcome(refused=(("*", IntakeRefusal.SYSTEM_PAUSED),))
 
         now = self.clock.now()
@@ -137,38 +167,41 @@ class CommanderIntakeService:
             if len(opened) >= self.policy.max_cases_per_cycle:
                 refused.append((candidate.pair_id, IntakeRefusal.CYCLE_LIMIT_REACHED))
                 continue
-            refusal = await self._refusal(candidate, now)
+            refusal, predecessor = await self._refusal(candidate, now)
             if refusal is not None:
                 refused.append((candidate.pair_id, refusal))
                 continue
-            case = await self._open(candidate, now)
+            # Re-checked immediately before the one write this service performs.
+            # A stop that came into force while candidates were being read had
+            # previously already been passed: the gate was at the top of the
+            # cycle and nothing looked again. The window cannot be closed by
+            # reading earlier — only by reading last.
+            if await self._halted():
+                refused.append((candidate.pair_id, IntakeRefusal.SYSTEM_PAUSED))
+                continue
+            try:
+                case = await self._open(candidate, now, predecessor)
+            except WorkflowFailure:
+                # One candidate the workflow declined must not end the cycle.
+                # The previous implementation let an idempotency conflict escape
+                # and take every remaining candidate down with it.
+                refused.append((candidate.pair_id, IntakeRefusal.OPEN_REFUSED))
+                continue
             if case is None:
                 refused.append((candidate.pair_id, IntakeRefusal.MARKET_UNAVAILABLE))
                 continue
             opened.append(case)
         return IntakeOutcome(opened=tuple(opened), refused=tuple(refused))
 
-    async def _refusal(self, candidate: MarketCandidate, now: datetime) -> IntakeRefusal | None:
-        if candidate.chain not in self.policy.enabled_chains:
-            return IntakeRefusal.CHAIN_NOT_ENABLED
-        if candidate.is_fixture and not self.policy.allow_fixtures:
-            # A synthetic market must never start a real workflow.
-            return IntakeRefusal.FIXTURE_MARKET
-        # Age is measured from the market's own observation time, never from
-        # when we fetched it: a candidate recorded from an hour-old reading
-        # describes a market that has moved on.
-        if now - candidate.observed_at > self.policy.max_candidate_age:
-            return IntakeRefusal.CANDIDATE_TOO_OLD
-        if await self._active_case(candidate):
-            return IntakeRefusal.ACTIVE_CASE_EXISTS
-        return None
-
     async def _active_case(self, candidate: MarketCandidate) -> bool:
-        """Whether this market already has a live case.
+        """Whether any live case exists for this market.
 
-        Advisory only: it saves work and produces a clear refusal reason, and it
-        is deliberately not the thing that prevents duplicates. The idempotency
-        key does that, atomically, where a race can actually be lost.
+        Deliberately a question about *any* non-terminal case rather than about
+        the newest one. The newest-row ordering is only a total order, not a
+        statement about which case is alive, and two cases opened in the same
+        instant tie — so asking "is the newest one active" would let an active
+        case hide behind a terminal sibling. The safety rule is "at most one
+        active case per market", so that is the question asked.
         """
         async with self.sessions() as session:
             row = await session.scalar(
@@ -181,7 +214,82 @@ class CommanderIntakeService:
             )
         return row is not None
 
-    async def _open(self, candidate: MarketCandidate, now: datetime) -> TradeCase | None:
+    async def _latest_terminal(
+        self, candidate: MarketCandidate
+    ) -> tuple[UUID | None, TradeCaseStatus | None]:
+        """The most recently ended case for this market: the generation predecessor.
+
+        Only consulted once no live case exists. Ordered by open time with the
+        identifier as a stable tiebreak, so every worker derives the same
+        generation from the same rows — a count would instead depend on which
+        rows a racing transaction could already see.
+        """
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(TradeCaseRow.id, TradeCaseRow.status)
+                    .where(
+                        TradeCaseRow.market_key == candidate.pair_id,
+                        TradeCaseRow.status.in_([item.value for item in TERMINAL_CASE_STATUSES]),
+                    )
+                    .order_by(TradeCaseRow.opened_at.desc(), TradeCaseRow.id.desc())
+                    .limit(1)
+                )
+            ).first()
+        if row is None:
+            return None, None
+        return row[0], TradeCaseStatus(row[1])
+
+    async def _already_opened(self, key: str) -> bool:
+        """Whether this exact generation has been opened before."""
+        async with self.sessions() as session:
+            existing = await session.scalar(
+                select(TradeCaseRow.id).where(TradeCaseRow.open_idempotency_key == key).limit(1)
+            )
+        return existing is not None
+
+    async def _refusal(
+        self, candidate: MarketCandidate, now: datetime
+    ) -> tuple[IntakeRefusal | None, UUID | None]:
+        """Whether this candidate may open a case, and which generation it is.
+
+        Operational checks only. Nothing here weighs the market.
+        """
+        if candidate.chain not in self.policy.enabled_chains:
+            return IntakeRefusal.CHAIN_NOT_ENABLED, None
+        if candidate.is_fixture and not self.policy.allow_fixtures:
+            # A synthetic market must never start a real workflow.
+            return IntakeRefusal.FIXTURE_MARKET, None
+        # Age is measured from the market's own observation time, never from
+        # when we fetched it: a candidate recorded from an hour-old reading
+        # describes a market that has moved on.
+        if now - candidate.observed_at > self.policy.max_candidate_age:
+            return IntakeRefusal.CANDIDATE_TOO_OLD, None
+
+        if await self._active_case(candidate):
+            return IntakeRefusal.ACTIVE_CASE_EXISTS, None
+
+        latest_id, latest_status = await self._latest_terminal(candidate)
+        if latest_status == TradeCaseStatus.RISK_REJECTED:
+            # A rejection is a verdict about this market's current state, not a
+            # case that merely ran out of road. Re-observing a market produces no
+            # new information about risk, so a fresh observation must not start a
+            # new attempt at the same question — that would be retry-until-pass
+            # with extra steps. Only an evidence change inside a live case can
+            # legitimately lead to a new assessment, and that path does not run
+            # through intake.
+            return IntakeRefusal.RISK_REJECTED_FOR_MARKET, None
+
+        # EXPIRED and CANCELLED end a case without deciding anything about the
+        # market, so the next observation may open the next generation.
+        key = self.intake_key(candidate, latest_id)
+        if await self._already_opened(key):
+            return IntakeRefusal.ALREADY_OPENED, latest_id
+        return None, latest_id
+
+    async def _open(
+        self, candidate: MarketCandidate, now: datetime, predecessor: UUID | None
+    ) -> TradeCase | None:
         """Open one case from a candidate whose snapshot is still readable.
 
         The snapshot is re-read rather than reconstructed from the candidate:
@@ -198,8 +306,8 @@ class CommanderIntakeService:
         return await self.cases.open_trade_case(
             snapshot.pair.market_identity,
             originating_discovery_reference=candidate.id,
-            correlation_id=self.intake_correlation(candidate),
-            idempotency_key=self.intake_key(candidate),
+            correlation_id=self.intake_correlation(candidate, predecessor),
+            idempotency_key=self.intake_key(candidate, predecessor),
             # Measured from the observation that produced this candidate rather
             # than from now, for the same reason as the correlation: two workers
             # reading the same candidate a second apart must compute the same
@@ -207,12 +315,20 @@ class CommanderIntakeService:
             expires_at=candidate.observed_at + self.policy.case_lifetime,
         )
 
-    async def _paused(self) -> bool:
-        """Whether a durable system-wide stop is in force.
+    async def _halted(self) -> bool:
+        """Whether any system-wide stop is in force.
 
-        Supplied through the same port the context reader uses, and for the same
-        reason: the durable pause lives in the Phase 0 accounting subsystem,
-        which the TradeCase workflow has no link to and whose schema a
-        workflow-only deployment does not carry.
+        Fails closed on every uncertainty. A missing pause port, a missing
+        account row or a control that cannot be read are all *unknown*, and
+        unknown is not permission — this system's standing rule everywhere else.
+        The previous implementation treated all three as "not paused", which
+        turned an unavailable stop into a green light.
         """
-        return False if self.pause is None else await self.pause.system_paused()
+        if self.kill_switch:
+            return True
+        if self.pause is None:
+            # No stop source configured. A service that may open real cases must
+            # be told where the stop lives; not knowing is not the same as being
+            # told there is none.
+            return True
+        return await self.pause.system_paused()

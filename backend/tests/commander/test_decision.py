@@ -20,10 +20,10 @@ from src.orchestration.workflow.models import EvidenceType, TradeCaseStatus
 from tests.commander.conftest import (
     build_stack,
     context_for,
+    inject_pre_trigger_evidence,
+    inject_trigger,
     open_case,
-    pre_trigger_evidence,
     record,
-    triggered,
 )
 from tests.fuse.conftest import onchain
 
@@ -83,7 +83,9 @@ async def test_scenario_b_a_blocked_case_is_not_something_coordination_fixes(wor
     _, sessions = worker_db
 
     async def build(runtime, trade_case):
-        await pre_trigger_evidence(runtime.cases, trade_case, now, onchain=onchain(holder="FAIL"))
+        await inject_pre_trigger_evidence(
+            runtime.cases, trade_case, now, onchain=onchain(holder="FAIL")
+        )
 
     context, decision = await decided(sessions, now, trace, "cmd-blocked", build=build)
 
@@ -101,7 +103,9 @@ async def test_an_advisory_synthesis_cannot_unblock_anything(worker_db, now, tra
     _, sessions = worker_db
 
     async def build(runtime, trade_case):
-        await pre_trigger_evidence(runtime.cases, trade_case, now, onchain=onchain(holder="FAIL"))
+        await inject_pre_trigger_evidence(
+            runtime.cases, trade_case, now, onchain=onchain(holder="FAIL")
+        )
 
     context, decision = await decided(sessions, now, trace, "cmd-advisory", build=build)
     without = decide(context.model_copy(update={"advisory": None}), now, COMMANDER_CONTROL_V1)
@@ -117,7 +121,7 @@ async def test_scenario_c_a_ready_case_waits_for_pulse_not_for_a_price_check(wor
     _, sessions = worker_db
 
     async def build(runtime, trade_case):
-        await pre_trigger_evidence(runtime.cases, trade_case, now)
+        await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
 
     context, decision = await decided(sessions, now, trace, "cmd-trigger", build=build)
 
@@ -131,8 +135,8 @@ async def test_scenario_d_a_triggered_case_waits_for_anchor_not_for_a_quote(work
     _, sessions = worker_db
 
     async def build(runtime, trade_case):
-        setup = await pre_trigger_evidence(runtime.cases, trade_case, now)
-        await triggered(runtime.cases, trade_case, now, setup)
+        setup = await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
+        await inject_trigger(runtime.cases, trade_case, now, setup)
 
     context, decision = await decided(sessions, now, trace, "cmd-triggered", build=build)
 
@@ -156,7 +160,7 @@ async def test_scenario_m_a_kill_switch_outranks_every_case_level_eligibility(
 
     async def build(runtime, trade_case):
         if status_build == "ready":
-            await pre_trigger_evidence(runtime.cases, trade_case, now)
+            await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
 
     _, decision = await decided(
         sessions, now, trace, f"cmd-kill-{status_build}", build=build, kill_switch=True
@@ -235,7 +239,7 @@ def synthetic(status, *, risk=None, controls=None, digest="a" * 64):
     )
 
 
-def risk_state(authorization, *, matches: bool):
+def risk_state(authorization, *, matches: bool, expired: bool = False):
     from src.orchestration.commander.models import RiskState
     from src.risk.authorization import RiskAuthorization
 
@@ -245,7 +249,8 @@ def risk_state(authorization, *, matches: bool):
         authorization=RiskAuthorization(authorization),
         risk_input_digest="b" * 64,
         matches_current_inputs=matches,
-        expires_at=NOW_FOR_SYNTHETIC,
+        expired=expired,
+        expires_at=NOW_FOR_SYNTHETIC + timedelta(hours=1),
     )
 
 

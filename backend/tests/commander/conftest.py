@@ -18,12 +18,33 @@ from tests.worker.conftest import submission
 from tests.worker.conftest import worker_db as worker_db  # noqa: F401
 
 
-def build_stack(sessions, instant, *, kill_switch=False):
+class RunningSystem:
+    """A deployment whose stop source is configured and reports no stop.
+
+    Supplied explicitly because the control plane fails closed without one: an
+    unconfigured stop is unknown, and unknown is not permission. Tests that want
+    "the system is running" have to say so, which is the same thing a real
+    deployment has to do.
+    """
+
+    def __init__(self, paused: bool = False) -> None:
+        self.paused = paused
+
+    async def system_paused(self) -> bool:
+        return self.paused
+
+
+def build_stack(sessions, instant, *, kill_switch=False, pause=None, mode="PAPER"):
     clock = FixedClock(instant)
     cases = TradeCaseService(sessions, clock=clock)
     runtime = WorkerRuntimeService(sessions, cases, clock=clock)
     reader = CommanderContextReader(
-        cases=cases, sessions=sessions, clock=clock, kill_switch=kill_switch
+        cases=cases,
+        sessions=sessions,
+        clock=clock,
+        kill_switch=kill_switch,
+        pause=pause if pause is not None else RunningSystem(),
+        trading_mode=mode,
     )
     return runtime, reader
 
@@ -44,8 +65,15 @@ async def record(cases, trade_case, now, role, evidence_type, payload, *, key, *
     )
 
 
-async def pre_trigger_evidence(cases, trade_case, now, **overrides):
-    """ATLAS, SIGNAL and VECTOR; ORBIT is recorded when the case opens."""
+async def inject_pre_trigger_evidence(cases, trade_case, now, **overrides):
+    """Write ATLAS, SIGNAL and VECTOR evidence directly; ORBIT arrives at case open.
+
+    Named for what it does. No specialist worker runs here — those need
+    reasoning providers and market data this suite does not reach — so these
+    tests exercise the workflow and the control plane against evidence of the
+    right shape, not the specialists that would produce it. The one worker
+    actually executed anywhere in this suite is FUSE.
+    """
     await record(
         cases,
         trade_case,
@@ -75,7 +103,7 @@ async def pre_trigger_evidence(cases, trade_case, now, **overrides):
     )
 
 
-async def triggered(cases, trade_case, now, setup_evidence):
+async def inject_trigger(cases, trade_case, now, setup_evidence):
     from tests.worker.conftest import trigger_payload
 
     return await record(
@@ -111,6 +139,7 @@ class StubMarkets:
 
 def intake_service(sessions, instant, *, candidates=(), snapshots=None, **overrides):
     clock = FixedClock(instant)
+    overrides.setdefault("pause", RunningSystem())
     return CommanderIntakeService(
         cases=TradeCaseService(sessions, clock=clock),
         markets=StubMarkets(candidates, snapshots),

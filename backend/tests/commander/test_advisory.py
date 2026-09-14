@@ -18,12 +18,12 @@ from src.orchestration.workflow.engine import active_evidence, risk_input_digest
 from src.orchestration.workflow.models import EvidenceType, TradeCaseStatus
 from tests.commander.conftest import (
     build_stack,
+    inject_pre_trigger_evidence,
+    inject_trigger,
     open_case,
-    pre_trigger_evidence,
     record,
-    triggered,
 )
-from tests.commander.test_execution import anchor_evidence, observe
+from tests.commander.test_execution import inject_anchor_evidence, observe
 from tests.fuse.conftest import onchain, sentiment
 
 pytestmark = pytest.mark.usefixtures("worker_db")
@@ -57,9 +57,9 @@ async def test_scenario_p_an_absent_synthesis_blocks_nothing_and_implies_nothing
     _, sessions = worker_db
     runtime, reader = build_stack(sessions, now)
     trade_case = await open_case(runtime.cases, now, trace, "cmd-nofuse")
-    setup = await pre_trigger_evidence(runtime.cases, trade_case, now)
-    await triggered(runtime.cases, trade_case, now, setup)
-    await anchor_evidence(runtime.cases, trade_case, now, setup)
+    setup = await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
+    await inject_trigger(runtime.cases, trade_case, now, setup)
+    await inject_anchor_evidence(runtime.cases, trade_case, now, setup)
 
     context, decision = await observe(reader, trade_case, now)
 
@@ -82,7 +82,7 @@ async def test_scenario_q_a_synthesis_of_superseded_evidence_is_marked_not_curre
     _, sessions = worker_db
     runtime, reader = build_stack(sessions, now)
     trade_case = await open_case(runtime.cases, now, trace, "cmd-stalefuse")
-    await pre_trigger_evidence(runtime.cases, trade_case, now)
+    await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
     await synthesis_for(sessions, runtime, trade_case, now, trace)
 
     fresh, _ = await observe(reader, trade_case, now)
@@ -121,7 +121,7 @@ async def test_the_advisory_field_is_excluded_from_the_context_digest(worker_db,
     _, sessions = worker_db
     runtime, reader = build_stack(sessions, now)
     trade_case = await open_case(runtime.cases, now, trace, "cmd-advisory-digest")
-    await pre_trigger_evidence(runtime.cases, trade_case, now)
+    await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
 
     before, _ = await observe(reader, trade_case, now)
     await synthesis_for(sessions, runtime, trade_case, now, trace)
@@ -142,9 +142,9 @@ async def test_scenario_j_a_sentiment_change_moves_neither_risk_digest_nor_decis
     _, sessions = worker_db
     runtime, reader = build_stack(sessions, now)
     trade_case = await open_case(runtime.cases, now, trace, "cmd-signal-risk")
-    setup = await pre_trigger_evidence(runtime.cases, trade_case, now)
-    await triggered(runtime.cases, trade_case, now, setup)
-    await anchor_evidence(runtime.cases, trade_case, now, setup)
+    setup = await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
+    await inject_trigger(runtime.cases, trade_case, now, setup)
+    await inject_anchor_evidence(runtime.cases, trade_case, now, setup)
 
     before, first = await observe(reader, trade_case, now)
     case = await runtime.cases.get_trade_case(trade_case.id)
@@ -182,9 +182,9 @@ async def test_scenario_i_a_safety_change_moves_the_risk_digest(worker_db, now, 
     _, sessions = worker_db
     runtime, reader = build_stack(sessions, now)
     trade_case = await open_case(runtime.cases, now, trace, "cmd-safety-risk")
-    setup = await pre_trigger_evidence(runtime.cases, trade_case, now)
-    await triggered(runtime.cases, trade_case, now, setup)
-    await anchor_evidence(runtime.cases, trade_case, now, setup)
+    setup = await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
+    await inject_trigger(runtime.cases, trade_case, now, setup)
+    await inject_anchor_evidence(runtime.cases, trade_case, now, setup)
 
     case = await runtime.cases.get_trade_case(trade_case.id)
     before = risk_input_digest(case, active_evidence(await runtime.cases.evidence(trade_case.id)))
@@ -225,7 +225,7 @@ async def test_scenario_f_a_decision_carries_the_state_it_was_reached_from(worke
     first, decision = await observe(reader, trade_case, now)
     assert decision.context_digest == first.context_digest
 
-    await pre_trigger_evidence(runtime.cases, trade_case, now)
+    await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
     second, _ = await observe(reader, trade_case, now)
 
     assert second.context_digest != decision.context_digest

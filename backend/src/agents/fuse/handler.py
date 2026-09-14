@@ -238,7 +238,6 @@ class FuseWorkerHandler:
                         sources=sources,
                         input_digest=synthesis.input_digest,
                         synthesis_fingerprint=fingerprint,
-                        evaluated_at=synthesis.evaluated_at,
                     ),
                 ),
                 # Each re-derivation replaces the last, so a case holds one

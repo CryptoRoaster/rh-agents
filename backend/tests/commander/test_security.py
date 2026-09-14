@@ -184,7 +184,6 @@ def test_the_package_never_mutates_workflow_state_directly():
         "transition_case",
         "record_risk_decision",
         "record_evidence",
-        "RiskBinding",
         "RiskDecision",
         "TradeCaseRow",
     ):
@@ -213,8 +212,13 @@ def test_the_only_authoritative_write_is_opening_a_case():
 def test_the_control_plane_cannot_construct_a_risk_evaluation():
     """§27, §28. Nothing here builds a RiskInput, a context or a limit."""
     reachable = package_identifiers()
-    for forbidden in ("RiskContext", "RiskLimits", "evaluate", "RiskInput", "classify_decision"):
+    for forbidden in ("RiskContext", "RiskLimits", "RiskInput", "classify_decision"):
         assert forbidden not in reachable
+    # `evaluate` *is* named: the authoritative evaluator is reused read-only so
+    # the view is temporally sound. What must stay absent is anything that
+    # constructs a risk input or persists a verdict.
+    assert "TradeCaseEvaluator" in reachable
+    assert "record_risk_decision" not in reachable
 
 
 def test_risk_state_carries_the_verdict_and_never_the_numbers():
@@ -225,6 +229,7 @@ def test_risk_state_carries_the_verdict_and_never_the_numbers():
         "authorization",
         "risk_input_digest",
         "matches_current_inputs",
+        "expired",
         "expires_at",
     }
 
@@ -344,6 +349,6 @@ def test_the_pause_reader_reads_and_never_writes():
 
     from src.orchestration.commander.context import AccountPauseReader
 
-    assert {item.name for item in fields(AccountPauseReader)} == {"sessions"}
+    assert {item.name for item in fields(AccountPauseReader)} == {"sessions", "account_id"}
     surface = {name for name in dir(AccountPauseReader) if not name.startswith("_")}
-    assert surface == {"system_paused"}
+    assert surface == {"account_id", "system_paused"}

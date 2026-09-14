@@ -14,15 +14,15 @@ whose judgement would be visible if it did.
 
 import hashlib
 import json
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Literal, Protocol
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.clock import Clock, SystemClock
-from src.core.models import TradingMode
 from src.data.tables import AccountRow, TradeCaseRiskBindingRow
 from src.orchestration.commander.models import (
     AdvisorySynthesis,
@@ -33,10 +33,16 @@ from src.orchestration.commander.models import (
     TaskState,
 )
 from src.orchestration.commander.policy import COMMANDER_CONTROL_V1, CommanderControlPolicy
-from src.orchestration.workflow.engine import active_evidence, risk_input_digest
+from src.orchestration.workflow.engine import (
+    TradeCaseEvaluator,
+    active_evidence,
+    risk_input_digest,
+)
 from src.orchestration.workflow.models import (
     EvidenceEnvelope,
+    EvidenceStatus,
     EvidenceType,
+    RiskBinding,
     SynthesisPayload,
     WorkflowErrorCode,
     WorkflowFailure,
@@ -55,15 +61,34 @@ class SystemPausePort(Protocol):
     async def system_paused(self) -> bool: ...
 
 
+class SystemPauseUnavailable(Exception):
+    """The stop could not be read. Never the same as "there is no stop"."""
+
+
 @dataclass(frozen=True)
 class AccountPauseReader:
-    """Reads the Phase 0 accounting pause, for deployments that carry it."""
+    """Reads the Phase 0 accounting pause for the one authoritative account.
+
+    The account is singular by database constraint (`single_paper_account`,
+    `id = 1`) and every other reader addresses it by that identity. Selecting
+    whichever row came first would read a different account than the one the
+    executor pauses, on any deployment that ever gained a second.
+
+    A missing row is an unreadable control, not an unpaused system: the
+    accounting subsystem has not been initialised, so nothing can be said about
+    whether it is stopped. Fails closed by raising rather than returning False.
+    """
 
     sessions: async_sessionmaker[AsyncSession]
+    account_id: int = 1
 
     async def system_paused(self) -> bool:
         async with self.sessions() as session:
-            paused = await session.scalar(select(AccountRow.paused).limit(1))
+            paused = await session.scalar(
+                select(AccountRow.paused).where(AccountRow.id == self.account_id)
+            )
+        if paused is None:
+            raise SystemPauseUnavailable("PAUSE_STATE_UNAVAILABLE")
         return bool(paused)
 
 
@@ -175,6 +200,14 @@ class CommanderContextReader:
     policy: CommanderControlPolicy = COMMANDER_CONTROL_V1
     workflow: WorkflowPolicy = TRADE_CASE_V1
     clock: Clock = SystemClock()
+    # The authoritative evaluator, reused read-only. Never a second engine.
+    evaluator: TradeCaseEvaluator = field(default_factory=TradeCaseEvaluator)
+    # The deployment's configured trading mode. OBSERVE and PAPER only; live is
+    # not representable, and the contract refuses it.
+    trading_mode: Literal["OBSERVE", "PAPER"] = "PAPER"
+    # A COMMANDER-local stop. Deliberately *not* described as the switch SENTINEL
+    # honours: `RiskLimits.kill_switch` is a separate field this one is not wired
+    # to, and claiming otherwise would promise a global stop that does not exist.
     kill_switch: bool = False
     # Supplied only by a deployment that also runs the Phase 0 accounting
     # subsystem, which is where the durable pause lives.
@@ -191,6 +224,22 @@ class CommanderContextReader:
 
         evidence = await self.cases.evidence(trade_case_id)
         current = active_evidence(evidence)
+
+        # The stored status is a snapshot of the last write, and time moves
+        # without writes: a case whose authorization or setup aged out keeps a
+        # stale row until something touches it. So the status is recomputed here
+        # from current state — by the *same* evaluator the workflow persists
+        # from, called read-only. That is deliberately reuse rather than a
+        # second engine: there is one requirement table, one transition matrix
+        # and one freshness rule, and this reads them at the present instant
+        # instead of trusting a row written at some earlier one.
+        binding_row = await self._binding_row(trade_case_id)
+        effective = self.evaluator.evaluate(
+            trade_case,
+            evidence,
+            risk_from_row(binding_row) if binding_row is not None else None,
+            now,
+        )
         states: list[EvidenceState] = []
         for evidence_type, item in sorted(current.items(), key=lambda kv: kv[0].value):
             if evidence_type is EvidenceType.SYNTHESIS:
@@ -231,19 +280,19 @@ class CommanderContextReader:
         )
 
         digest = risk_input_digest(trade_case, current, self.workflow)
-        risk = await self._risk(trade_case_id, digest)
+        risk = None if binding_row is None else _risk_state(risk_from_row(binding_row), digest, now)
         controls = await self._controls()
-        advisory = _advisory(current)
+        advisory = _advisory(current, now)
 
         return CommanderContext(
             trade_case_id=trade_case_id,
             task_id=task_id,
             workflow_version=trade_case.workflow_version,
             policy_version=self.policy.version,
-            status=trade_case.status,
+            status=effective.status,
             revision=trade_case.revision,
-            reason_code=trade_case.reason_code,
-            blocker_codes=tuple(item.code for item in trade_case.blockers)[:24],
+            reason_code=effective.reason_code,
+            blocker_codes=tuple(item.code for item in effective.blockers)[:24],
             evidence=tuple(states),
             tasks=tasks,
             risk=risk,
@@ -255,7 +304,7 @@ class CommanderContextReader:
                 trade_case_id=trade_case_id,
                 workflow_version=trade_case.workflow_version,
                 policy_version=self.policy.version,
-                status=trade_case.status.value,
+                status=effective.status.value,
                 revision=trade_case.revision,
                 evidence=tuple(states),
                 tasks=tasks,
@@ -265,10 +314,10 @@ class CommanderContextReader:
             ),
         )
 
-    async def _risk(self, trade_case_id: UUID, digest: str) -> RiskState | None:
-        """The newest authorization, and whether it still describes this case."""
+    async def _binding_row(self, trade_case_id: UUID) -> TradeCaseRiskBindingRow | None:
+        """The newest binding, selected exactly as the workflow's own read does."""
         async with self.sessions() as session:
-            row = await session.scalar(
+            row: TradeCaseRiskBindingRow | None = await session.scalar(
                 select(TradeCaseRiskBindingRow)
                 .where(TradeCaseRiskBindingRow.trade_case_id == trade_case_id)
                 .order_by(
@@ -278,21 +327,7 @@ class CommanderContextReader:
                 )
                 .limit(1)
             )
-        if row is None:
-            return None
-        binding = risk_from_row(row)
-        return RiskState(
-            binding_id=binding.binding_id,
-            risk_decision_id=binding.risk_decision_id,
-            authorization=binding.authorization,
-            risk_input_digest=binding.risk_input_digest,
-            # The only question worth asking of an authorization: was it granted
-            # against the evidence this case currently has? One granted against
-            # a different set is not weaker — it is about a case that no longer
-            # exists.
-            matches_current_inputs=binding.risk_input_digest == digest,
-            expires_at=binding.expires_at,
-        )
+        return row
 
     async def _controls(self) -> SystemControls:
         """The system-wide stops, as facts rather than opinions.
@@ -315,12 +350,43 @@ class CommanderContextReader:
         that sets it never runs here. Until that is wired, the kill switch is
         the stop that applies.
         """
-        paused = False if self.pause is None else await self.pause.system_paused()
+        # Fails closed on every uncertainty. A missing port, a missing account
+        # row or a control that cannot be read are all *unknown*, and unknown is
+        # not permission. The previous implementation returned False for all
+        # three, which turned an unavailable stop into a green light.
+        if self.pause is None:
+            paused = True
+        else:
+            try:
+                paused = await self.pause.system_paused()
+            except SystemPauseUnavailable:
+                paused = True
         return SystemControls(
             kill_switch=self.kill_switch,
             account_paused=paused,
-            trading_mode=TradingMode.PAPER.value,
+            # The configured mode, not a constant. Hard-coding PAPER made the
+            # field describe an intention rather than the deployment.
+            trading_mode=self.trading_mode,
         )
+
+
+def _risk_state(binding: RiskBinding, digest: str, now: datetime) -> RiskState:
+    """An authorization, what it covers, and whether it still holds."""
+    return RiskState(
+        binding_id=binding.binding_id,
+        risk_decision_id=binding.risk_decision_id,
+        authorization=binding.authorization,
+        risk_input_digest=binding.risk_input_digest,
+        # Two independent questions, and the first implementation asked only
+        # one. Identity: was it granted against the evidence this case currently
+        # has? One granted against a different set is not weaker, it is about a
+        # case that no longer exists. Time: has it aged out? A decision issued
+        # with a two-minute life is not an authorization eight minutes later,
+        # however unchanged the evidence is.
+        matches_current_inputs=binding.risk_input_digest == digest,
+        expired=now >= binding.expires_at,
+        expires_at=binding.expires_at,
+    )
 
 
 def _requirement(policy: WorkflowPolicy, evidence_type: EvidenceType) -> tuple[bool, bool]:
@@ -330,7 +396,9 @@ def _requirement(policy: WorkflowPolicy, evidence_type: EvidenceType) -> tuple[b
     return False, False
 
 
-def _advisory(current: dict[EvidenceType, EvidenceEnvelope]) -> AdvisorySynthesis | None:
+def _advisory(
+    current: dict[EvidenceType, EvidenceEnvelope], now: datetime
+) -> AdvisorySynthesis | None:
     """FUSE's reading, carried only when it describes this case's current evidence.
 
     A synthesis of a superseded evidence set is not a weaker opinion; it is an
@@ -355,4 +423,10 @@ def _advisory(current: dict[EvidenceType, EvidenceEnvelope]) -> AdvisorySynthesi
         hard_blocker_count=0 if detail is None else len(detail.hard_blockers),
         unresolved_gap_count=0 if detail is None else len(detail.unresolved_gaps),
         describes_current_inputs=set(payload.source_evidence_ids) <= live,
+        # Two ways to stop applying, and checking only the first was the defect.
+        # References stay intact while a reading ages out — and because a
+        # synthesis expires with the earliest of its sources *and* the setup it
+        # describes, an expired one can outlive an unchanged evidence set.
+        expired=item.effective_status(now) != EvidenceStatus.AVAILABLE,
+        valid_until=item.valid_until,
     )

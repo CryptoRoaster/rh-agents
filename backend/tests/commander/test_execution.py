@@ -22,16 +22,16 @@ from src.orchestration.workflow.models import (
 )
 from tests.commander.conftest import (
     build_stack,
+    inject_pre_trigger_evidence,
+    inject_trigger,
     open_case,
-    pre_trigger_evidence,
     record,
-    triggered,
 )
 
 pytestmark = pytest.mark.usefixtures("worker_db")
 
 
-async def anchor_evidence(cases, trade_case, now, setup_evidence, **kw):
+async def inject_anchor_evidence(cases, trade_case, now, setup_evidence, **kw):
     """ANCHOR's finding, in the legacy scalar shape the workflow accepts."""
     trigger = next(
         item
@@ -82,18 +82,18 @@ async def test_scenario_95_the_whole_lifecycle_up_to_the_risk_boundary(worker_db
     assert decision.disposition == CommanderDisposition.AWAIT_SPECIALISTS
 
     # ATLAS, SIGNAL, VECTOR.
-    setup = await pre_trigger_evidence(runtime.cases, trade_case, now)
+    setup = await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
     context, decision = await observe(reader, trade_case, now)
     assert context.status == TradeCaseStatus.READY_FOR_TRIGGER
     assert decision.disposition == CommanderDisposition.AWAIT_TRIGGER
 
     # PULSE.
-    await triggered(runtime.cases, trade_case, now, setup)
+    await inject_trigger(runtime.cases, trade_case, now, setup)
     context, decision = await observe(reader, trade_case, now)
     assert decision.disposition == CommanderDisposition.AWAIT_EXECUTION_EVIDENCE
 
     # ANCHOR.
-    await anchor_evidence(runtime.cases, trade_case, now, setup)
+    await inject_anchor_evidence(runtime.cases, trade_case, now, setup)
     context, decision = await observe(reader, trade_case, now)
 
     # Everything the workflow requires is present, and the control plane stops.
@@ -112,9 +112,9 @@ async def test_the_control_plane_never_wrote_anything_during_that_lifecycle(work
     _, sessions = worker_db
     runtime, reader = build_stack(sessions, now)
     trade_case = await open_case(runtime.cases, now, trace, "cmd-readonly")
-    setup = await pre_trigger_evidence(runtime.cases, trade_case, now)
-    await triggered(runtime.cases, trade_case, now, setup)
-    await anchor_evidence(runtime.cases, trade_case, now, setup)
+    setup = await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
+    await inject_trigger(runtime.cases, trade_case, now, setup)
+    await inject_anchor_evidence(runtime.cases, trade_case, now, setup)
 
     before = await runtime.cases.get_trade_case(trade_case.id)
     for _ in range(5):
@@ -131,7 +131,7 @@ async def test_scenario_y_repeated_observation_produces_an_identical_digest(work
     _, sessions = worker_db
     runtime, reader = build_stack(sessions, now)
     trade_case = await open_case(runtime.cases, now, trace, "cmd-churn")
-    await pre_trigger_evidence(runtime.cases, trade_case, now)
+    await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
 
     digests = set()
     for _ in range(4):
@@ -146,6 +146,6 @@ async def test_a_meaningful_change_moves_the_digest(worker_db, now, trace):
     runtime, reader = build_stack(sessions, now)
     trade_case = await open_case(runtime.cases, now, trace, "cmd-digest-moves")
     before, _ = await observe(reader, trade_case, now)
-    await pre_trigger_evidence(runtime.cases, trade_case, now)
+    await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
     after, _ = await observe(reader, trade_case, now)
     assert before.context_digest != after.context_digest

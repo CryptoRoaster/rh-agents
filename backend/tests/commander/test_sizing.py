@@ -64,18 +64,18 @@ async def test_scenario_e_a_fully_evidenced_case_stops_at_the_sizing_gap(worker_
     """
     from tests.commander.conftest import (
         build_stack,
+        inject_pre_trigger_evidence,
+        inject_trigger,
         open_case,
-        pre_trigger_evidence,
-        triggered,
     )
-    from tests.commander.test_execution import anchor_evidence
+    from tests.commander.test_execution import inject_anchor_evidence
 
     _, sessions = worker_db
     runtime, reader = build_stack(sessions, now)
     trade_case = await open_case(runtime.cases, now, trace, "cmd-sizing")
-    setup = await pre_trigger_evidence(runtime.cases, trade_case, now)
-    await triggered(runtime.cases, trade_case, now, setup)
-    await anchor_evidence(runtime.cases, trade_case, now, setup)
+    setup = await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
+    await inject_trigger(runtime.cases, trade_case, now, setup)
+    await inject_anchor_evidence(runtime.cases, trade_case, now, setup)
 
     from uuid import uuid4
 

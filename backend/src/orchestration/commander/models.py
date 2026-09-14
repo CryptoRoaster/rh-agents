@@ -21,7 +21,7 @@ produces is a typed reading of eligibility, and a reading permits nothing.
 """
 
 from enum import StrEnum
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
@@ -93,6 +93,9 @@ class CommanderReason(StrEnum):
     RISK_REJECTED = "RISK_REJECTED"
     TRADE_CASE_TERMINAL = "TRADE_CASE_TERMINAL"
     SYSTEM_PAUSED = "SYSTEM_PAUSED"
+    # The deployment observes and does not act. Not a fault and not a stop:
+    # a stated posture that coordination has to honour rather than narrate.
+    OBSERVE_MODE = "OBSERVE_MODE"
 
 
 class EvidenceState(Immutable):
@@ -124,11 +127,17 @@ class TaskState(Immutable):
 
 
 class RiskState(Immutable):
-    """The current authorization, and the evidence set it was granted against.
+    """The current authorization, the evidence it covers, and whether it still holds.
 
-    ``matches_current_inputs`` is the only question coordination asks of it. An
-    authorization granted against a different evidence set is not a weaker
-    authorization — it is one about a case that no longer exists.
+    Two independent questions, kept as two fields because collapsing them is
+    exactly the mistake this phase had to fix. *Does it describe this evidence?*
+    is about identity: an authorization granted against a different evidence set
+    is not weaker, it is about a case that no longer exists. *Is it still valid?*
+    is about time: a decision SENTINEL issued with a two-minute life is not an
+    authorization eight minutes later, however unchanged the evidence is.
+
+    The first implementation asked only the first question, so an expired
+    approval read as current indefinitely.
     """
 
     binding_id: UUID
@@ -136,7 +145,21 @@ class RiskState(Immutable):
     authorization: RiskAuthorization
     risk_input_digest: Digest
     matches_current_inputs: bool = Field(strict=True)
+    expired: bool = Field(strict=True)
     expires_at: AwareDatetime
+
+    @property
+    def is_usable(self) -> bool:
+        """Whether this authorization may be treated as covering the case now.
+
+        Both questions must answer yes. A rejection is never usable in this
+        sense either — it authorizes nothing to begin with.
+        """
+        return (
+            self.matches_current_inputs
+            and not self.expired
+            and self.authorization is not RiskAuthorization.REJECTED
+        )
 
 
 class AdvisorySynthesis(Immutable):
@@ -155,22 +178,47 @@ class AdvisorySynthesis(Immutable):
     disposition: Identifier
     hard_blocker_count: int = Field(strict=True, ge=0)
     unresolved_gap_count: int = Field(strict=True, ge=0)
+    # Whether it was built from the evidence the case currently holds.
     describes_current_inputs: bool = Field(strict=True)
+    # Whether it is still within its own validity. Separate from the question
+    # above because the two fail independently: references can be intact while
+    # the reading has aged out, which is precisely the state that previously
+    # presented itself as current.
+    expired: bool = Field(strict=True)
+    valid_until: AwareDatetime
+
+    @property
+    def is_usable(self) -> bool:
+        """Whether a reader may treat this synthesis as describing the case now."""
+        return self.describes_current_inputs and not self.expired
 
 
 class SystemControls(Immutable):
-    """The system-wide stops, as authoritative facts rather than opinions."""
+    """The system-wide stops and the mode, as facts rather than intentions."""
 
-    # The configured deterministic kill switch SENTINEL itself honours.
+    # A COMMANDER-local stop. Deliberately *not* described as the switch SENTINEL
+    # honours: `RiskLimits.kill_switch` is a separate field this one is not wired
+    # to, and saying otherwise would promise a global stop that does not exist.
     kill_switch: bool = Field(strict=True)
-    # A durable pause recorded after a SENTINEL PAUSE_SYSTEM verdict.
+    # A durable pause recorded after a SENTINEL PAUSE_SYSTEM verdict. True also
+    # when the control could not be read at all, because an unreadable stop is
+    # unknown and unknown is not permission.
     account_paused: bool = Field(strict=True)
-    # PAPER or OBSERVE. Live is not representable.
-    trading_mode: Identifier
+    # The deployment's mode. Only the two this system can actually operate in
+    # are representable — `LIVE_AUTONOMOUS` and anything unrecognised fail to
+    # validate rather than arriving as a value some later branch might honour.
+    trading_mode: Literal["OBSERVE", "PAPER"]
 
     @property
     def halted(self) -> bool:
-        return self.kill_switch or self.account_paused
+        """Whether coordination must not progress anything.
+
+        OBSERVE is included deliberately. It means the system watches and does
+        not act, so a control plane that kept advancing cases toward execution
+        under it would be acting — the mode would describe an intention nobody
+        enforced.
+        """
+        return self.kill_switch or self.account_paused or self.trading_mode == "OBSERVE"
 
 
 class CommanderContext(Immutable):

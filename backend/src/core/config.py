@@ -151,9 +151,14 @@ class Settings(BaseSettings):
     # cases is the one thing COMMANDER does that changes the world, and it
     # should be possible to run the control plane read-only.
     commander_intake_enabled: bool = False
-    # The deterministic stop SENTINEL already honours, surfaced so the control
-    # plane refuses to open new cases under the same condition that would make
-    # every risk verdict a system pause.
+    # A COMMANDER-local stop, and deliberately described as nothing more.
+    #
+    # `RiskLimits.kill_switch` is a different field that SENTINEL honours, and
+    # this one is not wired to it — so setting this stops the control plane from
+    # opening cases and progressing them, and changes nothing about what any
+    # risk verdict would say. Calling it a global kill switch would promise a
+    # reach it does not have; wiring the two together is a deliberate decision
+    # nobody has taken yet.
     commander_kill_switch: bool = False
     # Where executable quotes come from. "disabled" fails closed: without a quote
     # source ANCHOR establishes no capacity at all, which is the correct outcome

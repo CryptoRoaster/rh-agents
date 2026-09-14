@@ -582,6 +582,14 @@ class QuotedLadderPoint(Immutable):
 class ExecutionAssessmentDetail(Immutable):
     """What the market was shown to support, and how that was established.
 
+    Deliberately carries no evaluation timestamp, for the same reason the
+    synthesis detail carries none: the submission fingerprint is computed over
+    this payload, so a field moving with the wall clock made two assessments of
+    identical quotes produce one idempotency key with two fingerprints — which
+    the runtime correctly reports as a conflict rather than the replay it is.
+    When the work happened is already on the envelope as `created_at` and
+    `recorded_at`, and each ladder point carries its own `quoted_at`.
+
     ``market_capacity_notional`` is what the *market* will bear, never what
     anyone may trade: SENTINEL decides that, from facts this evidence cannot
     see. It is meaningless without ``capacity_semantics`` beside it, because a
@@ -615,7 +623,6 @@ class ExecutionAssessmentDetail(Immutable):
     quote_provider: Identifier
     quote_requests: int = Field(ge=0)
     ladder: tuple[QuotedLadderPoint, ...] = Field(min_length=1, max_length=12)
-    evaluated_at: AwareDatetime
     execution_digest: Digest
 
 
@@ -708,6 +715,15 @@ class SynthesisFinding(Immutable):
 class SynthesisDetail(Immutable):
     """The structured reading of a case's admissible evidence.
 
+    Deliberately carries no evaluation timestamp. A synthesis is a function of
+    the evidence it read, and the submission fingerprint is computed over this
+    payload — so a field that moved with the wall clock made two recomputations
+    of identical evidence produce the same idempotency key with different
+    fingerprints, which the runtime correctly reports as a conflict. When the
+    work *did* happen is already recorded authoritatively on the envelope as
+    `created_at` and `recorded_at`; repeating it here bought nothing and cost
+    replay.
+
     There is no score here, and its absence is deliberate. A composite number
     over four incommensurable specialist findings would be false precision — it
     would look calibrated, invite comparison between cases, and encode weights
@@ -724,7 +740,6 @@ class SynthesisDetail(Immutable):
     sources: tuple[SynthesisSource, ...] = Field(min_length=1, max_length=12)
     input_digest: Digest
     synthesis_fingerprint: Digest
-    evaluated_at: AwareDatetime
 
 
 class SynthesisPayload(AcceptancePayload):

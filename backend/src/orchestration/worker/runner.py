@@ -59,11 +59,21 @@ def new_registration_key() -> str:
     return f"runtime:{uuid4()}"
 
 
+# Refusals a worker can expect at the submission boundary, and how each must be
+# recorded. A refusal absent from this table propagates instead — which ends the
+# polling loop and leaves the task claimed until its lease expires, so anything
+# the server can legitimately answer with belongs here.
 REFUSAL_CATEGORIES = {
     WorkerErrorCode.ROLE_NOT_AUTHORIZED: WorkerFailureCategory.CAPABILITY_DENIED,
     WorkerErrorCode.EVIDENCE_TYPE_NOT_AUTHORIZED: WorkerFailureCategory.CAPABILITY_DENIED,
     WorkerErrorCode.TASK_SUPERSEDED: WorkerFailureCategory.TASK_INVALIDATED,
     WorkerErrorCode.RESULT_CONFLICT: WorkerFailureCategory.INVALID_RESULT,
+    # The work outlived its own inputs. Transient rather than superseding on
+    # purpose: a fresh attempt reads fresh inputs and may well succeed, but the
+    # attempt still spends the retry budget, so a worker that is persistently
+    # too slow stops rather than retrying forever. A superseded outcome would
+    # not be counted at all, which is the unbounded version of the same idea.
+    WorkerErrorCode.EVIDENCE_STALE: WorkerFailureCategory.TRANSIENT,
 }
 
 

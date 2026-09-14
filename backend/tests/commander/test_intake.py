@@ -231,10 +231,12 @@ async def test_the_intake_key_is_canonical_identity_never_a_symbol(worker_db, no
     candidate, snapshot = candidate_for(now)
     service = service_for(sessions, now, [(candidate, snapshot)])
 
-    key = service.intake_key(candidate)
+    key = service.intake_key(candidate, None)
     assert candidate.pair_id in key
     assert "DEMO" not in key
-    assert service.intake_key(candidate) == key
+    assert service.intake_key(candidate, None) == key
+    # The generation is part of the identity, so a later generation differs.
+    assert service.intake_key(candidate, uuid4()) != key
 
 
 # ------------------------------------------------ 53: two workers, one candidate
@@ -325,8 +327,8 @@ async def test_the_open_fingerprint_inputs_are_worker_independent(worker_db, now
     early = service_for(sessions, now, [(candidate, snapshot)])
     late = service_for(sessions, now + timedelta(seconds=37), [(candidate, snapshot)])
 
-    assert early.intake_key(candidate) == late.intake_key(candidate)
-    assert early.intake_correlation(candidate) == late.intake_correlation(candidate)
+    assert early.intake_key(candidate, None) == late.intake_key(candidate, None)
+    assert early.intake_correlation(candidate, None) == late.intake_correlation(candidate, None)
     # The expiry is measured from the observation, not from either clock.
     expected = candidate.observed_at + early.policy.case_lifetime
     opened = (await early.run_cycle()).opened[0]

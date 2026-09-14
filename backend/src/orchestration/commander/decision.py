@@ -29,7 +29,6 @@ from src.orchestration.commander.models import (
 )
 from src.orchestration.commander.policy import CommanderControlPolicy
 from src.orchestration.workflow.models import TERMINAL_CASE_STATUSES, TradeCaseStatus
-from src.risk.authorization import RiskAuthorization
 
 # What each waiting status means for coordination. Read from the evaluator's
 # published status rather than recomputed, so there is exactly one place where
@@ -82,6 +81,9 @@ STATEMENTS: dict[CommanderReason, str] = {
     ),
     CommanderReason.TRADE_CASE_TERMINAL: "The case is finished; nothing progresses it.",
     CommanderReason.SYSTEM_PAUSED: "A system-wide stop is in force.",
+    CommanderReason.OBSERVE_MODE: (
+        "The deployment is in OBSERVE mode: it watches and does not act."
+    ),
 }
 
 
@@ -109,7 +111,14 @@ def _conclude(
     # A system-wide stop outranks every case-level eligibility. Checked first so
     # no later branch can reach past it.
     if context.controls.halted:
-        return CommanderDisposition.PAUSED, CommanderReason.SYSTEM_PAUSED
+        reason = (
+            CommanderReason.OBSERVE_MODE
+            if context.controls.trading_mode == "OBSERVE"
+            and not context.controls.kill_switch
+            and not context.controls.account_paused
+            else CommanderReason.SYSTEM_PAUSED
+        )
+        return CommanderDisposition.PAUSED, reason
 
     if context.status in TERMINAL_CASE_STATUSES:
         reason = (
@@ -131,19 +140,19 @@ def _conclude(
         TradeCaseStatus.RISK_APPROVED,
         TradeCaseStatus.RISK_LIMITED,
     ):
-        # An authorization exists. Whether it still applies is a question about
-        # the evidence it was granted against, never about how recently it was
-        # issued.
-        if context.risk is not None and context.risk.matches_current_inputs:
+        # An authorization exists. It applies only if it covers this evidence
+        # *and* has not expired — identity alone would let a decision SENTINEL
+        # issued with a two-minute life read as current forever.
+        if context.risk is not None and context.risk.is_usable:
             return CommanderDisposition.RISK_CURRENT, CommanderReason.RISK_AUTHORIZATION_CURRENT
         return _risk_eligible()
 
     if context.status == TradeCaseStatus.READY_FOR_RISK:
-        if (
-            context.risk is not None
-            and context.risk.matches_current_inputs
-            and context.risk.authorization is not RiskAuthorization.REJECTED
-        ):
+        # The evaluator publishes READY_FOR_RISK precisely when no usable
+        # authorization covers the case — including when a previous one aged
+        # out. Reading an old binding as current here would reinstate the
+        # authorization the evaluator just withdrew.
+        if context.risk is not None and context.risk.is_usable:
             return CommanderDisposition.RISK_CURRENT, CommanderReason.RISK_AUTHORIZATION_CURRENT
         return _risk_eligible()
 
