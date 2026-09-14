@@ -477,6 +477,66 @@ setup's own — still binds at exactly its boundary.
 
 ---
 
+## The interim generation
+
+The round above fixed the two shapes it had fixtures for and missed the one the
+fix itself had written. `c760266` — the round-two commit — served
+`legacy_evaluated_at` as a real serialised field: `null` where no timestamp
+existed, a value where one did. Its rows are in the append-only evidence table
+like any other, and the round-three serializer dropped the key when it was
+`null`. Different bytes, different fingerprint, and an unchanged replay of a
+`c760266` FUSE submission raised `IDEMPOTENCY_CONFLICT` against its own stored
+value — the very defect that round was closing, one generation later.
+
+Four commits have written these payloads, and they are named here rather than
+described, because "the old format" is the ambiguity that caused this:
+
+* **`9515b49`** — the original implementation. Writes `evaluated_at`, always
+  with a value. In `ExecutionAssessmentDetail` it sits *before*
+  `execution_digest`, not last.
+* **`094cad3`** — first hardening round. Removed the field; writes no timestamp
+  key at all.
+* **`c760266`** — second hardening round. Writes `legacy_evaluated_at`, last in
+  the object, explicitly `null` for new results and carrying a value for
+  anything read with one.
+* **`bb462b42`** — third hardening round. Writes no timestamp key for new
+  results, byte-identical to `094cad3`; reproduces `9515b49` when it reads one.
+  It introduced no shape of its own, which is worth stating: a fifth shape would
+  need a fifth compatibility rule.
+
+That makes four distinct stored forms for one optional field — a key with a
+value, no key, an explicit `null`, and the same value under a second spelling —
+and two of them differ only in bytes. **An explicitly stored `null` is not
+absence.** Both parse to `None`, so a single nullable field cannot decide on the
+way out which of the two to write, and the fingerprint is taken over the bytes.
+
+The model therefore remembers the shape it read: which spelling arrived, or that
+none did, recorded on validation and reproduced on serialisation. Absence stays
+absence, a stored `null` stays a stored `null`, and each spelling comes back out
+under the name it went in with, in the position it occupied. New results
+continue to carry no timestamp key at all.
+
+Nothing stored is rewritten. No recorded fingerprint changes, the append-only
+evidence table is untouched, the conflict check is unchanged and unknown fields
+are still refused — compatibility is about reproducing what was written, never
+about accepting more.
+
+The fixtures for all four generations were produced by running those commits in
+throwaway worktrees and capturing both the bytes they serialised and the
+fingerprints they computed, including the non-`null` form of `c760266`. Replay
+runs the original envelope through the real service unchanged. For ANCHOR, whose
+payload names the setup and trigger it was assessed against, an earlier test
+rewrote those two ids to match a freshly built case — which re-serialised the
+submission with the current model and destroyed the identity it was proving.
+Evidence ids are `uuid5` of the idempotency key, so the fixtures instead name
+the ids that `historical-setup` and `historical-trigger` produce and the test
+writes exactly those keys. No reference is rebound, and a genuine content change
+under the same key is still a conflict.
+
+The FUSE shelf-life exclusion from the round above is unchanged.
+
+---
+
 ## Compatibility
 
 No migration. Alembic head remains `0006`, and none of `0001`–`0006` is altered.

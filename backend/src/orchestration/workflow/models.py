@@ -1,5 +1,6 @@
 """Immutable workflow contracts and typed evidence payloads."""
 
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -13,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     model_serializer,
     model_validator,
 )
@@ -557,26 +559,58 @@ class TriggerPayload(AcceptancePayload):
     detail: "TriggerDetail | None" = None
 
 
-def _without_absent_legacy_timestamp(data: dict[str, Any]) -> dict[str, Any]:
-    """Restore the historical shape of the legacy timestamp key.
+# The four shapes this system has written for the same optional timestamp, and
+# the rule for reproducing each. Evidence is append-only and fingerprints are
+# stored, so the serialised form is a contract with rows already in the
+# database — and these four differ in ways that a single nullable field cannot
+# express, because *absence* and *an explicitly stored null* are different bytes
+# that mean the same thing.
+#
+#   9515b49   "evaluated_at": "<value>"              before execution_digest / last
+#   094cad3   (no key at all)
+#   c760266   "legacy_evaluated_at": null            last
+#   c760266   "legacy_evaluated_at": "<value>"       last  (a rewritten 9515b49 row)
+#   current   (no key at all)                        for anything newly computed
+#
+# So the key *as read* is remembered and reproduced: its name decides both what
+# is emitted and where. The historical name keeps the position the field was
+# originally declared at; the interim name always came last, in both models.
+LEGACY_TIMESTAMP_KEYS = ("evaluated_at", "legacy_evaluated_at")
+INTERIM_TIMESTAMP_KEY = "legacy_evaluated_at"
+HISTORICAL_TIMESTAMP_KEY = "evaluated_at"
 
-    The wrap handler emits field names, so the key arrives as
-    ``legacy_evaluated_at``. Two corrections are needed and both change bytes:
-    it is renamed to the name it was stored under, and dropped entirely when
-    absent — serialising `null` would add a key the generation that wrote no
-    timestamp never had.
 
-    Position is preserved by rebuilding in iteration order rather than popping
-    and re-adding, because the key's place in the JSON is part of the bytes the
-    fingerprint was taken over.
+def _observed_legacy_key(data: Any) -> str | None:
+    """Which spelling of the optional timestamp a payload arrived with, if any."""
+    if isinstance(data, Mapping):
+        for key in LEGACY_TIMESTAMP_KEYS:
+            if key in data:
+                return key
+        return None
+    # Already a model instance: carry whatever it recorded.
+    return getattr(data, "_legacy_timestamp_key", None)
+
+
+def _restore_legacy_shape(data: dict[str, Any], observed: str | None) -> dict[str, Any]:
+    """Re-emit the optional timestamp exactly as it was read, or not at all.
+
+    Order matters as much as the name: the key's position is part of the bytes
+    the submission fingerprint was taken over, so it is rebuilt in iteration
+    order rather than popped and re-appended.
     """
-    if "legacy_evaluated_at" not in data:
-        return data
-    if data["legacy_evaluated_at"] is None:
-        return {key: value for key, value in data.items() if key != "legacy_evaluated_at"}
+    value = data.get(INTERIM_TIMESTAMP_KEY)
+    without = {key: item for key, item in data.items() if key != INTERIM_TIMESTAMP_KEY}
+    if observed is None:
+        # Never stored, or newly computed. Newly computed results deliberately
+        # carry no run metadata at all.
+        return without
+    if observed == INTERIM_TIMESTAMP_KEY:
+        # The interim shape always came last, including its explicit null.
+        return {**without, INTERIM_TIMESTAMP_KEY: value}
+    # The original shape, at the position it was declared in.
     return {
-        ("evaluated_at" if key == "legacy_evaluated_at" else key): value
-        for key, value in data.items()
+        (HISTORICAL_TIMESTAMP_KEY if key == INTERIM_TIMESTAMP_KEY else key): item
+        for key, item in data.items()
     }
 
 
@@ -678,9 +712,19 @@ class ExecutionAssessmentDetail(Immutable):
     )
     execution_digest: Digest
 
+    _legacy_timestamp_key: str | None = PrivateAttr(default=None)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _remember_legacy_shape(cls, data: Any, handler: Any) -> Any:
+        observed = _observed_legacy_key(data)
+        model = handler(data)
+        object.__setattr__(model, "_legacy_timestamp_key", observed)
+        return model
+
     @model_serializer(mode="wrap")
     def _historical_shape(self, handler: Any) -> dict[str, Any]:
-        return _without_absent_legacy_timestamp(handler(self))
+        return _restore_legacy_shape(handler(self), self._legacy_timestamp_key)
 
 
 class LiquidityExecutionPayload(AcceptancePayload):
@@ -820,9 +864,19 @@ class SynthesisDetail(Immutable):
         validation_alias=AliasChoices("evaluated_at", "legacy_evaluated_at"),
     )
 
+    _legacy_timestamp_key: str | None = PrivateAttr(default=None)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _remember_legacy_shape(cls, data: Any, handler: Any) -> Any:
+        observed = _observed_legacy_key(data)
+        model = handler(data)
+        object.__setattr__(model, "_legacy_timestamp_key", observed)
+        return model
+
     @model_serializer(mode="wrap")
     def _historical_shape(self, handler: Any) -> dict[str, Any]:
-        return _without_absent_legacy_timestamp(handler(self))
+        return _restore_legacy_shape(handler(self), self._legacy_timestamp_key)
 
 
 class SynthesisPayload(AcceptancePayload):

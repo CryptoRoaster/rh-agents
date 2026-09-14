@@ -112,11 +112,15 @@ async def inject_pre_trigger_evidence(cases, trade_case, now, **overrides):
         AgentRole.VECTOR,
         EvidenceType.TRADE_SETUP,
         overrides.get("trade_setup", trade_setup(now)),
-        key=f"cmd-setup-{trade_case.id}",
+        # Evidence ids are derived from the idempotency key alone, so naming the
+        # key names the id. Historical replay fixtures use that to reference
+        # evidence a test has yet to write, instead of being rewritten to match
+        # whatever id a run happened to produce.
+        key=overrides.get("setup_key", f"cmd-setup-{trade_case.id}"),
     )
 
 
-async def inject_trigger(cases, trade_case, now, setup_evidence):
+async def inject_trigger(cases, trade_case, now, setup_evidence, *, key=None):
     from tests.worker.conftest import trigger_payload
 
     return await record(
@@ -126,7 +130,7 @@ async def inject_trigger(cases, trade_case, now, setup_evidence):
         AgentRole.PULSE,
         EvidenceType.TRIGGER,
         trigger_payload(setup_evidence.evidence_id),
-        key=f"cmd-trigger-{trade_case.id}",
+        key=key or f"cmd-trigger-{trade_case.id}",
     )
 
 

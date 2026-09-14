@@ -34,64 +34,198 @@ from src.orchestration.workflow.models import (
 from tests.commander.conftest import (
     build_stack,
     inject_pre_trigger_evidence,
+    inject_trigger,
     open_case,
     record,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
-GENERATIONS = ("9515b49", "094cad3")
+
+# Every commit that has written one of these payloads, and the shape each wrote
+# for the optional timestamp. `bb462b4` is listed because it is a known state,
+# not because it is a distinct shape: it reproduces the two older ones exactly
+# and its own new output is byte-identical to `094cad3`.
+GENERATIONS = ("9515b49", "094cad3", "c760266", "bb462b4")
 KINDS = ("anchor", "fuse")
+
+
+def cases() -> list[tuple[str, str]]:
+    """Every (generation, entry) pair the fixtures actually contain."""
+    found = []
+    for generation in GENERATIONS:
+        payloads = json.loads((FIXTURES / f"evidence-{generation}.json").read_text())
+        found.extend((generation, entry) for entry in sorted(payloads))
+    return found
+
+
+ALL_CASES = cases()
+ANCHOR_CASES = [pair for pair in ALL_CASES if pair[1].startswith("anchor")]
+FUSE_CASES = [pair for pair in ALL_CASES if pair[1].startswith("fuse")]
+
+# The historical ANCHOR payloads reference their setup and trigger by these
+# keys. Evidence ids are `uuid5` of the key, so a test that writes them
+# reproduces the ids the fixtures already name — no reference rewriting.
+HISTORICAL_SETUP_KEY = "historical-setup"
+HISTORICAL_TRIGGER_KEY = "historical-trigger"
 
 pytestmark = pytest.mark.usefixtures("worker_db")
 
 
-def historical(generation: str, kind: str) -> tuple[str, str]:
-    """The raw submission JSON a predecessor wrote, and the fingerprint it got."""
-    entry = json.loads((FIXTURES / f"evidence-{generation}.json").read_text())[kind]
-    return entry["submission_raw"], entry["fingerprint"]
+def historical(generation: str, entry: str) -> tuple[str, str]:
+    """The raw submission JSON a predecessor wrote, and the fingerprint it got.
+
+    Produced by running that commit in a throwaway worktree, never by building
+    it with the current model — which would put the current model on both sides
+    of the comparison and prove nothing.
+    """
+    payload = json.loads((FIXTURES / f"evidence-{generation}.json").read_text())[entry]
+    return payload["submission_raw"], payload["fingerprint"]
 
 
 # ============================== 1: historical serialisation is a contract
 
 
-@pytest.mark.parametrize("generation", GENERATIONS)
-@pytest.mark.parametrize("kind", KINDS)
-def test_a_historical_payload_reserialises_to_exactly_its_stored_bytes(generation, kind):
+@pytest.mark.parametrize(("generation", "entry"), ALL_CASES)
+def test_a_historical_payload_reserialises_to_exactly_its_stored_bytes(generation, entry):
     """Byte identity, not merely successful parsing.
 
-    `9515b49` wrote an `evaluated_at` key; `094cad3` wrote no such key at all.
-    Renaming the first or adding a `null` for the second each changes the JSON
-    and therefore the fingerprint, while leaving the payload perfectly readable.
+    Four shapes have been written for one optional timestamp, and they differ in
+    ways a single nullable field cannot express — an explicitly stored `null` is
+    not the same bytes as an absent key, though both mean the same thing.
+    Renaming a key, moving it, or supplying or dropping a `null` each changes
+    the JSON and therefore the fingerprint, while leaving the payload perfectly
+    readable.
     """
-    raw, _ = historical(generation, kind)
+    raw, _ = historical(generation, entry)
     parsed = EvidenceSubmission.model_validate_json(raw)
     assert parsed.model_dump_json() == raw
 
 
-@pytest.mark.parametrize("generation", GENERATIONS)
-@pytest.mark.parametrize("kind", KINDS)
-def test_a_historical_payload_still_computes_its_original_fingerprint(generation, kind):
+@pytest.mark.parametrize(("generation", "entry"), ALL_CASES)
+def test_a_historical_payload_still_computes_its_original_fingerprint(generation, entry):
     """The comparison replay actually performs."""
-    raw, original = historical(generation, kind)
+    raw, original = historical(generation, entry)
     assert EvidenceSubmission.model_validate_json(raw).fingerprint() == original
 
 
-@pytest.mark.parametrize("generation", GENERATIONS)
-def test_the_two_generations_kept_their_different_shapes(generation):
-    """The fixtures differ in the way the defect was about, so the tests bite."""
-    raw, _ = historical(generation, "fuse")
+@pytest.mark.parametrize(
+    ("generation", "entry", "key", "has_value"),
+    [
+        ("9515b49", "fuse", "evaluated_at", True),
+        ("094cad3", "fuse", None, False),
+        ("c760266", "fuse", "legacy_evaluated_at", False),
+        ("c760266", "fuse_with_value", "legacy_evaluated_at", True),
+        ("bb462b4", "fuse", None, False),
+        ("bb462b4", "fuse_with_value", "evaluated_at", True),
+    ],
+)
+def test_each_generation_kept_its_own_shape(generation, entry, key, has_value):
+    """The fixtures differ in exactly the ways the defects were about.
+
+    Stated explicitly so the tests above cannot quietly become vacuous: an
+    absent key, an explicit `null` and a carried value are three different
+    things, and two different spellings have been used for the same field.
+    """
+    raw, _ = historical(generation, entry)
     detail = json.loads(raw)["payload"]["synthesis"]
-    if generation == "9515b49":
-        assert "evaluated_at" in detail
-        assert detail["evaluated_at"] is not None
-    else:
-        assert "evaluated_at" not in detail
-    assert "legacy_evaluated_at" not in detail
+    present = [name for name in ("evaluated_at", "legacy_evaluated_at") if name in detail]
+    assert present == ([key] if key else [])
+    if key:
+        assert (detail[key] is not None) is has_value
 
 
-@pytest.mark.parametrize("generation", GENERATIONS)
+def test_the_interim_shape_is_the_one_that_was_missing():
+    """`c760266` wrote a spelling and a null nothing else did.
+
+    It is also the only generation whose ANCHOR payload put the key *after*
+    `execution_digest` rather than before it, so both the name and the position
+    had to be remembered rather than inferred.
+    """
+    raw, _ = historical("c760266", "anchor")
+    detail = json.loads(raw)["payload"]["execution"]
+    assert list(detail)[-1] == "legacy_evaluated_at"
+    assert detail["legacy_evaluated_at"] is None
+
+    original, _ = historical("9515b49", "anchor")
+    older = json.loads(original)["payload"]["execution"]
+    assert list(older)[-2:] == ["evaluated_at", "execution_digest"]
+
+
+def test_the_current_generation_introduced_no_new_shape():
+    """`bb462b4` reproduces the older forms and writes `094cad3`'s exactly.
+
+    Worth asserting rather than assuming: if it had invented a fifth shape,
+    every row it wrote would need its own compatibility rule.
+    """
+    for entry, matching in (("fuse", "094cad3"), ("fuse_with_value", "9515b49")):
+        current, current_fp = historical("bb462b4", entry)
+        older, older_fp = historical(matching, "fuse")
+        assert current == older
+        assert current_fp == older_fp
+
+
+DETAIL_FIELD = {"anchor": "execution", "fuse": "synthesis"}
+
+
+def detail_of(raw: str, kind: str) -> dict:
+    return json.loads(raw)["payload"][DETAIL_FIELD[kind]]
+
+
+def timestamp_of(parsed: EvidenceSubmission, kind: str):
+    return getattr(parsed.payload, DETAIL_FIELD[kind]).legacy_evaluated_at
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_an_explicitly_stored_null_is_not_the_same_as_an_absent_key(kind):
+    """Two ways of saying "no timestamp" that are not interchangeable.
+
+    `094cad3` omitted the key; `c760266` wrote it with `null`. Both parse to the
+    same `None`, so a model with one nullable field cannot tell them apart on the
+    way back out — and the fingerprint is taken over the bytes, not the value.
+    Collapsing them would make one of the two generations unreplayable.
+    """
+    absent_raw, absent_fp = historical("094cad3", kind)
+    null_raw, null_fp = historical("c760266", kind)
+
+    assert detail_of(absent_raw, kind).get("legacy_evaluated_at", "missing") == "missing"
+    assert detail_of(null_raw, kind)["legacy_evaluated_at"] is None
+
+    absent = EvidenceSubmission.model_validate_json(absent_raw)
+    explicit = EvidenceSubmission.model_validate_json(null_raw)
+    assert timestamp_of(absent, kind) is None
+    assert timestamp_of(explicit, kind) is None
+
+    assert absent.model_dump_json() == absent_raw
+    assert explicit.model_dump_json() == null_raw
+    assert absent_fp != null_fp, "identical meaning, different stored identity"
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_one_value_under_two_spellings_keeps_two_identities(kind):
+    """The same instant, written under two field names, is two fingerprints.
+
+    `9515b49` called it `evaluated_at` and `c760266` called it
+    `legacy_evaluated_at`. Reading both through one alias was the previous
+    round's fix and is not enough: whichever spelling the writer used has to come
+    back out, or that generation's stored fingerprint no longer matches.
+    """
+    older_raw, older_fp = historical("9515b49", kind)
+    interim_raw, interim_fp = historical("c760266", f"{kind}_with_value")
+
+    older = EvidenceSubmission.model_validate_json(older_raw)
+    interim = EvidenceSubmission.model_validate_json(interim_raw)
+    assert timestamp_of(older, kind) == timestamp_of(interim, kind) is not None
+
+    assert "evaluated_at" in detail_of(older_raw, kind)
+    assert "legacy_evaluated_at" in detail_of(interim_raw, kind)
+    assert older.model_dump_json() == older_raw
+    assert interim.model_dump_json() == interim_raw
+    assert older_fp != interim_fp
+
+
+@pytest.mark.parametrize(("generation", "entry"), FUSE_CASES)
 async def test_a_historical_synthesis_replays_unchanged_through_the_real_service(
-    worker_db, now, generation
+    worker_db, now, generation, entry
 ):
     """The end the previous round missed: replay through the workflow itself.
 
@@ -102,13 +236,13 @@ async def test_a_historical_synthesis_replays_unchanged_through_the_real_service
     against.
     """
     _, sessions = worker_db
-    raw, original = historical(generation, "fuse")
+    raw, original = historical(generation, entry)
     stored = EvidenceSubmission.model_validate_json(raw)
     assert stored.fingerprint() == original
 
     runtime, _ = build_stack(sessions, now)
     trade_case = await open_case(
-        runtime.cases, now, stored.correlation_id, f"r3-replay-{generation}"
+        runtime.cases, now, stored.correlation_id, f"r3-replay-{generation}-{entry}"
     )
 
     first = await runtime.cases.record_evidence(trade_case.id, stored)
@@ -124,52 +258,47 @@ async def test_a_historical_synthesis_replays_unchanged_through_the_real_service
     assert len(synthesis) == 1
 
 
-@pytest.mark.parametrize("generation", GENERATIONS)
-async def test_a_historical_execution_assessment_replays_through_the_real_service(
-    worker_db, now, generation
+@pytest.mark.parametrize(("generation", "entry"), ANCHOR_CASES)
+async def test_a_historical_execution_assessment_replays_unchanged(
+    worker_db, now, generation, entry
 ):
     """The same property for ANCHOR, whose payload the service cross-checks.
 
     Execution evidence names the setup and trigger it was assessed against, and
-    the service refuses references that do not exist — so those two ids are
-    rebound to a real case here. Everything else, including the legacy
-    timestamp's presence or absence, is exactly as the predecessor wrote it, and
-    the round trip through the model is what the replay comparison rests on.
-    """
-    from src.orchestration.workflow.engine import active_evidence
-    from tests.commander.conftest import inject_trigger
+    the service refuses references that do not exist. An earlier version of this
+    test rewrote those two ids to match a freshly built case — which quietly
+    re-serialised the submission with the current model and destroyed the very
+    fingerprint it was meant to prove.
 
+    Nothing is rewritten now. Evidence ids are `uuid5` of the idempotency key, so
+    the fixtures were generated naming the ids that `historical-setup` and
+    `historical-trigger` produce, and the test writes exactly those keys. The
+    historical envelope reaches the service byte for byte, including the legacy
+    timestamp in whichever of its four shapes that generation wrote.
+    """
     _, sessions = worker_db
     runtime, _ = build_stack(sessions, now)
-    raw, _ = historical(generation, "anchor")
-    parsed = EvidenceSubmission.model_validate_json(raw)
+    raw, original = historical(generation, entry)
+    stored = EvidenceSubmission.model_validate_json(raw)
+    assert stored.fingerprint() == original
+
     trade_case = await open_case(
-        runtime.cases, now, parsed.correlation_id, f"r3-anchor-{generation}"
+        runtime.cases, now, stored.correlation_id, f"r3-anchor-{generation}-{entry}"
     )
-    setup = await inject_pre_trigger_evidence(runtime.cases, trade_case, now)
-    await inject_trigger(runtime.cases, trade_case, now, setup)
-    current = active_evidence(await runtime.cases.evidence(trade_case.id))
-
-    rebound = parsed.model_copy(
-        update={
-            "payload": parsed.payload.model_copy(
-                update={
-                    "setup_evidence_id": setup.evidence_id,
-                    "trigger_evidence_id": current[EvidenceType.TRIGGER].evidence_id,
-                }
-            ),
-        }
+    setup = await inject_pre_trigger_evidence(
+        runtime.cases, trade_case, now, setup_key=HISTORICAL_SETUP_KEY
     )
-    # The legacy shape survived the copy: that is what replay depends on.
-    detail = json.loads(rebound.model_dump_json())["payload"]["execution"]
-    assert ("evaluated_at" in detail) == (generation == "9515b49")
-    assert "legacy_evaluated_at" not in detail
+    trigger = await inject_trigger(
+        runtime.cases, trade_case, now, setup, key=HISTORICAL_TRIGGER_KEY
+    )
+    assert stored.payload.setup_evidence_id == setup.evidence_id, "no rebinding was needed"
+    assert stored.payload.trigger_evidence_id == trigger.evidence_id
 
-    first = await runtime.cases.record_evidence(trade_case.id, rebound)
-    replay = await runtime.cases.record_evidence(trade_case.id, rebound)
+    first = await runtime.cases.record_evidence(trade_case.id, stored)
+    replay = await runtime.cases.record_evidence(trade_case.id, stored)
 
     assert replay.evidence_id == first.evidence_id
-    assert first.submission_fingerprint == rebound.fingerprint()
+    assert first.submission_fingerprint == original, "the stored identity is the original"
     execution = [
         item
         for item in await runtime.cases.evidence(trade_case.id)
