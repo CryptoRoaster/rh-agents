@@ -241,6 +241,10 @@ class FuseWorkerHandler:
                         evaluated_at=synthesis.evaluated_at,
                     ),
                 ),
+                # Each re-derivation replaces the last, so a case holds one
+                # current reading rather than a pile of readings of evidence
+                # sets it has already left behind.
+                supersedes_id=task_input.supersedes_id,
                 correlation_id=lease.correlation_id,
             ),
             result_key=f"fuse:{fingerprint}",

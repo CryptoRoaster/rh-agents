@@ -325,6 +325,11 @@ class FuseTaskInput(Immutable):
     policy_version: Identifier
     sources: tuple[FuseSourceEvidence, ...] = Field(default=(), max_length=12)
     missing: tuple[MissingSource, ...] = Field(default=(), max_length=12)
+    # The synthesis this one would replace, when the case already carries one.
+    # A derived view is re-derived whenever its inputs change, and each new
+    # reading supersedes the last — so a case holds one current synthesis rather
+    # than a pile of readings of evidence sets it has left behind.
+    supersedes_id: UUID | None = None
     evaluated_at: AwareDatetime
 
     @model_validator(mode="after")

@@ -457,7 +457,18 @@ def synthesize(
     # could, a summariser would be able to launder stale evidence into fresh
     # evidence simply by running again.
     observed_at = min(source.reference.observed_at for source in task_input.sources)
-    valid_until = min(source.reference.valid_until for source in task_input.sources)
+    expiries = [source.reference.valid_until for source in task_input.sources]
+    # A setup's own expiry binds too, not only its envelope's. VECTOR states when
+    # the geometry stops being true, and that instant can arrive before the
+    # envelope carrying it goes stale — so without this a synthesis could outlive
+    # the setup it describes while still looking current, which is precisely the
+    # claim this phase says it does not make.
+    expiries.extend(
+        source.trade_setup.expires_at
+        for source in task_input.sources
+        if source.trade_setup is not None and source.trade_setup.expires_at is not None
+    )
+    valid_until = min(expiries)
     if valid_until <= observed_at:
         return FuseReasonCode.SOURCES_NOT_CONCURRENT
 

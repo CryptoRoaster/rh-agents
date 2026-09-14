@@ -88,6 +88,30 @@ the first two lists before any factor is consulted.
 
 ---
 
+### Blockers beside gaps
+
+Both facts can be true at once, and both are kept.
+
+Precedence is blockers, then gaps, then caution — deliberately, not
+incidentally. A measured danger stops the case on its own merits whether or not
+something else is also missing, so it is what gets reported. But the gaps are
+**not discarded**: a consumer that only learned "blocked" would not know a
+source was also absent, and one that only learned "insufficient" might conclude
+no definitive problem had been found.
+
+| Evidence | Disposition | `hard_blockers` | `unresolved_gaps` |
+|---|---|---|---|
+| ATLAS blocked, SIGNAL missing | `BLOCKED` | ATLAS blocker | SIGNAL gap |
+| SIGNAL missing only | `INSUFFICIENT` | empty | SIGNAL gap |
+| SIGNAL degraded only | `CAUTION` | empty | empty |
+| all clean | `COHERENT` | empty | empty |
+
+Nothing has to infer that an `INSUFFICIENT` reading might secretly also contain
+a definitive blocker. A future COMMANDER tests `hard_blockers != []` — a list,
+not a string and not a sentence. A degraded non-safety signal stays a caution
+and never becomes a blocker to simplify that table.
+
+
 ## Unknown fails closed
 
 The standing invariant survives intact, and in one place it turned out to be
@@ -149,6 +173,80 @@ It follows that no summary outlives the setup it summarises.
 
 ---
 
+## The derived-evidence lifecycle
+
+FUSE is a view over four other pieces of evidence, and a view has a lifecycle an
+observation does not. ATLAS looking at a contract produces a fact that stays
+true until somebody looks again. FUSE produces a reading that stops describing
+the case the moment one of its inputs is replaced.
+
+The first implementation got half of that right and the other half wrong, and
+the wrong half was invisible from either end on its own:
+
+* an **in-flight** synthesis of replaced evidence was correctly refused;
+* but once a synthesis was **recorded**, the task was `SUCCEEDED` forever. No
+  fresh reading could ever be derived, and the stale one stayed current and
+  `ACCEPTED` while pointing at superseded sources.
+
+Proved by probe rather than by reading: after superseding SIGNAL, the stored
+synthesis reported `STILL CURRENT: True`, `status AVAILABLE`,
+`acceptance ACCEPTED`, and `sources match live? False`. A consumer reading
+current synthesis evidence would have received a reading of an evidence set the
+case had left behind, presented as valid.
+
+### Re-arming
+
+A task definition may now declare `derived_from` — the evidence types its output
+is derived from. Exactly one task declares it, and four bounds keep it from
+becoming a cascade:
+
+| Bound | Why |
+|---|---|
+| Only declared derived tasks | `derived_from` is empty everywhere else, so ATLAS finishing does not make SIGNAL runnable again |
+| Only on a declared input | A synthesis is not an input to itself, so it cannot re-arm its own task and loop |
+| Only before a trigger exists | Once the case is past the pre-trigger stage, re-answering that question is work queued to describe a stage nobody is at |
+| Only a live, unexpired case | A terminal case is not re-derived into |
+
+Re-arming reuses the task's own row and bumps its attempt counter, so a case
+keeps one slot per role rather than accumulating one per revision. It also
+clears the finished attempt's lease, which otherwise makes the re-armed task
+look busy until that lease's own expiry.
+
+Each new reading **supersedes** the last, so a case holds exactly one current
+synthesis — the one describing the evidence it actually has.
+
+### Same inputs, no churn
+
+Re-derivation is driven by inputs changing, not by time passing. Recording the
+same source set again produces no new task, and the synthesis is not among its
+own declared inputs, so there is no loop.
+
+---
+
+## Freshness is revalidated at submission, not only referenced
+
+Identity is not freshness, and a derived result needs both.
+
+`_require_current_references` answers "were these the same envelopes?" — it
+cannot answer "are they still usable?", because nothing was superseded when a
+source simply ages out during computation. The context is built while every
+source is current, the worker computes, and by the time the answer arrives the
+window has closed. Without a second check the result would be stored claiming a
+currency its inputs no longer have.
+
+So a submission whose own `valid_until` has already passed is refused with
+`EVIDENCE_STALE` — deliberately a different code from `TASK_SUPERSEDED`, which
+means somebody replaced the inputs. Here nobody did; time simply passed.
+
+A second expiry binds alongside the envelopes'. VECTOR states when the geometry
+stops being true, and that instant can arrive well before the envelope carrying
+it goes stale — so `valid_until` is the earliest of every source envelope's
+expiry **and** the setup's own. Without it a synthesis could outlive the setup
+it describes while still looking current, and no identity check would catch it,
+because the setup's evidence id never changed.
+
+---
+
 ## Supersession
 
 A synthesis names every envelope it read, by id and by submission fingerprint.
@@ -199,6 +297,52 @@ two further rules true without extra machinery:
   additional layer, never a replacement source for risk facts.
 * ATLAS, VECTOR, PULSE and ANCHOR keep their direct risk binding. Summarising
   them does not weaken it.
+
+---
+
+## Advisory derived evidence
+
+Stated plainly, because the flags alone do not convey it.
+
+FUSE is **advisory derived evidence**. It is recorded, superseded and audited
+like anything else, and it gates nothing. It is not a workflow gate, not a risk
+gate, not a source-of-truth replacement, not required for SENTINEL, not required
+for PULSE, and not an approval stage. The canonical workflow already enforces
+the underlying required evidence; a summary should not become a second
+availability dependency on top of it.
+
+`required=False` was not changed in this audit and should not be changed to make
+FUSE feel important. Source evidence stays authoritative.
+
+### Implemented is not the same as running
+
+The FUSE task is created `PENDING` at case-open like every other task, and a
+registered FUSE worker can claim it, so this is not dead code and it does not
+wait on COMMANDER.
+
+What does not exist is any launcher: nothing in a startup path constructs a FUSE
+worker, `FUSE_WORKER_ENABLED` defaults to false, and no process claims tasks on
+its own. FUSE is therefore **implementation-complete and operationally
+disabled**, exactly like every specialist before it. It runs when something runs
+it.
+
+### The future COMMANDER contract
+
+Documented, not implemented.
+
+A future COMMANDER may consume a synthesis as advisory context, and must never
+trust it blindly:
+
+* before using one, it must check that the synthesis's `source_evidence_ids`
+  still match the current ORBIT, ATLAS, SIGNAL and VECTOR evidence;
+* if the synthesis is **absent**, it must not infer positive consensus — absence
+  of a reading is not a clean reading;
+* if the synthesis is **stale**, it must not use it;
+* it must read `hard_blockers != []` as a list test, never by parsing prose or
+  inferring from the disposition.
+
+Source evidence remains available to every later stage. A materialized view does
+not remove the facts it was built from.
 
 ---
 

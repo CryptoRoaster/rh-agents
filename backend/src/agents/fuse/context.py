@@ -48,6 +48,7 @@ from src.orchestration.workflow.models import (
     DiscoveryPayload,
     EvidenceEnvelope,
     EvidenceStatus,
+    EvidenceType,
     OnchainPayload,
     SentimentPayload,
     TradeCase,
@@ -212,6 +213,7 @@ class FuseContextReader:
         # that cannot fire is not a safeguard but an untested claim that one
         # exists — and the real case, every source missing, is answered by the
         # synthesis refusing rather than by the context pretending it cannot look.
+        previous = current.get(EvidenceType.SYNTHESIS)
         return FuseTaskInput(
             trade_case_id=trade_case_id,
             task_id=task_id,
@@ -219,5 +221,6 @@ class FuseContextReader:
             policy_version=self.policy.version,
             sources=tuple(sources),
             missing=tuple(missing),
+            supersedes_id=None if previous is None else previous.evidence_id,
             evaluated_at=now,
         )

@@ -69,6 +69,19 @@ class TaskDefinition:
     # Present only for tasks that monitor rather than compute. Absent means the
     # task may not wait at all.
     wait: WaitPolicy | None = None
+    # The evidence types this task's output is *derived* from, for the one task
+    # whose result is a view over other evidence rather than an observation of
+    # the world.
+    #
+    # A derived result stops describing the case the moment one of its inputs is
+    # replaced, so such a task re-arms when that happens and produces a fresh
+    # result for the new input set. Nothing else re-arms: ATLAS looking at a
+    # contract again would be a new observation, not a re-derivation, and making
+    # every completed task rerun on any evidence change would turn one
+    # supersession into an unbounded cascade of work.
+    #
+    # Empty for every task that observes rather than derives.
+    derived_from: frozenset[EvidenceType] = frozenset()
 
     @property
     def claim_ceiling(self) -> int | None:
@@ -89,6 +102,13 @@ class WorkflowPolicy:
     version: str
     requirements: tuple[EvidenceRequirement, ...]
     tasks: tuple[TaskDefinition, ...]
+
+    def derived_tasks(self, evidence_type: EvidenceType) -> tuple[TaskDefinition, ...]:
+        """Tasks whose result is derived from evidence of this type.
+
+        Ordered by the policy's own task order so re-arming is deterministic.
+        """
+        return tuple(item for item in self.tasks if evidence_type in item.derived_from)
 
     def task(self, role: AgentRole, task_type: str) -> TaskDefinition | None:
         """The server-side definition governing one task slot."""
@@ -165,7 +185,22 @@ TRADE_CASE_V1 = WorkflowPolicy(
         TaskDefinition(AgentRole.ATLAS, "ASSESS_ONCHAIN_INTEGRITY", True),
         TaskDefinition(AgentRole.SIGNAL, "ASSESS_SENTIMENT", True),
         TaskDefinition(AgentRole.VECTOR, "DEFINE_TRADE_SETUP", True),
-        TaskDefinition(AgentRole.FUSE, "SYNTHESIZE_EVIDENCE", False),
+        # The one derived task. Its output is a reading of the four pre-trigger
+        # sources, so replacing any of them makes the previous reading describe
+        # an evidence set the case has left behind.
+        TaskDefinition(
+            AgentRole.FUSE,
+            "SYNTHESIZE_EVIDENCE",
+            False,
+            derived_from=frozenset(
+                {
+                    EvidenceType.DISCOVERY,
+                    EvidenceType.ONCHAIN,
+                    EvidenceType.SENTIMENT,
+                    EvidenceType.TRADE_SETUP,
+                }
+            ),
+        ),
         # A trigger monitor re-claims its slot on every check, so it needs a
         # watch horizon rather than a larger retry budget. Five hours at a
         # ninety-second cadence covers the four a VECTOR setup may live with room

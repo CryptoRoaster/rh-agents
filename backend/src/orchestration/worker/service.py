@@ -952,6 +952,17 @@ class WorkerRuntimeService:
             if value in superseded:
                 raise WorkerFailure(WorkerErrorCode.TASK_SUPERSEDED)
 
+        # Identity is not freshness, and a derived result needs both.
+        #
+        # The references above can all still be current while the work was slow
+        # enough that one of them aged out during it — no supersession happened,
+        # so nothing above notices, and the result would be recorded claiming a
+        # currency its inputs no longer have. A submission that has already
+        # expired by the time it arrives is therefore refused rather than stored
+        # and left for a reader to catch.
+        if submission.valid_until <= self.clock.now():
+            raise WorkerFailure(WorkerErrorCode.EVIDENCE_STALE)
+
     async def _replayed(
         self,
         session: AsyncSession,

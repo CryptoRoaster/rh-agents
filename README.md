@@ -655,11 +655,36 @@ accounts posting the same thing produces *both* a supporting note and three
 cautions, all at once. Averaging those into "neutral" would delete the only part
 worth reading.
 
+Being a summary of other things gives it a lifecycle that the other agents don't
+have. ATLAS looks at a contract and that answer stays true until someone looks
+again. A summary stops being true the moment one of the things it summarises
+gets replaced.
+
+The first version only handled half of that. If the evidence changed while the
+summary was still being written, it was correctly thrown away. But once a
+summary had been *saved*, the job was marked done forever — so no new summary
+could ever be written, and the old one sat there looking perfectly valid while
+pointing at evidence the case had already replaced. That was found by trying it
+rather than by reading the code: swap the sentiment evidence, and the stored
+summary still reports itself as current.
+
+Now the job re-arms when one of its inputs is replaced, writes a fresh summary,
+and that one replaces the old one. With guards, because "redo work when
+something changes" is how you accidentally build an infinite loop: only this one
+job re-arms, only its declared inputs count (a summary isn't an input to itself),
+only before the case has moved on to waiting for its trigger, and only while the
+case is alive.
+
 One quiet rule matters more than it looks. A summary is only as fresh as the
 oldest thing it summarises. If that were not true — if writing a new summary
 made old facts look current — then re-running this would be a way to launder
 stale evidence into fresh evidence, which is about the worst thing a summariser
 could do.
+
+Being late matters too, and in a way that's easy to miss. Checking "is this
+still the same evidence?" doesn't catch evidence that simply got old while the
+work was happening — nobody replaced it, so nothing looks wrong. A summary that
+has already expired by the time it arrives is now rejected rather than filed.
 
 And a summary decides nothing. It doesn't approve a trade, doesn't size one,
 doesn't clear anything, and deliberately doesn't feed the risk layer: SENTINEL
@@ -676,6 +701,11 @@ variance and leave nobody able to say which answer the system acted on. Being
 deterministic also means it can't invent an evidence reference, can't be talked
 out of a blocker by text hidden inside the evidence it reads, and gives the same
 answer twice — so a retry is a retry, not a second opinion.
+
+Worth being precise about what "done" means here: the job is created and a
+worker can claim it, so this isn't dead code waiting on some future component.
+But nothing starts a worker on its own, and the flag is off. Built and ready,
+not running — same as every agent before it.
 
 Disabled by default, no migration, no worker started. See [the Phase 2K
 synthesis design](docs/phase-2k.md).
