@@ -134,7 +134,7 @@ here rather than left for whoever writes the execution path to infer.
 
 ## Test evidence
 
-53 tests in `tests/riskrequest/`, on a schema carrying accounting *and* workflow.
+57 tests in `tests/riskrequest/`, on a schema carrying accounting *and* workflow.
 The production path runs throughout: the real workflow service against a real
 database, the real completeness check, the real sizing calculation and
 `src.risk.engine.evaluate` itself.
@@ -177,10 +177,16 @@ complete reproduction asked SENTINEL about an expired case, recorded an
 the case to `EXPIRED`.
 
 The fix asks the central evaluator, read-only, at the final decision instant and
-under the locks already held: `TradeCaseService.evaluate_in_session` reuses the
-same evaluator over the same evidence and binding reads `_stabilize` performs.
-No second workflow engine, and nothing written from a refusal path. The recorded
-safety digest is compared against the recomputed one for the same reason.
+under the locks already held. Loading and judging are two steps:
+`TradeCaseService.workflow_inputs_in_session` performs the same evidence and
+binding reads `_stabilize` performs, and `evaluate_inputs` renders the verdict
+**synchronously** on exactly what was loaded. The clock is read between them, so
+one instant governs eligibility, the validity of the basis, every source age,
+the UTC loss day and SENTINEL itself — and nothing is awaited between that read
+and the verdict. An instant taken before those reads would describe the moment
+the loading began, and a case can lapse while it runs. No second workflow
+engine, and nothing written from a refusal path. The recorded safety digest is
+compared against the recomputed one for the same reason.
 
 The basis is checked at that instant too. Both readings are taken before the
 locks settle, and each carries the horizon its own sources give it; one that

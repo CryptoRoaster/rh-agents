@@ -21,6 +21,7 @@ from src.orchestration.workflow.models import (
     SentimentPayload,
     TradeCaseStatus,
 )
+from src.orchestration.workflow.service import TradeCaseService
 from tests.riskdata.conftest import anchor_payload, record, record_onchain
 from tests.riskrequest.conftest import (
     RecordedMarkets,
@@ -51,6 +52,35 @@ class SteppingClock:
         current = self.instant
         self.instant = self.instant + self.step
         return current
+
+
+class MovingClock:
+    """A trusted clock a test can advance, without any real sleeping."""
+
+    def __init__(self, instant) -> None:
+        self.instant = instant
+
+    def now(self):
+        return self.instant
+
+
+class DelayedCases(TradeCaseService):
+    """A workflow service whose input load takes time.
+
+    The point of the split between loading and judging is that the clock is read
+    *after* the last input read. Making that read cost time is the only way a
+    test can tell the two orderings apart: with the instant taken first, the
+    verdict describes the moment the loading began.
+    """
+
+    def __init__(self, sessions, *, clock, delay) -> None:
+        super().__init__(sessions, clock=clock)
+        self._delay = delay
+
+    async def workflow_inputs_in_session(self, session, row):
+        inputs = await super().workflow_inputs_in_session(session, row)
+        self.clock.instant = self.clock.instant + self._delay
+        return inputs
 
 
 class RefusingMarkets:
@@ -336,6 +366,84 @@ async def test_replaying_a_stored_verdict_is_not_a_new_authorization(risk_db, no
     assert again.authorizes_execution is False
     assert again.reserves_cash is False
     assert (await counts(sessions)) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    ("lifetime", "trigger_seconds", "delay", "expected"),
+    [
+        # The case's own lifetime lapses while the workflow inputs are loading.
+        (timedelta(seconds=10), None, timedelta(seconds=15), "EXPIRED"),
+        # A safety envelope does, with the case itself still alive.
+        (timedelta(hours=1), 10, timedelta(seconds=15), "BLOCKED"),
+        # The control: the same path with no time passing at all.
+        (timedelta(hours=1), None, timedelta(0), None),
+    ],
+)
+async def test_time_passing_during_the_workflow_reads_is_counted(
+    risk_db, now, trace, lifetime, trigger_seconds, delay, expected
+):
+    """The last gap: an instant taken before the last input read.
+
+    `evaluate_in_session` used to take the caller's instant and *then* perform
+    two database reads, so the verdict still described a moment before them.
+    Loading and judging are separated now, with one clock read in between and
+    nothing awaited after it.
+    """
+    _, sessions = risk_db
+    builder = build_service(sessions, now)
+    case = await aging_case(
+        builder.cases,
+        now,
+        lifetime=lifetime,
+        trigger_valid=None if trigger_seconds is None else now + timedelta(seconds=trigger_seconds),
+        key=f"final-{expected}",
+    )
+    clock = MovingClock(now)
+    service = build_service(
+        sessions,
+        now,
+        clock=clock,
+        cases=DelayedCases(sessions, clock=clock, delay=delay),
+    )
+
+    result = await service.request_risk_evaluation(case.id, request_key=f"final-key-{expected}")
+
+    assert clock.instant == now + delay
+    if expected is None:
+        assert result.kind == "risk_request_evaluated"
+        assert result.outcome is RiskOutcome.APPROVE
+        assert (await counts(sessions)) == (1, 1)
+    else:
+        assert result.kind == "risk_request_refused"
+        assert result.reason is RiskRequestRefusal.TRADE_CASE_NO_LONGER_ELIGIBLE
+        assert result.detail == expected
+        assert (await counts(sessions)) == (0, 0)
+
+
+def test_nothing_is_awaited_between_the_clock_read_and_the_verdict():
+    """The ordering, asserted on the source rather than only in behaviour.
+
+    One instant has to govern eligibility, the validity of the basis, every
+    source age, the UTC loss day and SENTINEL. Any await in between would let
+    the instant drift away from the state it describes.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from src.orchestration.riskrequest.service import RiskRequestService
+
+    source = textwrap.dedent(inspect.getsource(RiskRequestService.request_risk_evaluation))
+    tree = ast.parse(source)
+    lines = source.splitlines()
+    clock_read = next(index for index, line in enumerate(lines) if "now = self.clock.now()" in line)
+    verdict = next(index for index, line in enumerate(lines) if "decision = evaluate(" in line)
+    awaits = [
+        node.lineno - 1
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Await) and clock_read < node.lineno - 1 < verdict
+    ]
+    assert awaits == [], [lines[index].strip() for index in awaits]
 
 
 # ============================================ 2. the evaluated snapshot is kept

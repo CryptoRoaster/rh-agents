@@ -197,8 +197,13 @@ class RiskRequestService:
             positions = [
                 read_position(item) for item in (await session.scalars(select(PositionRow))).all()
             ]
-            # Read after every lock and every await. Time spent waiting counts
-            # toward freshness and toward the UTC loss day.
+            workflow = await self.cases.workflow_inputs_in_session(session, row)
+
+            # The last clock read, after the last input read. Everything from
+            # here to the verdict is synchronous, so one instant governs
+            # eligibility, the validity of the basis, every source age, the UTC
+            # loss day and SENTINEL itself. An instant taken earlier describes
+            # when the loading began, and a case can lapse while it runs.
             now = self.clock.now()
             roll_loss_day(account, now)
 
@@ -207,9 +212,9 @@ class RiskRequestService:
             # without writes: a case whose lifetime lapsed or whose trigger aged
             # out keeps READY_FOR_RISK until something touches the row, and
             # `_stabilize` runs after the binding is written — far too late to
-            # be a precondition. The same central evaluator answers, read-only,
-            # under the locks already held.
-            effective = await self.cases.evaluate_in_session(session, row, now)
+            # be a precondition. The same central evaluator answers, on inputs
+            # already loaded under the locks, without awaiting anything.
+            effective = self.cases.evaluate_inputs(workflow, now)
             if effective.status is not TradeCaseStatus.READY_FOR_RISK:
                 return _refused(
                     trade_case,

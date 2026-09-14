@@ -6,6 +6,7 @@ execution capabilities.
 """
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -119,6 +120,20 @@ CASE_TRANSITIONS: dict[TradeCaseStatus, frozenset[TradeCaseStatus]] = {
     TradeCaseStatus.RISK_APPROVED: COMMON_BACKTRACKS,
     TradeCaseStatus.RISK_LIMITED: COMMON_BACKTRACKS,
 }
+
+
+@dataclass(frozen=True)
+class WorkflowInputs:
+    """Everything the central evaluator reads, loaded once and held.
+
+    Exists so loading and judging can happen at two clearly separated moments:
+    the reads under the caller's locks, then one clock read, then a synchronous
+    verdict on exactly what was loaded.
+    """
+
+    trade_case: TradeCase
+    evidence: tuple[EvidenceEnvelope, ...]
+    risk_binding: RiskBinding | None
 
 
 def canonical_digest(value: object) -> str:
@@ -837,23 +852,18 @@ class TradeCaseService:
             await self._stabilize(session, row)
             return case_from_row(row)
 
-    async def evaluate_in_session(
-        self, session: AsyncSession, row: TradeCaseRow, now: datetime
-    ) -> Evaluation:
-        """What the case is *at this instant*, read-only, inside a caller's transaction.
+    async def workflow_inputs_in_session(
+        self, session: AsyncSession, row: TradeCaseRow
+    ) -> WorkflowInputs:
+        """Load everything an evaluation needs, inside a caller's transaction.
 
-        A stored status is a snapshot of the last write, and time moves without
-        writes: a case whose own lifetime or whose safety evidence lapsed keeps
-        a stale row until something touches it. Callers that must not act on a
-        case that has gone ineligible therefore need the recomputed answer
-        rather than the recorded one — and need it before they act, not as a
-        side effect of writing.
+        Separated from the evaluation itself so a caller can read its clock
+        *after* the last of these reads. An instant taken before them describes
+        the moment the loading started, not the moment the answer is used, and a
+        case can lapse in between — which is exactly the window this split
+        closes.
 
-        Deliberately the *same* evaluator, over the same evidence and binding
-        reads `_stabilize` performs. There is one requirement table, one
-        transition matrix and one freshness rule, and this reads them at the
-        instant given instead of trusting a row written at an earlier one.
-        Nothing here writes, so the caller decides what the answer means.
+        Read-only, and the same reads `_stabilize` performs.
         """
         trade_case = case_from_row(row)
         evidence = tuple(
@@ -879,8 +889,25 @@ class TradeCaseService:
             )
             .limit(1)
         )
-        binding = risk_from_row(binding_row) if binding_row is not None else None
-        return self.evaluator.evaluate(trade_case, evidence, binding, now)
+        return WorkflowInputs(
+            trade_case=trade_case,
+            evidence=evidence,
+            risk_binding=risk_from_row(binding_row) if binding_row is not None else None,
+        )
+
+    def evaluate_inputs(self, inputs: WorkflowInputs, now: datetime) -> Evaluation:
+        """What the case is at `now`, computed without touching the database.
+
+        Synchronous on purpose: nothing between a caller's last clock read and
+        this answer may await, or the instant the answer describes drifts again.
+
+        Deliberately the *same* evaluator `_stabilize` uses. There is one
+        requirement table, one transition matrix and one freshness rule, and
+        this reads them at the instant given instead of trusting a row written
+        at an earlier one. Nothing here writes, so the caller decides what the
+        answer means.
+        """
+        return self.evaluator.evaluate(inputs.trade_case, inputs.evidence, inputs.risk_binding, now)
 
     async def _stabilize(self, session: AsyncSession, row: TradeCaseRow) -> None:
         for _ in range(12):
