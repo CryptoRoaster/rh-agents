@@ -98,10 +98,13 @@ class PortfolioValuation(Immutable):
     kind: Literal["portfolio_valuation"] = "portfolio_valuation"
     marks: tuple[PositionMark, ...] = Field(default=(), max_length=64)
     unvalued: tuple[UnvaluedPosition, ...] = Field(default=(), max_length=64)
-    # The assets the valuation covers, as read before the account lock. Compared
-    # against the holdings found under the lock, because a position created in
-    # between would make this valuation describe a different portfolio.
-    valued_assets: tuple[Identifier, ...] = Field(default=(), max_length=64)
+    # Every asset this valuation looked at, as read before the account lock —
+    # whether or not it could be priced. Compared against the holdings found
+    # under the lock, because a position created in between would make this
+    # valuation describe a different portfolio. Deliberately *not* named for
+    # success: an asset appearing here means it was considered, and asking it
+    # whether a holding was priced is the question `unusable` answers.
+    considered_assets: tuple[Identifier, ...] = Field(default=(), max_length=64)
 
     @property
     def complete(self) -> bool:
@@ -111,9 +114,24 @@ class PortfolioValuation(Immutable):
     def by_asset(self) -> dict[str, PositionMark]:
         return {item.asset_id: item for item in self.marks}
 
-    def covers(self, held: set[str]) -> bool:
-        """Whether every currently held asset was part of what was valued."""
-        return held <= set(self.valued_assets)
+    def unconsidered(self, held: set[str]) -> tuple[str, ...]:
+        """Held assets this valuation never looked at.
+
+        Any entry means the portfolio changed between the valuation and the
+        lock, so the figure would cover only part of what is held.
+        """
+        return tuple(sorted(held - set(self.considered_assets)))
+
+    def unusable(self, held: set[str]) -> tuple[str, ...]:
+        """Held assets that were looked at and could not be priced.
+
+        Separate from `unconsidered` because the two are different failures: one
+        says the portfolio moved, the other that a holding cannot be valued at
+        all. A single predicate over "was it considered?" answers neither, and
+        reading it as "was it valued?" is how a refusal disappears.
+        """
+        refused = {item.asset_id for item in self.unvalued}
+        return tuple(sorted(held & refused))
 
     def stale_at(self, instant: datetime, tolerance_seconds: int) -> tuple[str, ...]:
         """Assets whose mark no longer prices them at `instant`."""

@@ -74,7 +74,7 @@ async def test_several_open_positions_are_all_priced(now):
     assert valuation.complete
     assert len(valuation.marks) == 2
     assert valuation.by_asset[OTHER.base_asset_id].price_usd == Decimal("7.5")
-    assert set(valuation.valued_assets) == {BASE_ASSET, OTHER.base_asset_id}
+    assert set(valuation.considered_assets) == {BASE_ASSET, OTHER.base_asset_id}
 
 
 async def test_a_closed_position_needs_no_price(now):
@@ -83,7 +83,7 @@ async def test_a_closed_position_needs_no_price(now):
 
     assert valuation.complete
     assert valuation.marks == ()
-    assert valuation.valued_assets == ()
+    assert valuation.considered_assets == ()
     assert feed.requested == []
 
 

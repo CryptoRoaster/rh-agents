@@ -54,13 +54,13 @@ class PositionValuationReader:
         """
         marks: list[PositionMark] = []
         unvalued: list[UnvaluedPosition] = []
-        valued: list[str] = []
+        considered: list[str] = []
         for holding in sorted(positions, key=lambda item: item.asset_id):
             if holding.quantity == 0:
                 # Nothing held, nothing to value. A closed position contributes
                 # no exposure and needs no price.
                 continue
-            valued.append(holding.asset_id)
+            considered.append(holding.asset_id)
             outcome = await self._mark(holding, now)
             if isinstance(outcome, PositionMark):
                 marks.append(outcome)
@@ -73,7 +73,9 @@ class PositionValuationReader:
                     )
                 )
         return PortfolioValuation(
-            marks=tuple(marks), unvalued=tuple(unvalued), valued_assets=tuple(valued)
+            marks=tuple(marks),
+            unvalued=tuple(unvalued),
+            considered_assets=tuple(considered),
         )
 
     async def _mark(self, holding: Position, now: datetime) -> PositionMark | ValuationRefusal:

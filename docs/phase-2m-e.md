@@ -188,3 +188,88 @@ value is backfilled, because there is no value that could be inferred. Head is
   market, the answer is a refusal, not a fallback price.
 - **No launcher and no worker.** Nothing calls either service automatically.
 - Live execution, signing and broadcast remain out of scope entirely.
+
+## Hardening round
+
+Three defects, each reproduced against `e5c5657` before being fixed.
+
+**The case's own asset was priced by the case.** `portfolio_state` skipped every
+holding whose asset was the one being traded, and `prices[asset_id]` — this
+market's price — then valued it anyway. Inventory bought in pool A was marked at
+pool B's price, and a holding with no recorded market at all was valued as if it
+had been bought in the case's. The reproduction held four units acquired in a
+second pool at 9.00 while the case ran in a pool at 1.25: the exposure SENTINEL
+judged was **5**, not 36, `position_marks` was empty, and the fill went through.
+`covers()` could catch neither, because it compared *which* assets had been
+looked at, not which had been priced — a valuation with a refusal in it answered
+`True`.
+
+Three separate corrections:
+
+- Every non-zero holding is valued, the order's asset included. The order's price
+  now prices only the position the order would open.
+- A holding is priced from the case's market only when it was *acquired* in that
+  market — same pair, chain, network and provider — and a market prices one base
+  asset, so a different asset is never priced by it. A holding that records no
+  market is never "here": that absence is the ambiguity the identity contract
+  refuses to resolve, and resolving it in favour of whichever market happens to
+  be asking is the worst available answer. It refuses with
+  `POSITION_MARKET_UNKNOWN` instead.
+- `valued_assets` is now `considered_assets`, and the one lying predicate is
+  replaced by two honest ones: `unconsidered(held)` names holdings that appeared
+  after the valuation, `unusable(held)` names holdings that were looked at and
+  could not be priced. They are different failures and now have different
+  answers.
+
+That leaves the case where the order's asset is already held, bought elsewhere.
+Positions are one row per asset, so a fill would merge inventory from two markets
+into one position recorded against one of them — one of the two records would be
+false. That is a top-up across markets, and **no top-up contract exists here to
+fall back on**; inventing one would be a strategy hidden in a valuation. Both
+paths refuse with `POSITION_MARKET_CONFLICT`: the request too, because approving
+an order that could only be filled that way would spend the case's one request on
+an impossibility. The standalone paper path raises on the same condition, where
+reaching it is an invariant violation rather than a decision.
+
+**A stored rejection was not treated as history.** The short-circuit before the
+valuation asked whether a *fill* existed, so a case whose fill-time re-check had
+already rejected valued the portfolio all over again — and with a holding to
+price and the market layer unreachable, the replay raised instead of answering.
+One order gets one verdict, and a rejection is as final as a fill. The check now
+asks whether the re-check's decision exists at all (`RiskRow` by the stored
+request's intent), which covers both and covers a rolled-back attempt correctly
+by covering neither. It remains a decision not to do work: `replay_in_session`
+still answers authoritatively under the account and case locks, on the intent
+identity, and a mismatched request key is still refused rather than answered.
+
+**The stored basis could not be recomputed.** The request recorded marks and
+aggregate figures; the execution recorded marks and no portfolio at all. Neither
+kept the holdings the figures applied to, so checking an exposure meant re-reading
+position rows that the fill itself had changed — which is not a reconstruction of
+anything. `portfolio_basis` now records the holdings with their quantities, cost
+bases and market attributions, the marks relied on, the account's cash and the
+day's realised loss as the evaluation saw them (read before the fill books onto
+the same row), the instant, the freshness bound and the market being judged.
+`replay_portfolio_basis` feeds all of it back through the same `portfolio_state`,
+so the recomputation *is* the computation rather than a second implementation of
+it, and both bases also store the typed `RiskContext` that was handed to SENTINEL
+to compare against. The execution basis takes its portfolio from the state the
+re-check was actually reached from, carried out of `execute_in_session` on
+`PaperOutcome`, rather than from a recomputation after the fact. Both are covered
+by the existing digests: the request's whole basis by `risk_request_digest`, and
+the execution's by the row it is written with.
+
+Proved in `tests/casefill/test_marks_hardening.py` (15 tests): a holding in
+another pool refusing in both paths, a holding with no recorded market refusing
+in both, a refused holding no longer passing as valued, a different asset never
+taking this market's price, a holding acquired in this market being priced by
+this market's own reading, a stored fill-time rejection replaying with
+`replayed=True` against a market layer that raises on contact and with no
+bookings, completed fills and key conflicts still behaving as before, and the
+stored basis of both the request and the fill recomputing the exact `RiskContext`
+SENTINEL judged after the position rows have been changed underneath it.
+
+Unchanged by this round and re-checked by the existing suites: the 2M-D execution
+boundary, the freshness of every mark used at it, the account → case lock order,
+full rollback on a lapsed window, the account pause, the single limits source and
+the intent identity.

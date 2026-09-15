@@ -38,7 +38,12 @@ from src.core.models import (
 )
 from src.data.repository import aware, read_position
 from src.data.tables import AccountRow, PositionRow, TradeCaseRiskRequestRow
-from src.ledger.portfolio import PortfolioState, portfolio_state, roll_loss_day
+from src.ledger.portfolio import (
+    PortfolioState,
+    portfolio_basis,
+    portfolio_state,
+    roll_loss_day,
+)
 from src.markets.models import Availability
 from src.markets.models import MarketSnapshot as RecordedMarket
 from src.orchestration.commander.context import SystemPausePort
@@ -50,7 +55,6 @@ from src.orchestration.riskrequest.models import (
     RiskRequestReading,
     RiskRequestRefusal,
     RiskRequestRefused,
-    canonical_amount,
     risk_request_digest,
 )
 from src.orchestration.sizing.context import PaperSizingReader
@@ -217,10 +221,13 @@ class RiskRequestService:
                 read_position(item) for item in (await session.scalars(select(PositionRow))).all()
             ]
             held = {item.asset_id for item in positions if item.quantity != 0}
-            if not valuation.covers(held):
+            appeared = valuation.unconsidered(held)
+            if appeared:
                 # The portfolio moved while it was being valued, so the figure
                 # SENTINEL would judge covers only part of it — worse than no
-                # figure, because it looks like one.
+                # figure, because it looks like one. A holding that *was* looked
+                # at and could not be priced is a different failure, answered
+                # below on the marks as they stand at the decision instant.
                 return _refused(
                     trade_case,
                     RiskRequestRefusal.PORTFOLIO_CHANGED_DURING_VALUATION,
@@ -314,6 +321,16 @@ class RiskRequestService:
                     assessed.readiness,
                     detail=unvaluable_reason(valuation, state.unmarked_assets),
                 )
+            if state.conflicting_market is not None:
+                # This asset is already held, bought in another market. A fill
+                # would merge the two into one position recorded against one of
+                # them. Approving an order that could only be filled by doing
+                # that would spend the case's one request on an impossibility.
+                return _refused(
+                    trade_case,
+                    RiskRequestRefusal.POSITION_MARKET_CONFLICT,
+                    assessed.readiness,
+                )
 
             intent = _trade_intent(assessed, market, trade_case, request_key, now)
             limits = self.limits.model_copy(
@@ -338,7 +355,26 @@ class RiskRequestService:
                 account.paused = True
 
             basis = _basis(
-                request_key, trade_case, assessed, limits, state, intent, decision, market
+                request_key,
+                trade_case,
+                assessed,
+                limits,
+                state,
+                intent,
+                decision,
+                market,
+                portfolio_basis(
+                    state,
+                    cash_usd=account.cash_usd,
+                    realized_loss_today_usd=account.realized_loss_today_usd,
+                    positions=positions,
+                    asset_id=market.asset_id,
+                    price_usd=market.price_usd,
+                    now=now,
+                    max_snapshot_age_seconds=self.limits.max_snapshot_age_seconds,
+                    correlation_id=trade_case.correlation_id,
+                    market=trade_case.market,
+                ),
             )
             digest = risk_request_digest(basis)
             request_id = uuid5(NAMESPACE_URL, f"rh-agents:risk-request:{request_key}")
@@ -711,6 +747,7 @@ def _basis(
     intent: TradeIntent,
     decision: Any,
     market: MarketSnapshot,
+    portfolio: dict[str, Any],
 ) -> dict[str, Any]:
     """The whole decision basis, persisted beside the verdict.
 
@@ -729,18 +766,11 @@ def _basis(
         "readiness": inputs.readiness.model_dump(mode="json"),
         "cost_assumptions": inputs.costs.model_dump(mode="json"),
         "risk_limits": limits.model_dump(mode="json"),
-        "portfolio": {
-            # The marks actually relied on, with the market, source and instant
-            # each came from. A stored exposure figure nobody could re-derive is
-            # not an audit record.
-            "position_marks": [item.model_dump(mode="json") for item in state.marks_used],
-            "cash_usd": canonical_amount(state.context.cash_usd),
-            "exposure_usd": canonical_amount(state.context.exposure_usd),
-            "position_quantity": canonical_amount(state.context.position_quantity),
-            "daily_loss_usd": canonical_amount(state.context.daily_loss_usd),
-            "accounting": state.context.accounting.value,
-            "unmarked_assets": list(state.unmarked_assets),
-        },
+        "portfolio": portfolio,
+        # The typed context `evaluate` was actually given. `portfolio` carries
+        # the holdings it was computed from, so this figure can be recomputed
+        # rather than taken on trust.
+        "risk_context": state.context.model_dump(mode="json"),
         # The typed snapshot `evaluate` was actually given, whole. The
         # completeness reading records provenance rather than values, so without
         # this the only way to learn what SENTINEL was shown would be to re-read
