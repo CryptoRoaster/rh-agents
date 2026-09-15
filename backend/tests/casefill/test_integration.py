@@ -324,6 +324,29 @@ async def test_a_caller_naming_another_binding_is_refused(risk_db, now, trace):
     assert (await counts(sessions)) == (0, 0)
 
 
+async def test_a_later_case_sees_the_first_fill_s_committed_cash(risk_db, now, trace):
+    """Sequentially, the cash check still bites: no overdraw, no second entry."""
+    from uuid import uuid4 as _uuid4
+
+    _, sessions = risk_db
+    first, _, feed = await approved_case(sessions, now, trace, key="cash-one")
+    service = build_fill_service(sessions, now, feed=feed)
+    assert (await service.execute_case_fill(first.id, request_key="cash-one-req")).kind == (
+        "paper_fill_recorded"
+    )
+
+    second, _, _ = await approved_case(sessions, now, _uuid4(), key="cash-two")
+    await set_account(sessions, cash_usd=Decimal("10"))
+    later = build_fill_service(sessions, now, feed=feed)
+
+    result = await later.execute_case_fill(second.id, request_key="cash-two-req")
+
+    assert result.kind == "execution_refused"
+    assert result.reason is ExecutionRefusal.RISK_RECHECK_REFUSED
+    assert "INSUFFICIENT_CASH" in result.reason_codes
+    assert (await read_account(sessions)).cash_usd == Decimal("10")
+
+
 # ------------------------------------------------------------- stops and risk
 
 

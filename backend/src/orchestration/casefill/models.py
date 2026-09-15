@@ -71,6 +71,15 @@ class ExecutionRefusal(StrEnum):
     # A holding exists that this system cannot value, so the portfolio SENTINEL
     # would judge is unknown. A missing capability, not a verdict.
     PORTFOLIO_MARKS_UNAVAILABLE = "PORTFOLIO_MARKS_UNAVAILABLE"
+    # This order's asset is already held, bought in another market. Filling
+    # would merge inventory from two markets into one position recorded against
+    # one of them. Adding to a position across markets is a contract this
+    # system does not have, and inventing one here would be a strategy.
+    POSITION_MARKET_CONFLICT = "POSITION_MARKET_CONFLICT"
+    # A position appeared between the valuation and the account lock, so the
+    # portfolio about to be judged is not the one that was valued. Refused
+    # rather than judged on a partial picture, which would look like a figure.
+    PORTFOLIO_CHANGED_DURING_VALUATION = "PORTFOLIO_CHANGED_DURING_VALUATION"
     SYSTEM_PAUSED = "SYSTEM_PAUSED"
     SYSTEM_STOP_UNREADABLE = "SYSTEM_STOP_UNREADABLE"
     KILL_SWITCH_ENGAGED = "KILL_SWITCH_ENGAGED"

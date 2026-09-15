@@ -72,13 +72,35 @@ async def approved_case(
     onchain=None,
     lifetime=None,
     limits=None,
+    identity=None,
+    feed=None,
 ):
     """A case carried through the real risk request into a stored approval."""
-    risk = build_service(sessions, now, notional=notional, limits=limits)
+    risk = build_service(sessions, now, notional=notional, limits=limits, feed=feed)
     extra = {} if lifetime is None else {"lifetime": lifetime}
-    case = await ready_case(risk.cases, now, trace, onchain=onchain, key=f"{key}-case", **extra)
+    case = await ready_case(
+        risk.cases, now, trace, onchain=onchain, key=f"{key}-case", identity=identity, **extra
+    )
     result = await risk.request_risk_evaluation(case.id, request_key=f"{key}-req")
     return case, result, risk.markets
+
+
+class MultiMarkets:
+    """Several recorded markets, answered by pair. Never a provider."""
+
+    def __init__(self, *snapshots) -> None:
+        self._by_pair = {item.pair.pair_id: item for item in snapshots}
+        self.requested: list[str] = []
+
+    def replace(self, snapshot) -> None:
+        self._by_pair[snapshot.pair.pair_id] = snapshot
+
+    def drop(self, pair_id: str) -> None:
+        self._by_pair.pop(pair_id, None)
+
+    async def latest(self, identity: str, *, include_fixtures: bool = False):
+        self.requested.append(identity)
+        return self._by_pair.get(identity)
 
 
 def candidate_for(snapshot) -> MarketCandidate:

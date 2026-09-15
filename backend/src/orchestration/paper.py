@@ -25,7 +25,9 @@ from src.data.repository import append, read_position, save_position
 from src.data.tables import AccountRow, ExecutionRow, IntentRow, PositionRow, RiskRow
 from src.execution.paper import PaperExecutor
 from src.ledger.accounting import apply_fill, calculate_pnl
-from src.ledger.portfolio import portfolio_state, roll_loss_day
+from src.ledger.portfolio import PortfolioState, portfolio_state, roll_loss_day
+from src.markets.models import MarketIdentity
+from src.orchestration.valuation.models import PositionMark
 from src.risk.engine import evaluate
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,10 @@ class PaperOutcome:
     # risk verdict: the decision above says what SENTINEL thought, and this says
     # the world moved on before it could be acted on.
     stop_reason: str | None = None
+    # The portfolio this decision was actually reached from. Carried out so a
+    # caller records the valuation the evaluation used rather than one it
+    # recomputes afterwards from rows the fill has since changed.
+    state: PortfolioState | None = None
 
     @property
     def result(self) -> ExecutionResult | RiskDecision:
@@ -102,7 +108,7 @@ class PaperTradingService:
         intent: TradeIntent,
         market: MarketSnapshot,
         *,
-        marks: dict[str, MarketSnapshot] | None = None,
+        marks: dict[str, PositionMark] | None = None,
     ) -> ExecutionResult | RiskDecision:
         try:
             return await self._process(intent, market, marks=marks)
@@ -118,7 +124,7 @@ class PaperTradingService:
         intent: TradeIntent,
         market: MarketSnapshot,
         *,
-        marks: dict[str, MarketSnapshot] | None = None,
+        marks: dict[str, PositionMark] | None = None,
     ) -> ExecutionResult | RiskDecision:
         if self.mode != TradingMode.PAPER:
             raise ValueError("Paper execution must be explicitly enabled")
@@ -185,8 +191,9 @@ class PaperTradingService:
         market: MarketSnapshot,
         *,
         positions: list[Position],
-        marks: dict[str, MarketSnapshot] | None,
+        marks: dict[str, PositionMark] | None,
         now: datetime,
+        market_identity: MarketIdentity | None = None,
         authorize: Callable[[datetime], str | None] | None = None,
     ) -> PaperOutcome:
         """Risk-check, fill and book one order inside a transaction the caller owns.
@@ -232,9 +239,15 @@ class PaperTradingService:
             now=now,
             max_snapshot_age_seconds=self.limits.max_snapshot_age_seconds,
             correlation_id=intent.correlation_id,
+            market=market_identity,
         )
-        for mark in state.marks_used:
-            await append(session, mark)
+        if state.conflicting_market is not None:
+            # This asset is already held, and was bought somewhere else. Filling
+            # would merge the two into one position recorded against one market,
+            # so one of them would be a lie. Case-bound callers refuse on this
+            # before asking SENTINEL anything; reaching it here is an invariant
+            # violation rather than a decision to be made.
+            raise ValueError(f"Asset already held in another market: {state.conflicting_market}")
         position, prices, context = state.position, state.prices, state.context
         limits = self.limits.model_copy(
             update={"kill_switch": self.limits.kill_switch or account.paused}
@@ -246,7 +259,7 @@ class PaperTradingService:
         if risk.outcome != RiskOutcome.APPROVE:
             if risk.outcome == RiskOutcome.PAUSE_SYSTEM:
                 account.paused = True
-            return PaperOutcome(decision=risk)
+            return PaperOutcome(decision=risk, state=state)
 
         # ------------------------------------------------ execution boundary
         # The truthful instant the order is actually placed at, read after the
@@ -258,7 +271,7 @@ class PaperTradingService:
         if stop is not None:
             # Approved, and not executed. The caller rolls back; nothing here
             # turns a lapsed window into a risk rejection.
-            return PaperOutcome(decision=risk, stop_reason=stop)
+            return PaperOutcome(decision=risk, stop_reason=stop, state=state)
 
         order = OrderIntent(
             source="PAPER_EXECUTION",
@@ -287,4 +300,4 @@ class PaperTradingService:
             positions, prices, cash=cash, fees_paid=account.fees_paid_usd, fill=fill
         )
         await append(session, pnl)
-        return PaperOutcome(decision=risk, order=order, fill=fill)
+        return PaperOutcome(decision=risk, order=order, fill=fill, state=state)

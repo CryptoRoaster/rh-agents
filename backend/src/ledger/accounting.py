@@ -35,6 +35,12 @@ def apply_fill(
         source="LEDGER",
         correlation_id=fill.correlation_id,
         asset_id=position.asset_id,
+        # The market the holding was acquired in travels with it; a fill never
+        # moves a position to a different market.
+        market_pair_id=position.market_pair_id,
+        market_chain=position.market_chain,
+        market_network=position.market_network,
+        market_provider=position.market_provider,
         quantity=quantity,
         cost_basis_usd=basis,
         realized_pnl_usd=position.realized_pnl_usd + realized,

@@ -288,6 +288,15 @@ class ExecutionResult(Record):
 
 class Position(Record):
     asset_id: Identifier
+    # The market this position was acquired in, when it is known. An asset is
+    # not a market — a token can trade in several pools — so valuing a position
+    # needs the pair it came from rather than a market chosen for its asset.
+    # Absent on anything acquired before this was recorded, and absence is
+    # reported rather than resolved.
+    market_pair_id: Identifier | None = None
+    market_chain: Identifier | None = None
+    market_network: Identifier | None = None
+    market_provider: Identifier | None = None
     quantity: Amount = Decimal("0")
     cost_basis_usd: Amount = Decimal("0")
     realized_pnl_usd: SignedAmount = Decimal("0")

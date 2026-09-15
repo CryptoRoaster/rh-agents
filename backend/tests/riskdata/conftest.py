@@ -51,6 +51,27 @@ LIQUIDITY = Decimal("750000")
 TOTAL_SUPPLY = "1000000000000000000000000"
 
 
+def market_for(token: str, pool: str) -> object:
+    """A second coherent market, for the cases that need more than one.
+
+    Everything is rewritten together — token, quote, pool and pair — because the
+    contracts refuse a market whose identities disagree, and that invariant is
+    not something to work around in a fixture.
+    """
+    from src.markets.models import MarketIdentity
+
+    return MarketIdentity(
+        provider="geckoterminal",
+        chain=CHAIN,
+        network=NETWORK,
+        pair_id=f"{CHAIN}:{NETWORK}:contract_address:0x{pool}",
+        base_asset_id=f"{CHAIN}:{NETWORK}:0x{token}",
+        quote_asset_id=f"{CHAIN}:{NETWORK}:{QUOTE}",
+        venue="uniswap-v3",
+        is_fixture=False,
+    )
+
+
 def stable_id(label: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"rh-agents:riskdata-test:{label}")
 
@@ -93,6 +114,8 @@ def recorded_snapshot(
     decimals: int | None = 18,
     base_asset_id: str = BASE_ASSET,
     metadata_age: timedelta | None = None,
+    pair_id: str = PAIR_ID,
+    label: str = "",
 ) -> MarketSnapshot:
     """One observation of the ATLAS market, shaped as the recorder stores them.
 
@@ -105,6 +128,7 @@ def recorded_snapshot(
     """
     observed_at = now - age
     metadata_at = observed_at if metadata_age is None else now - metadata_age
+    tag = f"{label}:" if label else ""
     if metadata_at > observed_at:
         raise ValueError("Nested asset metadata cannot be newer than its snapshot")
     meta = dict(
@@ -112,46 +136,50 @@ def recorded_snapshot(
         provider="geckoterminal",
         chain=CHAIN,
         network=NETWORK,
-        correlation_id=stable_id("market"),
+        correlation_id=stable_id(f"{tag}market"),
         is_fixture=False,
     )
     asset_meta = {**meta, "observed_at": metadata_at}
     base = AssetIdentity(
-        **asset_meta, id=stable_id("base"), asset_id=base_asset_id, symbol="TKN", decimals=decimals
+        **asset_meta,
+        id=stable_id(f"{tag}base"),
+        asset_id=base_asset_id,
+        symbol="TKN",
+        decimals=decimals,
     )
     quote = AssetIdentity(
         **{**asset_meta, "asset_id": f"{CHAIN}:{NETWORK}:{QUOTE}"},
-        id=stable_id("quote"),
+        id=stable_id(f"{tag}quote"),
         symbol="USDC",
         decimals=6,
     )
     pair = MarketPair(
         **{**meta, "asset_id": base_asset_id},
-        id=stable_id("pair"),
-        pair_id=PAIR_ID,
+        id=stable_id(f"{tag}pair"),
+        pair_id=pair_id,
         base=base,
         quote=quote,
         venue="uniswap-v3",
     )
     return MarketSnapshot(
         **{**meta, "asset_id": base_asset_id},
-        id=stable_id("snapshot"),
+        id=stable_id(f"{tag}snapshot"),
         pair=pair,
         price=PriceSnapshot(
             **{**meta, "asset_id": base_asset_id},
-            id=stable_id("price"),
+            id=stable_id(f"{tag}price"),
             status=Availability.AVAILABLE if price is not None else Availability.UNKNOWN,
             value_usd=price,
         ),
         liquidity=LiquiditySnapshot(
             **{**meta, "asset_id": base_asset_id},
-            id=stable_id("liquidity"),
+            id=stable_id(f"{tag}liquidity"),
             status=Availability.AVAILABLE if liquidity is not None else Availability.UNKNOWN,
             value_usd=liquidity,
         ),
         volume=VolumeSnapshot(
             **{**meta, "asset_id": base_asset_id},
-            id=stable_id("volume"),
+            id=stable_id(f"{tag}volume"),
             status=Availability.AVAILABLE,
             value_usd=Decimal("120000"),
             window_seconds=86400,
@@ -301,9 +329,11 @@ async def record_sentiment(cases, trade_case, now, assessment="NEGATIVE"):
     )
 
 
-async def open_case(cases, now, trace, key="riskdata-case", lifetime=timedelta(hours=1)):
+async def open_case(
+    cases, now, trace, key="riskdata-case", lifetime=timedelta(hours=1), identity=None
+):
     return await cases.open_trade_case(
-        IDENTITY,
+        identity or IDENTITY,
         originating_discovery_reference=uuid4(),
         correlation_id=trace,
         idempotency_key=key,
