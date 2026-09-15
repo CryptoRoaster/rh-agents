@@ -85,6 +85,7 @@ async def risk_db():
                 "0005_trade_case_workflow",
                 "0006_worker_runtime",
                 "0007_trade_case_risk_requests",
+                "0008_trade_case_executions",
             ):
                 spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
                 module = importlib.util.module_from_spec(spec)

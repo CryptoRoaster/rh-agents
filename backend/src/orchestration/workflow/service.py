@@ -117,7 +117,10 @@ CASE_TRANSITIONS: dict[TradeCaseStatus, frozenset[TradeCaseStatus]] = {
     # Both authorized states are revalidatable. Neither may reach another risk
     # verdict directly: revocation always returns through the evaluator, and a
     # fresh SENTINEL decision is bound only from READY_FOR_RISK.
-    TradeCaseStatus.RISK_APPROVED: COMMON_BACKTRACKS,
+    # An approval may be revoked by the evaluator, or spent by an execution.
+    # `EXECUTED` is reachable from nowhere else: only a booked fill ends a case
+    # that way, and only from the one status that authorised it.
+    TradeCaseStatus.RISK_APPROVED: COMMON_BACKTRACKS | {TradeCaseStatus.EXECUTED},
     TradeCaseStatus.RISK_LIMITED: COMMON_BACKTRACKS,
 }
 
@@ -1108,6 +1111,32 @@ class TradeCaseService:
         await session.flush()
         await self._stabilize(session, row)
         return binding_id
+
+    async def complete_execution_in_session(
+        self,
+        session: AsyncSession,
+        row: TradeCaseRow,
+        *,
+        detail: dict[str, object],
+    ) -> None:
+        """End a case because its authorised entry was filled.
+
+        The workflow stays the status owner: this goes through the same guarded
+        transition every other status change uses, so the matrix decides whether
+        `EXECUTED` is reachable from where the case actually is. It is reachable
+        only from `RISK_APPROVED`, which means only an authorised case can be
+        ended this way and no caller can write the status directly.
+
+        Terminal on purpose. The case asked one question, received one
+        authorization and spent it. What may happen to the resulting position —
+        adding to it, exiting it, or deciding that a later entry is a different
+        trade — has no contract yet, and inventing one here would be a strategy
+        hidden in a state machine.
+        """
+        self._mutable(row, None)
+        await self._direct_transition(session, row, TradeCaseStatus.EXECUTED, "ENTRY_EXECUTED", ())
+        self._event(session, row, "ENTRY_EXECUTED", "ENTRY_EXECUTED", detail)
+        await session.flush()
 
     async def expire_trade_case(self, trade_case_id: UUID) -> TradeCase:
         async with self.sessions.begin() as session:

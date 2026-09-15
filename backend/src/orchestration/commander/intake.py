@@ -32,6 +32,7 @@ from src.markets.models import MarketCandidate, MarketSnapshot
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.commander.policy import COMMANDER_CONTROL_V1, CommanderControlPolicy
 from src.orchestration.workflow.models import (
+    MARKET_BARRING_CASE_STATUSES,
     TERMINAL_CASE_STATUSES,
     TradeCase,
     TradeCaseStatus,
@@ -62,6 +63,11 @@ class IntakeRefusal(StrEnum):
     # SENTINEL rejected the most recent case for this market. Re-observing a
     # market is not new information about risk, and must not launder a refusal.
     RISK_REJECTED_FOR_MARKET = "RISK_REJECTED_FOR_MARKET"
+    # The most recent case for this market was filled, so a position exists.
+    # Adding to it, exiting it, or deciding that a further entry is a different
+    # trade are all contracts this system does not have, and intake must not
+    # invent one by simply observing the market again.
+    POSITION_OPENED_FOR_MARKET = "POSITION_OPENED_FOR_MARKET"
     CYCLE_LIMIT_REACHED = "CYCLE_LIMIT_REACHED"
     SYSTEM_PAUSED = "SYSTEM_PAUSED"
     # The open was refused by the workflow itself. Recorded per candidate so one
@@ -276,18 +282,23 @@ class CommanderIntakeService:
             return IntakeRefusal.ACTIVE_CASE_EXISTS, None
 
         latest_id, latest_status = await self._latest_terminal(candidate)
-        if latest_status == TradeCaseStatus.RISK_REJECTED:
-            # A rejection is a verdict about this market's current state, not a
-            # case that merely ran out of road. Re-observing a market produces no
-            # new information about risk, so a fresh observation must not start a
-            # new attempt at the same question — that would be retry-until-pass
-            # with extra steps. Only an evidence change inside a live case can
-            # legitimately lead to a new assessment, and that path does not run
-            # through intake.
-            return IntakeRefusal.RISK_REJECTED_FOR_MARKET, None
+        if latest_status in MARKET_BARRING_CASE_STATUSES:
+            # One set decides whether a market is spoken for; the codes differ
+            # because the reasons do. A rejection is a verdict about the market,
+            # and re-observing it is not new information about risk. An
+            # execution left a position, and adding to one, exiting one or
+            # deciding that a further entry is a different trade are contracts
+            # this system does not have — intake must not invent one by looking
+            # at the market again.
+            return (
+                IntakeRefusal.POSITION_OPENED_FOR_MARKET
+                if latest_status is TradeCaseStatus.EXECUTED
+                else IntakeRefusal.RISK_REJECTED_FOR_MARKET
+            ), None
 
         # EXPIRED and CANCELLED end a case without deciding anything about the
-        # market, so the next observation may open the next generation.
+        # market and without leaving a position behind, so the next observation
+        # may open the next generation.
         key = self.intake_key(candidate, latest_id)
         if await self._already_opened(key):
             return IntakeRefusal.ALREADY_OPENED, latest_id
