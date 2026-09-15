@@ -26,6 +26,8 @@ from src.data.tables import AccountRow, ExecutionRow, IntentRow, PositionRow, Ri
 from src.execution.paper import PaperExecutor
 from src.ledger.accounting import apply_fill, calculate_pnl
 from src.ledger.portfolio import portfolio_state, roll_loss_day
+from src.markets.models import MarketIdentity
+from src.orchestration.valuation.models import PositionMark
 from src.risk.engine import evaluate
 
 logger = logging.getLogger(__name__)
@@ -102,7 +104,7 @@ class PaperTradingService:
         intent: TradeIntent,
         market: MarketSnapshot,
         *,
-        marks: dict[str, MarketSnapshot] | None = None,
+        marks: dict[str, PositionMark] | None = None,
     ) -> ExecutionResult | RiskDecision:
         try:
             return await self._process(intent, market, marks=marks)
@@ -118,7 +120,7 @@ class PaperTradingService:
         intent: TradeIntent,
         market: MarketSnapshot,
         *,
-        marks: dict[str, MarketSnapshot] | None = None,
+        marks: dict[str, PositionMark] | None = None,
     ) -> ExecutionResult | RiskDecision:
         if self.mode != TradingMode.PAPER:
             raise ValueError("Paper execution must be explicitly enabled")
@@ -185,8 +187,9 @@ class PaperTradingService:
         market: MarketSnapshot,
         *,
         positions: list[Position],
-        marks: dict[str, MarketSnapshot] | None,
+        marks: dict[str, PositionMark] | None,
         now: datetime,
+        market_identity: MarketIdentity | None = None,
         authorize: Callable[[datetime], str | None] | None = None,
     ) -> PaperOutcome:
         """Risk-check, fill and book one order inside a transaction the caller owns.
@@ -232,9 +235,8 @@ class PaperTradingService:
             now=now,
             max_snapshot_age_seconds=self.limits.max_snapshot_age_seconds,
             correlation_id=intent.correlation_id,
+            market=market_identity,
         )
-        for mark in state.marks_used:
-            await append(session, mark)
         position, prices, context = state.position, state.prices, state.context
         limits = self.limits.model_copy(
             update={"kill_switch": self.limits.kill_switch or account.paused}

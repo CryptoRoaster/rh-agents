@@ -86,6 +86,7 @@ async def risk_db():
                 "0006_worker_runtime",
                 "0007_trade_case_risk_requests",
                 "0008_trade_case_executions",
+                "0009_position_market_identity",
             ):
                 spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
                 module = importlib.util.module_from_spec(spec)
@@ -158,13 +159,14 @@ async def ready_case(
     key="riskrequest-case",
     anchor=True,
     lifetime=timedelta(hours=1),
+    identity=None,
 ):
     """A case the evaluator publishes as READY_FOR_RISK.
 
     Every required envelope, in order: ORBIT's discovery arrives at open, then
     ATLAS, SIGNAL and VECTOR before the trigger, then PULSE and ANCHOR.
     """
-    trade_case = await open_case(cases, now, trace, key, lifetime=lifetime)
+    trade_case = await open_case(cases, now, trace, key, lifetime=lifetime, identity=identity)
     await record_onchain(cases, trade_case, now, onchain or fresh_onchain(now))
     await record(
         cases,

@@ -51,6 +51,12 @@ from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
 from src.orchestration.riskrequest.service import OneSnapshot, risk_market, too_old_for
 from src.orchestration.sizing.context import base_asset_metadata, reference_price
+from src.orchestration.valuation.models import (
+    PortfolioValuation,
+    PositionMark,
+    unvaluable_reason,
+)
+from src.orchestration.valuation.service import PositionValuationReader
 from src.orchestration.workflow.engine import active_evidence
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
@@ -149,6 +155,18 @@ class CaseFillService:
         expected_risk_input_digest: str | None = None,
     ) -> ExecutionReading:
         feed = OneSnapshot(self.markets, self.include_fixtures)
+        # History needs no current prices. Checked before anything is valued, so
+        # replaying a stored fill never depends on the market layer being
+        # reachable. The authoritative replay check still happens under the lock.
+        if await self._already_filled(trade_case_id):
+            valuation = PortfolioValuation()
+        else:
+            # Every open holding is priced before the account lock is taken.
+            # Holding a portfolio-wide lock across an injected port is a latency
+            # somebody else pays for; what that costs is the chance of a
+            # position appearing in between, and the check under the lock below
+            # closes it.
+            valuation = await self._value_portfolio(feed)
         async with self.sessions.begin() as session:
             account = await session.scalar(
                 select(AccountRow).where(AccountRow.id == 1).with_for_update()
@@ -223,6 +241,14 @@ class CaseFillService:
             snapshot = await feed.latest(trade_case.market.pair_id)
             current = active_evidence(await self.cases.evidence(trade_case_id))
             positions = await self.paper.positions_in_session(session)
+            held = {item.asset_id for item in positions if item.quantity != 0}
+            if not valuation.covers(held):
+                # The portfolio moved while it was being valued, so the figure
+                # SENTINEL would judge covers only part of it — worse than no
+                # figure, because it looks like one.
+                return _refused(
+                    trade_case, ExecutionRefusal.PORTFOLIO_CHANGED_DURING_VALUATION, readiness
+                )
 
             # The last clock read, after the last input read. Everything from
             # here to the verdict is synchronous, so one instant governs
@@ -313,15 +339,21 @@ class CaseFillService:
                 positions=positions,
                 asset_id=market.asset_id,
                 price_usd=market.price_usd,
-                marks=None,
+                marks=valuation.by_asset,
                 now=now,
                 max_snapshot_age_seconds=self.limits.max_snapshot_age_seconds,
                 correlation_id=trade_case.correlation_id,
+                market=trade_case.market,
             ).unmarked_assets
             if unmarked:
                 # SENTINEL would answer `PORTFOLIO_DATA_UNKNOWN`. A holding this
                 # system cannot value is a missing capability, not a verdict.
-                return _refused(trade_case, ExecutionRefusal.PORTFOLIO_MARKS_UNAVAILABLE, readiness)
+                return _refused(
+                    trade_case,
+                    ExecutionRefusal.PORTFOLIO_MARKS_UNAVAILABLE,
+                    readiness,
+                    detail=unvaluable_reason(valuation, unmarked),
+                )
 
             # The same risk evaluation, the same executor and the same
             # accounting the standalone paper path performs — inside this
@@ -347,6 +379,11 @@ class CaseFillService:
                     return "SAFETY_EVIDENCE_CHANGED"
                 if not readiness.is_current_at(at):
                     return "DECISION_BASIS_EXPIRED"
+                if valuation.stale_at(at, self.limits.max_snapshot_age_seconds):
+                    # A holding's price aged out while the execution was being
+                    # prepared. Exposure would then rest on a moment that has
+                    # passed, so the fill does not happen.
+                    return "POSITION_VALUATION_STALE"
                 return too_old_for(market, at, self.limits)
 
             outcome = await self.paper.execute_in_session(
@@ -355,8 +392,9 @@ class CaseFillService:
                 intent,
                 market,
                 positions=positions,
-                marks=None,
+                marks=valuation.by_asset,
                 now=now,
+                market_identity=trade_case.market,
                 authorize=still_authorised,
             )
             if outcome.stop_reason is not None:
@@ -387,6 +425,7 @@ class CaseFillService:
                 outcome,
                 market,
                 now,
+                marks_used=valuation.marks,
             )
             await self.cases.complete_execution_in_session(
                 session,
@@ -399,6 +438,25 @@ class CaseFillService:
                 },
             )
             return recorded.model_copy(update={"trade_case_status": TradeCaseStatus.EXECUTED.value})
+
+    async def _already_filled(self, trade_case_id: UUID) -> bool:
+        async with self.sessions() as session:
+            found = await session.scalar(
+                select(TradeCaseExecutionRow.case_execution_id).where(
+                    TradeCaseExecutionRow.trade_case_id == trade_case_id
+                )
+            )
+        return found is not None
+
+    async def _value_portfolio(self, feed: OneSnapshot) -> PortfolioValuation:
+        """Price every open holding from the market it was acquired in."""
+        async with self.sessions() as session:
+            positions = await self.paper.positions_in_session(session)
+        return await PositionValuationReader(
+            markets=feed,
+            max_age_seconds=self.limits.max_snapshot_age_seconds,
+            include_fixtures=self.include_fixtures,
+        ).value(positions, self.clock.now())
 
     def _stops(self, trade_case: TradeCase, account: AccountRow) -> ExecutionRefused | None:
         """Every stop this path must honour, checked before anything else.
@@ -426,6 +484,7 @@ class CaseFillService:
         outcome: PaperOutcome,
         market: Any,
         now: Any,
+        marks_used: tuple[PositionMark, ...] = (),
     ) -> PaperFillRecorded:
         """Bind the fill to the case, the request and the decision behind it."""
         fill = outcome.fill
@@ -451,6 +510,10 @@ class CaseFillService:
             "risk_limits": self.limits.model_dump(mode="json"),
             "cost_assumptions": self.costs.model_dump(mode="json"),
             "intent": request.basis["intent"],
+            # The marks the re-check's exposure figure rested on, with the
+            # market, source and instant each came from. A stored figure nobody
+            # could re-derive is not an audit record.
+            "position_marks": [item.model_dump(mode="json") for item in marks_used],
             "recheck_decision": decision.model_dump(mode="json"),
             "fill": fill.model_dump(mode="json"),
         }

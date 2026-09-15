@@ -320,8 +320,10 @@ async def test_a_basis_that_expires_during_the_reads_is_refused(risk_db, now, tr
     case = await aging_case(builder.cases, now, key="hard-basis")
     # Old enough that the horizon falls between the readers' instants and the
     # decision instant, and fresh enough that each reader still accepts it.
+    # Four clock reads now precede the decision — the portfolio valuation reads
+    # one before the readers do — so the window sits a step earlier than it did.
     clock = SteppingClock(now, step=timedelta(seconds=3))
-    aged = timedelta(seconds=85)
+    aged = timedelta(seconds=82)
     feed = RecordedMarkets(fresh_snapshot(now, age=aged, metadata_age=aged))
     service = build_service(sessions, now, feed=feed, clock=clock)
 

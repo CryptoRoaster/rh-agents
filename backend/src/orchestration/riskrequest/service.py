@@ -60,6 +60,8 @@ from src.orchestration.sizing.models import (
     SizingAssessment,
     SizingRefusal,
 )
+from src.orchestration.valuation.models import PortfolioValuation, unvaluable_reason
+from src.orchestration.valuation.service import PositionValuationReader
 from src.orchestration.workflow.engine import active_evidence
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
@@ -165,6 +167,18 @@ class RiskRequestService:
     ) -> RiskRequestReading:
         """Ask SENTINEL about one case, once, and keep the whole basis."""
         feed = OneSnapshot(self.markets, self.include_fixtures)
+        # History needs no current prices. Checked before anything is valued, so
+        # replaying a stored verdict never depends on the market layer being
+        # reachable. The authoritative replay check still happens under the lock.
+        if await self._already_evaluated(trade_case_id):
+            valuation = PortfolioValuation()
+        else:
+            valuation = await self._value_portfolio(feed)
+        # Every open holding is priced before the account lock is taken. The
+        # reads are bounded, but holding a portfolio-wide lock across an
+        # injected port is a latency somebody else pays for. What that costs is
+        # the chance of a position appearing in between, and the check under the
+        # lock below closes it.
         async with self.sessions.begin() as session:
             account = await session.scalar(
                 select(AccountRow).where(AccountRow.id == 1).with_for_update()
@@ -202,6 +216,16 @@ class RiskRequestService:
             positions = [
                 read_position(item) for item in (await session.scalars(select(PositionRow))).all()
             ]
+            held = {item.asset_id for item in positions if item.quantity != 0}
+            if not valuation.covers(held):
+                # The portfolio moved while it was being valued, so the figure
+                # SENTINEL would judge covers only part of it — worse than no
+                # figure, because it looks like one.
+                return _refused(
+                    trade_case,
+                    RiskRequestRefusal.PORTFOLIO_CHANGED_DURING_VALUATION,
+                    assessed.readiness,
+                )
             workflow = await self.cases.workflow_inputs_in_session(session, row)
 
             # The last clock read, after the last input read. Everything from
@@ -272,19 +296,23 @@ class RiskRequestService:
                 positions=positions,
                 asset_id=market.asset_id,
                 price_usd=market.price_usd,
-                # No mark source exists for a holding in another market, so one
-                # is never supplied rather than guessed.
-                marks=None,
+                # Marks from recorded observations of each holding's own market,
+                # re-checked here against the authoritative instant.
+                marks=valuation.by_asset,
                 now=now,
                 max_snapshot_age_seconds=self.limits.max_snapshot_age_seconds,
                 correlation_id=trade_case.correlation_id,
+                market=trade_case.market,
             )
             if state.unmarked_assets:
                 # SENTINEL would answer `PORTFOLIO_DATA_UNKNOWN`, terminally. A
                 # holding this system cannot value is a missing capability, not
                 # a judgement about this market.
                 return _refused(
-                    trade_case, RiskRequestRefusal.PORTFOLIO_MARKS_UNAVAILABLE, assessed.readiness
+                    trade_case,
+                    RiskRequestRefusal.PORTFOLIO_MARKS_UNAVAILABLE,
+                    assessed.readiness,
+                    detail=unvaluable_reason(valuation, state.unmarked_assets),
                 )
 
             intent = _trade_intent(assessed, market, trade_case, request_key, now)
@@ -356,6 +384,27 @@ class RiskRequestService:
                 replayed=False,
                 blockers=assessed.readiness.blockers,
             )
+
+    async def _already_evaluated(self, trade_case_id: UUID) -> bool:
+        async with self.sessions() as session:
+            found = await session.scalar(
+                select(TradeCaseRiskRequestRow.request_id).where(
+                    TradeCaseRiskRequestRow.trade_case_id == trade_case_id
+                )
+            )
+        return found is not None
+
+    async def _value_portfolio(self, feed: OneSnapshot) -> PortfolioValuation:
+        """Price every open holding from the market it was acquired in."""
+        async with self.sessions() as session:
+            positions = [
+                read_position(item) for item in (await session.scalars(select(PositionRow))).all()
+            ]
+        return await PositionValuationReader(
+            markets=feed,
+            max_age_seconds=self.limits.max_snapshot_age_seconds,
+            include_fixtures=self.include_fixtures,
+        ).value(positions, self.clock.now())
 
     async def _assess(
         self,
@@ -681,6 +730,10 @@ def _basis(
         "cost_assumptions": inputs.costs.model_dump(mode="json"),
         "risk_limits": limits.model_dump(mode="json"),
         "portfolio": {
+            # The marks actually relied on, with the market, source and instant
+            # each came from. A stored exposure figure nobody could re-derive is
+            # not an audit record.
+            "position_marks": [item.model_dump(mode="json") for item in state.marks_used],
             "cash_usd": canonical_amount(state.context.cash_usd),
             "exposure_usd": canonical_amount(state.context.exposure_usd),
             "position_quantity": canonical_amount(state.context.position_quantity),

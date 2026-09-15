@@ -17,7 +17,10 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from uuid import UUID
 
-from src.core.models import MarketSnapshot, Position, RiskContext, SafetyStatus
+from src.core.models import Position, RiskContext, SafetyStatus
+from src.core.numbers import quantize
+from src.markets.models import MarketIdentity
+from src.orchestration.valuation.models import PositionMark
 
 
 def loss_day(now: datetime) -> date:
@@ -45,8 +48,8 @@ class PortfolioState:
     context: RiskContext
     position: Position
     prices: dict[str, Decimal]
-    # Marks a caller may record as observations it relied on.
-    marks_used: tuple[MarketSnapshot, ...]
+    # The marks actually relied on, for the decision basis.
+    marks_used: tuple[PositionMark, ...]
     # Non-zero holdings with no usable mark. Their presence is why `context`
     # reports unknown exposure rather than a figure computed from a guess.
     unmarked_assets: tuple[str, ...]
@@ -59,10 +62,11 @@ def portfolio_state(
     positions: list[Position],
     asset_id: str,
     price_usd: Decimal,
-    marks: dict[str, MarketSnapshot] | None,
+    marks: dict[str, PositionMark] | None,
     now: datetime,
     max_snapshot_age_seconds: int,
     correlation_id: UUID,
+    market: MarketIdentity | None = None,
 ) -> PortfolioState:
     """Value the portfolio, or say honestly that it could not be valued.
 
@@ -72,7 +76,7 @@ def portfolio_state(
     `PORTFOLIO_DATA_UNKNOWN` instead of judging a number nobody measured.
     """
     prices = {asset_id: price_usd}
-    used: list[MarketSnapshot] = []
+    used: list[PositionMark] = []
     unmarked: list[str] = []
     for holding in positions:
         if holding.quantity == 0 or holding.asset_id == asset_id:
@@ -81,7 +85,7 @@ def portfolio_state(
         if (
             mark is None
             or mark.asset_id != holding.asset_id
-            or not 0 <= (now - mark.observed_at).total_seconds() <= max_snapshot_age_seconds
+            or not mark.is_current_at(now, max_snapshot_age_seconds)
         ):
             unmarked.append(holding.asset_id)
             continue
@@ -90,27 +94,41 @@ def portfolio_state(
 
     position = next((item for item in positions if item.asset_id == asset_id), None)
     if position is None:
+        # A new holding records the market it is being acquired in, so it can be
+        # valued later without anyone having to guess which pool it came from.
         position = Position(
             source="LEDGER",
             correlation_id=correlation_id,
             asset_id=asset_id,
+            market_pair_id=None if market is None else market.pair_id,
+            market_chain=None if market is None else market.chain,
+            market_network=None if market is None else market.network,
+            market_provider=None if market is None else market.provider,
             created_at=now,
             updated_at=now,
         )
     valid = not unmarked
-    exposure = sum(
-        (item.quantity * prices.get(item.asset_id, Decimal("0")) for item in positions),
-        Decimal("0"),
+    # Quantity and price each carry eighteen places, so their product carries
+    # thirty-six. The sum is exact whatever order the holdings arrive in; only
+    # the result is brought to the ledger's storage precision, so the same
+    # holdings always produce the same figure.
+    exposure = quantize(
+        sum(
+            (item.quantity * prices.get(item.asset_id, Decimal("0")) for item in positions),
+            Decimal("0"),
+        )
     )
-    unrealized_loss = sum(
-        (
-            max(
-                Decimal("0"),
-                item.cost_basis_usd - item.quantity * prices.get(item.asset_id, Decimal("0")),
-            )
-            for item in positions
-        ),
-        Decimal("0"),
+    unrealized_loss = quantize(
+        sum(
+            (
+                max(
+                    Decimal("0"),
+                    item.cost_basis_usd - item.quantity * prices.get(item.asset_id, Decimal("0")),
+                )
+                for item in positions
+            ),
+            Decimal("0"),
+        )
     )
     return PortfolioState(
         context=RiskContext(

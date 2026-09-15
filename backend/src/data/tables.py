@@ -99,9 +99,19 @@ class PositionRow(Base):
     __table_args__ = (
         CheckConstraint("quantity >= 0", name="position_quantity_nonnegative"),
         CheckConstraint("cost_basis_usd >= 0", name="position_basis_nonnegative"),
+        Index("ix_positions_market_pair", "market_pair_id"),
     )
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
     asset_id: Mapped[str] = mapped_column(String(200), unique=True)
+    # The market this position was acquired in. An asset is not a market: a
+    # token can trade in several pools, and observations are indexed by pair, so
+    # a position that does not name its own market cannot be valued without
+    # resolving an ambiguity silently. Nullable because positions written before
+    # this carry none, and those are reported unvaluable rather than guessed at.
+    market_pair_id: Mapped[str | None] = mapped_column(String(512))
+    market_chain: Mapped[str | None] = mapped_column(String(60))
+    market_network: Mapped[str | None] = mapped_column(String(60))
+    market_provider: Mapped[str | None] = mapped_column(String(200))
     quantity: Mapped[Decimal] = mapped_column(Numeric(38, 18))
     cost_basis_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
     realized_pnl_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))

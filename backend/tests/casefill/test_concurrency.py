@@ -67,7 +67,15 @@ async def test_a_racing_second_key_never_adds_a_fill(risk_db, now, trace):
 
 
 async def test_two_cases_sharing_cash_cannot_overdraw(risk_db, now, trace):
-    """The account row serialises them, and the second sees the first's commit."""
+    """The account row serialises them, and the loser never books.
+
+    Both refusals are correct answers and which one appears depends on
+    ordering. The second caller priced the portfolio before the first fill
+    existed, so under the lock its valuation no longer describes what is held —
+    refusing there is the stricter of the two, and it happens first. When the
+    valuation does still hold, the cash check bites instead. Neither outcome
+    lets the account go negative.
+    """
     _, sessions = risk_db
     first_case, _, feed = await approved_case(sessions, now, trace, key="cash-a")
     second_case, _, _ = await approved_case(sessions, now, uuid4(), key="cash-b")
@@ -84,8 +92,12 @@ async def test_two_cases_sharing_cash_cannot_overdraw(risk_db, now, trace):
     kinds = sorted(item.kind for item in results)
     assert kinds == ["execution_refused", "paper_fill_recorded"]
     refused = next(item for item in results if item.kind == "execution_refused")
-    assert refused.reason is ExecutionRefusal.RISK_RECHECK_REFUSED
-    assert "INSUFFICIENT_CASH" in refused.reason_codes
+    assert refused.reason in (
+        ExecutionRefusal.RISK_RECHECK_REFUSED,
+        ExecutionRefusal.PORTFOLIO_CHANGED_DURING_VALUATION,
+    )
+    if refused.reason is ExecutionRefusal.RISK_RECHECK_REFUSED:
+        assert "INSUFFICIENT_CASH" in refused.reason_codes
     account = await read_account(sessions)
     assert account.cash_usd >= 0
     assert (await counts(sessions)) == (1, 1)
