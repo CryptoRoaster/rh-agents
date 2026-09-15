@@ -18,6 +18,7 @@ from src.core.models import (
     RiskDecision,
     RiskLimits,
     RiskOutcome,
+    Trade,
     TradeIntent,
     TradingMode,
 )
@@ -56,6 +57,13 @@ class PaperOutcome:
     # caller records the valuation the evaluation used rather than one it
     # recomputes afterwards from rows the fill has since changed.
     state: PortfolioState | None = None
+    # What the ledger made of the fill: the trade it booked and the position it
+    # left behind. Carried out for the same reason — a caller that must record
+    # a realised result would otherwise compute one beside the accounting, and
+    # two implementations of "what did this sale produce?" would disagree about
+    # money on the day it mattered.
+    trade: Trade | None = None
+    position: Position | None = None
 
     @property
     def result(self) -> ExecutionResult | RiskDecision:
@@ -294,10 +302,28 @@ class PaperTradingService:
         await append(session, trade)
         account.cash_usd = cash
         account.fees_paid_usd += fill.fees_usd + fill.gas_usd
+        # The day this fill actually happened on, which is not always the day
+        # the decision was taken on: `roll_loss_day` above ran at `now`, and the
+        # decision, the intent and the market were persisted after it, each a
+        # database round trip taking real time. A sale decided at 23:59:55 and
+        # filled at 00:00:04 realises its result on the new day, and booking it
+        # against the old one would add a loss to a day that had already ended.
+        #
+        # The same normalisation, against the instant the fill itself recorded.
+        # No second clock is read here: a booking time taken after the fill
+        # would be a third instant nobody checked anything at.
+        roll_loss_day(account, fill.created_at)
         account.realized_loss_today_usd += max(Decimal("0"), -trade.realized_pnl_usd)
         positions = [p for p in positions if p.asset_id != updated.asset_id] + [updated]
         pnl = calculate_pnl(
             positions, prices, cash=cash, fees_paid=account.fees_paid_usd, fill=fill
         )
         await append(session, pnl)
-        return PaperOutcome(decision=risk, order=order, fill=fill, state=state)
+        return PaperOutcome(
+            decision=risk,
+            order=order,
+            fill=fill,
+            state=state,
+            trade=trade,
+            position=updated,
+        )
