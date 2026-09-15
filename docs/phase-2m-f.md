@@ -213,6 +213,38 @@ midnight landing on the new day with the old day's loss rolled off, and the
 control case on the same day accumulating; and a closed position still barred
 from opening another case and from being sold again.
 
+## Hardening round: the day a sale is booked on
+
+One defect, reproduced against `2b98e83` before being fixed.
+
+`roll_loss_day` ran at the decision instant, and the decision, the intent and
+the market are persisted after it — three database round trips that take real
+time. A sale decided at `23:59:55` and filled at `00:00:04` recorded the later
+instant on its fill and added its realised loss to the day set at the earlier
+one. The reproduction, on a clock that advances when work happens: the fill
+carried `2026-09-10 00:00:04`, `paper_accounts.loss_day` stayed `2026-09-09`,
+and yesterday ended holding both its own 50 and a loss that happened today.
+
+The same normalisation now runs again against **the instant the fill itself
+recorded**, immediately before the realised loss is booked. No second clock is
+read: a booking time taken after the fill would be a third instant nothing was
+checked at. The ledger logic and `roll_loss_day` are unchanged and reused.
+
+Booking state and decision basis stay separate. `portfolio_basis` records the
+`ValuationInputs` captured when `portfolio_state` ran, so the stored basis still
+carries the day's loss as it stood when SENTINEL was asked — the 50 — and
+`replay_portfolio_basis` still reconstructs exactly the `RiskContext` that was
+handed over. What changed is where the *money* lands, not what the record says
+was judged.
+
+Five regressions in `tests/paperexit/test_loss_day.py`, controlled clock, no
+sleeps: the loss landing on the fill's day with nothing carried over; a later
+entry booked on the new day leaving that loss alone; the control run with the
+same nine seconds and no midnight in them accumulating correctly; the decision
+basis still reconstructing its context, including after the account and
+positions are changed underneath it; and a failure before commit leaving no
+sale, no day normalisation and no loss booking.
+
 ## Remaining limits
 
 - **No partial exit.** An exit closes the position or does not happen.

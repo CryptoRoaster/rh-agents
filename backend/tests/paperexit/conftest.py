@@ -73,21 +73,30 @@ def market_feed(now, *, price=None, age=FRESH):
     return MultiMarkets(recorded_snapshot(now, age=age, metadata_age=age, **extra))
 
 
-async def entered(sessions, now, trace, *, key="entry", feed=None, limits=None):
+async def entered(sessions, now, trace, *, key="entry", feed=None, limits=None, identity=None):
     """One case carried all the way to a booked PAPER entry, and its position."""
     feed = feed if feed is not None else market_feed(now)
-    case, approval, _ = await approved_case(sessions, now, trace, key=key, feed=feed, limits=limits)
+    case, approval, _ = await approved_case(
+        sessions, now, trace, key=key, feed=feed, limits=limits, identity=identity
+    )
     assert approval.kind == "risk_request_evaluated", getattr(approval, "reason", None)
     fill = await build_fill_service(sessions, now, feed=feed, limits=limits).execute_case_fill(
         case.id, request_key=f"{key}-req"
     )
     assert fill.kind == "paper_fill_recorded", getattr(fill, "detail", None)
-    return case, fill, await position_of(sessions)
+    return (
+        case,
+        fill,
+        await position_of(sessions, asset=None if identity is None else identity.base_asset_id),
+    )
 
 
-async def position_of(sessions):
+async def position_of(sessions, asset=None):
     async with sessions() as session:
-        return await session.scalar(select(PositionRow))
+        statement = select(PositionRow)
+        if asset is not None:
+            statement = statement.where(PositionRow.asset_id == asset)
+        return await session.scalar(statement)
 
 
 async def exits(sessions):

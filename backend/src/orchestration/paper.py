@@ -302,6 +302,17 @@ class PaperTradingService:
         await append(session, trade)
         account.cash_usd = cash
         account.fees_paid_usd += fill.fees_usd + fill.gas_usd
+        # The day this fill actually happened on, which is not always the day
+        # the decision was taken on: `roll_loss_day` above ran at `now`, and the
+        # decision, the intent and the market were persisted after it, each a
+        # database round trip taking real time. A sale decided at 23:59:55 and
+        # filled at 00:00:04 realises its result on the new day, and booking it
+        # against the old one would add a loss to a day that had already ended.
+        #
+        # The same normalisation, against the instant the fill itself recorded.
+        # No second clock is read here: a booking time taken after the fill
+        # would be a third instant nobody checked anything at.
+        roll_loss_day(account, fill.created_at)
         account.realized_loss_today_usd += max(Decimal("0"), -trade.realized_pnl_usd)
         positions = [p for p in positions if p.asset_id != updated.asset_id] + [updated]
         pnl = calculate_pnl(
