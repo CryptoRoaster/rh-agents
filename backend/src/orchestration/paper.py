@@ -1,6 +1,7 @@
 """Trusted internal entry point: serialize risk + fill + ledger in one DB transaction."""
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
@@ -27,6 +28,27 @@ from src.ledger.portfolio import portfolio_state, roll_loss_day
 from src.risk.engine import evaluate
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PaperOutcome:
+    """What one order produced: the verdict, and the fill when there was one.
+
+    The decision travels beside the fill rather than being inferred from it. A
+    caller that must record *which* evaluation authorised an execution cannot
+    get that from an `ExecutionResult` — it names its order, not the decision
+    behind it — and deriving a second identifier would be recording a decision
+    that does not exist.
+    """
+
+    decision: RiskDecision
+    order: OrderIntent | None = None
+    fill: ExecutionResult | None = None
+
+    @property
+    def result(self) -> ExecutionResult | RiskDecision:
+        """The historical answer, in the shape the standalone path returns."""
+        return self.fill if self.fill is not None else self.decision
 
 
 class PaperTradingService:
@@ -84,9 +106,10 @@ class PaperTradingService:
             # Read time after acquiring the lock and loading the portfolio: time
             # spent waiting must count toward freshness and the UTC loss day.
             now = self._clock.now()
-            return await self.execute_in_session(
+            outcome = await self.execute_in_session(
                 session, account, intent, market, positions=positions, marks=marks, now=now
             )
+            return outcome.result
 
     async def replay_in_session(
         self, session: AsyncSession, intent: TradeIntent
@@ -129,7 +152,7 @@ class PaperTradingService:
         positions: list[Position],
         marks: dict[str, MarketSnapshot] | None,
         now: datetime,
-    ) -> ExecutionResult | RiskDecision:
+    ) -> PaperOutcome:
         """Risk-check, fill and book one order inside a transaction the caller owns.
 
         Exists so a case-bound execution can commit the fill, the ledger and its
@@ -143,6 +166,12 @@ class PaperTradingService:
         `positions` and any replay check before reading `now`, and owns the
         commit. Everything here is the same risk evaluation, the same executor
         and the same accounting the standalone path performs.
+
+        `now` is the only instant used. The order is requested at it rather than
+        at a clock read taken after the intervening writes — those writes are
+        this transaction's own, and re-reading the clock between the checks and
+        the fill would place the execution outside validities that were checked
+        and found good, without anything having actually changed.
         """
         if self.mode != TradingMode.PAPER:
             raise ValueError("Paper execution must be explicitly enabled")
@@ -174,8 +203,8 @@ class PaperTradingService:
         if risk.outcome != RiskOutcome.APPROVE:
             if risk.outcome == RiskOutcome.PAUSE_SYSTEM:
                 account.paused = True
-            return risk
-        execution_requested_at = self._clock.now()
+            return PaperOutcome(decision=risk)
+        execution_requested_at = now
         order = OrderIntent(
             source="PAPER_EXECUTION",
             correlation_id=intent.correlation_id,
@@ -199,4 +228,4 @@ class PaperTradingService:
             positions, prices, cash=cash, fees_paid=account.fees_paid_usd, fill=fill
         )
         await append(session, pnl)
-        return fill
+        return PaperOutcome(decision=risk, order=order, fill=fill)

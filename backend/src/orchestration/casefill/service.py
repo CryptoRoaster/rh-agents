@@ -45,7 +45,7 @@ from src.orchestration.casefill.models import (
 )
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
-from src.orchestration.paper import PaperTradingService
+from src.orchestration.paper import PaperOutcome, PaperTradingService
 from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
 from src.orchestration.riskrequest.service import OneSnapshot, risk_market, too_old_for
@@ -79,9 +79,6 @@ class CaseFillService:
     paper: PaperTradingService
     markets: Any
     costs: PaperCostReading
-    # SENTINEL's own limits, obtained server-side. The same object the re-check
-    # is performed against and the one the fill-time freshness bound comes from.
-    limits: RiskLimits
     trading_mode: TradingMode = TradingMode.OBSERVE
     kill_switch: bool = False
     # Supplied by a deployment that also runs the accounting subsystem. Its
@@ -90,6 +87,22 @@ class CaseFillService:
     pause: SystemPausePort | None = None
     clock: Clock = SystemClock()
     include_fixtures: bool = False
+
+    @property
+    def limits(self) -> RiskLimits:
+        """SENTINEL's limits, from the one place that owns them.
+
+        Read off the paper service rather than configured a second time here.
+        Two settable copies could disagree, and the failure that produces is the
+        worst available: the pre-checks refusing under one set while the
+        evaluation that actually gates the fill runs under another, and the
+        stricter of the two recorded in the basis as if it had applied.
+
+        The account's durable pause is still folded in where the evaluation
+        happens, inside `execute_in_session`, so a paused account tightens the
+        same limits the rest of this call was checked against.
+        """
+        return self.paper.limits
 
     async def execute_case_fill(
         self,
@@ -280,7 +293,7 @@ class CaseFillService:
             # transaction, so the fill and its case reference commit together.
             # A `PAUSE_SYSTEM` verdict sets the durable pause in here, with the
             # rejection it came with and without a fill.
-            result = await self.paper.execute_in_session(
+            outcome = await self.paper.execute_in_session(
                 session,
                 account,
                 intent,
@@ -289,24 +302,37 @@ class CaseFillService:
                 marks=None,
                 now=now,
             )
-            if isinstance(result, RiskDecision):
+            if outcome.fill is None or outcome.order is None:
                 return _refused(
                     trade_case,
                     ExecutionRefusal.RISK_RECHECK_REFUSED,
                     readiness,
-                    outcome=result.outcome,
-                    reason_codes=result.reason_codes,
+                    outcome=outcome.decision.outcome,
+                    reason_codes=outcome.decision.reason_codes,
                 )
+            if outcome.order.execution_requested_at != now:  # pragma: no cover - guard
+                # The instant every validity above was checked at is the instant
+                # the order must be requested at. A later one would place the
+                # execution outside a window that was checked and found good,
+                # and the transaction is rolled back rather than booked.
+                raise CaseFillUnavailable("EXECUTION_INSTANT_DRIFTED")
 
             recorded = self._record(
-                session, trade_case, request, binding.binding_id, result, market, now
+                session,
+                trade_case,
+                request,
+                binding.binding_id,
+                outcome,
+                market,
+                now,
             )
             await self.cases.complete_execution_in_session(
                 session,
                 row,
                 detail={
                     "request_id": str(request.request_id),
-                    "execution_id": str(result.id),
+                    "execution_id": str(outcome.fill.id),
+                    "recheck_decision_id": str(outcome.decision.id),
                     "intent_id": str(intent.id),
                 },
             )
@@ -335,11 +361,16 @@ class CaseFillService:
         trade_case: TradeCase,
         request: TradeCaseRiskRequestRow,
         binding_id: UUID,
-        fill: ExecutionResult,
+        outcome: PaperOutcome,
         market: Any,
         now: Any,
     ) -> PaperFillRecorded:
-        """Bind the fill to the case and the request that authorised it."""
+        """Bind the fill to the case, the request and the decision behind it."""
+        fill = outcome.fill
+        order = outcome.order
+        decision = outcome.decision
+        if fill is None or order is None:  # pragma: no cover - guarded by the caller
+            raise CaseFillUnavailable("EXECUTION_NOT_FILLED")
         notional = notional_of(fill.quantity, fill.execution_price)
         case_execution_id = uuid5(
             NAMESPACE_URL, f"rh-agents:trade-case-execution:{request.request_key}"
@@ -358,6 +389,7 @@ class CaseFillService:
             "risk_limits": self.limits.model_dump(mode="json"),
             "cost_assumptions": self.costs.model_dump(mode="json"),
             "intent": request.basis["intent"],
+            "recheck_decision": decision.model_dump(mode="json"),
             "fill": fill.model_dump(mode="json"),
         }
         session.add(
@@ -367,12 +399,13 @@ class CaseFillService:
                 request_id=request.request_id,
                 request_key=request.request_key,
                 intent_id=fill.intent_id,
-                order_id=fill.order_id,
+                order_id=order.id,
                 execution_id=fill.id,
                 authorizing_binding_id=binding_id,
-                recheck_decision_id=uuid5(
-                    NAMESPACE_URL, f"rh-agents:fill-recheck:{request.request_key}"
-                ),
+                # The decision this order was actually built on, not a second
+                # identifier derived from the request key. `OrderRow.risk_id`
+                # and `RiskRow.id` are this same value.
+                recheck_decision_id=decision.id,
                 risk_input_digest=request.risk_input_digest,
                 quantity=fill.quantity,
                 execution_price_usd=fill.execution_price,
@@ -390,12 +423,10 @@ class CaseFillService:
             request_id=request.request_id,
             request_key=request.request_key,
             intent_id=fill.intent_id,
-            order_id=fill.order_id,
+            order_id=order.id,
             execution_id=fill.id,
             authorizing_binding_id=binding_id,
-            recheck_decision_id=uuid5(
-                NAMESPACE_URL, f"rh-agents:fill-recheck:{request.request_key}"
-            ),
+            recheck_decision_id=decision.id,
             risk_input_digest=request.risk_input_digest,
             quantity=fill.quantity,
             execution_price_usd=fill.execution_price,

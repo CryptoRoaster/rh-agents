@@ -40,7 +40,12 @@ from tests.riskrequest.conftest import (  # noqa: F401
 
 
 def build_fill_service(sessions, now, *, feed, limits=None, pause="running", **overrides):
-    """The real workflow service and the real paper service behind one call."""
+    """The real workflow service and the real paper service behind one call.
+
+    `limits` configures the paper service and nothing else. There is exactly one
+    place SENTINEL's limits live, and a test that could set a second copy would
+    be testing a configuration the service cannot be given.
+    """
     clock = FixedClock(now)
     bounds = limits if limits is not None else RiskLimits()
     arguments = {
@@ -49,7 +54,6 @@ def build_fill_service(sessions, now, *, feed, limits=None, pause="running", **o
         "paper": PaperTradingService(sessions, bounds, TradingMode.PAPER, clock=clock),
         "markets": feed,
         "costs": configured_costs(),
-        "limits": bounds,
         "trading_mode": TradingMode.PAPER,
         "clock": clock,
         "pause": RunningSystem() if pause == "running" else pause,
@@ -58,10 +62,13 @@ def build_fill_service(sessions, now, *, feed, limits=None, pause="running", **o
     return CaseFillService(**{**arguments, **overrides})
 
 
-async def approved_case(sessions, now, trace, *, key="fill", notional="500", onchain=None):
+async def approved_case(
+    sessions, now, trace, *, key="fill", notional="500", onchain=None, lifetime=None
+):
     """A case carried through the real risk request into a stored approval."""
     risk = build_service(sessions, now, notional=notional)
-    case = await ready_case(risk.cases, now, trace, onchain=onchain, key=f"{key}-case")
+    extra = {} if lifetime is None else {"lifetime": lifetime}
+    case = await ready_case(risk.cases, now, trace, onchain=onchain, key=f"{key}-case", **extra)
     result = await risk.request_risk_evaluation(case.id, request_key=f"{key}-req")
     return case, result, risk.markets
 

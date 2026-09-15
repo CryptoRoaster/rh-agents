@@ -7,7 +7,6 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
 from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -236,21 +235,39 @@ async def test_trading_caller_cannot_supply_now(sessions, intent, market, now):
         await service.process(intent, market, now=now)
 
 
-async def test_execution_rechecks_clock_for_approval_expiry(sessions, intent, market, now):
+async def test_the_order_cannot_be_requested_after_the_approval_it_rests_on(
+    sessions, intent, market, now
+):
+    """The window this used to *detect* is now closed instead.
+
+    The service read the clock again after persisting the decision and built the
+    order at that later instant, so an approval could expire in between and
+    `OrderIntent` would raise, rolling everything back. That protection depended
+    on the gap being large enough to exceed the new decision's own validity, and
+    only ever noticed the gap after it had happened.
+
+    There is no second read now. The order is requested at the instant the
+    evaluation was made, so it lies inside the approval by construction — and a
+    case-bound fill lies inside the *case's* authorization for the same reason.
+    """
+
     class AdvancingClock:
-        def __init__(self):
-            self.instants = iter([now, now + timedelta(seconds=6)])
+        def __init__(self) -> None:
+            self.reads = 0
 
         def now(self):
-            return next(self.instants)
+            self.reads += 1
+            return now + timedelta(seconds=6 * (self.reads - 1))
 
-    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=AdvancingClock())
-    with pytest.raises(ValidationError, match="expired"):
-        await service.process(intent, market)
+    clock = AdvancingClock()
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=clock)
+    fill = await service.process(intent, market)
+    assert clock.reads == 1
+    assert fill.timing.execution_requested_at == now
     async with sessions() as session:
-        assert await session.scalar(select(func.count()).select_from(ExecutionRow)) == 0
-        assert await session.scalar(select(func.count()).select_from(IntentRow)) == 0
-        assert (await session.get(AccountRow, 1)).cash_usd == 10000
+        order = await session.scalar(select(OrderRow))
+        risk = await session.scalar(select(RiskRow))
+    assert order.payload["execution_requested_at"] == risk.payload["evaluated_at"]
 
 
 async def test_legacy_rejection_replays_without_rewriting_history(sessions, intent, market, now):
