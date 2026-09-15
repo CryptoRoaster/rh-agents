@@ -54,7 +54,12 @@ from src.orchestration.riskrequest.models import (
     risk_request_digest,
 )
 from src.orchestration.sizing.context import PaperSizingReader
-from src.orchestration.sizing.models import SizingAssessment, SizingRefusal
+from src.orchestration.sizing.models import (
+    BaseAssetMetadata,
+    ReferencePrice,
+    SizingAssessment,
+    SizingRefusal,
+)
 from src.orchestration.workflow.engine import active_evidence
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
@@ -238,8 +243,18 @@ class RiskRequestService:
                     assessed.readiness,
                 )
 
-            market = _risk_market(assessed, trade_case, request_key)
-            stale = _too_old_for(market, now, self.limits)
+            market = risk_market(
+                base_asset_id=assessed.sizing.base_asset_id,
+                price=assessed.sizing.reference_price,
+                base_asset=assessed.sizing.base_asset,
+                snapshot=assessed.snapshot,
+                onchain=assessed.onchain,
+                anchor=assessed.anchor,
+                costs=assessed.costs,
+                correlation_id=trade_case.correlation_id,
+                identity_key=request_key,
+            )
+            stale = too_old_for(market, now, self.limits)
             if stale is not None:
                 # Present, provable and still older than SENTINEL's own bound.
                 # Asking anyway would come back as a terminal rejection of the
@@ -478,8 +493,17 @@ def _replay(
     )
 
 
-def _risk_market(
-    inputs: CanonicalInputs, trade_case: TradeCase, request_key: str
+def risk_market(
+    *,
+    base_asset_id: str,
+    price: ReferencePrice,
+    base_asset: BaseAssetMetadata,
+    snapshot: RecordedMarket,
+    onchain: EvidenceEnvelope,
+    anchor: EvidenceEnvelope,
+    costs: PaperCostAssumptions,
+    correlation_id: UUID,
+    identity_key: str,
 ) -> MarketSnapshot:
     """Build SENTINEL's market view from facts that were actually established.
 
@@ -488,15 +512,14 @@ def _risk_market(
     assembly time written here would rejuvenate every source at once and hand it
     a freshness none of them had.
 
-    Identifiers are derived from the request key rather than generated, so the
-    same request always produces the same market fingerprint and the stored
-    basis can be recomputed and checked.
+    Identifiers are derived from `identity_key` rather than generated, so the
+    same inputs always produce the same market fingerprint and a stored basis
+    can be recomputed and checked.
     """
-    sizing, snapshot = inputs.sizing, inputs.snapshot
-    payload = inputs.onchain.payload
-    anchor = inputs.anchor.payload
+    payload = onchain.payload
+    execution = anchor.payload
     if not isinstance(payload, OnchainPayload) or not isinstance(
-        anchor, LiquidityExecutionPayload
+        execution, LiquidityExecutionPayload
     ):  # pragma: no cover - guarded by the completeness check
         raise RiskRequestUnavailable("CANONICAL_INPUTS_INCONSISTENT")
     holders = None if payload.intelligence is None else payload.intelligence.holders
@@ -511,29 +534,27 @@ def _risk_market(
         raise RiskRequestUnavailable("CANONICAL_INPUTS_INCONSISTENT")
 
     def identity(label: str) -> UUID:
-        return uuid5(NAMESPACE_URL, f"rh-agents:risk-market:{request_key}:{label}")
+        return uuid5(NAMESPACE_URL, f"rh-agents:risk-market:{identity_key}:{label}")
 
-    asset_id = sizing.base_asset_id
-    trace = trade_case.correlation_id
-    price_at = sizing.reference_price.observed_at
+    price_at = price.observed_at
     return MarketSnapshot(
         id=identity("market"),
         created_at=price_at,
         updated_at=price_at,
-        source=sizing.reference_price.provider,
-        correlation_id=trace,
-        asset_id=asset_id,
+        source=price.provider,
+        correlation_id=correlation_id,
+        asset_id=base_asset_id,
         observed_at=price_at,
-        price_usd=sizing.reference_price.usd_per_base_unit,
+        price_usd=price.usd_per_base_unit,
         token=TokenSnapshot(
             id=identity("token"),
-            created_at=sizing.base_asset.source_observed_at,
-            updated_at=sizing.base_asset.source_observed_at,
-            source=sizing.base_asset.source_provider,
-            correlation_id=trace,
-            asset_id=asset_id,
-            symbol=sizing.base_asset.symbol,
-            decimals=sizing.base_asset.decimals,
+            created_at=base_asset.source_observed_at,
+            updated_at=base_asset.source_observed_at,
+            source=base_asset.source_provider,
+            correlation_id=correlation_id,
+            asset_id=base_asset_id,
+            symbol=base_asset.symbol,
+            decimals=base_asset.decimals,
             # Contract integrity is exactly the token-level safety question:
             # code present, supply known, no unreviewed proxy admin. Whether a
             # route exists is a different question and travels on `routing`.
@@ -544,23 +565,23 @@ def _risk_market(
             created_at=liquidity.observed_at,
             updated_at=liquidity.observed_at,
             source=liquidity.provider,
-            correlation_id=trace,
-            asset_id=asset_id,
+            correlation_id=correlation_id,
+            asset_id=base_asset_id,
             liquidity_usd=liquidity.value_usd,
             # ANCHOR established an executable route at a tested size, which is
             # what this field asks. It is not a claim about the price.
             routing=SafetyStatus.PASS,
             # A configured simulation assumption, never a measured fill cost and
             # never ANCHOR's execution deviation.
-            estimated_slippage_bps=inputs.costs.slippage_bps,
+            estimated_slippage_bps=costs.slippage_bps,
         ),
         holders=HolderSnapshot(
             id=identity("holders"),
             created_at=holders.observed_at,
             updated_at=holders.observed_at,
             source=holders.source,
-            correlation_id=trace,
-            asset_id=asset_id,
+            correlation_id=correlation_id,
+            asset_id=base_asset_id,
             holder_count=holders.holder_count,
             # Top ten over total supply, unadjusted — the measure this field
             # means and the one the limit is written against.
@@ -568,11 +589,11 @@ def _risk_market(
             concentration_check=SAFETY_STATUS[payload.holder_integrity],
         ),
         # The configured proportional fee on one side's executed notional.
-        fee_bps=inputs.costs.fee_bps,
+        fee_bps=costs.fee_bps,
     )
 
 
-def _too_old_for(market: MarketSnapshot, now: datetime, limits: RiskLimits) -> str | None:
+def too_old_for(market: MarketSnapshot, now: datetime, limits: RiskLimits) -> str | None:
     """Apply SENTINEL's own configured tolerance before SENTINEL is asked.
 
     The same bound it would apply, to the same instants, so a stale reading is

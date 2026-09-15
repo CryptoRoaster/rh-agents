@@ -66,6 +66,9 @@ class TradeCaseStatus(StrEnum):
     RISK_REJECTED = "RISK_REJECTED"
     RISK_LIMITED = "RISK_LIMITED"
     RISK_APPROVED = "RISK_APPROVED"
+    # A paper entry was filled and booked against this case. Terminal: the case
+    # asked one question, got one authorization and spent it.
+    EXECUTED = "EXECUTED"
     EXPIRED = "EXPIRED"
     CANCELLED = "CANCELLED"
 
@@ -77,8 +80,25 @@ class TradeCaseStatus(StrEnum):
 TERMINAL_CASE_STATUSES = frozenset(
     {
         TradeCaseStatus.RISK_REJECTED,
+        TradeCaseStatus.EXECUTED,
         TradeCaseStatus.EXPIRED,
         TradeCaseStatus.CANCELLED,
+    }
+)
+
+# Terminal statuses that also bar the market from opening a further case.
+#
+# A rejection is a verdict about the market, and re-observing it is not new
+# information about risk. An execution leaves a *position*, and this system has
+# no contract for adding to one, exiting one, or deciding when a further entry
+# would be a different trade rather than the same one repeated — so a further
+# case is refused rather than opened on an invented rule. `EXPIRED` and
+# `CANCELLED` are deliberately absent: both end a case without deciding anything
+# about the market and without leaving anything behind.
+MARKET_BARRING_CASE_STATUSES = frozenset(
+    {
+        TradeCaseStatus.RISK_REJECTED,
+        TradeCaseStatus.EXECUTED,
     }
 )
 

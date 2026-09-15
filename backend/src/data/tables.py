@@ -378,6 +378,52 @@ class TradeCaseRiskRequestRow(Base):
     basis: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
 
 
+class TradeCaseExecutionRow(Base):
+    """One durable paper fill per TradeCase, bound to what authorised it.
+
+    `execution_results.intent_id` is already unique and the intent identity
+    derives from the stored request, so a second fill for one order cannot
+    exist. What was missing is the case reference: an execution row names no
+    case, so nothing joined a fill back to the authorization it ran under.
+
+    Two decisions are referenced and kept apart. ``authorizing_binding_id`` is
+    the original approval, untouched; ``recheck_decision_id`` is the evaluation
+    performed immediately before the fill, on the portfolio and market as they
+    were at that moment.
+    """
+
+    __tablename__ = "trade_case_executions"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="trade_case_execution_quantity_positive"),
+        CheckConstraint("execution_price_usd > 0", name="trade_case_execution_price_positive"),
+        CheckConstraint("notional_usd > 0", name="trade_case_execution_notional_positive"),
+        CheckConstraint("fees_usd >= 0", name="trade_case_execution_fees_nonnegative"),
+        UniqueConstraint("trade_case_id", name="uq_trade_case_execution_case"),
+        Index("ix_trade_case_executions_case_time", "trade_case_id", "recorded_at"),
+        Index("ix_trade_case_executions_correlation", "correlation_id"),
+    )
+    case_execution_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    trade_case_id: Mapped[UUID] = mapped_column(ForeignKey("trade_cases.id", ondelete="CASCADE"))
+    request_id: Mapped[UUID] = mapped_column(
+        ForeignKey("trade_case_risk_requests.request_id", ondelete="CASCADE"), unique=True
+    )
+    request_key: Mapped[str] = mapped_column(String(200))
+    intent_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    order_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    execution_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    authorizing_binding_id: Mapped[UUID] = mapped_column(Uuid)
+    recheck_decision_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    risk_input_digest: Mapped[str] = mapped_column(String(64))
+    quantity: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    execution_price_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    notional_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    fees_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    filled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    correlation_id: Mapped[UUID] = mapped_column(Uuid)
+    basis: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+
+
 class TradeCaseTransitionRow(Base):
     __tablename__ = "trade_case_transitions"
     __table_args__ = (
