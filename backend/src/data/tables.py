@@ -434,6 +434,59 @@ class TradeCaseExecutionRow(Base):
     basis: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
 
 
+class TradeCaseExitRow(Base):
+    """One durable paper exit per entry, bound to everything it closes.
+
+    A position row that reached zero looks exactly like one that was never
+    opened, and the SELL fill beside it names no case. This is the join that
+    makes a deliberate close answerable in one read: the holding, the case that
+    opened it, the entry fill, the market both happened in, and the exit's own
+    intent, order, fill and decision.
+
+    The uniqueness is the contract. One exit per position, per entry fill and
+    per case, so two callers racing for the same holding cannot both sell it —
+    the account lock orders them and this refuses the loser even if it did not.
+    """
+
+    __tablename__ = "trade_case_exits"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="trade_case_exit_quantity_positive"),
+        CheckConstraint("execution_price_usd > 0", name="trade_case_exit_price_positive"),
+        CheckConstraint("notional_usd > 0", name="trade_case_exit_notional_positive"),
+        CheckConstraint("fees_usd >= 0", name="trade_case_exit_fees_nonnegative"),
+        CheckConstraint("cost_basis_released_usd >= 0", name="trade_case_exit_basis_nonnegative"),
+        UniqueConstraint("trade_case_id", name="uq_trade_case_exit_case"),
+        Index("ix_trade_case_exits_case_time", "trade_case_id", "recorded_at"),
+        Index("ix_trade_case_exits_correlation", "correlation_id"),
+    )
+    exit_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    trade_case_id: Mapped[UUID] = mapped_column(ForeignKey("trade_cases.id", ondelete="CASCADE"))
+    case_execution_id: Mapped[UUID] = mapped_column(
+        ForeignKey("trade_case_executions.case_execution_id", ondelete="CASCADE"), unique=True
+    )
+    request_key: Mapped[str] = mapped_column(String(200), unique=True)
+    position_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    asset_id: Mapped[str] = mapped_column(String(200))
+    market_pair_id: Mapped[str] = mapped_column(String(512))
+    intent_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    order_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    execution_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    # The exit's own decision. The entry's approval authorised a purchase and
+    # nothing else, so it is referenced by the entry row and never here.
+    risk_decision_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    execution_price_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    notional_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    fees_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    # Signed: a loss is a real outcome, not a missing value.
+    realized_pnl_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    cost_basis_released_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    filled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    correlation_id: Mapped[UUID] = mapped_column(Uuid)
+    basis: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+
+
 class TradeCaseTransitionRow(Base):
     __tablename__ = "trade_case_transitions"
     __table_args__ = (

@@ -18,6 +18,7 @@ from src.core.models import (
     RiskDecision,
     RiskLimits,
     RiskOutcome,
+    Trade,
     TradeIntent,
     TradingMode,
 )
@@ -56,6 +57,13 @@ class PaperOutcome:
     # caller records the valuation the evaluation used rather than one it
     # recomputes afterwards from rows the fill has since changed.
     state: PortfolioState | None = None
+    # What the ledger made of the fill: the trade it booked and the position it
+    # left behind. Carried out for the same reason — a caller that must record
+    # a realised result would otherwise compute one beside the accounting, and
+    # two implementations of "what did this sale produce?" would disagree about
+    # money on the day it mattered.
+    trade: Trade | None = None
+    position: Position | None = None
 
     @property
     def result(self) -> ExecutionResult | RiskDecision:
@@ -300,4 +308,11 @@ class PaperTradingService:
             positions, prices, cash=cash, fees_paid=account.fees_paid_usd, fill=fill
         )
         await append(session, pnl)
-        return PaperOutcome(decision=risk, order=order, fill=fill, state=state)
+        return PaperOutcome(
+            decision=risk,
+            order=order,
+            fill=fill,
+            state=state,
+            trade=trade,
+            position=updated,
+        )

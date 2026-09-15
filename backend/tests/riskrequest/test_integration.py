@@ -597,8 +597,11 @@ def test_the_service_never_mutates_sentinel_or_its_classification():
 def test_only_the_risk_request_service_constructs_a_trade_intent():
     """The assertion Phase 2M-A left standing, now inverted rather than deleted.
 
-    Exactly one place in the source tree may build the object that carries a
-    size into a risk evaluation, and this names it.
+    Two places in the source tree may build the object that carries a size into
+    a risk evaluation, and this names both. The second arrived with Phase 2M-F:
+    an exit is a SELL, and the entry's approval authorised a purchase, so the
+    exit constructs its own intent for the whole open holding. Neither is a
+    caller-supplied size, and nothing in the control plane may build one.
     """
     import subprocess
 
@@ -610,5 +613,6 @@ def test_only_the_risk_request_service_constructs_a_trade_intent():
     ).stdout.split()
     assert sorted(found) == [
         "backend/src/core/models.py",
+        "backend/src/orchestration/paperexit/service.py",
         "backend/src/orchestration/riskrequest/service.py",
     ]

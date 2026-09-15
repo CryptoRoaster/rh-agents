@@ -148,9 +148,11 @@ def test_only_the_risk_request_service_produces_a_requested_trade_size():
 
     It said a `TradeIntent` constructor appearing anywhere would be the signal
     that the control plane's honest stop could finally become a risk request.
-    That happened in Phase 2M-C, so the test now pins *where* — exactly one
-    server-side service may build the object that carries a size into a risk
-    evaluation, and nothing in the control plane may.
+    That happened in Phase 2M-C, so the test now pins *where* — two server-side
+    services may build the object that carries a size into a risk evaluation,
+    the entry's request and Phase 2M-F's exit, and nothing in the control plane
+    may. Both sizes are read from the system's own state: a stored request in
+    the first case, the open holding under the account lock in the second.
     """
     import subprocess
 
@@ -162,6 +164,7 @@ def test_only_the_risk_request_service_produces_a_requested_trade_size():
     ).stdout.split()
     assert sorted(found) == [
         "backend/src/core/models.py",
+        "backend/src/orchestration/paperexit/service.py",
         "backend/src/orchestration/riskrequest/service.py",
     ]
 
