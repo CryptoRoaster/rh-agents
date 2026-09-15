@@ -269,6 +269,32 @@ bookings, completed fills and key conflicts still behaving as before, and the
 stored basis of both the request and the fill recomputing the exact `RiskContext`
 SENTINEL judged after the position rows have been changed underneath it.
 
+### Follow-up: the day that had already ended
+
+One audit discrepancy remained. The case-fill service read the account's cash and
+realised loss *before* `execute_in_session`, and `roll_loss_day` zeroes the day's
+loss inside that call — before `portfolio_state` and SENTINEL use it. Filled two
+seconds before UTC midnight and judged four seconds after it, SENTINEL saw a
+daily loss of **64** while the basis recorded the inputs for **114**: the stored
+record described yesterday.
+
+The inputs are now captured where they are used. `portfolio_state` returns the
+`ValuationInputs` it was given as part of its own result, and `portfolio_basis`
+takes nothing but that state — there is no longer a second set of arguments that
+could differ from the first. The case fill passes `PaperOutcome.state` straight
+through, so the record comes from the evaluation rather than from an account row
+that has since been normalised for a new day and booked against by the fill. The
+day-rolling logic itself and the execution boundary are untouched.
+
+Proved in `tests/casefill/test_loss_day.py` on a controlled clock with no sleeps:
+an approval two seconds before midnight with a real loss on the books, a fill
+four seconds later inside the same approval window with every source still valid,
+SENTINEL judging the new day's loss, and `replay_portfolio_basis` reconstructing
+that exact `RiskContext` from the stored row — before and after the account
+values and position rows are changed underneath it. The control case, filled one
+second later on the same day, keeps its 50 and reconstructs just as exactly. The
+request's own basis records the day it was made on.
+
 Unchanged by this round and re-checked by the existing suites: the 2M-D execution
 boundary, the freshness of every mark used at it, the account → case lock order,
 full rollback on a lapsed window, the account pause, the single limits source and

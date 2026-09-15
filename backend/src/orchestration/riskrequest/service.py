@@ -363,18 +363,7 @@ class RiskRequestService:
                 intent,
                 decision,
                 market,
-                portfolio_basis(
-                    state,
-                    cash_usd=account.cash_usd,
-                    realized_loss_today_usd=account.realized_loss_today_usd,
-                    positions=positions,
-                    asset_id=market.asset_id,
-                    price_usd=market.price_usd,
-                    now=now,
-                    max_snapshot_age_seconds=self.limits.max_snapshot_age_seconds,
-                    correlation_id=trade_case.correlation_id,
-                    market=trade_case.market,
-                ),
+                portfolio_basis(state),
             )
             digest = risk_request_digest(basis)
             request_id = uuid5(NAMESPACE_URL, f"rh-agents:risk-request:{request_key}")

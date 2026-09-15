@@ -43,10 +43,38 @@ def roll_loss_day(account: object, now: datetime) -> None:
 
 
 @dataclass(frozen=True)
+class ValuationInputs:
+    """Exactly what the valuation was given, captured where it was given.
+
+    The account values are read under the lock and then normalised for the UTC
+    day before anything is computed from them, so "the loss this evaluation
+    used" and "the loss the row held when the caller looked" are two different
+    numbers on the day the date turns. A basis assembled from the second
+    describes a day that had already ended.
+
+    Recorded here rather than passed separately to the recorder, because the two
+    could then be given different values — and were.
+    """
+
+    cash_usd: Decimal
+    realized_loss_today_usd: Decimal
+    positions: tuple[Position, ...]
+    asset_id: str
+    price_usd: Decimal
+    now: datetime
+    max_snapshot_age_seconds: int
+    correlation_id: UUID
+    market: MarketIdentity | None
+
+
+@dataclass(frozen=True)
 class PortfolioState:
     """What the account holds, valued, and what could not be valued."""
 
     context: RiskContext
+    # The inputs this state was computed from, so the record of a decision
+    # cannot describe inputs the decision did not have.
+    inputs: ValuationInputs
     position: Position
     prices: dict[str, Decimal]
     # The marks actually relied on, for the decision basis.
@@ -152,6 +180,17 @@ def portfolio_state(
         )
     )
     return PortfolioState(
+        inputs=ValuationInputs(
+            cash_usd=cash_usd,
+            realized_loss_today_usd=realized_loss_today_usd,
+            positions=tuple(positions),
+            asset_id=asset_id,
+            price_usd=price_usd,
+            now=now,
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+            correlation_id=correlation_id,
+            market=market,
+        ),
         context=RiskContext(
             cash_usd=cash_usd,
             exposure_usd=exposure if valid else None,
@@ -198,19 +237,7 @@ def _acquired_here(holding: Position, asset_id: str, market: MarketIdentity | No
     )
 
 
-def portfolio_basis(
-    state: PortfolioState,
-    *,
-    cash_usd: Decimal,
-    realized_loss_today_usd: Decimal,
-    positions: list[Position],
-    asset_id: str,
-    price_usd: Decimal,
-    now: datetime,
-    max_snapshot_age_seconds: int,
-    correlation_id: UUID,
-    market: MarketIdentity | None,
-) -> dict[str, Any]:
+def portfolio_basis(state: PortfolioState) -> dict[str, Any]:
     """Everything the valuation rested on, as an audit record.
 
     The figures are recorded beside their inputs rather than instead of them. A
@@ -223,20 +250,26 @@ def portfolio_basis(
     each was acquired in — beside the account values, the instant and the bound
     the valuation was judged under. `replay_portfolio_basis` feeds them back
     through the same `portfolio_state`, so the recomputation is the computation.
+
+    Every input is taken from the state itself. Passing them in alongside would
+    let a caller record something the evaluation never saw: the account's own
+    row is normalised for the UTC day inside the evaluation, so values read
+    before it are a different day's.
     """
     from src.orchestration.riskrequest.models import canonical_amount
 
-    held = [item for item in sorted(positions, key=lambda row: row.asset_id) if item.quantity]
+    used = state.inputs
+    held = [item for item in sorted(used.positions, key=lambda row: row.asset_id) if item.quantity]
     return {
         # --------------------------------------------------- the inputs
-        "cash_usd": canonical_amount(cash_usd),
-        "realized_loss_today_usd": canonical_amount(realized_loss_today_usd),
-        "asset_id": asset_id,
-        "order_price_usd": canonical_amount(price_usd),
-        "valued_at": now.isoformat(),
-        "max_snapshot_age_seconds": max_snapshot_age_seconds,
-        "correlation_id": str(correlation_id),
-        "market": None if market is None else market.model_dump(mode="json"),
+        "cash_usd": canonical_amount(used.cash_usd),
+        "realized_loss_today_usd": canonical_amount(used.realized_loss_today_usd),
+        "asset_id": used.asset_id,
+        "order_price_usd": canonical_amount(used.price_usd),
+        "valued_at": used.now.isoformat(),
+        "max_snapshot_age_seconds": used.max_snapshot_age_seconds,
+        "correlation_id": str(used.correlation_id),
+        "market": None if used.market is None else used.market.model_dump(mode="json"),
         "holdings": [item.model_dump(mode="json") for item in held],
         # The marks actually relied on, with the market, source and instant each
         # came from.

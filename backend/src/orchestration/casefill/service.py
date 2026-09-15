@@ -37,7 +37,7 @@ from src.data.tables import (
     TradeCaseRiskBindingRow,
     TradeCaseRiskRequestRow,
 )
-from src.ledger.portfolio import portfolio_basis, portfolio_state
+from src.ledger.portfolio import PortfolioState, portfolio_basis, portfolio_state
 from src.orchestration.casefill.models import (
     ExecutionReading,
     ExecutionRefusal,
@@ -405,12 +405,6 @@ class CaseFillService:
                     return "POSITION_VALUATION_STALE"
                 return too_old_for(market, at, self.limits)
 
-            # The account as the evaluation saw it. `execute_in_session` books
-            # the fill onto this same row, so reading these afterwards would
-            # record the balance the decision produced rather than the one it
-            # was made on.
-            account_cash = account.cash_usd
-            account_loss = account.realized_loss_today_usd
             outcome = await self.paper.execute_in_session(
                 session,
                 account,
@@ -442,6 +436,8 @@ class CaseFillService:
                     outcome=outcome.decision.outcome,
                     reason_codes=outcome.decision.reason_codes,
                 )
+            if outcome.state is None:  # pragma: no cover - a fill always carries one
+                raise CaseFillUnavailable("EXECUTION_PORTFOLIO_MISSING")
             recorded = self._record(
                 session,
                 trade_case,
@@ -450,21 +446,12 @@ class CaseFillService:
                 outcome,
                 market,
                 now,
-                portfolio=portfolio_basis(
-                    # The state the re-check was actually reached from, carried
-                    # out of the evaluation rather than recomputed here from
-                    # rows this fill has already changed.
-                    outcome.state if outcome.state is not None else valued,
-                    cash_usd=account_cash,
-                    realized_loss_today_usd=account_loss,
-                    positions=positions,
-                    asset_id=market.asset_id,
-                    price_usd=market.price_usd,
-                    now=now,
-                    max_snapshot_age_seconds=self.limits.max_snapshot_age_seconds,
-                    correlation_id=trade_case.correlation_id,
-                    market=trade_case.market,
-                ),
+                # The state the re-check was actually reached from, carried out
+                # of the evaluation with the inputs it used. Assembling this
+                # from the account row here would take values from before the
+                # UTC day was normalised inside the evaluation, and from after
+                # the fill has booked onto the same row.
+                portfolio=outcome.state,
             )
             await self.cases.complete_execution_in_session(
                 session,
@@ -539,7 +526,7 @@ class CaseFillService:
         outcome: PaperOutcome,
         market: Any,
         now: Any,
-        portfolio: dict[str, Any],
+        portfolio: PortfolioState,
     ) -> PaperFillRecorded:
         """Bind the fill to the case, the request and the decision behind it."""
         fill = outcome.fill
@@ -547,9 +534,8 @@ class CaseFillService:
         decision = outcome.decision
         if fill is None or order is None:  # pragma: no cover - guarded by the caller
             raise CaseFillUnavailable("EXECUTION_NOT_FILLED")
-        if outcome.state is None:  # pragma: no cover - a fill always carries one
-            raise CaseFillUnavailable("EXECUTION_PORTFOLIO_MISSING")
-        context = outcome.state.context
+        context = portfolio.context
+        recorded = portfolio_basis(portfolio)
         notional = notional_of(fill.quantity, fill.execution_price)
         case_execution_id = uuid5(
             NAMESPACE_URL, f"rh-agents:trade-case-execution:{request.request_key}"
@@ -573,9 +559,9 @@ class CaseFillService:
             # instant. A stored figure nobody could re-derive is not an audit
             # record, and re-deriving it from today's position rows is not a
             # reconstruction of anything.
-            "portfolio": portfolio,
+            "portfolio": recorded,
             "risk_context": context.model_dump(mode="json"),
-            "position_marks": portfolio["position_marks"],
+            "position_marks": recorded["position_marks"],
             "recheck_decision": decision.model_dump(mode="json"),
             "fill": fill.model_dump(mode="json"),
         }
