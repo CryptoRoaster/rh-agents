@@ -192,7 +192,8 @@ now refuses at the re-check and books nothing, and the basis records exactly the
 limits the evaluation used. The account's durable pause is still folded in where
 the evaluation happens, under the same lock.
 
-**The fill landed outside the authorization it ran under.** The case binding and
+**The fill landed outside the authorization it ran under.** *(First attempt
+insufficient — see the follow-up below.)* The case binding and
 workflow validity were checked at one instant; three persistence writes then
 followed, and the order took a *fresh* clock read, which `OrderIntent` validates
 only against the new SENTINEL window. With a controlled clock the original
@@ -213,6 +214,39 @@ edit cannot quietly restore the drift.
 An expiry reached *before* the decision instant still refuses, with no risk row,
 no order and no position written — an expiry never becomes a terminal risk
 verdict about the market. Historical replay of completed fills is unchanged.
+
+### Follow-up: the wait itself
+
+Removing the clock read did not remove the *wait*. Between `evaluate()` and the
+executor the service persists the market, the intent and the decision, and each
+of those is a database round trip that takes real time. Carrying the evaluation
+instant onto the order recorded a moment that had already passed — an older
+timestamp is an expiry bypass, not a fix for one.
+
+Reproduced with a clock that advances when work happens rather than when it is
+read, and a real persistence access made to take time: an approval ending at
+`12:00:05` was filled while the clock stood at `12:00:16`, and the order
+truthfully claimed `12:00:02`.
+
+The clock is now read **at the execution boundary**, and every governing
+validity is re-checked there on the inputs already loaded under the locks: the
+service's own approval window, the original case binding, the central
+evaluator's verdict, the completeness reading and every source age. The guard is
+synchronous and nothing between it and the pure fill simulation touches the
+database — a source-level assertion pins that, and `PaperExecutor.execute`
+performs no I/O. The order and fill carry the boundary instant, which is the
+instant the execution actually happened at.
+
+An expiry is a typed stop: `EXECUTION_WINDOW_EXPIRED` for the case path,
+`PaperExecutionExpired` for the standalone one. Both roll the whole transaction
+back, so the decision, intent and market staged before the boundary do not
+survive as a permanent record of an order that was never placed, and no
+artificial final risk rejection is written in their place.
+
+Two tests were corrected rather than kept: the one asserting that no clock read
+occurs after the decision (there is one now, deliberately, at the boundary) and
+the one that accepted a late fill as correct because "no time passed in the
+span".
 
 ## Remaining limits
 

@@ -13,6 +13,7 @@ that owns it.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -60,6 +61,21 @@ from src.orchestration.workflow.models import (
 )
 from src.orchestration.workflow.service import TradeCaseService, case_from_row, risk_from_row
 from src.risk.authorization import RiskAuthorization
+
+
+class _Abort(Exception):  # noqa: N818 - carries a reading, not an error condition
+    """Roll the transaction back and answer with this refusal.
+
+    Some refusals are only discoverable once the execution has been started —
+    the decision and its market are already staged when the execution boundary
+    is reached. Returning normally would commit those; raising rolls them back,
+    and the reading is handed out afterwards so the caller still gets a typed
+    answer rather than an exception.
+    """
+
+    def __init__(self, refusal: ExecutionRefused) -> None:
+        self.refusal = refusal
+        super().__init__(refusal.reason.value)
 
 
 class CaseFillUnavailable(Exception):
@@ -113,6 +129,25 @@ class CaseFillService:
         expected_risk_input_digest: str | None = None,
     ) -> ExecutionReading:
         """Fill the stored request for one case, once, or say why not."""
+        try:
+            return await self._attempt(
+                trade_case_id,
+                request_key=request_key,
+                expected_binding_id=expected_binding_id,
+                expected_risk_input_digest=expected_risk_input_digest,
+            )
+        except _Abort as abort:
+            # The transaction has rolled back; the answer survives it.
+            return abort.refusal
+
+    async def _attempt(
+        self,
+        trade_case_id: UUID,
+        *,
+        request_key: str,
+        expected_binding_id: UUID | None = None,
+        expected_risk_input_digest: str | None = None,
+    ) -> ExecutionReading:
         feed = OneSnapshot(self.markets, self.include_fixtures)
         async with self.sessions.begin() as session:
             account = await session.scalar(
@@ -293,6 +328,27 @@ class CaseFillService:
             # transaction, so the fill and its case reference commit together.
             # A `PAUSE_SYSTEM` verdict sets the durable pause in here, with the
             # rejection it came with and without a fill.
+            def still_authorised(at: datetime) -> str | None:
+                """Every governing validity, re-checked at the actual boundary.
+
+                Synchronous and over inputs already loaded under the locks, so
+                nothing between this answer and the fill touches the database.
+                The central evaluator is the one that answers about the case;
+                this adds no second opinion about what a case is.
+                """
+                if at >= binding.expires_at:
+                    return "AUTHORIZATION_EXPIRED"
+                current_status = self.cases.evaluate_inputs(workflow, at)
+                if current_status.status in TERMINAL_CASE_STATUSES:
+                    return "TRADE_CASE_TERMINAL"
+                if current_status.status is not TradeCaseStatus.RISK_APPROVED:
+                    return "TRADE_CASE_NOT_AUTHORIZED"
+                if current_status.risk_input_digest != binding.risk_input_digest:
+                    return "SAFETY_EVIDENCE_CHANGED"
+                if not readiness.is_current_at(at):
+                    return "DECISION_BASIS_EXPIRED"
+                return too_old_for(market, at, self.limits)
+
             outcome = await self.paper.execute_in_session(
                 session,
                 account,
@@ -301,7 +357,20 @@ class CaseFillService:
                 positions=positions,
                 marks=None,
                 now=now,
+                authorize=still_authorised,
             )
+            if outcome.stop_reason is not None:
+                # Approved, and the world moved on before it could be acted on.
+                # Everything started is rolled back, and no artificial final
+                # risk rejection is written in its place.
+                raise _Abort(
+                    _refused(
+                        trade_case,
+                        ExecutionRefusal.EXECUTION_WINDOW_EXPIRED,
+                        readiness,
+                        detail=outcome.stop_reason,
+                    )
+                )
             if outcome.fill is None or outcome.order is None:
                 return _refused(
                     trade_case,
@@ -310,13 +379,6 @@ class CaseFillService:
                     outcome=outcome.decision.outcome,
                     reason_codes=outcome.decision.reason_codes,
                 )
-            if outcome.order.execution_requested_at != now:  # pragma: no cover - guard
-                # The instant every validity above was checked at is the instant
-                # the order must be requested at. A later one would place the
-                # execution outside a window that was checked and found good,
-                # and the transaction is rolled back rather than booked.
-                raise CaseFillUnavailable("EXECUTION_INSTANT_DRIFTED")
-
             recorded = self._record(
                 session,
                 trade_case,

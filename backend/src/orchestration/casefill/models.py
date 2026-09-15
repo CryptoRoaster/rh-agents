@@ -77,6 +77,11 @@ class ExecutionRefusal(StrEnum):
     # SENTINEL, asked again immediately before the fill, did not approve. The
     # outcome and authorization travel on the reading.
     RISK_RECHECK_REFUSED = "RISK_RECHECK_REFUSED"
+    # A validity lapsed between the evaluation and the execution boundary — the
+    # decision, the intent and the market are persisted in between, and each of
+    # those writes takes real time. Approved and not executed, with everything
+    # started rolled back. Never a risk verdict about the market.
+    EXECUTION_WINDOW_EXPIRED = "EXECUTION_WINDOW_EXPIRED"
 
 
 class PaperFillRecorded(Immutable):

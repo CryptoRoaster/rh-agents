@@ -63,10 +63,18 @@ def build_fill_service(sessions, now, *, feed, limits=None, pause="running", **o
 
 
 async def approved_case(
-    sessions, now, trace, *, key="fill", notional="500", onchain=None, lifetime=None
+    sessions,
+    now,
+    trace,
+    *,
+    key="fill",
+    notional="500",
+    onchain=None,
+    lifetime=None,
+    limits=None,
 ):
     """A case carried through the real risk request into a stored approval."""
-    risk = build_service(sessions, now, notional=notional)
+    risk = build_service(sessions, now, notional=notional, limits=limits)
     extra = {} if lifetime is None else {"lifetime": lifetime}
     case = await ready_case(risk.cases, now, trace, onchain=onchain, key=f"{key}-case", **extra)
     result = await risk.request_risk_evaluation(case.id, request_key=f"{key}-req")

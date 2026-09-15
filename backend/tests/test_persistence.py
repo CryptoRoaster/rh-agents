@@ -30,7 +30,7 @@ from src.data.tables import (
     RiskRow,
     TradeRow,
 )
-from src.orchestration.paper import PaperTradingService
+from src.orchestration.paper import PaperExecutionExpired, PaperTradingService
 
 
 @pytest.fixture
@@ -235,20 +235,17 @@ async def test_trading_caller_cannot_supply_now(sessions, intent, market, now):
         await service.process(intent, market, now=now)
 
 
-async def test_the_order_cannot_be_requested_after_the_approval_it_rests_on(
+async def test_an_approval_that_lapses_before_the_fill_stops_the_execution(
     sessions, intent, market, now
 ):
-    """The window this used to *detect* is now closed instead.
+    """Time passes while the decision is persisted, and that has to count.
 
-    The service read the clock again after persisting the decision and built the
-    order at that later instant, so an approval could expire in between and
-    `OrderIntent` would raise, rolling everything back. That protection depended
-    on the gap being large enough to exceed the new decision's own validity, and
-    only ever noticed the gap after it had happened.
-
-    There is no second read now. The order is requested at the instant the
-    evaluation was made, so it lies inside the approval by construction — and a
-    case-bound fill lies inside the *case's* authorization for the same reason.
+    Between `evaluate()` and the executor the service writes the market, the
+    intent and the decision — three database round trips. The clock is read
+    again at the execution boundary rather than carried from before them,
+    because an older timestamp would hide exactly that wait instead of
+    respecting it. An approval that has lapsed by then is a typed stop and a
+    full rollback, not a fill and not a manufactured rejection.
     """
 
     class AdvancingClock:
@@ -261,13 +258,36 @@ async def test_the_order_cannot_be_requested_after_the_approval_it_rests_on(
 
     clock = AdvancingClock()
     service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=clock)
+    with pytest.raises(PaperExecutionExpired, match="APPROVAL_EXPIRED"):
+        await service.process(intent, market)
+    async with sessions() as session:
+        for table in (ExecutionRow, IntentRow, RiskRow, OrderRow, PositionRow):
+            assert await session.scalar(select(func.count()).select_from(table)) == 0
+        assert (await session.get(AccountRow, 1)).cash_usd == 10000
+
+
+async def test_the_order_is_timestamped_at_the_boundary_it_was_placed_at(
+    sessions, intent, market, now
+):
+    """Truthful, not convenient: the instant the order was actually placed."""
+
+    class AdvancingClock:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def now(self):
+            self.reads += 1
+            return now + timedelta(seconds=self.reads - 1)
+
+    clock = AdvancingClock()
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=clock)
     fill = await service.process(intent, market)
-    assert clock.reads == 1
-    assert fill.timing.execution_requested_at == now
+    assert clock.reads == 2, "the evaluation and the execution boundary are separate"
+    assert fill.timing.execution_requested_at == now + timedelta(seconds=1)
     async with sessions() as session:
         order = await session.scalar(select(OrderRow))
         risk = await session.scalar(select(RiskRow))
-    assert order.payload["execution_requested_at"] == risk.payload["evaluated_at"]
+    assert order.payload["execution_requested_at"] > risk.payload["evaluated_at"]
 
 
 async def test_legacy_rejection_replays_without_rewriting_history(sessions, intent, market, now):

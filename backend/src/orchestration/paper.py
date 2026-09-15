@@ -1,6 +1,7 @@
 """Trusted internal entry point: serialize risk + fill + ledger in one DB transaction."""
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -44,11 +45,40 @@ class PaperOutcome:
     decision: RiskDecision
     order: OrderIntent | None = None
     fill: ExecutionResult | None = None
+    # Set when the order was approved and still not executed, because a validity
+    # had lapsed by the time the execution boundary was actually reached. Not a
+    # risk verdict: the decision above says what SENTINEL thought, and this says
+    # the world moved on before it could be acted on.
+    stop_reason: str | None = None
 
     @property
     def result(self) -> ExecutionResult | RiskDecision:
         """The historical answer, in the shape the standalone path returns."""
         return self.fill if self.fill is not None else self.decision
+
+
+class PaperExecutionExpired(Exception):
+    """An approval lapsed before the fill could be reached. Safe code only.
+
+    Raised rather than returned on the standalone path, so a caller's
+    transaction rolls back rather than keeping the half-written records of an
+    execution that never happened.
+    """
+
+    def __init__(self, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
+def approval_window(decision: RiskDecision, at: datetime) -> str | None:
+    """Whether this approval still covers `at`.
+
+    The same window `OrderIntent` enforces, checked here so an expiry is a typed
+    stop rather than a validation error raised from inside a constructor.
+    """
+    if not decision.evaluated_at <= at <= decision.expires_at:
+        return "APPROVAL_EXPIRED"
+    return None
 
 
 class PaperTradingService:
@@ -109,6 +139,11 @@ class PaperTradingService:
             outcome = await self.execute_in_session(
                 session, account, intent, market, positions=positions, marks=marks, now=now
             )
+            if outcome.stop_reason is not None:
+                # The approval lapsed while its own records were being written.
+                # Raised so this transaction rolls back rather than leaving the
+                # decision behind as if the order had been decided for good.
+                raise PaperExecutionExpired(outcome.stop_reason)
             return outcome.result
 
     async def replay_in_session(
@@ -152,6 +187,7 @@ class PaperTradingService:
         positions: list[Position],
         marks: dict[str, MarketSnapshot] | None,
         now: datetime,
+        authorize: Callable[[datetime], str | None] | None = None,
     ) -> PaperOutcome:
         """Risk-check, fill and book one order inside a transaction the caller owns.
 
@@ -167,11 +203,18 @@ class PaperTradingService:
         commit. Everything here is the same risk evaluation, the same executor
         and the same accounting the standalone path performs.
 
-        `now` is the only instant used. The order is requested at it rather than
-        at a clock read taken after the intervening writes — those writes are
-        this transaction's own, and re-reading the clock between the checks and
-        the fill would place the execution outside validities that were checked
-        and found good, without anything having actually changed.
+        `now` governs the evaluation. It does not govern the *execution*: real
+        time passes while the decision, the intent and the market are persisted,
+        and each of those writes is a database round trip. Carrying `now`
+        forward to the order would record an instant that had already passed and
+        hide exactly the wait that matters — an older timestamp is an expiry
+        bypass, not a fix for one.
+
+        So the clock is read again at the execution boundary, truthfully, and
+        every governing validity is re-checked there: this service's own
+        approval window, and whatever `authorize` adds. `authorize` must be
+        synchronous, because nothing between that check and the fill may suspend
+        on the database — the fill simulation itself performs no I/O.
         """
         if self.mode != TradingMode.PAPER:
             raise ValueError("Paper execution must be explicitly enabled")
@@ -204,7 +247,19 @@ class PaperTradingService:
             if risk.outcome == RiskOutcome.PAUSE_SYSTEM:
                 account.paused = True
             return PaperOutcome(decision=risk)
-        execution_requested_at = now
+
+        # ------------------------------------------------ execution boundary
+        # The truthful instant the order is actually placed at, read after the
+        # persistence above rather than carried from before it.
+        execution_requested_at = self._clock.now()
+        stop = approval_window(risk, execution_requested_at)
+        if stop is None and authorize is not None:
+            stop = authorize(execution_requested_at)
+        if stop is not None:
+            # Approved, and not executed. The caller rolls back; nothing here
+            # turns a lapsed window into a risk rejection.
+            return PaperOutcome(decision=risk, stop_reason=stop)
+
         order = OrderIntent(
             source="PAPER_EXECUTION",
             correlation_id=intent.correlation_id,
@@ -214,8 +269,12 @@ class PaperTradingService:
             risk=risk,
             execution_requested_at=execution_requested_at,
         )
-        await append(session, order)
+        # Pure simulation: arithmetic over the order and the snapshot, no I/O.
+        # Nothing between the boundary check above and this line touches the
+        # database, so the checks and the fill describe one instant.
         fill = await self.executor.execute(order, market)
+        # ------------------------------------------------ boundary ends
+        await append(session, order)
         await append(session, fill)
         updated, trade, cash = apply_fill(position, fill, account.cash_usd)
         await save_position(session, updated)
