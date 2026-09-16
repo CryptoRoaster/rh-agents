@@ -258,14 +258,11 @@ async def test_a_role_that_needs_an_unbuildable_port_is_reported(risk_db, now, t
     reasons = {item.role: item.reason for item in stack.roles}
     assert reasons["ORBIT"] == "REASONING_PROVIDER_NOT_COMPOSABLE"
     assert reasons["SIGNAL"] == "REASONING_PROVIDER_NOT_COMPOSABLE"
-    # FUSE has no evidence requirement, so the runtime refuses to hand it a
-    # task at all. Composing a runner for it would raise on the first attempt.
-    assert reasons["FUSE"] == "ROLE_NOT_CLAIMABLE"
-    assert stack.runners == ()
-    assert {item.reason for item in stack.misconfigured} == {
-        "REASONING_PROVIDER_NOT_COMPOSABLE",
-        "ROLE_NOT_CLAIMABLE",
-    }
+    # FUSE needs no provider and no port: its synthesis reads verdicts the
+    # specialists already committed, so it composes and is the only runner here.
+    assert reasons["FUSE"] is None
+    assert [item.handler.role for item in stack.runners] == [AgentRole.FUSE]
+    assert {item.reason for item in stack.misconfigured} == {"REASONING_PROVIDER_NOT_COMPOSABLE"}
 
 
 # ------------------------------------------------------- the process contract
@@ -321,6 +318,7 @@ def test_the_summary_carries_no_secret_and_no_payload(risk_db):
         stop=RunStop.NOTHING_LEFT_TO_DO,
         limits=RunLimits(
             max_candidates=1,
+            max_new_cases=1,
             max_steps=1,
             max_cases=1,
             max_runtime_seconds=5,
@@ -339,6 +337,7 @@ def test_the_summary_carries_no_secret_and_no_payload(risk_db):
         "roles",
         "candidates_seen",
         "cases_opened",
+        "intake_outcome_unknown",
         "intake_refusals",
         "steps_taken",
         "steps_timed_out",

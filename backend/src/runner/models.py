@@ -76,7 +76,14 @@ class RunStop(StrEnum):
 class RunLimits(Immutable):
     """The bounds one run is held to. All upper limits, none a target."""
 
+    # How many recorded candidates one pass may *process*. Intake reads and
+    # judges up to this many; most of them are refused for reasons that have
+    # nothing to do with a budget.
     max_candidates: int = Field(ge=1, le=50)
+    # How many of them may become new cases. A different question from the one
+    # above and answered by a different number: looking at a market costs a
+    # read, taking it on creates work somebody has to finish or expire.
+    max_new_cases: int = Field(ge=1, le=50)
     max_steps: int = Field(ge=1, le=500)
     max_cases: int = Field(ge=1, le=20)
     max_runtime_seconds: int = Field(ge=5, le=3600)
@@ -139,8 +146,15 @@ class RunSummary(Immutable):
     stop: RunStop
     limits: RunLimits
     roles: tuple[RoleAvailability, ...] = Field(default=(), max_length=16)
+    # Considered by intake, and the subset that became cases. Reported apart
+    # because they answer different questions about one pass.
     candidates_seen: int = Field(default=0, ge=0)
     cases_opened: int = Field(default=0, ge=0)
+    # The intake cycle did not return an answer. It commits one case at a time,
+    # so an interrupted cycle may have opened some and this run cannot say how
+    # many — the count stays zero and this says why, rather than a number nobody
+    # confirmed or a claim that nothing happened.
+    intake_outcome_unknown: bool = Field(default=False, strict=True)
     intake_refusals: tuple[Code, ...] = Field(default=(), max_length=64)
     steps_taken: int = Field(default=0, ge=0)
     # Attempts that began and were cut off. Counted apart from an empty claim,

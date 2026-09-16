@@ -47,10 +47,11 @@ and there was no entry point that carried a case from a candidate to a fill.
   than serving one chain and silently refusing the others. Making either
   multi-chain means changing the port, which is a deliberate decision this phase
   does not take.
-- **FUSE is enabled-but-unclaimable.** It has no evidence requirement in the
-  workflow policy, so the runtime refuses to hand it a task at all; a runner for
-  it would raise on its first attempt rather than find nothing. Reported as
-  `ROLE_NOT_CLAIMABLE`.
+- **FUSE needs no port at all.** It has an evidence requirement in the workflow
+  policy — `SYNTHESIZE_EVIDENCE`, optional and not safety-critical — so
+  `authorized_task_type` answers for it and its tasks are claimable like any
+  other. Its synthesis reads verdicts the specialists already committed, so
+  there is no provider and no model beside it.
 
 **Where idempotency and restart were already secured:** the intake key is scoped
 to the market *generation*, and `open_trade_case` is idempotent on it at the
@@ -93,7 +94,8 @@ fields, and `errors`.
 | Setting | Default | What it bounds |
 | --- | --- | --- |
 | `PAPER_RUNNER_ENABLED` | `false` | whether a run may exist at all |
-| `PAPER_RUNNER_MAX_CANDIDATES` | `5` | candidates one pass may open cases from |
+| `PAPER_RUNNER_MAX_CANDIDATES` | `5` | candidates one pass may *process* |
+| `PAPER_RUNNER_MAX_NEW_CASES` | `3` | how many of them may become cases |
 | `PAPER_RUNNER_MAX_STEPS` | `40` | mutating service calls in one pass |
 | `PAPER_RUNNER_MAX_CASES` | `3` | **distinct cases this run works on, across all stages** |
 | `PAPER_RUNNER_MAX_SECONDS` | `300` | the whole pass, measured monotonically |
@@ -101,16 +103,22 @@ fields, and `errors`.
 
 Precisely what each one means, because the differences matter:
 
-**Candidates** are bounded *inside* intake: the control policy's own per-cycle
-ceiling is lowered to the smaller of it, the candidate budget and the case
-budget before the cycle runs. Nothing is opened and then discarded — a case that
-was never allowed is never created.
+**Candidates and new cases are two different quantities**, and each has its own
+number. `MAX_CANDIDATES` bounds how many recorded candidates intake *reads and
+judges*, passed to `run_cycle(limit=…)`. `MAX_NEW_CASES` bounds how many of them
+may become cases, and is applied by lowering the control policy's own per-cycle
+ceiling to the smallest of it, that ceiling and the case budget — **before** the
+cycle runs, so nothing is opened and then discarded. A case that was never
+allowed is never created.
 
-**Cases** counts distinct trade cases the run touches, through intake, worker
+**Cases** counts distinct trade cases the run works on, through intake, worker
 steps and the decision path alike. A case counts once however often it is
-touched. Once the budget is full, claims are narrowed to the cases already being
-worked **in the claim query itself**, so no task belonging to another case is
-taken and then dropped — a dropped claim is a lease nobody is working.
+touched. The working set is **decided before the first claim**: whatever intake
+opened, topped up from the cases already alive, oldest first, until the budget
+is full. Every claim is narrowed to that set **in the claim query**, so a task
+outside the budget is never taken and then dropped — a dropped claim is a lease
+nobody is working, held for as long as the lease lasts. A claim whose handler
+then times out still spends its case place and its step.
 
 **Steps** counts service calls that may change something: the intake cycle, each
 worker attempt that actually claimed a task, each risk request, each fill.
@@ -192,9 +200,15 @@ Three distinctions the output makes deliberately:
   `outcome_unknown`; the next explicit run addresses the same order key and finds
   out what really happened. Nothing is invented in either direction.
 - **Confirmed work survives a later fault.** The account is accumulated as the
-  pass happens rather than assembled at the end, so a database that stops
-  answering after a fill cannot make the run report zero fills for a fill that
-  really happened.
+  pass happens rather than assembled at the end. A SENTINEL verdict is written
+  into it the moment the risk request returns and before the fill is started, so
+  a fill that then fails cannot take a committed approval down with it, and a
+  database that stops answering after a fill cannot make the run report zero
+  fills for a fill that really happened.
+- **An unconfirmed intake is named, not counted.** The cycle commits one case at
+  a time, so a cycle that stopped part-way may have opened some. The run does not
+  count rows — another run's commits are not its own — it reports
+  `intake_outcome_unknown` and leaves the count at zero.
 
 Safe by construction: every value is an identifier this system already exposes, a
 count, or a typed reason code from a published vocabulary. No secret, provider
@@ -279,6 +293,24 @@ thing that keeps "configuring a size enables nothing" true — **the web process
 cannot reach the runner at all**, so an amount sitting in the environment can
 begin nothing by being present.
 
+## A budget rule this document previously claimed and the code did not have
+
+An earlier revision of these notes described the intake policy as being lowered
+before the cycle ran. `build_stack` never passed that policy, so the ceiling in
+force was the control plane's own five and the runner's candidate number bounded
+nothing — a report can describe a rule the code does not implement, and this one
+did. Reproduced by counting `trade_cases` rows rather than reading the summary:
+three cases written with a budget of one.
+
+Two further gaps in the same area, found the same way: worker claims never
+entered the run's working set, so the claim scope stayed unset whenever intake
+had not already filled the budget; and FUSE was reported `ROLE_NOT_CLAIMABLE` on
+the strength of a stale comment in the runtime rather than the workflow policy,
+which has had an evidence requirement for it all along.
+
+All three are fixed above and proved against the database in
+`tests/runner/test_budgets.py` and `tests/runner/test_end_to_end.py`.
+
 ## A limit the end-to-end proof exposed
 
 PULSE re-checks a pending trigger on a **ninety-second** interval by workflow
@@ -303,7 +335,6 @@ a workaround, and the limit is recorded here instead of being hidden by it.
 - **ATLAS and VECTOR history are chain-bound**, so a run with more than one chain
   enabled reports them unavailable rather than serving one chain silently.
   Making either multi-chain means changing the port.
-- **FUSE cannot be claimed** through the evidence-submission runtime at all.
 - **Only `anthropic` composes as a reasoning provider**, by design.
 - **A rescheduled PULSE check cannot reach a fill** while its interval exceeds
   SENTINEL's source bound; see above.

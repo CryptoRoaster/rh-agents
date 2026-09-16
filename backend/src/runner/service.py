@@ -81,11 +81,6 @@ T = TypeVar("T")
 # deliberately the same string derived from the same identity.
 ORDER_PREFIX = "paper-run"
 
-# Roles the evidence-submission runtime can actually hand a task to. FUSE and
-# COMMANDER have no evidence requirement and are refused at the claim, so a
-# runner for either would raise rather than find nothing.
-CLAIMABLE_ROLES = frozenset({"ORBIT", "ATLAS", "SIGNAL", "VECTOR", "PULSE", "ANCHOR"})
-
 
 def order_key(trade_case_id: UUID) -> str:
     """The business identity of this case's one entry order.
@@ -148,6 +143,7 @@ class Account:
     candidates_seen: int = 0
     cases_opened: int = 0
     intake_refusals: tuple[str, ...] = ()
+    intake_unknown: bool = False
     steps: int = 0
     steps_timed_out: int = 0
     cases: dict[UUID, CaseProgress] = field(default_factory=dict)
@@ -256,7 +252,20 @@ class BoundedPaperRun:
         if not account.may_step(deadline):
             return
         account.steps += 1
-        outcome = await self._bounded(self.stack.intake.run_cycle(), deadline)
+        try:
+            outcome = await self._bounded(
+                self.stack.intake.run_cycle(limit=self.stack.limits.max_candidates), deadline
+            )
+        except (SystemPauseUnavailable, asyncio.CancelledError):
+            raise
+        except Exception:
+            # The cycle commits one case at a time, so it may have opened some
+            # before it stopped. This run cannot say how many without counting
+            # rows another run may have written, so it names the outcome as
+            # unconfirmed and counts nothing.
+            account.intake_unknown = True
+            account.fail("INTAKE_OUTCOME_UNKNOWN")
+            return
         account.candidates_seen = len(outcome.opened) + len(outcome.refused)
         account.intake_refusals = tuple(sorted({reason.value for _, reason in outcome.refused}))
         if any(reason is IntakeRefusal.SYSTEM_PAUSED for _, reason in outcome.refused):
@@ -280,6 +289,13 @@ class BoundedPaperRun:
         runners = self.stack.runners
         if not runners:
             return
+        # The working set, decided before a single claim is made. Every claim is
+        # narrowed to it in the query, so a task outside the budget is never
+        # taken and then dropped — a dropped claim is a lease nobody is working,
+        # held for as long as the lease lasts.
+        scope = await self._working_set(account, deadline)
+        if not scope:
+            return
         for runner in runners:
             if not account.may_step(deadline):
                 return
@@ -290,10 +306,6 @@ class BoundedPaperRun:
             for runner in runners:
                 if not account.may_step(deadline):
                     return
-                # Once the case budget is full, the claim is narrowed to the
-                # cases already being worked — in the query, so no foreign task
-                # is taken and dropped.
-                scope = frozenset(account.touched) if account.full else None
                 account.steps += 1
                 claimed, timed_out = await self._step(runner, scope, deadline)
                 if timed_out:
@@ -301,19 +313,53 @@ class BoundedPaperRun:
                     # Started work that did not finish. It counts, and the run
                     # stops asking this role for more in this pass.
                     return
-                if not claimed:
+                if claimed is None:
                     # Nothing to claim is not work: give the step back.
                     account.steps -= 1
                     continue
                 progressed = True
 
+    async def _working_set(self, account: Account, deadline: Deadline) -> frozenset[UUID]:
+        """The cases this pass may work on, fixed before any claim.
+
+        Whatever intake opened comes first — this run already spent part of its
+        allowance on those — and the rest is topped up from the cases that are
+        already alive, oldest first. Deciding it up front is what lets the claim
+        be narrowed in the query rather than after the fact.
+        """
+        if account.full:
+            return frozenset(account.touched)
+        for trade_case_id in await self._open_cases(deadline):
+            if not account.admits(trade_case_id):
+                break
+        return frozenset(account.touched)
+
+    async def _open_cases(self, deadline: Deadline) -> tuple[UUID, ...]:
+        async def read() -> tuple[UUID, ...]:
+            async with self.stack.sessions() as session:
+                rows = (
+                    await session.scalars(
+                        select(TradeCaseRow.id)
+                        .where(
+                            TradeCaseRow.status.notin_(
+                                [item.value for item in TERMINAL_CASE_STATUSES]
+                            )
+                        )
+                        .order_by(TradeCaseRow.opened_at, TradeCaseRow.id)
+                        .limit(self.stack.limits.max_cases)
+                    )
+                ).all()
+            return tuple(rows)
+
+        return await self._bounded(read(), deadline)
+
     async def _step(
-        self, runner: Any, scope: frozenset[UUID] | None, deadline: Deadline
-    ) -> tuple[bool, bool]:
+        self, runner: Any, scope: frozenset[UUID], deadline: Deadline
+    ) -> tuple[UUID | None, bool]:
         """One claim, bounded by the nearer of the step timeout and the deadline.
 
-        Returns whether anything was claimed and whether the attempt timed out,
-        which are different facts: an empty claim means there was no work, a
+        Returns the case that was claimed, if any, and whether the attempt timed
+        out. Those are different facts: an empty claim means there was no work, a
         timeout means work began and was cut off. Reporting them as one would
         hide a handler that hangs behind a queue that is simply empty.
 
@@ -324,14 +370,20 @@ class BoundedPaperRun:
         """
         budget = deadline.within(self.stack.limits.step_timeout_seconds)
         if budget <= 0:
-            return False, False
+            return None, False
         try:
             disposition = await asyncio.wait_for(
                 runner.run_once(trade_case_ids=scope), timeout=budget
             )
         except TimeoutError:
-            return True, True
-        return disposition is not None, False
+            # The claim happened; the handler did not finish. The lease the
+            # runner recorded says which case spent the budget.
+            lease = runner.last_lease
+            return (None if lease is None else lease.trade_case_id), True
+        if disposition is None:
+            return None, False
+        lease = runner.last_lease
+        return (None if lease is None else lease.trade_case_id), False
 
     async def _decide(self, account: Account, deadline: Deadline) -> None:
         """Ask SENTINEL about what became ready, and fill what it approved."""
@@ -415,17 +467,21 @@ class BoundedPaperRun:
             )
             return
         outcome = verdict.outcome.value
+        # Written into the account the moment the verdict returns, and before
+        # anything is done with it. The risk request is its own transaction; a
+        # fill that then fails must not take a committed verdict down with it.
+        account.record(
+            CaseProgress(
+                trade_case_id=trade_case_id,
+                status=case.status.value,
+                risk_outcome=outcome,
+                replayed=verdict.replayed,
+            )
+        )
         if verdict.authorization.value != "APPROVED":
             # `LIMITED`, `REJECT` and `PAUSE_SYSTEM` all end here. No second key,
-            # no downsize, no retry: one order gets one verdict.
-            account.record(
-                CaseProgress(
-                    trade_case_id=trade_case_id,
-                    status=case.status.value,
-                    risk_outcome=outcome,
-                    replayed=verdict.replayed,
-                )
-            )
+            # no downsize, no retry: one order gets one verdict. Already
+            # recorded above.
             return
         if not account.may_step(deadline):
             # Approved and not acted on. The verdict stands and is recorded; the
@@ -516,6 +572,7 @@ class BoundedPaperRun:
             candidates_seen=account.candidates_seen,
             cases_opened=account.cases_opened,
             intake_refusals=account.intake_refusals,
+            intake_outcome_unknown=account.intake_unknown,
             steps_taken=account.steps,
             steps_timed_out=account.steps_timed_out,
             cases=cases,

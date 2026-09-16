@@ -127,7 +127,11 @@ async def test_a_run_that_cannot_reach_the_database_reports_a_technical_failure(
     summary = await BoundedPaperRun(stack).execute()
 
     assert summary.kind == "paper_run_summary"
-    assert summary.errors == ("DATABASE_UNAVAILABLE",)
+    # Named precisely: the cycle commits one case at a time, so a database that
+    # stopped answering inside it leaves an outcome this run cannot confirm.
+    assert summary.errors == ("INTAKE_OUTCOME_UNKNOWN",)
+    assert summary.intake_outcome_unknown is True
+    assert summary.cases_opened == 0
     assert summary.exit_code is ExitCode.TECHNICAL_FAILURE
     assert await executions(sessions) == []
 

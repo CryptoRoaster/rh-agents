@@ -181,6 +181,10 @@ class WorkerRunner:
         self.runtime_version = runtime_version
         self.poll_interval = poll_interval
         self.worker_instance_id: UUID | None = None
+        # The lease this runner is holding, or last held. A caller whose own
+        # attempt was cut off still needs to know which case it spent its
+        # budget on; `run_once` cannot return that once it has stopped waiting.
+        self.last_lease: TaskLease | None = None
 
     async def register(self) -> UUID:
         instance = await self.service.register_worker(
@@ -204,11 +208,13 @@ class WorkerRunner:
         """
         if self.worker_instance_id is None:
             raise WorkerFailure(WorkerErrorCode.WORKER_NOT_FOUND)
+        self.last_lease = None
         lease = await self.service.claim_next_task(
             self.worker_instance_id, trade_case_ids=trade_case_ids
         )
         if lease is None:
             return None
+        self.last_lease = lease
         try:
             report = await self.handler.handle(lease, self.capabilities.build(lease))
         except asyncio.CancelledError:

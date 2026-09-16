@@ -224,7 +224,12 @@ class Settings(BaseSettings):
     # Hard bounds on one run. Every one of them is an upper limit, never a
     # target: a run that reaches a limit stops and says so, and what it did not
     # reach is left for the next explicit run rather than retried in place.
+    # How many recorded candidates one pass may process, and how many of them
+    # may become cases. Two numbers because they are two questions: reading a
+    # market costs a read, opening a case creates work somebody has to finish
+    # or expire.
     paper_runner_max_candidates: int = Field(default=5, ge=1, le=50)
+    paper_runner_max_new_cases: int = Field(default=3, ge=1, le=50)
     paper_runner_max_steps: int = Field(default=40, ge=1, le=500)
     paper_runner_max_cases: int = Field(default=3, ge=1, le=20)
     # The whole run, and one external wait inside it. The second bounds what a

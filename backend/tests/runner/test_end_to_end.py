@@ -255,6 +255,7 @@ def full_settings(**overrides):
         "signal_social_provider": "neynar",
         "neynar_api_key": "unused-because-the-source-is-supplied",
         "vector_worker_enabled": True,
+        "fuse_worker_enabled": True,
         "pulse_worker_enabled": True,
         "anchor_worker_enabled": True,
         "evm_runtime_enabled": True,
@@ -364,13 +365,16 @@ async def test_the_whole_chain_runs_from_a_recorded_candidate(risk_db, now, trac
     assert await succeeded(sessions, AgentRole.ANCHOR, case), second
 
     # Every specialist the workflow requires produced its own evidence, through
-    # its own handler. Nothing here was submitted by this test.
+    # its own handler. Nothing here was submitted by this test. FUSE is in the
+    # set too: its synthesis is optional and gates nothing, and it is claimed
+    # through the same runtime as the rest.
     produced = await produced_for(sessions, case)
     assert produced == {
         AgentRole.ORBIT.value,
         AgentRole.ATLAS.value,
         AgentRole.SIGNAL.value,
         AgentRole.VECTOR.value,
+        AgentRole.FUSE.value,
         AgentRole.PULSE.value,
         AgentRole.ANCHOR.value,
     }, produced
@@ -401,3 +405,83 @@ async def produced_for(sessions, trade_case_id) -> set[str]:
             )
         ).all()
     return {item.producer_role for item in rows} - {"COMMANDER"}
+
+
+async def test_fuse_is_claimed_and_produces_synthesis(risk_db, now, trace):
+    """FUSE has a requirement in the workflow policy, so its task is claimable.
+
+    Nothing special is needed for it: the synthesis reads verdicts the other
+    specialists already committed, so there is no provider, no model and no
+    extra port. This runs it through the same runtime and the same
+    `WorkerRunner` as every other role, on a case the real specialists built.
+    """
+    _, sessions = risk_db
+    await record_market(sessions, now, price=SPOT)
+    await record_payment_asset(sessions, now)
+    model = ScriptedSpecialists()
+    settings = full_settings(pulse_worker_enabled=False, anchor_worker_enabled=False)
+
+    summary = await run(sessions, settings, now, ports=full_ports(now, model))
+
+    assert summary.exit_code is ExitCode.COMPLETED, summary
+    assert "FUSE" in {item.role for item in summary.roles if item.available}, summary.roles
+    case = await traded_case(sessions)
+    assert await succeeded(sessions, AgentRole.FUSE, case), summary
+    recorded = await evidence_of(sessions, EvidenceType.SYNTHESIS)
+    assert [item.producer_role for item in recorded] == [AgentRole.FUSE.value]
+
+
+async def test_fuse_without_its_inputs_waits_rather_than_inventing_one(risk_db, now, trace):
+    """Missing prerequisites end in the existing wait or block contract."""
+    _, sessions = risk_db
+    await record_market(sessions, now, price=SPOT)
+    model = ScriptedSpecialists()
+    # Only FUSE. Nothing has produced the verdicts it synthesises.
+    settings = runner_settings(fuse_worker_enabled=True)
+
+    summary = await run(sessions, settings, now, ports=RunnerPorts(reasoning=model))
+
+    assert summary.exit_code is ExitCode.COMPLETED, summary
+    assert "FUSE" in {item.role for item in summary.roles if item.available}
+    # FUSE synthesises what exists and names what does not. It is advisory and
+    # gates nothing, so an incomplete evidence set produces a reading that says
+    # so rather than silence or an invented verdict.
+    recorded = await evidence_of(sessions, EvidenceType.SYNTHESIS)
+    assert [item.producer_role for item in recorded] == [AgentRole.FUSE.value]
+    synthesis = recorded[0].payload["payload"]["synthesis"]
+    assert synthesis["sources"], "the reading names what it was built from"
+
+
+def test_a_disabled_fuse_is_reported_as_disabled(risk_db, now):
+    """And not as something the composition could not build."""
+    from src.core.clock import FixedClock
+    from src.runner.composition import build_stack
+
+    _, sessions = risk_db
+    stack = build_stack(
+        runner_settings(fuse_worker_enabled=False),
+        sessions,
+        ports=RunnerPorts(),
+        clock=FixedClock(now),
+    )
+
+    reasons = {item.role: item.reason for item in stack.roles}
+    assert reasons["FUSE"] == "ROLE_NOT_ENABLED"
+
+
+def test_the_cli_precheck_accepts_a_composed_fuse(risk_db, now):
+    """An enabled, composable role is not a configuration problem."""
+    from src.core.clock import FixedClock
+    from src.runner.composition import build_stack
+    from src.runner.main import _misconfigured
+
+    _, sessions = risk_db
+    stack = build_stack(
+        runner_settings(fuse_worker_enabled=True),
+        sessions,
+        ports=RunnerPorts(),
+        clock=FixedClock(now),
+    )
+
+    assert stack.misconfigured == ()
+    assert _misconfigured(stack) is None

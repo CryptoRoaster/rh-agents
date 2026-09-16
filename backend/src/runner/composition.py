@@ -32,6 +32,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.agents.anchor.context import AnchorContextReader
 from src.agents.anchor.handler import AnchorWorkerHandler
 from src.agents.atlas.context import AtlasContextReader
+from src.agents.fuse.context import FuseContextReader
+from src.agents.fuse.handler import FuseWorkerHandler
 from src.agents.orbit.context import OrbitContextReader
 from src.agents.orbit.handler import OrbitWorkerHandler
 from src.agents.pulse.context import PulseContextReader
@@ -50,6 +52,7 @@ from src.markets.reader import MarketReader
 from src.orchestration.casefill.service import CaseFillService
 from src.orchestration.commander.context import AccountPauseReader, SystemPausePort
 from src.orchestration.commander.intake import CommanderIntakeService
+from src.orchestration.commander.policy import COMMANDER_CONTROL_V1
 from src.orchestration.costs.models import PaperCostReading, paper_cost_assumptions
 from src.orchestration.paper import PaperTradingService
 from src.orchestration.riskrequest.service import RiskRequestService
@@ -109,6 +112,7 @@ class RunnerPorts:
 def limits_from_settings(settings: Settings) -> RunLimits:
     return RunLimits(
         max_candidates=settings.paper_runner_max_candidates,
+        max_new_cases=settings.paper_runner_max_new_cases,
         max_steps=settings.paper_runner_max_steps,
         max_cases=settings.paper_runner_max_cases,
         max_runtime_seconds=settings.paper_runner_max_seconds,
@@ -280,10 +284,25 @@ def build_stack(
         trading_mode=settings.trading_mode,
     )
     paper = PaperTradingService(sessions, RiskLimits(), settings.trading_mode, clock=tick)
+    limits = limits_from_settings(settings)
     intake = CommanderIntakeService(
         cases=cases,
         markets=markets,
         sessions=sessions,
+        # The opening budget, enforced where cases are actually written. A
+        # ceiling applied to the result would mean opening cases and then
+        # discarding them, and an opened case is a real thing in the workflow
+        # that somebody has to work or expire. Never above the control policy's
+        # own bound, and never above the case budget either: a case this run
+        # could not then work on is a case opened for nobody.
+        policy=replace(
+            COMMANDER_CONTROL_V1,
+            max_cases_per_cycle=min(
+                COMMANDER_CONTROL_V1.max_cases_per_cycle,
+                limits.max_new_cases,
+                limits.max_cases,
+            ),
+        ),
         clock=tick,
         kill_switch=settings.commander_kill_switch,
         pause=supplied.pause,
@@ -322,7 +341,7 @@ def build_stack(
         risk=risk,
         fills=fills,
         costs=costs,
-        limits=limits_from_settings(settings),
+        limits=limits,
         runners=runners,
         roles=roles,
         clock=tick,
@@ -512,12 +531,16 @@ def _runners(
     if not settings.fuse_worker_enabled:
         note(AgentRole.FUSE, "ROLE_NOT_ENABLED")
     else:
-        # Enabled, and still not runnable here. FUSE has no evidence requirement
-        # in the workflow policy, so `authorized_task_type` has nothing to give
-        # it and the runtime refuses the claim outright. Composing a runner for
-        # it would raise on the first attempt rather than find nothing, so the
-        # honest report is that the role has no claimable work in this runtime.
-        note(AgentRole.FUSE, "ROLE_NOT_CLAIMABLE")
+        # FUSE has an evidence requirement in the workflow policy —
+        # `SYNTHESIZE_EVIDENCE`, optional and not safety-critical — so
+        # `authorized_task_type` answers for it and its tasks are claimable like
+        # any other. Nothing else is needed: the synthesis reads verdicts the
+        # specialists already committed, so there is no provider and no model.
+        add(
+            AgentRole.FUSE,
+            FuseWorkerHandler(),
+            CapabilityProvider(service=runtime, fuse=FuseContextReader(cases=cases, clock=clock)),
+        )
 
     order = {role: index for index, role in enumerate(AgentRole)}
     return tuple(built), tuple(sorted(reported, key=lambda item: order[AgentRole(item.role)]))
