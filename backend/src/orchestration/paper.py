@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -202,6 +203,7 @@ class PaperTradingService:
         marks: dict[str, PositionMark] | None,
         now: datetime,
         market_identity: MarketIdentity | None = None,
+        cycle_id: UUID | None = None,
         authorize: Callable[[datetime], str | None] | None = None,
     ) -> PaperOutcome:
         """Risk-check, fill and book one order inside a transaction the caller owns.
@@ -248,6 +250,10 @@ class PaperTradingService:
             max_snapshot_age_seconds=self.limits.max_snapshot_age_seconds,
             correlation_id=intent.correlation_id,
             market=market_identity,
+            # Which trading cycle a newly opened holding belongs to. The
+            # position row is reused after an exit, so without this a second
+            # entry would leave a holding that names only its asset.
+            cycle_id=cycle_id,
         )
         if state.conflicting_market is not None:
             # This asset is already held, and was bought somewhere else. Filling

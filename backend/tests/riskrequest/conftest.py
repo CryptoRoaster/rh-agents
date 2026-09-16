@@ -88,6 +88,7 @@ async def risk_db():
                 "0008_trade_case_executions",
                 "0009_position_market_identity",
                 "0010_trade_case_exits",
+                "0011_trade_cycles",
             ):
                 spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
                 module = importlib.util.module_from_spec(spec)
@@ -168,6 +169,18 @@ async def ready_case(
     ATLAS, SIGNAL and VECTOR before the trigger, then PULSE and ANCHOR.
     """
     trade_case = await open_case(cases, now, trace, key, lifetime=lifetime, identity=identity)
+    return await evidence_for(cases, trade_case.id, now, onchain=onchain, anchor=anchor)
+
+
+async def evidence_for(cases, trade_case_id, now, *, onchain=None, anchor=True):
+    """Submit the full evidence set to an already-open case, in order.
+
+    Split out of `ready_case` so a case opened by something other than a fixture
+    — an explicit re-entry, say — is carried to `READY_FOR_RISK` by exactly the
+    same submissions, through the real workflow, rather than by copying anything
+    an earlier case happened to have.
+    """
+    trade_case = await cases.get_trade_case(trade_case_id)
     await record_onchain(cases, trade_case, now, onchain or fresh_onchain(now))
     await record(
         cases,

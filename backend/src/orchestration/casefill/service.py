@@ -36,6 +36,7 @@ from src.data.tables import (
     TradeCaseExecutionRow,
     TradeCaseRiskBindingRow,
     TradeCaseRiskRequestRow,
+    TradeCycleRow,
 )
 from src.ledger.portfolio import PortfolioState, portfolio_basis, portfolio_state
 from src.orchestration.casefill.models import (
@@ -47,6 +48,7 @@ from src.orchestration.casefill.models import (
 )
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
+from src.orchestration.cycles import cycle_of
 from src.orchestration.paper import PaperOutcome, PaperTradingService
 from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
@@ -242,6 +244,11 @@ class CaseFillService:
             snapshot = await feed.latest(trade_case.market.pair_id)
             current = active_evidence(await self.cases.evidence(trade_case_id))
             positions = await self.paper.positions_in_session(session)
+            # The trading cycle this entry opens, derived from the case rather
+            # than written now: a fill that is refused must leave no cycle
+            # behind, and an identity does not need a row to exist. The row is
+            # written with the fill, below.
+            cycle_id = cycle_of(trade_case.id)
             held = {item.asset_id for item in positions if item.quantity != 0}
             appeared = valuation.unconsidered(held)
             if appeared:
@@ -414,6 +421,7 @@ class CaseFillService:
                 marks=valuation.by_asset,
                 now=now,
                 market_identity=trade_case.market,
+                cycle_id=cycle_id,
                 authorize=still_authorised,
             )
             if outcome.stop_reason is not None:
@@ -438,9 +446,11 @@ class CaseFillService:
                 )
             if outcome.state is None:  # pragma: no cover - a fill always carries one
                 raise CaseFillUnavailable("EXECUTION_PORTFOLIO_MISSING")
+            cycle = await self._cycle(session, trade_case)
             recorded = self._record(
                 session,
                 trade_case,
+                cycle,
                 request,
                 binding.binding_id,
                 outcome,
@@ -500,6 +510,39 @@ class CaseFillService:
             include_fixtures=self.include_fixtures,
         ).value(positions, self.clock.now())
 
+    async def _cycle(self, session: AsyncSession, trade_case: TradeCase) -> TradeCycleRow:
+        """The trading cycle this case belongs to, opening it if it is the first.
+
+        A market's first entry opens cycle 1 with no predecessor. Every later
+        cycle is opened by the explicit re-entry call, which records its own row
+        against the new case *before* any fill — so this finds that row rather
+        than starting a second count for the same market.
+
+        Called only once a fill has actually happened. A case that never fills
+        never becomes a cycle: intake opens cases that expire and re-checks
+        refuse cases that were approved, and a cycle that held nothing would
+        consume a market's sequence number and its one successor slot.
+        """
+        found = await session.scalar(
+            select(TradeCycleRow).where(TradeCycleRow.trade_case_id == trade_case.id)
+        )
+        if found is not None:
+            return found
+        cycle = TradeCycleRow(
+            cycle_id=cycle_of(trade_case.id),
+            trade_case_id=trade_case.id,
+            asset_id=trade_case.market.base_asset_id,
+            market_pair_id=trade_case.market.pair_id,
+            sequence=1,
+            predecessor_exit_id=None,
+            request_key=None,
+            opened_at=trade_case.opened_at,
+            correlation_id=trade_case.correlation_id,
+        )
+        session.add(cycle)
+        await session.flush()
+        return cycle
+
     def _stops(self, trade_case: TradeCase, account: AccountRow) -> ExecutionRefused | None:
         """Every stop this path must honour, checked before anything else.
 
@@ -521,6 +564,7 @@ class CaseFillService:
         self,
         session: AsyncSession,
         trade_case: TradeCase,
+        cycle: TradeCycleRow,
         request: TradeCaseRiskRequestRow,
         binding_id: UUID,
         outcome: PaperOutcome,
@@ -543,6 +587,8 @@ class CaseFillService:
         basis = {
             "request_key": request.request_key,
             "trade_case_id": str(trade_case.id),
+            "cycle_id": str(cycle.cycle_id),
+            "cycle_sequence": cycle.sequence,
             "case_revision": trade_case.revision,
             "authorizing_binding_id": str(binding_id),
             "safety_risk_input_digest": request.risk_input_digest,
@@ -569,6 +615,7 @@ class CaseFillService:
             TradeCaseExecutionRow(
                 case_execution_id=case_execution_id,
                 trade_case_id=trade_case.id,
+                cycle_id=cycle.cycle_id,
                 request_id=request.request_id,
                 request_key=request.request_key,
                 intent_id=fill.intent_id,

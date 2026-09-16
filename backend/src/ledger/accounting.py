@@ -41,6 +41,8 @@ def apply_fill(
         market_chain=position.market_chain,
         market_network=position.market_network,
         market_provider=position.market_provider,
+        # A fill changes a holding's size, never which cycle it belongs to.
+        cycle_id=position.cycle_id,
         quantity=quantity,
         cost_basis_usd=basis,
         realized_pnl_usd=position.realized_pnl_usd + realized,

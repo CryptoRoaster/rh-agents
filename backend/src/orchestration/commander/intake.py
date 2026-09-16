@@ -226,6 +226,38 @@ class CommanderIntakeService:
             )
         return row is not None
 
+    async def _barred(self, candidate: MarketCandidate) -> TradeCaseStatus | None:
+        """Whether *any* case for this market has spoken for it.
+
+        Deliberately a question about every case rather than about the newest
+        terminal one, for the same reason `_active_case` asks about every live
+        case: the newest-row ordering is a total order, not a statement about
+        what a market has already done. An executed cycle that was later
+        followed by a case which expired or was cancelled would otherwise look
+        unbarred, and intake would open a generation on a market whose one
+        legitimate successor path is the explicit re-entry contract.
+
+        `EXECUTED` wins over `RISK_REJECTED` when both appear, because it is the
+        one that left a position and the one whose successor has a contract.
+        """
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(TradeCaseRow.status).where(
+                        TradeCaseRow.market_key == candidate.pair_id,
+                        TradeCaseRow.status.in_(
+                            [item.value for item in MARKET_BARRING_CASE_STATUSES]
+                        ),
+                    )
+                )
+            ).all()
+        found = {TradeCaseStatus(item) for item in rows}
+        if TradeCaseStatus.EXECUTED in found:
+            return TradeCaseStatus.EXECUTED
+        if TradeCaseStatus.RISK_REJECTED in found:
+            return TradeCaseStatus.RISK_REJECTED
+        return None
+
     async def _latest_terminal(
         self, candidate: MarketCandidate
     ) -> tuple[UUID | None, TradeCaseStatus | None]:
@@ -281,20 +313,23 @@ class CommanderIntakeService:
         if await self._active_case(candidate):
             return IntakeRefusal.ACTIVE_CASE_EXISTS, None
 
-        latest_id, latest_status = await self._latest_terminal(candidate)
-        if latest_status in MARKET_BARRING_CASE_STATUSES:
+        barring = await self._barred(candidate)
+        if barring is not None:
             # One set decides whether a market is spoken for; the codes differ
             # because the reasons do. A rejection is a verdict about the market,
             # and re-observing it is not new information about risk. An
             # execution left a position, and adding to one, exiting one or
             # deciding that a further entry is a different trade are contracts
             # this system does not have — intake must not invent one by looking
-            # at the market again.
+            # at the market again. Re-entry after a completed cycle exists, and
+            # goes through its own explicit contract rather than through here.
             return (
                 IntakeRefusal.POSITION_OPENED_FOR_MARKET
-                if latest_status is TradeCaseStatus.EXECUTED
+                if barring is TradeCaseStatus.EXECUTED
                 else IntakeRefusal.RISK_REJECTED_FOR_MARKET
             ), None
+
+        latest_id, _ = await self._latest_terminal(candidate)
 
         # EXPIRED and CANCELLED end a case without deciding anything about the
         # market and without leaving a position behind, so the next observation
