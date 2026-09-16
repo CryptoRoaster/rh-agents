@@ -53,6 +53,13 @@ def runner_settings(**overrides) -> Settings:
     """
     base = {
         "database_url": TEST_DATABASE,
+        # Stated rather than inherited. `Settings` still consults the ambient
+        # environment for anything a test leaves unset, so a value that happens
+        # to sit in a developer's `.env` would make a fixture pass there and
+        # fail everywhere else. The key is never used: every test that selects
+        # a provider supplies the port itself, and the setting exists only
+        # because a selected provider must be fully configured.
+        "anthropic_api_key": "unused-the-reasoning-port-is-supplied",
         "trading_mode": "PAPER",
         "paper_runner_enabled": True,
         "paper_requested_notional_usd": "500",

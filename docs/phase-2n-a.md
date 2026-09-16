@@ -247,6 +247,25 @@ generated, frontend typecheck/lint/format/build.
 
 **No migration.** This phase persists nothing of its own.
 
+## Two things CI caught that a local run could not
+
+Both were test-environment faults rather than defects in the runner, and both are
+worth recording because a local pass had said otherwise.
+
+**A guard that reads the tracked tree.** `tests/sizing/test_authority.py` pins
+where `paper_requested_notional_usd` may be read, so a new file only appears to
+it once committed. The guard was extended rather than loosened: the bounded run
+is the second legitimate reader, and it now also asserts that the web process
+cannot reach the runner at all, which is what keeps "configuring a size enables
+nothing" true.
+
+**A fixture that inherited the developer's environment.** `Settings` consults the
+ambient environment for anything a test leaves unset, so an `ANTHROPIC_API_KEY`
+exported in one shell made the end-to-end fixtures pass there and fail
+everywhere else. The runner test settings now state the value themselves. It is
+never used — every test that selects a provider supplies the port itself — and
+exists only because a selected provider must be fully configured.
+
 ## The guard the first CI run caught
 
 `tests/sizing/test_authority.py` pins where `paper_requested_notional_usd` may
