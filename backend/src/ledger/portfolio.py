@@ -65,6 +65,7 @@ class ValuationInputs:
     max_snapshot_age_seconds: int
     correlation_id: UUID
     market: MarketIdentity | None
+    cycle_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,7 @@ def portfolio_state(
     max_snapshot_age_seconds: int,
     correlation_id: UUID,
     market: MarketIdentity | None = None,
+    cycle_id: UUID | None = None,
 ) -> PortfolioState:
     """Value the portfolio, or say honestly that it could not be valued.
 
@@ -142,6 +144,21 @@ def portfolio_state(
         used.append(mark)
 
     position = next((item for item in positions if item.asset_id == asset_id), None)
+    if position is not None and position.quantity == 0:
+        # The row is there and holds nothing. A closed position belongs to the
+        # cycle that closed it only as history: whatever reopens it is a new
+        # acquisition, in whatever market and cycle *this* order names. Leaving
+        # the old attribution on it would make the next exit look for its origin
+        # in the cycle before last.
+        position = position.model_copy(
+            update={
+                "cycle_id": cycle_id,
+                "market_pair_id": None if market is None else market.pair_id,
+                "market_chain": None if market is None else market.chain,
+                "market_network": None if market is None else market.network,
+                "market_provider": None if market is None else market.provider,
+            }
+        )
     if position is None:
         # A new holding records the market it is being acquired in, so it can be
         # valued later without anyone having to guess which pool it came from.
@@ -149,6 +166,7 @@ def portfolio_state(
             source="LEDGER",
             correlation_id=correlation_id,
             asset_id=asset_id,
+            cycle_id=cycle_id,
             market_pair_id=None if market is None else market.pair_id,
             market_chain=None if market is None else market.chain,
             market_network=None if market is None else market.network,
@@ -190,6 +208,7 @@ def portfolio_state(
             max_snapshot_age_seconds=max_snapshot_age_seconds,
             correlation_id=correlation_id,
             market=market,
+            cycle_id=cycle_id,
         ),
         context=RiskContext(
             cash_usd=cash_usd,
@@ -270,6 +289,7 @@ def portfolio_basis(state: PortfolioState) -> dict[str, Any]:
         "max_snapshot_age_seconds": used.max_snapshot_age_seconds,
         "correlation_id": str(used.correlation_id),
         "market": None if used.market is None else used.market.model_dump(mode="json"),
+        "cycle_id": None if used.cycle_id is None else str(used.cycle_id),
         "holdings": [item.model_dump(mode="json") for item in held],
         # The marks actually relied on, with the market, source and instant each
         # came from.
@@ -304,4 +324,5 @@ def replay_portfolio_basis(stored: dict[str, Any]) -> PortfolioState:
         max_snapshot_age_seconds=stored["max_snapshot_age_seconds"],
         correlation_id=UUID(stored["correlation_id"]),
         market=None if market is None else MarketIdentity.model_validate(market),
+        cycle_id=None if stored.get("cycle_id") is None else UUID(stored["cycle_id"]),
     )

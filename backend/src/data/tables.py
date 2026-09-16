@@ -100,9 +100,16 @@ class PositionRow(Base):
         CheckConstraint("quantity >= 0", name="position_quantity_nonnegative"),
         CheckConstraint("cost_basis_usd >= 0", name="position_basis_nonnegative"),
         Index("ix_positions_market_pair", "market_pair_id"),
+        Index("ix_positions_cycle", "cycle_id"),
     )
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
     asset_id: Mapped[str] = mapped_column(String(200), unique=True)
+    # The trading cycle this holding currently belongs to. One row per asset is
+    # deliberate — the valuation contract rests on exactly one holding per
+    # asset — so the row is reused after an exit and this is what distinguishes
+    # its current owner from every cycle before it. Nullable for holdings that
+    # predate cycles, and those are reported rather than attributed.
+    cycle_id: Mapped[UUID | None] = mapped_column(Uuid)
     # The market this position was acquired in. An asset is not a market: a
     # token can trade in several pools, and observations are indexed by pair, so
     # a position that does not name its own market cannot be valued without
@@ -409,11 +416,15 @@ class TradeCaseExecutionRow(Base):
         CheckConstraint("notional_usd > 0", name="trade_case_execution_notional_positive"),
         CheckConstraint("fees_usd >= 0", name="trade_case_execution_fees_nonnegative"),
         UniqueConstraint("trade_case_id", name="uq_trade_case_execution_case"),
+        UniqueConstraint("cycle_id", name="uq_trade_case_execution_cycle"),
         Index("ix_trade_case_executions_case_time", "trade_case_id", "recorded_at"),
         Index("ix_trade_case_executions_correlation", "correlation_id"),
     )
     case_execution_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
     trade_case_id: Mapped[UUID] = mapped_column(ForeignKey("trade_cases.id", ondelete="CASCADE"))
+    cycle_id: Mapped[UUID] = mapped_column(
+        ForeignKey("trade_cycles.cycle_id", ondelete="RESTRICT"), name="cycle_id"
+    )
     request_id: Mapped[UUID] = mapped_column(
         ForeignKey("trade_case_risk_requests.request_id", ondelete="CASCADE"), unique=True
     )
@@ -432,6 +443,60 @@ class TradeCaseExecutionRow(Base):
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     correlation_id: Mapped[UUID] = mapped_column(Uuid)
     basis: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+
+
+class TradeCycleRow(Base):
+    """One trading cycle: a case that opened a position, and the exit that closed it.
+
+    "One position per asset" and "one trade per market" used to be the same
+    sentence. A position row reached zero and stayed, and every record pointing
+    at it pointed at the only entry there had ever been. Re-entry breaks that:
+    the row is reused, a second entry and exit appear beside the first, and
+    "which entry does this holding come from?" stops having a single answer.
+
+    This is that answer, and it is the only thing that distinguishes a reused
+    position row's current owner from every cycle that came before it. The
+    position table stays one row per asset — the whole valuation contract rests
+    on exactly one holding per asset — and carries the cycle it currently
+    belongs to rather than a history it would have to merge.
+
+    `predecessor_exit_id` is unique, so a completed cycle has at most one
+    successor: a second re-entry request for the same exit is refused rather
+    than opening a parallel one.
+    """
+
+    __tablename__ = "trade_cycles"
+    __table_args__ = (
+        CheckConstraint("sequence >= 1", name="trade_cycle_sequence_positive"),
+        # A first cycle has neither a predecessor nor a request key; every later
+        # one has both. Half of either would be a cycle nobody could place.
+        CheckConstraint(
+            "(predecessor_exit_id IS NULL) = (request_key IS NULL)",
+            name="trade_cycle_succession_complete",
+        ),
+        CheckConstraint(
+            "(predecessor_exit_id IS NULL) = (sequence = 1)",
+            name="trade_cycle_first_has_no_predecessor",
+        ),
+        UniqueConstraint("market_pair_id", "sequence", name="uq_trade_cycle_market_sequence"),
+        Index("ix_trade_cycles_asset", "asset_id"),
+        Index("ix_trade_cycles_market", "market_pair_id", "sequence"),
+    )
+    cycle_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    trade_case_id: Mapped[UUID] = mapped_column(
+        ForeignKey("trade_cases.id", ondelete="CASCADE"), unique=True
+    )
+    asset_id: Mapped[str] = mapped_column(String(200))
+    market_pair_id: Mapped[str] = mapped_column(String(512))
+    sequence: Mapped[int] = mapped_column(Integer)
+    # Deliberately not a foreign key: an exit already points at its cycle, and
+    # pointing back would make the two tables mutually dependent, which no
+    # schema tool can order and no fresh database can create. The value is read
+    # under the account and case locks from the exit row itself.
+    predecessor_exit_id: Mapped[UUID | None] = mapped_column(Uuid, unique=True)
+    request_key: Mapped[str | None] = mapped_column(String(200), unique=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    correlation_id: Mapped[UUID] = mapped_column(Uuid)
 
 
 class TradeCaseExitRow(Base):
@@ -456,6 +521,10 @@ class TradeCaseExitRow(Base):
         CheckConstraint("fees_usd >= 0", name="trade_case_exit_fees_nonnegative"),
         CheckConstraint("cost_basis_released_usd >= 0", name="trade_case_exit_basis_nonnegative"),
         UniqueConstraint("trade_case_id", name="uq_trade_case_exit_case"),
+        # One exit per *cycle* rather than per position: the position row
+        # outlives the cycle and is reused by the next one. Two sales of one
+        # holding inside a cycle stay impossible.
+        UniqueConstraint("cycle_id", name="uq_trade_case_exit_cycle"),
         Index("ix_trade_case_exits_case_time", "trade_case_id", "recorded_at"),
         Index("ix_trade_case_exits_correlation", "correlation_id"),
     )
@@ -464,8 +533,9 @@ class TradeCaseExitRow(Base):
     case_execution_id: Mapped[UUID] = mapped_column(
         ForeignKey("trade_case_executions.case_execution_id", ondelete="CASCADE"), unique=True
     )
+    cycle_id: Mapped[UUID] = mapped_column(ForeignKey("trade_cycles.cycle_id", ondelete="RESTRICT"))
     request_key: Mapped[str] = mapped_column(String(200), unique=True)
-    position_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    position_id: Mapped[UUID] = mapped_column(Uuid)
     asset_id: Mapped[str] = mapped_column(String(200))
     market_pair_id: Mapped[str] = mapped_column(String(512))
     intent_id: Mapped[UUID] = mapped_column(Uuid, unique=True)

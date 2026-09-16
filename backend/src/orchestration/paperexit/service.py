@@ -54,7 +54,7 @@ from src.data.tables import (
     PositionRow,
     TradeCaseExecutionRow,
     TradeCaseExitRow,
-    TradeCaseRow,
+    TradeCycleRow,
 )
 from src.ledger.portfolio import portfolio_basis, portfolio_state
 from src.markets.models import MarketIdentity
@@ -295,6 +295,7 @@ class PaperExitService:
                 max_snapshot_age_seconds=self.limits.max_snapshot_age_seconds,
                 correlation_id=trade_case.correlation_id,
                 market=trade_case.market,
+                cycle_id=position.cycle_id,
             )
             if valued.unmarked_assets:
                 # SENTINEL would answer `PORTFOLIO_DATA_UNKNOWN`. A holding this
@@ -334,6 +335,7 @@ class PaperExitService:
                 marks=valuation.by_asset,
                 now=now,
                 market_identity=trade_case.market,
+                cycle_id=position.cycle_id,
                 authorize=still_authorised,
             )
             if outcome.stop_reason is not None:
@@ -389,37 +391,37 @@ class PaperExitService:
     async def _entry(
         self, session: AsyncSession, position: Position
     ) -> TradeCaseExecutionRow | ExitRefusal:
-        """The one case-bound PAPER entry that accounts for this holding.
+        """The case-bound PAPER entry of the cycle this holding belongs to.
 
-        Selling something this system cannot say it bought would be a trade with
-        no origin, and attributing a sale to whichever case happens to mention
-        the asset would be worse: the exit is bound durably to the entry, and a
-        wrong binding is a false record rather than a missing one.
+        Read through the holding's own cycle rather than by searching the
+        market's history. After a re-entry the same position row has been opened
+        twice, and every executed entry for that asset would otherwise look like
+        an equally good origin — so a search would report ambiguity exactly when
+        the answer is in fact recorded.
+
+        Selling something this system cannot place in a cycle would be a trade
+        with no origin, and attributing it to whichever entry happens to match
+        would be worse: the binding is durable, and a wrong one is a false
+        record rather than a missing one.
         """
         if position.market_pair_id is None:
             return ExitRefusal.POSITION_MARKET_UNKNOWN
-        found = (
-            await session.scalars(
-                select(TradeCaseExecutionRow)
-                .join(TradeCaseRow, TradeCaseRow.id == TradeCaseExecutionRow.trade_case_id)
-                .where(
-                    TradeCaseRow.chain == position.market_chain,
-                    TradeCaseRow.network == position.market_network,
-                )
-            )
-        ).all()
-        cases = {item.trade_case_id: item for item in found}
-        rows = (await session.scalars(select(TradeCaseRow).where(TradeCaseRow.id.in_(cases)))).all()
-        matching = [
-            cases[item.id]
-            for item in rows
-            if MarketIdentity.model_validate(item.market_payload).base_asset_id == position.asset_id
-        ]
-        if not matching:
+        if position.cycle_id is None:
             return ExitRefusal.POSITION_ORIGIN_UNKNOWN
-        if len(matching) > 1:
-            return ExitRefusal.POSITION_ORIGIN_AMBIGUOUS
-        return matching[0]
+        cycle = await session.get(TradeCycleRow, position.cycle_id)
+        if cycle is None:
+            return ExitRefusal.POSITION_ORIGIN_UNKNOWN
+        if cycle.asset_id != position.asset_id or cycle.market_pair_id != position.market_pair_id:
+            # The holding and the cycle it names describe different markets. One
+            # of the two records is wrong, and a sale is not where that is
+            # settled.
+            return ExitRefusal.POSITION_MARKET_MISMATCH
+        entry = await session.scalar(
+            select(TradeCaseExecutionRow).where(TradeCaseExecutionRow.cycle_id == cycle.cycle_id)
+        )
+        if entry is None:
+            return ExitRefusal.POSITION_ORIGIN_UNKNOWN
+        return entry
 
     async def _replay(
         self,
@@ -503,6 +505,7 @@ class PaperExitService:
         row = TradeCaseExitRow(
             exit_id=exit_id,
             trade_case_id=trade_case.id,
+            cycle_id=entry.cycle_id,
             case_execution_id=entry.case_execution_id,
             request_key=request_key,
             position_id=position.id,
@@ -529,6 +532,7 @@ class PaperExitService:
             basis={
                 "request_key": request_key,
                 "trade_case_id": str(trade_case.id),
+                "cycle_id": str(entry.cycle_id),
                 "case_execution_id": str(entry.case_execution_id),
                 "entry_execution_id": str(entry.execution_id),
                 "position_id": str(position.id),

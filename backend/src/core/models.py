@@ -297,6 +297,11 @@ class Position(Record):
     market_chain: Identifier | None = None
     market_network: Identifier | None = None
     market_provider: Identifier | None = None
+    # The trading cycle this holding currently belongs to. The row is reused
+    # after an exit, so without this a second entry and a second exit would both
+    # point at a position that named only its asset. Absent on anything that
+    # predates cycles, and absence is reported rather than resolved.
+    cycle_id: UUID | None = None
     quantity: Amount = Decimal("0")
     cost_basis_usd: Amount = Decimal("0")
     realized_pnl_usd: SignedAmount = Decimal("0")

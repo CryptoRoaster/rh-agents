@@ -82,6 +82,7 @@ def read_position(row: PositionRow) -> Position:
         market_chain=row.market_chain,
         market_network=row.market_network,
         market_provider=row.market_provider,
+        cycle_id=row.cycle_id,
         quantity=row.quantity,
         cost_basis_usd=row.cost_basis_usd,
         realized_pnl_usd=row.realized_pnl_usd,
