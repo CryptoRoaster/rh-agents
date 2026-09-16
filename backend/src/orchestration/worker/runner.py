@@ -6,6 +6,7 @@ enough to prove the runtime; probabilistic reasoning arrives in a later phase.
 """
 
 import asyncio
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Protocol
@@ -192,11 +193,20 @@ class WorkerRunner:
         self.worker_instance_id = instance.worker_instance_id
         return instance.worker_instance_id
 
-    async def run_once(self) -> TaskDisposition | None:
-        """Claim at most one task and carry it to a durable disposition."""
+    async def run_once(
+        self, *, trade_case_ids: Collection[UUID] | None = None
+    ) -> TaskDisposition | None:
+        """Claim at most one task and carry it to a durable disposition.
+
+        `trade_case_ids` narrows what may be claimed, for a caller working to a
+        budget. Applied where the claim happens rather than afterwards: a task
+        claimed and then dropped is a lease nobody is working.
+        """
         if self.worker_instance_id is None:
             raise WorkerFailure(WorkerErrorCode.WORKER_NOT_FOUND)
-        lease = await self.service.claim_next_task(self.worker_instance_id)
+        lease = await self.service.claim_next_task(
+            self.worker_instance_id, trade_case_ids=trade_case_ids
+        )
         if lease is None:
             return None
         try:

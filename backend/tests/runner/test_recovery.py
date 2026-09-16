@@ -19,7 +19,7 @@ from src.data.tables import (
     TradeCaseRiskRequestRow,
 )
 from src.runner.models import ExitCode
-from src.runner.service import BoundedPaperRun, order_key
+from src.runner.service import BoundedPaperRun, Deadline, order_key
 from tests.runner.conftest import (
     executions,
     read_account,
@@ -129,4 +129,81 @@ async def test_a_run_that_cannot_reach_the_database_reports_a_technical_failure(
     assert summary.kind == "paper_run_summary"
     assert summary.errors == ("DATABASE_UNAVAILABLE",)
     assert summary.exit_code is ExitCode.TECHNICAL_FAILURE
+    assert await executions(sessions) == []
+
+
+async def test_a_later_failure_does_not_erase_confirmed_work(risk_db, now, trace):
+    """A fill that committed stays in the account even if the run then breaks.
+
+    The summary is accumulated as the pass happens rather than assembled at the
+    end, so a database that stops answering after a fill cannot make the run
+    report zero fills for a fill that really happened.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    _, sessions = risk_db
+    await record_market(sessions, now)
+    settings = runner_settings(paper_runner_max_cases=3)
+    stack = stack_for(sessions, settings, now)
+    await ready_case(stack.cases, now, trace, key="runner-keep")
+    # A second ready case, so there is still work left when the database stops
+    # answering — the point being what the summary keeps, not what it loses.
+    await ready_case(stack.cases, now, uuid4(), key="runner-keep-two")
+    # The database stops answering immediately after a fill has committed,
+    # whichever case that fill belonged to.
+    filled: list[object] = []
+    fill = stack.fills.execute_case_fill
+    read = stack.cases.get_trade_case
+
+    async def watched_fill(trade_case_id, *, request_key):
+        result = await fill(trade_case_id, request_key=request_key)
+        filled.append(result)
+        return result
+
+    async def breaks_after_a_fill(trade_case_id):
+        if filled:
+            raise OperationalError("SELECT 1", {}, Exception("connection refused"))
+        return await read(trade_case_id)
+
+    object.__setattr__(stack.fills, "execute_case_fill", watched_fill)
+    object.__setattr__(stack.cases, "get_trade_case", breaks_after_a_fill)
+
+    summary = await BoundedPaperRun(stack).execute()
+
+    # The fault is reported, and so is the work that had already committed.
+    assert summary.errors == ("DATABASE_UNAVAILABLE",)
+    assert summary.exit_code is ExitCode.TECHNICAL_FAILURE
+    assert summary.fills == 1
+    assert summary.risk_requests == 1
+    assert len(await executions(sessions)) == 1
+
+
+async def test_an_unknown_outcome_is_reported_as_unknown(risk_db, now, trace):
+    """A decisive call cut off mid-flight may have committed. The run says so.
+
+    No success is invented and no failure either: the case is marked with an
+    unknown outcome, and the next explicit run addresses the same order key and
+    finds out what really happened.
+    """
+    import asyncio
+
+    _, sessions = risk_db
+    await record_market(sessions, now)
+    settings = runner_settings()
+    stack = stack_for(sessions, settings, now)
+    case = await ready_case(stack.cases, now, trace, key="runner-unknown")
+
+    async def never_answers(*arguments, **keywords):
+        await asyncio.Event().wait()
+
+    object.__setattr__(stack.risk, "request_risk_evaluation", never_answers)
+
+    summary = await BoundedPaperRun(stack, deadline=Deadline(0.05)).execute()
+
+    progress = next(item for item in summary.cases if item.trade_case_id == case.id)
+    assert progress.outcome_unknown is True
+    assert progress.execution_id is None
+    assert summary.fills == 0
+    assert summary.stop.value == "TIME_BUDGET_REACHED"
+    # And nothing was invented: the account is untouched.
     assert await executions(sessions) == []

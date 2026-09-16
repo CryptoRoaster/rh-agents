@@ -31,7 +31,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from src.core.config import Settings
 from src.data.database import connect
-from src.runner.composition import RunnerPorts, build_stack
+from src.runner.composition import RunnerPorts, RunnerStack, runner_stack
 from src.runner.models import (
     ConfigurationRefused,
     RunReading,
@@ -49,10 +49,26 @@ async def run_once(settings: Settings, *, ports: RunnerPorts | None = None) -> R
     """
     engine, sessions = connect(settings.database_url)
     try:
-        stack = build_stack(settings, sessions, ports=ports)
-        return await BoundedPaperRun(stack).execute()
+        async with runner_stack(settings, sessions, ports=ports) as stack:
+            refused = _misconfigured(stack)
+            if refused is not None:
+                return refused
+            return await BoundedPaperRun(stack).execute()
     finally:
         await engine.dispose()
+
+
+def _misconfigured(stack: RunnerStack) -> ConfigurationRefused | None:
+    """An enabled role this configuration cannot run is a mistake, not a result.
+
+    Refused before any mutating step, because proceeding would open cases whose
+    evidence nobody could ever produce — and report them as waiting, which reads
+    like patience rather than a missing setting.
+    """
+    broken = stack.misconfigured
+    if not broken:
+        return None
+    return ConfigurationRefused(reason="ROLE_NOT_CONFIGURED", detail=broken[0].reason)
 
 
 def render(reading: RunReading) -> str:

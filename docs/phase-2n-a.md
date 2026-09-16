@@ -27,21 +27,30 @@ durable stop.
 starts no task — `WORKER_RUNTIME_ENABLED` was read only by a read-only endpoint —
 and there was no entry point that carried a case from a candidate to a fill.
 
-**Ports still missing, named rather than faked:**
+**Ports, and what each one costs to compose:**
 
 - `reasoning_provider="fake"` is **not constructible from configuration** and
   never will be: `DeterministicReasoningProvider` replays a script, and a
   configuration has no script to give it. Only `anthropic` composes. This is the
   guarantee that no production configuration can reach a synthetic model.
-- **ATLAS** reads contract facts through the EVM runtime, a separate process
-  with its own lifecycle. Composing one inside a trading run would start chain
-  I/O from inside it, so the port is supplied or the role is absent.
-- **Market history** for VECTOR is not composable here.
-  `GeckoTerminalOhlcvSource` needs a transport whose lifetime is an async
-  context manager and one chain fixed at construction, while a run handles
-  whatever chains its cases are on. Wiring it properly is real work this phase
-  does not do, and the role is reported `MARKET_HISTORY_NOT_COMPOSABLE` rather
-  than quietly downgraded to the unconfigured source.
+- **ATLAS** is composed from the request/response `EvmRpcClient` the ATLAS source
+  already uses — a block and two contract slots when a handler asks, not the
+  websocket runtime and no ingestion. The client is owned by the run and closed
+  with it.
+- **Market history** for VECTOR is composed from the GeckoTerminal transport and
+  network directory, owned by the run and closed with it.
+- Both of those are **chain-bound by the contracts they implement**:
+  `TokenContractReadPort.chain_snapshot()` takes no chain argument, and the OHLCV
+  adapter fixes its chain at construction. With more than one chain enabled there
+  is no single correct source to build, so the role reports
+  `ONCHAIN_SOURCE_CHAIN_AMBIGUOUS` or `MARKET_HISTORY_CHAIN_AMBIGUOUS` rather
+  than serving one chain and silently refusing the others. Making either
+  multi-chain means changing the port, which is a deliberate decision this phase
+  does not take.
+- **FUSE is enabled-but-unclaimable.** It has no evidence requirement in the
+  workflow policy, so the runtime refuses to hand it a task at all; a runner for
+  it would raise on its first attempt rather than find nothing. Reported as
+  `ROLE_NOT_CLAIMABLE`.
 
 **Where idempotency and restart were already secured:** the intake key is scoped
 to the market *generation*, and `open_trade_case` is idempotent on it at the
@@ -84,22 +93,47 @@ fields, and `errors`.
 | Setting | Default | What it bounds |
 | --- | --- | --- |
 | `PAPER_RUNNER_ENABLED` | `false` | whether a run may exist at all |
-| `PAPER_RUNNER_MAX_CANDIDATES` | `5` | candidates one pass may take from intake |
-| `PAPER_RUNNER_MAX_STEPS` | `40` | specialist steps in one pass |
-| `PAPER_RUNNER_MAX_CASES` | `3` | cases one pass may decide |
-| `PAPER_RUNNER_MAX_SECONDS` | `300` | the whole pass |
+| `PAPER_RUNNER_MAX_CANDIDATES` | `5` | candidates one pass may open cases from |
+| `PAPER_RUNNER_MAX_STEPS` | `40` | mutating service calls in one pass |
+| `PAPER_RUNNER_MAX_CASES` | `3` | **distinct cases this run works on, across all stages** |
+| `PAPER_RUNNER_MAX_SECONDS` | `300` | the whole pass, measured monotonically |
 | `PAPER_RUNNER_STEP_TIMEOUT_SECONDS` | `60` | one external wait inside it |
 
-Every one is an upper limit, never a target. Refused at settings level:
-`PAPER_RUNNER_ENABLED` without `TRADING_MODE=PAPER`, and a step timeout longer
-than the run — a single wait that may outlast the run is not a bound. Provider
-budgets are the existing ones (`GECKOTERMINAL_MAX_REQUESTS`,
-`ATLAS_HOLDER_MAX_PAGES`, the per-source timeouts); this phase adds no second
-budget beside them.
+Precisely what each one means, because the differences matter:
 
-A run also needs what every entry already needed and does not default:
-`PAPER_REQUESTED_NOTIONAL_USD`, `PAPER_FEE_BPS`, `PAPER_SLIPPAGE_BPS`. Unset
-means there is no entry size and no cost basis, which is a refusal.
+**Candidates** are bounded *inside* intake: the control policy's own per-cycle
+ceiling is lowered to the smaller of it, the candidate budget and the case
+budget before the cycle runs. Nothing is opened and then discarded — a case that
+was never allowed is never created.
+
+**Cases** counts distinct trade cases the run touches, through intake, worker
+steps and the decision path alike. A case counts once however often it is
+touched. Once the budget is full, claims are narrowed to the cases already being
+worked **in the claim query itself**, so no task belonging to another case is
+taken and then dropped — a dropped claim is a lease nobody is working.
+
+**Steps** counts service calls that may change something: the intake cycle, each
+worker attempt that actually claimed a task, each risk request, each fill.
+Checked *before* the next such call. An empty claim is not a step; an attempt
+that began and was cut off **is** one, because work was started.
+
+**Runtime** is a monotonic deadline, so a clock adjustment can neither extend nor
+end a run. It is checked before every mutating step, and every wait — intake,
+worker registration, a handler, a database read, the risk request, the fill — is
+bounded by `min(step timeout, time remaining)`. The trusted clock is untouched:
+it still decides evidence freshness, the approval window and the fill instant,
+which are business facts rather than scheduling.
+
+Refused at settings level: `PAPER_RUNNER_ENABLED` without `TRADING_MODE=PAPER`,
+and a step timeout longer than the run. Refused before any mutating step: an
+enabled role this configuration cannot actually run (`ROLE_NOT_CONFIGURED`),
+because proceeding would open cases whose evidence nobody could produce and then
+report them as *waiting*, which reads like patience rather than a missing
+setting.
+
+Provider budgets are the existing ones; this phase adds no second budget beside
+them. A run also needs what every entry already needed and does not default:
+`PAPER_REQUESTED_NOTIONAL_USD`, `PAPER_FEE_BPS`, `PAPER_SLIPPAGE_BPS`.
 
 ## Responsibilities, unchanged
 
@@ -144,64 +178,74 @@ booking transaction.
 ## Operational output
 
 One JSON object: `run_id`, limits, per-role availability with a reason when a
-role could not run, candidates seen, cases opened, intake refusal codes, steps
-taken, per-case progress (status, reason code, risk outcome, risk refusal, fill
-refusal, execution id, replayed), counts of requests, fills and replays, and
-technical `errors` as codes.
+role could not run, candidates seen, cases opened, intake refusal codes,
+`steps_taken`, `steps_timed_out`, per-case progress, counts of requests, fills
+and replays, and technical `errors` as codes.
 
-Safe by construction: every value is an identifier this system already exposes,
-a count, or a typed reason code from a published vocabulary. No secret, provider
+Three distinctions the output makes deliberately:
+
+- **An empty claim and a timeout are different.** Nothing to do leaves
+  `steps_timed_out` at zero; a handler that began and was cut off increments it.
+  Reporting them as one would hide a hanging provider behind an empty queue.
+- **An unknown outcome is not a failure and not a success.** A decisive call cut
+  off mid-flight may have committed or may not have. The case is marked
+  `outcome_unknown`; the next explicit run addresses the same order key and finds
+  out what really happened. Nothing is invented in either direction.
+- **Confirmed work survives a later fault.** The account is accumulated as the
+  pass happens rather than assembled at the end, so a database that stops
+  answering after a fill cannot make the run report zero fills for a fill that
+  really happened.
+
+Safe by construction: every value is an identifier this system already exposes, a
+count, or a typed reason code from a published vocabulary. No secret, provider
 payload or exception text is ever put into the model, so none can be printed.
 
 ## Test evidence
 
-30 tests in `tests/runner/`, on a schema carrying markets, workflow and
+37 tests in `tests/runner/`, on a schema carrying markets, workflow and
 accounting.
 
-**Real components:** the real intake, the real workflow service, the real worker
-runtime and `WorkerRunner`, the real `MarketRecorder` and `MarketReader`, the
-real `RiskRequestService`, `src.risk.engine.evaluate`, the real `PaperExecutor`,
-the real ledger, and the real `build_stack` composition. The run object under
-test is the production one.
+**The whole chain, once, through the production runner.**
+`test_the_whole_chain_runs_from_a_recorded_candidate` starts from a recorded
+market observation written through the real `MarketRecorder` and runs the real
+`build_stack` composition: intake opens the case, the real `WorkerRunner` claims
+real tasks, and the real ORBIT, ATLAS, SIGNAL, VECTOR, PULSE and ANCHOR handlers
+with their real context readers produce every piece of evidence the workflow
+requires. No evidence is submitted by the test and no case is prepared at
+`READY_FOR_RISK`. The case then goes through the real risk request,
+`src.risk.engine.evaluate`, `CaseFillService`, `PaperExecutor` and the ledger to
+a booked fill, with cash and a position to show for it.
 
-**Fixtures:** the recorded market observations are fixture-shaped rows written
-through the real recorder; the case evidence is fixture evidence submitted
-through the real workflow, because no specialist could produce it here.
+**What is substituted, and only at the outside edge:** the model (a provider
+that answers from the very prompt payload the handler built, so its citations
+name the observation the context really contained), the chain read, the holder
+and origin indexers, the social source, the market structure series and the
+quote source. Each is a fixture from the suite that owns that boundary, against
+the same market. **No provider or model is called for real anywhere**, no
+launcher exists, and nothing outlives the call that asked for it.
 
-**Mocked ports:** none needed for the paths proved. Two handlers are substituted
-in the bounds tests — one that never returns, one that reports a wait — to
-exercise the step timeout and the no-spin ending. `RunnerPorts` is passed empty,
-so no external port exists at all.
+**Two runs, because that is what the contracts produce.** The first pass carries
+the case to a setup; the second, twenty seconds later and after the market has
+moved through the level, triggers, assesses execution, and fills. Nothing waits
+in between — the pass ends and the task table holds the work.
 
-**Real external calls: none.** No provider, no model, no network. No run in this
-suite lasts beyond the call that asked for it.
+Also covered: budgets (candidates enforced inside intake, distinct cases across
+all stages, steps checked before the next mutating call, a monotonic deadline);
+a handler entered exactly once and its cancellation awaited; a real claimable
+monitor executed once, rescheduled, and not handled again in the same pass;
+confirmed work surviving a later database fault; an unknown outcome reported as
+unknown; restart replaying rather than re-ordering; two concurrent runs producing
+one order and one fill; a failure inside the fill leaving no partial booking;
+every stop; `--once` required; an invalid configuration exiting `2` without
+touching anything; a configuration never producing a synthetic model; an enabled
+role that cannot be composed refused before any mutating step; and no exit,
+re-entry or second case for an executed market.
 
-Covered: a recorded candidate opening a case and the pass ending rather than
-waiting; a ready case going all the way to a booked fill with real cash and fee
-movement; the order key derived from the case and not from the run; a second run
-replaying instead of ordering again; an interruption between the verdict and the
-fill leaving the order addressable and the next run completing it once; a
-failure inside the fill leaving no partial booking, with a later run still
-completing it once; two concurrent runs producing one order and one fill
-(PostgreSQL only); a paused account stopping the run before it opens anything;
-the kill switch refusing before any mutation; `OBSERVE` and an over-long step
-timeout refused in the settings; no market data producing an honest empty pass;
-stale market data and a missing entry size each preventing the fill; the time
-and case budgets ending the pass; an external call that hangs bounded by the
-step timeout; a waiting monitor ending the pass without spinning; a
-configuration never producing a synthetic model; a role with an unbuildable port
-reported rather than skipped; `--once` required; an invalid configuration
-exiting `2` without touching anything; the summary carrying nothing but codes
-and counts; no background task left behind; and no exit, re-entry or second
-case for an executed market.
-
-Full gates: PostgreSQL 3288 passed / 20 skipped, SQLite 3204 passed / 104
+Full gates: PostgreSQL 3295 passed / 20 skipped, SQLite 3211 passed / 104
 skipped, ruff, strict mypy, Alembic at `0011` with `check` clean and offline SQL
 generated, frontend typecheck/lint/format/build.
 
-**No migration.** This phase persists nothing of its own: a run is an ordering
-of calls into services that already own their tables, and a run id that is not
-an identity has nothing to store.
+**No migration.** This phase persists nothing of its own.
 
 ## The guard the first CI run caught
 
@@ -216,13 +260,34 @@ thing that keeps "configuring a size enables nothing" true — **the web process
 cannot reach the runner at all**, so an amount sitting in the environment can
 begin nothing by being present.
 
+## A limit the end-to-end proof exposed
+
+PULSE re-checks a pending trigger on a **ninety-second** interval by workflow
+policy. SENTINEL refuses any source older than **thirty seconds**. So a trigger
+found on a *rescheduled* check arrives with on-chain and sentiment evidence the
+risk engine has already stopped accepting, and the run correctly reports
+`SOURCE_OLDER_THAN_RISK_LIMIT` rather than filling.
+
+This is an interaction between two existing policies, not a defect in either and
+not something this phase loosened: the monitor's interval is deliberate, and so
+is the freshness bound. A deployment that wants a trigger to reach a fill needs
+either evidence that is refreshed closer to the decision, or the two windows
+reconciled. Both are contract changes, and neither belongs in a runner.
+
+The end-to-end test therefore has the monitor make its **first** check after the
+market moved, which is inside both windows. That is a real sequence rather than
+a workaround, and the limit is recorded here instead of being hidden by it.
+
 ## Remaining limits
 
 - **A run promises nothing.** Waiting and blocked cases are ordinary outcomes.
-- **ATLAS and VECTOR history are not composable from configuration**, so those
-  roles report unavailable in a production run. Wiring them is future work, and
-  naming it is better than a stub that looks like a specialist finding nothing.
+- **ATLAS and VECTOR history are chain-bound**, so a run with more than one chain
+  enabled reports them unavailable rather than serving one chain silently.
+  Making either multi-chain means changing the port.
+- **FUSE cannot be claimed** through the evidence-submission runtime at all.
 - **Only `anthropic` composes as a reasoning provider**, by design.
+- **A rescheduled PULSE check cannot reach a fill** while its interval exceeds
+  SENTINEL's source bound; see above.
 - **No automatic exit or re-entry**, and no automatic stop-loss or take-profit.
 - **No daemon, scheduler or background start.** One pass per invocation.
 - **No public write endpoint.** The API remains read-only.

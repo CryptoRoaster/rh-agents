@@ -64,10 +64,15 @@ def runner_settings(**overrides) -> Settings:
     return Settings.model_validate({**base, **overrides})
 
 
-async def record_market(sessions, now, *, age=FRESH, price=None):
-    """One real recorded observation, written through the real recorder."""
+async def record_market(sessions, now, *, age=FRESH, price=None, label=""):
+    """One real recorded observation, written through the real recorder.
+
+    `label` gives a second observation of the same market its own identity, the
+    way a real recorder would: two readings at two instants are two events, and
+    the recorder refuses to let one overwrite the other.
+    """
     extra = {} if price is None else {"price": price}
-    snapshot = recorded_snapshot(now, age=age, metadata_age=age, **extra)
+    snapshot = recorded_snapshot(now, age=age, metadata_age=age, label=label, **extra)
     await MarketRecorder(sessions, clock=FixedClock(now)).record(snapshot)
     return snapshot
 

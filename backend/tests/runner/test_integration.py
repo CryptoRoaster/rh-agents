@@ -41,7 +41,10 @@ async def test_a_run_opens_a_case_from_a_recorded_candidate_and_stops(risk_db, n
     assert summary.kind == "paper_run_summary"
     assert summary.exit_code is ExitCode.COMPLETED
     assert summary.cases_opened == 1
-    assert summary.steps_taken == 0
+    # One step: the intake cycle. No role could claim anything, and an empty
+    # claim is not work.
+    assert summary.steps_taken == 1
+    assert summary.steps_timed_out == 0
     assert summary.stop is RunStop.NOTHING_LEFT_TO_DO
     # The case is waiting on evidence no configured role can produce, and says so
     # rather than being hurried along.

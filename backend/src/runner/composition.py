@@ -21,16 +21,17 @@ that is what the operator configured; nothing here quietly substitutes one for a
 provider that failed to build.
 """
 
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import timedelta
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.agents.anchor.context import AnchorContextReader
 from src.agents.anchor.handler import AnchorWorkerHandler
 from src.agents.atlas.context import AtlasContextReader
-from src.agents.fuse.context import FuseContextReader
-from src.agents.fuse.handler import FuseWorkerHandler
 from src.agents.orbit.context import OrbitContextReader
 from src.agents.orbit.handler import OrbitWorkerHandler
 from src.agents.pulse.context import PulseContextReader
@@ -57,6 +58,23 @@ from src.orchestration.worker.service import WorkerRuntimeService
 from src.orchestration.workflow.service import TradeCaseService
 from src.reasoning.provider import ReasoningProvider
 from src.runner.models import RoleAvailability, RunLimits
+from src.runtime.models import chain_configs
+
+Closer = Callable[[], Awaitable[None]]
+
+
+def _exit(resource: Any) -> Closer:
+    """Close something whose lifetime contract is `async with`.
+
+    Both the market transport and the quote source expose their release through
+    `__aexit__` and nothing else, so that is what is called — the documented
+    contract, rather than reaching for the client they happen to hold.
+    """
+
+    async def close() -> None:
+        await resource.__aexit__(None, None, None)
+
+    return close
 
 
 @dataclass(frozen=True)
@@ -74,11 +92,18 @@ class RunnerPorts:
     history: MarketHistorySource | None = None
     history_unavailable: str = "MARKET_HISTORY_NOT_CONFIGURED"
     quotes: ExecutionQuoteSource | None = None
-    # ATLAS reads chain facts through the EVM runtime, which is a separate
-    # process with its own lifecycle. Composing one here would start chain I/O
-    # from inside a trading run, so the port is supplied or the role is absent.
     onchain: object | None = None
+    onchain_unavailable: str = "ONCHAIN_SOURCE_NOT_CONFIGURED"
+    # The two ATLAS fact sources and the SIGNAL social source. Built from
+    # settings when a provider is selected; supplied here when a caller is
+    # replacing the external boundary itself.
+    holders: object | None = None
+    origins: object | None = None
+    social: object | None = None
     pause: SystemPausePort | None = None
+    # Everything built here that owns a connection pool. Closed by
+    # `runner_stack` on success, on error and on cancellation alike.
+    closers: tuple[Closer, ...] = ()
 
 
 def limits_from_settings(settings: Settings) -> RunLimits:
@@ -91,6 +116,19 @@ def limits_from_settings(settings: Settings) -> RunLimits:
     )
 
 
+def _single_chain(names: tuple[str, ...]) -> str | None:
+    """The one chain a chain-bound port can serve, or nothing when it is ambiguous.
+
+    `TokenContractReadPort.chain_snapshot()` and `GeckoTerminalOhlcvSource` are
+    both fixed to one chain at construction — the first because the port takes
+    no chain argument, the second because the adapter is built per chain. A run
+    handles whatever chains its cases are on, so with more than one enabled
+    there is no single correct source to build and the role says so instead of
+    serving one chain and silently refusing the others.
+    """
+    return names[0] if len(names) == 1 else None
+
+
 def ports_from_settings(
     settings: Settings,
     sessions: async_sessionmaker[AsyncSession],
@@ -99,9 +137,10 @@ def ports_from_settings(
 ) -> RunnerPorts:
     """Build every port the configuration actually describes.
 
-    Nothing here reaches a network. Constructing an HTTP adapter opens no
-    connection; the first call happens when a handler asks, under this run's own
-    step timeout.
+    Constructing an HTTP or RPC client opens no connection; the first call
+    happens when a handler asks, under this run's own step timeout. Every client
+    built here is owned by `runner_stack`, which closes it on success, on error
+    and on cancellation alike.
     """
     tick = clock if clock is not None else SystemClock()
     reasoning: ReasoningProvider | None = None
@@ -120,31 +159,65 @@ def ports_from_settings(
         # script to give it. A run that wants one is a test, and says so in code.
         unavailable = "REASONING_PROVIDER_NOT_COMPOSABLE"
 
-    # Recorded market structure is not composable here, and saying so is the
-    # point. `GeckoTerminalOhlcvSource` needs a transport whose lifetime is an
-    # async context manager and a single chain fixed at construction, while a
-    # run handles whatever chains its cases are on — so one built here would
-    # either leak a client or serve one chain and silently refuse the others.
-    # Wiring it properly is a real piece of work this phase does not do.
-    history_unavailable = (
-        "MARKET_HISTORY_NOT_COMPOSABLE"
-        if settings.vector_history_provider == "geckoterminal"
-        else "MARKET_HISTORY_NOT_CONFIGURED"
-    )
+    closers: list[Closer] = []
+
+    history: MarketHistorySource | None = None
+    history_unavailable = "MARKET_HISTORY_NOT_CONFIGURED"
+    if settings.vector_history_provider == "geckoterminal":
+        chain = _single_chain(tuple(settings.market_chains.split(",")))
+        if chain is None:
+            history_unavailable = "MARKET_HISTORY_CHAIN_AMBIGUOUS"
+        else:
+            from src.markets.geckoterminal.networks import CHAINS, NetworkDirectory
+            from src.markets.geckoterminal.ohlcv import GeckoTerminalOhlcvSource
+            from src.markets.geckoterminal.transport import GeckoTerminalTransport
+
+            transport = GeckoTerminalTransport(settings, clock=tick)
+            closers.append(_exit(transport))
+            history = GeckoTerminalOhlcvSource(
+                transport,
+                NetworkDirectory(transport, settings),
+                CHAINS[chain],
+                settings,
+                clock=tick,
+            )
+
+    onchain: object | None = None
+    onchain_unavailable = "ONCHAIN_SOURCE_NOT_CONFIGURED"
+    configs = chain_configs(settings)
+    if configs:
+        config = configs[0] if len(configs) == 1 else None
+        if config is None:
+            onchain_unavailable = "ONCHAIN_SOURCE_CHAIN_AMBIGUOUS"
+        else:
+            from src.agents.atlas.rpc_source import RpcTokenContractSource
+            from src.runtime.rpc import EvmRpcClient
+
+            # The request/response RPC client the ATLAS source already uses. No
+            # websocket, no recovery loop and no ingestion: this reads a block
+            # and two contract slots when a handler asks for them.
+            client = EvmRpcClient(config, settings)
+            closers.append(client.close)
+            onchain = RpcTokenContractSource(client=client, config=config, clock=tick)
 
     quotes: ExecutionQuoteSource | None = None
     if settings.execution_quote_provider == "kyberswap":
         from src.markets.kyberswap.source import KyberSwapQuoteSource
 
-        quotes = KyberSwapQuoteSource(settings, clock=tick)
+        source = KyberSwapQuoteSource(settings, clock=tick)
+        closers.append(_exit(source))
+        quotes = source
 
     return RunnerPorts(
         reasoning=reasoning,
         reasoning_unavailable=unavailable,
-        history=None,
+        history=history,
         history_unavailable=history_unavailable,
         quotes=quotes,
+        onchain=onchain,
+        onchain_unavailable=onchain_unavailable,
         pause=AccountPauseReader(sessions),
+        closers=tuple(closers),
     )
 
 
@@ -165,6 +238,20 @@ class RunnerStack:
     runners: tuple[WorkerRunner, ...]
     roles: tuple[RoleAvailability, ...]
     clock: Clock
+    closers: tuple[Closer, ...] = ()
+
+    @property
+    def misconfigured(self) -> tuple[RoleAvailability, ...]:
+        """Roles an operator switched on that this configuration cannot run.
+
+        Kept apart from the ones deliberately left off. Enabling a role and not
+        configuring what it needs is a mistake somebody made, and a run that
+        quietly proceeded without it would report a market as unexamined when it
+        was really unexaminable.
+        """
+        return tuple(
+            item for item in self.roles if not item.available and item.reason != "ROLE_NOT_ENABLED"
+        )
 
 
 def build_stack(
@@ -239,6 +326,7 @@ def build_stack(
         runners=runners,
         roles=roles,
         clock=tick,
+        closers=supplied.closers,
     )
 
 
@@ -301,8 +389,7 @@ def _runners(
     if not settings.atlas_worker_enabled:
         note(AgentRole.ATLAS, "ROLE_NOT_ENABLED")
     elif ports.onchain is None:
-        # The contract facts come from the EVM runtime, a separate process.
-        note(AgentRole.ATLAS, "ONCHAIN_SOURCE_NOT_AVAILABLE")
+        note(AgentRole.ATLAS, ports.onchain_unavailable)
     else:
         from src.agents.atlas.context import AtlasSnapshotBuilder
         from src.agents.atlas.handler import AtlasWorkerHandler
@@ -317,15 +404,19 @@ def _runners(
                     cases=cases,
                     builder=AtlasSnapshotBuilder(
                         contracts=ports.onchain,  # type: ignore[arg-type]
-                        holders=holder_sources(settings, clock=clock),
-                        origins=origin_sources(settings),
+                        holders=ports.holders  # type: ignore[arg-type]
+                        if ports.holders is not None
+                        else holder_sources(settings, clock=clock),
+                        origins=ports.origins  # type: ignore[arg-type]
+                        if ports.origins is not None
+                        else origin_sources(settings),
                         clock=clock,
                     ),
                 ),
             ),
         )
 
-    social = social_source(settings, clock=clock)
+    social = ports.social if ports.social is not None else social_source(settings, clock=clock)
     if not settings.signal_worker_enabled:
         note(AgentRole.SIGNAL, "ROLE_NOT_ENABLED")
     elif ports.reasoning is None:
@@ -346,7 +437,7 @@ def _runners(
                 service=runtime,
                 sentiment=SignalContextReader(
                     cases=cases,
-                    source=social,
+                    source=social,  # type: ignore[arg-type]
                     max_observations=settings.signal_max_observations,
                     max_model_observations=settings.signal_max_model_observations,
                     clock=clock,
@@ -421,11 +512,36 @@ def _runners(
     if not settings.fuse_worker_enabled:
         note(AgentRole.FUSE, "ROLE_NOT_ENABLED")
     else:
-        add(
-            AgentRole.FUSE,
-            FuseWorkerHandler(),
-            CapabilityProvider(service=runtime, fuse=FuseContextReader(cases=cases, clock=clock)),
-        )
+        # Enabled, and still not runnable here. FUSE has no evidence requirement
+        # in the workflow policy, so `authorized_task_type` has nothing to give
+        # it and the runtime refuses the claim outright. Composing a runner for
+        # it would raise on the first attempt rather than find nothing, so the
+        # honest report is that the role has no claimable work in this runtime.
+        note(AgentRole.FUSE, "ROLE_NOT_CLAIMABLE")
 
     order = {role: index for index, role in enumerate(AgentRole)}
     return tuple(built), tuple(sorted(reported, key=lambda item: order[AgentRole(item.role)]))
+
+
+@asynccontextmanager
+async def runner_stack(
+    settings: Settings,
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    ports: RunnerPorts | None = None,
+    clock: Clock | None = None,
+) -> AsyncIterator[RunnerStack]:
+    """The composed stack, with every client it owns released afterwards.
+
+    Success, failure and cancellation all leave through the same `finally`, so a
+    run that is cut off does not leave an HTTP or RPC connection pool behind.
+    Each close is awaited and its own failure suppressed: one client that cannot
+    be closed must not prevent the others from being.
+    """
+    stack = build_stack(settings, sessions, ports=ports, clock=clock)
+    try:
+        yield stack
+    finally:
+        for close in stack.closers:
+            with suppress(Exception):
+                await close()

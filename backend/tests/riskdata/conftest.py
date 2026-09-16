@@ -116,6 +116,7 @@ def recorded_snapshot(
     metadata_age: timedelta | None = None,
     pair_id: str = PAIR_ID,
     label: str = "",
+    quote_address: str = QUOTE,
 ) -> MarketSnapshot:
     """One observation of the ATLAS market, shaped as the recorder stores them.
 
@@ -148,7 +149,7 @@ def recorded_snapshot(
         decimals=decimals,
     )
     quote = AssetIdentity(
-        **{**asset_meta, "asset_id": f"{CHAIN}:{NETWORK}:{QUOTE}"},
+        **{**asset_meta, "asset_id": f"{CHAIN}:{NETWORK}:{quote_address}"},
         id=stable_id(f"{tag}quote"),
         symbol="USDC",
         decimals=6,

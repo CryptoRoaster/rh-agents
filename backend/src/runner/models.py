@@ -116,6 +116,11 @@ class CaseProgress(Immutable):
     risk_refusal: Code | None = None
     fill_refusal: Code | None = None
     execution_id: UUID | None = None
+    # A decisive call was cut off before it answered. It may have committed and
+    # it may not, and this run does not know which — so it says so rather than
+    # inventing either. The next explicit run addresses the same order key and
+    # finds out what really happened.
+    outcome_unknown: bool = Field(default=False, strict=True)
     replayed: bool = Field(default=False, strict=True)
 
 
@@ -138,6 +143,10 @@ class RunSummary(Immutable):
     cases_opened: int = Field(default=0, ge=0)
     intake_refusals: tuple[Code, ...] = Field(default=(), max_length=64)
     steps_taken: int = Field(default=0, ge=0)
+    # Attempts that began and were cut off. Counted apart from an empty claim,
+    # because "there was no work" and "the work did not finish" are different
+    # facts about a run and lead to different questions.
+    steps_timed_out: int = Field(default=0, ge=0)
     cases: tuple[CaseProgress, ...] = Field(default=(), max_length=64)
     risk_requests: int = Field(default=0, ge=0)
     fills: int = Field(default=0, ge=0)
