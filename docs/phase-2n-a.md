@@ -203,6 +203,19 @@ generated, frontend typecheck/lint/format/build.
 of calls into services that already own their tables, and a run id that is not
 an identity has nothing to store.
 
+## The guard the first CI run caught
+
+`tests/sizing/test_authority.py` pins where `paper_requested_notional_usd` may
+be read, and it reads the tracked tree — so a new file only appears to it once
+committed, which is exactly when CI saw it and the local run had not.
+
+The guard was extended rather than loosened. The bounded run is the second
+legitimate reader: the risk request has always needed a configured amount, and
+until now only a test could supply one. What the guard now also asserts is the
+thing that keeps "configuring a size enables nothing" true — **the web process
+cannot reach the runner at all**, so an amount sitting in the environment can
+begin nothing by being present.
+
 ## Remaining limits
 
 - **A run promises nothing.** Waiting and blocked cases are ordinary outcomes.

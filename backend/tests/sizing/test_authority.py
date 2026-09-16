@@ -168,15 +168,38 @@ def test_the_control_plane_is_not_wired_to_sizing():
 
 
 def test_the_configured_amount_starts_no_worker_and_reaches_no_launcher():
-    """Configuring a size enables nothing, like every other phase flag here."""
+    """Configuring a size still enables nothing, and this names who may read it.
+
+    Two places, and the second arrived with Phase 2N-A. The bounded run reads
+    the configured amount to hand it to the risk request — which has always
+    needed it, and until then only a test could supply one. That is the field's
+    purpose, not a widening of it: the amount is read when somebody explicitly
+    invokes a run, and reading it still starts no worker and no launcher.
+
+    The assertion below is what keeps that true. The web process must not be
+    able to reach the runner at all, so a configured amount cannot begin
+    anything by being present.
+    """
     found = subprocess.run(
-        ["git", "grep", "-n", "paper_requested_notional_usd", "--", "backend/src/"],
+        ["git", "grep", "-l", "--untracked", "paper_requested_notional_usd", "--", "backend/src/"],
         capture_output=True,
         text=True,
         cwd="..",
-    ).stdout.strip()
-    assert found.count("\n") == 0
-    assert found.startswith("backend/src/core/config.py:")
+    ).stdout.split()
+    assert sorted(found) == [
+        "backend/src/core/config.py",
+        "backend/src/runner/composition.py",
+    ]
+
+    # And the only reader of it is unreachable from the process a deployment
+    # actually starts on its own.
+    reachable = subprocess.run(
+        ["git", "grep", "-l", "--untracked", "src.runner", "--", "backend/src/api/"],
+        capture_output=True,
+        text=True,
+        cwd="..",
+    ).stdout.split()
+    assert reachable == []
 
 
 async def test_a_live_anchor_capacity_does_not_move_the_requested_size(worker_db, now, trace):
