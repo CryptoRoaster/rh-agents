@@ -316,3 +316,90 @@ async def test_two_cycles_share_one_position_row(risk_db, now, trace):
     assert {item.position_id for item in rows} == {position.id}
     assert len({item.cycle_id for item in rows}) == 2
     assert (await position_of(sessions)).id == position.id
+
+
+# ============================================================ the last two links
+
+
+async def test_the_exit_s_own_market_must_match_the_holding(risk_db, now, trace):
+    """Only `TradeCaseExitRow.market_pair_id` is disturbed, nothing else.
+
+    The holding, the cycle and the case all still agree with each other, so
+    every other comparison passes. What is left is the exit's own record of
+    which market it sold in, and until it is compared too, a sale recorded
+    against a different market still opens the next cycle.
+    """
+    from src.data.tables import TradeCaseExitRow
+
+    _, sessions = risk_db
+    feed = market_feed(now)
+    _, _, position, sale = await closed_cycle(sessions, now, trace, feed=feed)
+    async with sessions.begin() as session:
+        await session.execute(
+            update(TradeCaseExitRow)
+            .where(TradeCaseExitRow.exit_id == sale.exit_id)
+            .values(market_pair_id="robinhood:mainnet:contract_address:0xdeadbeef")
+        )
+    before = await counts(sessions)
+
+    result = await build_reentry_service(sessions, now).open_reentry(
+        sale.exit_id, request_key="exit-market"
+    )
+
+    assert result.kind == "reentry_refused"
+    assert result.reason is ReentryRefusal.POSITION_CYCLE_MISMATCH
+    assert await counts(sessions) == before
+    assert len(await cycles(sessions)) == 1
+    # The holding itself was never touched: this is about the exit's record.
+    async with sessions() as session:
+        untouched = await session.get(PositionRow, position.id)
+    assert untouched.market_pair_id is not None
+
+
+async def test_the_entry_must_belong_to_the_cycle_s_own_case(risk_db, now, trace):
+    """Only `TradeCaseExecutionRow.trade_case_id` is repointed, nothing else.
+
+    The entry is found by cycle and its `case_execution_id` still matches the
+    exit, so both existing comparisons pass. Its own case reference is the one
+    nothing looked at, and a chain that is checked in two of three places is a
+    chain with a link missing.
+    """
+    from src.data.tables import TradeCaseExecutionRow
+    from tests.reentry.conftest import market_for
+    from tests.riskrequest.conftest import ready_case
+
+    _, sessions = risk_db
+    feed = market_feed(now)
+    _, entry, _, sale = await closed_cycle(sessions, now, trace, feed=feed)
+
+    # A real second case, so the reference stays valid and is still wrong. It
+    # has no execution of its own, so the one-entry-per-case constraint holds
+    # and nothing has to be disabled to set this up.
+    service = build_reentry_service(sessions, now)
+    stranger = await ready_case(
+        service.cases,
+        now,
+        uuid4(),
+        key="stranger-case",
+        identity=market_for(token="c7" * 20, pool="d8" * 20),
+    )
+    async with sessions.begin() as session:
+        await session.execute(
+            update(TradeCaseExecutionRow)
+            .where(TradeCaseExecutionRow.case_execution_id == entry.case_execution_id)
+            .values(trade_case_id=stranger.id)
+        )
+    before = await counts(sessions)
+
+    result = await service.open_reentry(sale.exit_id, request_key="entry-case")
+
+    assert result.kind == "reentry_refused"
+    assert result.reason is ReentryRefusal.PREDECESSOR_MISMATCH
+    assert await counts(sessions) == before
+    assert len(await cycles(sessions)) == 1
+    # The two references the existing checks look at are still intact.
+    async with sessions() as session:
+        moved = await session.get(TradeCaseExecutionRow, entry.case_execution_id)
+        cycle = await session.scalar(select(TradeCycleRow))
+    assert moved.cycle_id == cycle.cycle_id
+    assert moved.case_execution_id == entry.case_execution_id

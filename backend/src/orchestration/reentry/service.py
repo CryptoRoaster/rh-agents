@@ -148,9 +148,17 @@ class PaperReentryService:
                     TradeCaseExecutionRow.cycle_id == cycle.cycle_id
                 )
             )
-            if entry is None or entry.case_execution_id != closed.case_execution_id:
-                # The exit must close the entry of its own cycle. Anything else
-                # is a record that disagrees with itself.
+            if (
+                entry is None
+                or entry.case_execution_id != closed.case_execution_id
+                or entry.trade_case_id != cycle.trade_case_id
+            ):
+                # The exit must close the entry of its own cycle, and that entry
+                # must belong to the cycle's own case. A chain checked in two of
+                # three places is a chain with a link missing: the entry is found
+                # *by* cycle, so its own case reference is the one thing that
+                # nothing else here would notice. Anything that disagrees is a
+                # record at odds with itself.
                 return _refused(
                     exit_id, ReentryRefusal.PREDECESSOR_MISMATCH, cycle_id=cycle.cycle_id
                 )
@@ -288,6 +296,7 @@ def _describes_one_trade(
         and holding.asset_id == closed.asset_id
         and holding.asset_id == market.base_asset_id
         and holding.market_pair_id == cycle.market_pair_id
+        and holding.market_pair_id == closed.market_pair_id
         and holding.market_pair_id == market.pair_id
         and holding.market_chain == market.chain
         and holding.market_network == market.network
