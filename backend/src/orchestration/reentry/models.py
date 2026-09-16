@@ -51,10 +51,16 @@ class ReentryRefusal(StrEnum):
     # one, and none of them is a completed trade.
     PREDECESSOR_NOT_EXECUTED = "PREDECESSOR_NOT_EXECUTED"
     # ------------------------------------------------- the holding
+    # The exit names a holding nothing can resolve. A row this system cannot
+    # read is not a holding it has shown to be closed, and an absent record is
+    # not an absent objection: nothing about the previous cycle follows from it.
+    POSITION_NOT_FOUND = "POSITION_NOT_FOUND"
     # The asset is still held, or still carries a cost basis. A cycle that still
     # owns something has not ended, and a second entry would be a top-up.
     POSITION_STILL_OPEN = "POSITION_STILL_OPEN"
-    # The holding is attributed to a different cycle than the exit closed.
+    # The holding is attributed to a different cycle than the exit closed, or
+    # its asset or recorded market disagrees with the entry's own case. One of
+    # the records is wrong, and opening a new cycle is not where that is settled.
     POSITION_CYCLE_MISMATCH = "POSITION_CYCLE_MISMATCH"
     # ------------------------------------------------- succession
     # This cycle already has a successor. One completed exit gets one, and a

@@ -47,6 +47,7 @@ from src.data.tables import (
     TradeCaseExitRow,
     TradeCycleRow,
 )
+from src.markets.models import MarketIdentity
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.cycles import cycle_of
 from src.orchestration.paper import PaperTradingService
@@ -170,20 +171,29 @@ class PaperReentryService:
                     detail=previous.status.value,
                 )
 
+            # The holding, and every way it has to agree with what closed it.
+            # None of this is optional: a check that only runs when the record
+            # happens to be readable is not a precondition, and the one case it
+            # skips is the one where nothing at all is established.
             holding = await session.scalar(
                 select(PositionRow).where(PositionRow.id == closed.position_id)
             )
-            if holding is not None:
-                if holding.quantity != 0 or holding.cost_basis_usd != 0:
-                    # Still owned, so the cycle has not ended. A second entry
-                    # here would be a top-up, which has no contract.
-                    return _refused(
-                        exit_id, ReentryRefusal.POSITION_STILL_OPEN, cycle_id=cycle.cycle_id
-                    )
-                if holding.cycle_id != cycle.cycle_id:
-                    return _refused(
-                        exit_id, ReentryRefusal.POSITION_CYCLE_MISMATCH, cycle_id=cycle.cycle_id
-                    )
+            if holding is None:
+                return _refused(exit_id, ReentryRefusal.POSITION_NOT_FOUND, cycle_id=cycle.cycle_id)
+            if holding.quantity != 0 or holding.cost_basis_usd != 0:
+                # Still owned, so the cycle has not ended. A second entry here
+                # would be a top-up, which has no contract.
+                return _refused(
+                    exit_id, ReentryRefusal.POSITION_STILL_OPEN, cycle_id=cycle.cycle_id
+                )
+            if not _describes_one_trade(holding, cycle, previous.market, closed):
+                # The holding, the cycle it names, the exit that closed it and
+                # the case that opened it must all describe one trade in one
+                # market. Where they do not, one of the records is wrong, and
+                # nothing here guesses which or repairs it.
+                return _refused(
+                    exit_id, ReentryRefusal.POSITION_CYCLE_MISMATCH, cycle_id=cycle.cycle_id
+                )
 
             now = self.clock.now()
             case, created = await self.cases.open_trade_case_in_session(
@@ -258,6 +268,31 @@ class PaperReentryService:
         if bool(account.paused):
             return _refused(exit_id, ReentryRefusal.SYSTEM_PAUSED, cycle_id=cycle_id)
         return None
+
+
+def _describes_one_trade(
+    holding: PositionRow,
+    cycle: TradeCycleRow,
+    market: MarketIdentity,
+    closed: TradeCaseExitRow,
+) -> bool:
+    """Whether the holding, its cycle, the exit and the entry's market agree.
+
+    The whole recorded identity, not just the pair: an address means nothing
+    across chains, and two providers observing one pool are two sources. A
+    partial match is exactly the kind of agreement that looks like one.
+    """
+    return (
+        holding.cycle_id == cycle.cycle_id
+        and holding.asset_id == cycle.asset_id
+        and holding.asset_id == closed.asset_id
+        and holding.asset_id == market.base_asset_id
+        and holding.market_pair_id == cycle.market_pair_id
+        and holding.market_pair_id == market.pair_id
+        and holding.market_chain == market.chain
+        and holding.market_network == market.network
+        and holding.market_provider == market.provider
+    )
 
 
 def _refused(

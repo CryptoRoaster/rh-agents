@@ -165,7 +165,61 @@ def _backfill() -> None:
     )
 
 
+SUCCESSORS = (
+    "SELECT COUNT(*) FROM trade_cycles WHERE sequence > 1 OR predecessor_exit_id IS NOT NULL"
+)
+
+REFUSAL = (
+    "Downgrading 0011 is not supported once an explicit re-entry has opened a "
+    "successor cycle. Two cycles share one reused position row, so the old "
+    "one-exit-per-position uniqueness is no longer true of the data and cannot "
+    "be restored; and the predecessor and idempotency links that say which "
+    "cycle followed which exit live only in trade_cycles, so dropping the table "
+    "would silently lose them. Deleting, merging or renumbering exits to make "
+    "the old shape fit would destroy booked history, so this refuses instead. "
+    "Restore from a backup taken before the re-entry if the older schema is "
+    "genuinely required."
+)
+
+
+def _refuse_after_reentry() -> None:
+    """Stop before any schema change if a successor cycle exists.
+
+    A successor counts from the moment it is *opened*, filled or not: the row is
+    what records which exit it followed and under which key, and that mapping
+    cannot be rebuilt from anything the older schema keeps.
+
+    Offline generation is covered rather than exempted. A script that quietly
+    dropped the table because nobody could run the check would be exactly the
+    silent bypass this guard exists to prevent, so the emitted SQL carries the
+    same condition and fails loudly in the database that runs it.
+    """
+    context = op.get_context()
+    if context.as_sql:
+        if context.dialect.name != "postgresql":
+            raise RuntimeError(
+                "Offline downgrade of 0011 can only be generated for PostgreSQL, "
+                "because the re-entry guard has no portable form. " + REFUSAL
+            )
+        op.execute(
+            sa.text(
+                "DO $$ BEGIN IF EXISTS ("
+                " SELECT 1 FROM trade_cycles"
+                " WHERE sequence > 1 OR predecessor_exit_id IS NOT NULL"
+                f") THEN RAISE EXCEPTION '{REFUSAL}'; END IF; END $$;"
+            )
+        )
+        return
+    found = op.get_bind().execute(sa.text(SUCCESSORS)).scalar_one()
+    if found:
+        raise RuntimeError(REFUSAL)
+
+
 def downgrade() -> None:
+    # First, and before anything is altered: with successor cycles on file this
+    # downgrade cannot be performed without losing records, so it is refused
+    # rather than begun and abandoned half-way.
+    _refuse_after_reentry()
     op.drop_index("ix_positions_cycle", table_name="positions")
     op.drop_constraint("fk_trade_case_exit_cycle", "trade_case_exits", type_="foreignkey")
     op.drop_constraint("uq_trade_case_exit_cycle", "trade_case_exits", type_="unique")

@@ -191,6 +191,68 @@ Full gates: PostgreSQL 3237 passed / 20 skipped, SQLite 3159 passed / 98 skipped
 ruff, strict mypy, Alembic heads/current/check/offline SQL and a downgrade to
 `0010` and back at `0011`, frontend typecheck/lint/format/build.
 
+## Hardening round
+
+Two defects, each reproduced against `96b7e8d` before being fixed.
+
+**An absent record was read as an absent objection.** Every holding check sat
+inside `if holding is not None`, so an exit naming a position row that could not
+be resolved skipped all of them and a successor was opened for a predecessor
+whose holding had not been shown to be closed at all. `trade_case_exits` carries
+its position reference without a foreign key — the row outlives the cycle and is
+reused — so a reference that leads nowhere is reachable. Six reproductions
+returned `ReentryOpened` where a refusal was required: a dangling position
+reference, a holding whose asset had changed, and one whose pair, chain, network
+or provider had.
+
+The checks are now unconditional, and there are more of them. A missing row is
+`POSITION_NOT_FOUND`. Quantity **and** cost basis must both be nil. And the
+holding, the cycle it names, the exit that closed it and the market of the entry
+case must describe one trade: the cycle reference, the asset against the cycle,
+the exit and the entry's own market, and the whole recorded market identity —
+pair, chain, network and provider — not just the pair. Nothing is guessed or
+repaired; a disagreement is reported and the call writes nothing.
+
+The replay of an already-opened successor stays *before* all of it, deliberately:
+that successor exists, and re-reading the holding now would answer a question
+about today rather than returning what was recorded. So does the
+one-successor-per-exit refusal.
+
+**The downgrade could be started and not finished.** With two completed cycles
+both exits reference the same reused position row — proved with real cycles, not
+asserted about the schema — so restoring the old one-exit-per-position uniqueness
+fails part-way through a migration that has already dropped things.
+
+### The actual downgrade boundary
+
+A lossless downgrade after re-entry is **not offered**, and is now refused before
+any schema change rather than attempted:
+
+- **Refused** as soon as any successor cycle exists — `sequence > 1` or a
+  predecessor exit on file. An *opened* successor counts even if it never
+  filled: the row is what records which exit it followed and under which key,
+  and that mapping exists nowhere else.
+- **Nothing is deleted, merged or renumbered** to make the old shape fit. That
+  would destroy booked history, so the migration refuses instead and says to
+  restore from a backup taken before the re-entry.
+- **Supported** with first-cycle data only: the downgrade runs, the booked exits
+  and positions survive it unchanged, and upgrading again rebuilds every cycle
+  link from the backfill.
+- **Online and offline are both covered.** Online the check queries and raises.
+  Offline the generated script cannot query while it is written, so it carries
+  the same condition as a `DO` block that raises in the database that runs it,
+  emitted *before* the first `DROP` — a script that quietly dropped the table
+  because nobody could run the check would be exactly the silent bypass this
+  exists to prevent. For a dialect with no portable form for that guard,
+  generation is refused rather than emitted without one.
+
+Proved in `tests/reentry/test_downgrade.py` on native PostgreSQL: first-cycle
+data downgrading and upgrading again; an opened successor and two completed
+cycles each refusing with the schema, the `alembic_version` row, the cycle links
+and the realised results all intact afterwards; the generated PostgreSQL script
+carrying the guard ahead of every `DROP`; and generation refused for a dialect
+that cannot carry it.
+
 ## Remaining limits
 
 - **One successor per completed exit.** Whether a *further* attempt should ever
