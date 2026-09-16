@@ -293,6 +293,9 @@ class BoundedPaperRun:
         # narrowed to it in the query, so a task outside the budget is never
         # taken and then dropped — a dropped claim is a lease nobody is working,
         # held for as long as the lease lasts.
+        if deadline.expired:
+            account.stop = RunStop.TIME_BUDGET_REACHED
+            return
         scope = await self._working_set(account, deadline)
         if not scope:
             return
@@ -388,6 +391,11 @@ class BoundedPaperRun:
     async def _decide(self, account: Account, deadline: Deadline) -> None:
         """Ask SENTINEL about what became ready, and fill what it approved."""
         if account.stop is RunStop.SYSTEM_STOPPED:
+            return
+        if deadline.expired:
+            # Out of time before the first read. A query started now would be
+            # cancelled mid-flight, which costs a round trip and answers nothing.
+            account.stop = RunStop.TIME_BUDGET_REACHED
             return
         for trade_case_id in await self._cases(account, deadline):
             if not account.may_step(deadline):

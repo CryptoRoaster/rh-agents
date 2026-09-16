@@ -126,7 +126,9 @@ Checked *before* the next such call. An empty claim is not a step; an attempt
 that began and was cut off **is** one, because work was started.
 
 **Runtime** is a monotonic deadline, so a clock adjustment can neither extend nor
-end a run. It is checked before every mutating step, and every wait — intake,
+end a run. A run that is already out of time starts no database read at all: a
+query begun past the deadline would only be cancelled mid-flight, which costs a
+round trip and answers nothing. It is checked before every mutating step, and every wait — intake,
 worker registration, a handler, a database read, the risk request, the fill — is
 bounded by `min(step timeout, time remaining)`. The trusted clock is untouched:
 it still decides evidence freshness, the approval window and the fill instant,
