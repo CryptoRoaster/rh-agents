@@ -82,6 +82,10 @@ async def risk_db():
             modules = []
             for name in (
                 "0001_foundation",
+                # Recorded market observations, because a deployment has them and
+                # the bounded run reads candidates out of them.
+                "0002_market_observations",
+                "0003_pool_locator",
                 "0005_trade_case_workflow",
                 "0006_worker_runtime",
                 "0007_trade_case_risk_requests",
