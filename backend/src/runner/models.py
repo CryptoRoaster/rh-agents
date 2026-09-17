@@ -121,6 +121,10 @@ class CaseProgress(Immutable):
     reason_code: Code | None = None
     risk_outcome: Code | None = None
     risk_refusal: Code | None = None
+    # What came of asking for a stale source to be observed again, when this run
+    # asked. Absent means it never needed to: nothing was stale, or the refusal
+    # was about something a new observation could not fix.
+    refresh: Code | None = None
     fill_refusal: Code | None = None
     execution_id: UUID | None = None
     # A decisive call was cut off before it answered. It may have committed and

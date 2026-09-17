@@ -63,7 +63,13 @@ from src.core.models import TradingMode
 from src.data.tables import TradeCaseRow
 from src.orchestration.commander.context import SystemPauseUnavailable
 from src.orchestration.commander.intake import IntakeRefusal
-from src.orchestration.workflow.models import TERMINAL_CASE_STATUSES, TradeCaseStatus
+from src.orchestration.riskrequest.models import RiskRequestRefusal
+from src.orchestration.riskrequest.service import stale_source
+from src.orchestration.workflow.models import (
+    TERMINAL_CASE_STATUSES,
+    SourceRefreshOutcome,
+    TradeCaseStatus,
+)
 from src.runner.composition import RunnerStack
 from src.runner.models import (
     CaseProgress,
@@ -149,6 +155,10 @@ class Account:
     cases: dict[UUID, CaseProgress] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     touched: set[UUID] = field(default_factory=set)
+    # Cases this run has already asked to have a source re-observed for. One
+    # attempt each: a second would be this process retrying until something
+    # passes, which is exactly what a bounded run must not do.
+    refreshed: set[UUID] = field(default_factory=set)
 
     def admits(self, trade_case_id: UUID) -> bool:
         """Whether this run may work on that case, counting it if it may."""
@@ -315,14 +325,34 @@ class BoundedPaperRun:
         scope = await self._working_set(account, deadline)
         if not scope:
             return
-        for runner in runners:
+        if not await self._register(account, deadline):
+            return
+        await self._drain(scope, account, deadline)
+
+    async def _register(self, account: Account, deadline: Deadline) -> bool:
+        """Announce every runner once, and say whether the budget allowed it.
+
+        Registration writes a worker instance rather than touching a case, so it
+        is bounded but not counted as a step. A runner that never registered
+        cannot claim, which is why a partial registration ends the stage.
+        """
+        for runner in self.stack.runners:
             if not account.may_step(deadline):
-                return
+                return False
             await self._bounded(runner.register(), deadline)
+        return True
+
+    async def _drain(self, scope: frozenset[UUID], account: Account, deadline: Deadline) -> None:
+        """Let every role claim within `scope` until nobody can claim again.
+
+        The same loop whether it is working the whole pass or one case whose
+        source was just re-observed: a narrower scope is a narrower claim query,
+        not a different kind of work.
+        """
         progressed = True
         while progressed:
             progressed = False
-            for runner in runners:
+            for runner in self.stack.runners:
                 if not account.may_step(deadline):
                     return
                 account.steps += 1
@@ -481,12 +511,23 @@ class BoundedPaperRun:
         )
         if verdict is None:
             return
+        refresh: str | None = None
+        if verdict.kind == "risk_request_refused":
+            # A precondition that is merely too old is the one refusal a run can
+            # do something about, and the only moment to do it is now — before
+            # the case's one request is spent on a reading nobody would accept.
+            refresh, verdict = await self._refresh(
+                trade_case_id, verdict, key, account, deadline, status=case.status.value
+            )
+            if verdict is None:
+                return
         if verdict.kind == "risk_request_refused":
             account.record(
                 CaseProgress(
                     trade_case_id=trade_case_id,
                     status=case.status.value,
                     risk_refusal=verdict.reason.value,
+                    refresh=refresh,
                 )
             )
             return
@@ -500,6 +541,7 @@ class BoundedPaperRun:
                 status=case.status.value,
                 risk_outcome=outcome,
                 replayed=verdict.replayed,
+                refresh=refresh,
             )
         )
         if verdict.authorization.value != "APPROVED":
@@ -516,6 +558,7 @@ class BoundedPaperRun:
                     status=case.status.value,
                     risk_outcome=outcome,
                     replayed=verdict.replayed,
+                    refresh=refresh,
                 )
             )
             return
@@ -538,6 +581,7 @@ class BoundedPaperRun:
                     risk_outcome=outcome,
                     fill_refusal=fill.reason.value,
                     replayed=fill.replayed,
+                    refresh=refresh,
                 )
             )
             return
@@ -548,8 +592,67 @@ class BoundedPaperRun:
                 risk_outcome=outcome,
                 execution_id=fill.execution_id,
                 replayed=fill.replayed,
+                refresh=refresh,
             )
         )
+
+    async def _refresh(
+        self,
+        trade_case_id: UUID,
+        refusal: Any,
+        key: str,
+        account: Account,
+        deadline: Deadline,
+        *,
+        status: str,
+    ) -> tuple[str | None, Any]:
+        """Establish a fresh precondition once, then ask the same question again.
+
+        The refusal names the source it stopped on. If the workflow declares a
+        task that observes that source, this orders one new observation, lets
+        that handler run under the run's own budgets, and re-asks *under the
+        same request key* — so the case still has exactly one canonical request
+        and this is the same question asked once the preconditions it needs are
+        in place, not a second request invented for a second chance.
+
+        Bounded in four ways, none of them new. One refresh per case per run, so
+        a run can never sit here retrying until something passes. Ordering,
+        working and re-asking are ordinary steps against the same step and time
+        budgets. The order itself is refused by the workflow if the slot is
+        already armed, spent or expired. And when the new observation does not
+        arrive — the handler refused, the source had not changed, the budget ran
+        out — the original refusal is what gets reported, unchanged.
+        """
+        if refusal.reason is not RiskRequestRefusal.SOURCE_OLDER_THAN_RISK_LIMIT:
+            return None, refusal
+        source = stale_source(refusal.detail)
+        if source is None or trade_case_id in account.refreshed:
+            return None, refusal
+        account.refreshed.add(trade_case_id)
+        if not account.may_step(deadline):
+            return None, refusal
+        account.steps += 1
+        order = await self._bounded(
+            self.stack.cases.refresh_source(trade_case_id, source), deadline
+        )
+        if order.outcome is not SourceRefreshOutcome.ORDERED:
+            return order.outcome.value, refusal
+        if not await self._register(account, deadline):
+            return order.outcome.value, refusal
+        # Scoped to this case alone. The budget already counts it, and widening
+        # the claim here would let a refresh spend the pass on somebody else.
+        await self._drain(frozenset({trade_case_id}), account, deadline)
+        if not account.may_step(deadline):
+            return order.outcome.value, refusal
+        account.steps += 1
+        verdict = await self._attempt(
+            self.stack.risk.request_risk_evaluation(trade_case_id, request_key=key),
+            deadline,
+            trade_case_id,
+            account,
+            status=status,
+        )
+        return order.outcome.value, verdict
 
     async def _attempt(
         self,

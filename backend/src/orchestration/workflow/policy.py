@@ -98,10 +98,39 @@ class TaskDefinition:
 
 
 @dataclass(frozen=True)
+class RefreshableSource:
+    """A risk input whose freshness one specialist can restore by observing again.
+
+    SENTINEL judges four sources independently and names the one that is too
+    old. Three of them — the traded price, the token metadata and the liquidity
+    value — are read from the recorded market, which nothing in this workflow
+    observes on demand: no task exists that could make a market be recorded
+    again, and a run that pretended otherwise would be inventing a source. The
+    holder distribution is the exception. It is carried inside ATLAS's on-chain
+    evidence, and ATLAS reading the chain again is exactly a new observation of
+    that source, produced by the handler that owns it.
+
+    Declared here so the mapping is part of the workflow contract rather than
+    something a runner knows privately. `source` is the label SENTINEL's own
+    staleness check reports, so the two cannot drift apart silently.
+    """
+
+    source: str
+    evidence_type: EvidenceType
+
+
+@dataclass(frozen=True)
 class WorkflowPolicy:
     version: str
     requirements: tuple[EvidenceRequirement, ...]
     tasks: tuple[TaskDefinition, ...]
+    # Risk sources this workflow can observe again. Empty means a stale source
+    # is simply stale: the case waits for the world to be recorded again.
+    refreshable_sources: tuple[RefreshableSource, ...] = ()
+
+    def refreshable(self, source: str) -> RefreshableSource | None:
+        """The declaration for one named source, or nothing if none observes it."""
+        return next((item for item in self.refreshable_sources if item.source == source), None)
 
     def derived_tasks(self, evidence_type: EvidenceType) -> tuple[TaskDefinition, ...]:
         """Tasks whose result is derived from evidence of this type.
@@ -232,4 +261,8 @@ TRADE_CASE_V1 = WorkflowPolicy(
         ),
         TaskDefinition(AgentRole.ANCHOR, "ASSESS_EXECUTION", True),
     ),
+    # Exactly one. The holder reading travels inside ONCHAIN evidence, so the
+    # task that observes it is ATLAS's, reached through the requirement above
+    # rather than named twice here.
+    refreshable_sources=(RefreshableSource("HOLDERS", EvidenceType.ONCHAIN),),
 )
