@@ -111,6 +111,24 @@ class RoleAvailability(Immutable):
     reason: Code | None = None
 
 
+class SourceRefresh(Immutable):
+    """One request for a source to be observed again, and what came of it.
+
+    Reported per source rather than as a single verdict for the case, because a
+    case can need two different observers and the answer for one says nothing
+    about the other.
+    """
+
+    # A `RiskFactOrigin` value: which source was asked about.
+    origin: Code
+    # A `SourceRefreshOutcome` value: what the workflow answered.
+    outcome: Code
+    role: Code | None = None
+    # The attempt the observing task was moved to. Present only when one really
+    # was armed, so a refusal cannot be read as progress.
+    attempt: int | None = Field(default=None, ge=1)
+
+
 class CaseProgress(Immutable):
     """What happened to one case in this run."""
 
@@ -121,10 +139,10 @@ class CaseProgress(Immutable):
     reason_code: Code | None = None
     risk_outcome: Code | None = None
     risk_refusal: Code | None = None
-    # What came of asking for a stale source to be observed again, when this run
-    # asked. Absent means it never needed to: nothing was stale, or the refusal
-    # was about something a new observation could not fix.
-    refresh: Code | None = None
+    # What came of asking for sources to be observed again, when this run asked.
+    # Empty means it never needed to: nothing had aged out, or what stopped the
+    # case was not something a new observation could fix.
+    refreshes: tuple[SourceRefresh, ...] = Field(default=(), max_length=8)
     fill_refusal: Code | None = None
     execution_id: UUID | None = None
     # A decisive call was cut off before it answered. It may have committed and

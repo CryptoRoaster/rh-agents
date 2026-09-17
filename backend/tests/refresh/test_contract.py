@@ -9,6 +9,7 @@ against a case that really reached the state it refuses in.
 from src.core.models import AgentRole
 from src.orchestration.workflow.models import SourceRefreshOutcome
 from tests.refresh.conftest import (
+    ATLAS_SOURCE,
     at_the_recheck,
     first_pass,
     ports_at,
@@ -47,7 +48,11 @@ async def test_a_source_no_task_observes_is_refused(risk_db, now, trace):
     stack = stack_for(sessions, settings, later, ports=ports_at(later, model))
     case = await traded_case(sessions)
 
-    for source in ("MARKET", "TOKEN", "LIQUIDITY", "SOMETHING_ELSE"):
+    for source in (
+        "RECORDED_MARKET_OBSERVATION",
+        "OPERATOR_CONFIGURED_ASSUMPTION",
+        "SOMETHING_ELSE",
+    ):
         order = await stack.cases.refresh_source(case.id, source)
         assert order.outcome is SourceRefreshOutcome.SOURCE_NOT_REFRESHABLE, source
         assert order.task_id is None
@@ -67,7 +72,7 @@ async def test_a_case_still_being_assembled_is_refused(risk_db, now, trace):
     case = await traded_case(sessions)
     assert case.status != "READY_FOR_RISK"
 
-    order = await stack.cases.refresh_source(case.id, "HOLDERS")
+    order = await stack.cases.refresh_source(case.id, ATLAS_SOURCE)
 
     assert order.outcome is SourceRefreshOutcome.CASE_NOT_READY
     assert order.attempt is None
@@ -85,7 +90,7 @@ async def test_a_second_order_finds_the_first(risk_db, now, trace):
     armed = await task_row(sessions, AgentRole.ATLAS, "ASSESS_ONCHAIN_INTEGRITY")
     assert (armed.status, armed.attempt) == ("PENDING", 2)
 
-    order = await stack.cases.refresh_source(case.id, "HOLDERS")
+    order = await stack.cases.refresh_source(case.id, ATLAS_SOURCE)
 
     assert order.outcome is SourceRefreshOutcome.ALREADY_ORDERED
     assert order.role is AgentRole.ATLAS
@@ -109,7 +114,7 @@ async def test_a_decided_case_is_not_reopened(risk_db, now, trace):
     stack = stack_for(sessions, settings, later, ports=ports_at(later, model))
     case = await traded_case(sessions)
 
-    order = await stack.cases.refresh_source(case.id, "HOLDERS")
+    order = await stack.cases.refresh_source(case.id, ATLAS_SOURCE)
 
     assert order.outcome is SourceRefreshOutcome.CASE_NOT_READY
     observer = await task_row(sessions, AgentRole.ATLAS, "ASSESS_ONCHAIN_INTEGRITY")
@@ -137,7 +142,7 @@ async def test_the_order_is_recorded_against_the_case_and_the_source(risk_db, no
     event = ordered[0]
     assert event.event_type == "TASK_STATUS_CHANGED"
     assert event.payload["role"] == AgentRole.ATLAS.value
-    assert event.payload["source"] == "HOLDERS"
+    assert event.payload["source"] == ATLAS_SOURCE
     assert event.payload["to"] == "PENDING"
     assert event.payload["attempt"] == 2
     observer = await task_row(sessions, AgentRole.ATLAS, "ASSESS_ONCHAIN_INTEGRITY")
@@ -155,8 +160,70 @@ async def test_an_order_against_a_stale_revision_is_refused(risk_db, now, trace)
     case = await traded_case(sessions)
 
     try:
-        await stack.cases.refresh_source(case.id, "HOLDERS", expected_revision=case.revision + 1)
+        await stack.cases.refresh_source(case.id, ATLAS_SOURCE, expected_revision=case.revision + 1)
     except WorkflowFailure as error:
         assert error.code is WorkflowErrorCode.CONCURRENCY_CONFLICT
     else:  # pragma: no cover - the guard is the point of the test
         raise AssertionError("a stale revision must not be accepted")
+
+
+def test_the_declared_origins_are_the_ones_the_risk_data_contract_publishes():
+    """The one table, held against the vocabulary it is written in.
+
+    `policy.py` cannot import the risk-data package — the risk-data package
+    reads the policy — so the origins are held there as the strings that
+    vocabulary publishes. This is what stops the two drifting apart: a renamed
+    origin, or one silently invented here, fails.
+
+    It also states, executably, which origins are deliberately *not* refreshable.
+    Nothing in this workflow records a market, and a configured assumption was
+    never observed at all, so no task could ever be armed for either.
+    """
+    from src.orchestration.riskdata.models import RiskDataGapCode, RiskFactOrigin
+    from src.orchestration.workflow.policy import STALE_GAP, TRADE_CASE_V1
+
+    declared = {item.origin for item in TRADE_CASE_V1.refreshable_sources}
+    assert declared <= {item.value for item in RiskFactOrigin}
+    assert declared == {"ATLAS_ONCHAIN_EVIDENCE", "ANCHOR_EXECUTION_EVIDENCE"}
+    assert {item.value for item in RiskFactOrigin} - declared == {
+        "RECORDED_MARKET_OBSERVATION",
+        "OPERATOR_CONFIGURED_ASSUMPTION",
+    }
+    assert STALE_GAP == RiskDataGapCode.STALE.value
+    # One declaration per evidence type, so a lookup can never be ambiguous.
+    assert len({item.evidence_type for item in TRADE_CASE_V1.refreshable_sources}) == len(declared)
+
+
+def test_only_an_age_gap_maps_to_an_observer():
+    """Every other cause a readiness gap can name keeps its own refusal."""
+    from src.orchestration.riskdata.models import (
+        RiskDataGap,
+        RiskDataGapCode,
+        RiskFactKind,
+        RiskFactOrigin,
+    )
+    from src.orchestration.workflow.policy import TRADE_CASE_V1
+
+    def gap(code: RiskDataGapCode) -> RiskDataGap:
+        return RiskDataGap(
+            kind=RiskFactKind.ROUTING_AVAILABILITY,
+            code=code,
+            expected_origin=RiskFactOrigin.ANCHOR_EXECUTION_EVIDENCE,
+        )
+
+    assert TRADE_CASE_V1.refreshable_for_gap(gap(RiskDataGapCode.STALE)) is not None
+    for code in RiskDataGapCode:
+        if code is RiskDataGapCode.STALE:
+            continue
+        assert TRADE_CASE_V1.refreshable_for_gap(gap(code)) is None, code
+    # And an origin nothing observes stays unobservable whatever the cause.
+    assert (
+        TRADE_CASE_V1.refreshable_for_gap(
+            RiskDataGap(
+                kind=RiskFactKind.REFERENCE_PRICE,
+                code=RiskDataGapCode.STALE,
+                expected_origin=RiskFactOrigin.RECORDED_MARKET_OBSERVATION,
+            )
+        )
+        is None
+    )

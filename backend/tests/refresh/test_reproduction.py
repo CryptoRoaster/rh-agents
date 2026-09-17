@@ -21,6 +21,7 @@ from src.data.tables import TradeCaseRiskBindingRow, TradeCaseRiskRequestRow
 from src.orchestration.workflow.models import EvidenceType
 from src.runner.service import order_key
 from tests.refresh.conftest import (
+    ATLAS_SOURCE,
     RECHECK,
     all_specialists,
     attempts,
@@ -29,6 +30,7 @@ from tests.refresh.conftest import (
     ports_at,
     record_market_at,
     record_payment_at,
+    refreshes,
     scripted,
     task_row,
     traded_case,
@@ -120,7 +122,7 @@ async def test_the_state_after_a_regular_pulse_wait(risk_db, now, trace):
     # chain had not been observed again — so the new envelope carries the same
     # source instant and the refusal is unchanged. A refresh is a new
     # observation or it is nothing.
-    assert progress.refresh == "ORDERED", progress
+    assert refreshes(progress) == {ATLAS_SOURCE: "ORDERED"}, progress
     assert len(onchain) == 2
     first_envelope = next(item.evidence_id for item in onchain if item.supersedes_id is None)
     assert [item.supersedes_id for item in onchain if item.supersedes_id is not None] == [

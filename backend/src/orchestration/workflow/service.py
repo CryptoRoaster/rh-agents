@@ -31,6 +31,7 @@ from src.orchestration.workflow.engine import Evaluation, TradeCaseEvaluator, ac
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
     TERMINAL_TASK_STATUSES,
+    Blocker,
     DiscoveryPayload,
     EvidenceEnvelope,
     EvidenceProvenance,
@@ -53,6 +54,7 @@ from src.orchestration.workflow.models import (
 from src.orchestration.workflow.policy import (
     TRADE_CASE_V1,
     EvidenceRequirement,
+    RefreshableSource,
     WorkflowPolicy,
 )
 from src.risk.authorization import RiskAuthorization, classify_decision
@@ -837,13 +839,14 @@ class TradeCaseService:
         )
 
     async def refresh_source(
-        self, trade_case_id: UUID, source: str, *, expected_revision: int | None = None
+        self, trade_case_id: UUID, origin: str, *, expected_revision: int | None = None
     ) -> SourceRefreshOrder:
         """Order a new observation of one risk source, through the task that owns it.
 
         A case that reaches its trigger after a wait can be complete by every
-        workflow rule and still be judged on a reading older than the risk
-        engine's own bound. The gap is real and it is not closed by reading the
+        workflow rule and still be judged on readings that have aged past what
+        depends on them — the holder distribution past SENTINEL's own bound, the
+        execution assessment past its own life. Neither is closed by reading the
         same reading again: what is needed is a *new observation*, produced by
         the handler that observes that source, recorded as evidence, and bound
         to the case revision it was produced for.
@@ -858,15 +861,18 @@ class TradeCaseService:
 
         Five things bound it.
 
-        **Only a declared source.** `refreshable_sources` names the sources this
-        workflow can observe again and which evidence carries each. A source no
+        **Only a declared source.** `refreshable_sources` names the origins this
+        workflow can observe again and which evidence carries each. An origin no
         task observes is refused rather than approximated.
 
-        **Only a case waiting on a risk request.** `READY_FOR_RISK` is the one
-        state where a fresher precondition changes anything: earlier, the case
-        is still being built and the ordinary tasks are running anyway; later,
-        the decision has been made and remaking its inputs would be reopening a
-        settled question.
+        **Only a case a fresher observation could still move.** Two states
+        qualify and no others. `READY_FOR_RISK`, where the risk boundary is
+        waiting on preconditions. And `BLOCKED` *on this source having expired* —
+        checked here against the envelope's own effective status rather than
+        taken from the caller, so a case blocked by a negative assessment, an
+        unavailable one, or evidence that established nothing is refused. Earlier
+        the ordinary tasks are running anyway; later the decision has been made,
+        and remaking its inputs would be reopening a settled question.
 
         **Only a slot that finished.** A task still pending or running already
         represents outstanding work, so a second order is refused instead of
@@ -886,13 +892,14 @@ class TradeCaseService:
         async with self.sessions.begin() as session:
             row = await self._locked_case(session, trade_case_id)
             self._revision(row, expected_revision)
-            refreshable = self.policy.refreshable(source)
+            refreshable = self.policy.refreshable(origin)
             if refreshable is None:
                 return self._refresh_refused(
-                    row, source, SourceRefreshOutcome.SOURCE_NOT_REFRESHABLE
+                    row, origin, SourceRefreshOutcome.SOURCE_NOT_REFRESHABLE
                 )
-            if TradeCaseStatus(row.status) is not TradeCaseStatus.READY_FOR_RISK:
-                return self._refresh_refused(row, source, SourceRefreshOutcome.CASE_NOT_READY)
+            admissible = await self._refresh_admissible(session, row, refreshable)
+            if admissible is not None:
+                return self._refresh_refused(row, origin, admissible)
             requirement = self.policy.requirement(refreshable.evidence_type)
             task = await session.scalar(
                 select(TradeCaseTaskRow).where(
@@ -902,12 +909,12 @@ class TradeCaseService:
                 )
             )
             if task is None:
-                return self._refresh_refused(row, source, SourceRefreshOutcome.OBSERVER_UNAVAILABLE)
+                return self._refresh_refused(row, origin, SourceRefreshOutcome.OBSERVER_UNAVAILABLE)
             status = SpecialistTaskStatus(task.status)
             if status in (SpecialistTaskStatus.PENDING, SpecialistTaskStatus.RUNNING):
                 return self._refresh_refused(
                     row,
-                    source,
+                    origin,
                     SourceRefreshOutcome.ALREADY_ORDERED,
                     task=task,
                     requirement=requirement,
@@ -921,15 +928,15 @@ class TradeCaseService:
             ):
                 return self._refresh_refused(
                     row,
-                    source,
+                    origin,
                     SourceRefreshOutcome.OBSERVER_UNAVAILABLE,
                     task=task,
                     requirement=requirement,
                 )
-            self._rearm(session, row, task, "RISK_SOURCE_TOO_OLD", {"source": source})
+            self._rearm(session, row, task, "RISK_SOURCE_TOO_OLD", {"source": origin})
             return SourceRefreshOrder(
                 outcome=SourceRefreshOutcome.ORDERED,
-                source=source,
+                source=origin,
                 trade_case_id=row.id,
                 case_revision=row.revision,
                 role=requirement.role,
@@ -937,6 +944,42 @@ class TradeCaseService:
                 task_id=task.task_id,
                 attempt=task.attempt,
             )
+
+    async def _refresh_admissible(
+        self,
+        session: AsyncSession,
+        row: TradeCaseRow,
+        refreshable: RefreshableSource,
+    ) -> SourceRefreshOutcome | None:
+        """Whether this case is in a state a new observation could still move.
+
+        `READY_FOR_RISK` needs no further argument: the risk boundary is waiting
+        on preconditions and named the source itself.
+
+        `BLOCKED` needs one, because a case is blocked for whatever the evaluator
+        found wrong with it. The published blockers say which evidence that was,
+        and the envelope itself says whether the matter is age — read here
+        through `effective_status`, so a negative assessment can never be
+        re-armed into a second opinion by a caller that says the word stale.
+        """
+        status = TradeCaseStatus(row.status)
+        if status is TradeCaseStatus.READY_FOR_RISK:
+            return None
+        if status is not TradeCaseStatus.BLOCKED:
+            return SourceRefreshOutcome.CASE_NOT_READY
+        blocked_on = {Blocker.model_validate(item).evidence_type for item in row.blockers}
+        if refreshable.evidence_type not in blocked_on:
+            return SourceRefreshOutcome.CASE_NOT_READY
+        rows = (
+            await session.scalars(
+                select(TradeCaseEvidenceRow).where(TradeCaseEvidenceRow.trade_case_id == row.id)
+            )
+        ).all()
+        current = active_evidence(tuple(evidence_from_row(item) for item in rows))
+        item = current.get(refreshable.evidence_type)
+        if item is None or item.effective_status(self.clock.now()) is not EvidenceStatus.STALE:
+            return SourceRefreshOutcome.SOURCE_NOT_STALE
+        return None
 
     @staticmethod
     def _refresh_refused(

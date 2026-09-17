@@ -1210,8 +1210,13 @@ class SourceRefreshOutcome(StrEnum):
     # Nothing in this workflow observes that source, so there is no task to arm.
     SOURCE_NOT_REFRESHABLE = "SOURCE_NOT_REFRESHABLE"
     # The case is not at the point where a refresh means anything: it is not
-    # waiting on a risk request, or it is already finished.
+    # waiting on a risk request, not blocked on a source that has merely aged
+    # out, or already finished.
     CASE_NOT_READY = "CASE_NOT_READY"
+    # The case is blocked, and not on this source being old. A negative
+    # assessment, an unavailable one, or evidence that established nothing are
+    # all real findings, and observing again is not the answer to any of them.
+    SOURCE_NOT_STALE = "SOURCE_NOT_STALE"
     # Somebody already ordered this and it has not produced a reading yet. A
     # second order would be a duplicate of work already outstanding.
     ALREADY_ORDERED = "ALREADY_ORDERED"

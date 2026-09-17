@@ -20,6 +20,7 @@ from tests.refresh.conftest import (
     ports_at,
     scripted,
     task_row,
+    traded_case,
 )
 from tests.refresh.test_refresh import waited
 from tests.runner.conftest import executions, run
@@ -29,17 +30,27 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-async def test_two_runs_at_once_produce_one_refresh_and_one_fill(risk_db, now, trace):
-    """A restart or an overlap must not double anything.
+async def test_two_runs_at_once_produce_one_order_and_one_fill(risk_db, now, trace):
+    """Both passes reach the same case needing the same new observation.
 
-    Both passes are real and both may claim; the case row serializes the order
-    and the request key serializes the order that follows from it.
+    Which of them gets there first is a genuine race and not this test's
+    business. What must hold either way is that only one order is placed, only
+    one canonical request exists, and at most one fill happens — and that the
+    work the race left unfinished is still there for the next explicit pass.
     """
     _, sessions = risk_db
     model = scripted()
     settings, first = await first_pass(sessions, now, model)
     await waited(first, sessions)
     later = await at_the_recheck(sessions, now)
+    # Stopped one step before the order, so both runs below start from a case
+    # that is ready, refused, and has nothing outstanding.
+    staged = type(settings).model_validate({**settings.model_dump(), "paper_runner_max_steps": 4})
+    await run(sessions, staged, later, ports=ports_at(later, model))
+    case = await traded_case(sessions)
+    assert case.status == "READY_FOR_RISK"
+    observer = await task_row(sessions, AgentRole.ATLAS, "ASSESS_ONCHAIN_INTEGRITY")
+    assert (observer.status, observer.attempt) == ("SUCCEEDED", 1)
 
     both = await asyncio.gather(
         run(sessions, settings, later, ports=ports_at(later, model)),
@@ -49,23 +60,21 @@ async def test_two_runs_at_once_produce_one_refresh_and_one_fill(risk_db, now, t
 
     for item in both:
         assert not isinstance(item, BaseException), item
-    # Which of the two gets there first is a genuine race and not this test's
-    # business. What must hold either way is that nothing happened twice — and
-    # a run that addressed the same order key and was handed the same fill back
-    # reports that fill, so the count to check is the durable one, not how many
-    # runs saw it.
+    outcomes = [
+        entry.outcome for item in both for progress in item.cases for entry in progress.refreshes
+    ]
+    assert outcomes.count("ORDERED") <= 1, outcomes
+    # One order, whoever placed it: the slot moved by exactly one attempt.
+    armed = await task_row(sessions, AgentRole.ATLAS, "ASSESS_ONCHAIN_INTEGRITY")
+    assert armed.attempt == 2, outcomes
     assert len(await executions(sessions)) <= 1
-    ordered = [item for item in both for case in item.cases if case.refresh == "ORDERED"]
-    assert len(ordered) == 1, "the second run found the order the first had placed"
-    observer = await task_row(sessions, AgentRole.ATLAS, "ASSESS_ONCHAIN_INTEGRITY")
-    assert observer.attempt == 2, "only one of the two runs ordered a new observation"
     async with sessions() as session:
         assert (
             await session.scalar(select(func.count()).select_from(TradeCaseRiskRequestRow))
         ) <= 1
 
-    # And nothing was lost either: one more explicit pass completes whatever the
-    # race left unfinished, and the totals are still one of each.
+    # And nothing was lost: one more explicit pass completes whatever the race
+    # left unfinished, and the totals are still one of each.
     await run(sessions, settings, later, ports=ports_at(later, model))
     assert len(await executions(sessions)) == 1
     async with sessions() as session:
@@ -73,3 +82,42 @@ async def test_two_runs_at_once_produce_one_refresh_and_one_fill(risk_db, now, t
             await session.scalar(select(func.count()).select_from(TradeCaseRiskRequestRow))
         ) == 1
     assert (await task_row(sessions, AgentRole.ATLAS, "ASSESS_ONCHAIN_INTEGRITY")).attempt == 2
+
+
+async def test_two_runs_at_once_order_one_execution_reassessment(risk_db, now, trace):
+    """The same guarantee for the second observer, on its own gap.
+
+    Both passes find a case whose execution assessment has expired. The case row
+    serializes the order, so one of them places it and the other is told it
+    already exists — and the slot moves by exactly one attempt.
+    """
+    from tests.refresh.conftest import ANCHOR_SOURCE
+    from tests.refresh.test_execution import carried_to_an_expired_assessment, observer_attempts
+
+    _, sessions = risk_db
+    model = scripted()
+    settings, third_at, _, before = await carried_to_an_expired_assessment(sessions, now, model)
+
+    both = await asyncio.gather(
+        run(sessions, settings, third_at, ports=ports_at(third_at, model)),
+        run(sessions, settings, third_at, ports=ports_at(third_at, model)),
+        return_exceptions=True,
+    )
+
+    for item in both:
+        assert not isinstance(item, BaseException), item
+    outcomes = [
+        (entry.origin, entry.outcome)
+        for item in both
+        for progress in item.cases
+        for entry in progress.refreshes
+    ]
+    anchor = [outcome for origin, outcome in outcomes if origin == ANCHOR_SOURCE]
+    assert anchor.count("ORDERED") <= 1, outcomes
+    after = await observer_attempts(sessions)
+    assert after[AgentRole.ANCHOR] - before[AgentRole.ANCHOR] == 1, (before, after)
+    assert len(await executions(sessions)) <= 1
+    async with sessions() as session:
+        assert (
+            await session.scalar(select(func.count()).select_from(TradeCaseRiskRequestRow))
+        ) <= 1

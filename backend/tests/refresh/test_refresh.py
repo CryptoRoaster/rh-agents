@@ -24,6 +24,7 @@ from src.orchestration.workflow.models import EvidenceType
 from src.runner.models import ExitCode, RunStop
 from src.runner.service import order_key
 from tests.refresh.conftest import (
+    ATLAS_SOURCE,
     RECHECK,
     SPOT_UP,
     at_the_recheck,
@@ -32,6 +33,7 @@ from tests.refresh.conftest import (
     evidence_rows,
     first_pass,
     ports_at,
+    refreshes,
     scripted,
     task_row,
     traded_case,
@@ -41,7 +43,7 @@ from tests.runner.conftest import executions, run, stack_for
 # The step at which the second pass has a verdict and has not yet filled. Taken
 # from the run that completes, not guessed: a test that picked a number would
 # stop meaning anything the moment the pass changed shape.
-APPROVAL_STEPS = 14
+APPROVAL_STEPS = 7
 
 
 async def waited(summary, sessions):
@@ -87,7 +89,7 @@ async def test_new_observations_and_a_reassessment_make_exactly_one_fill(risk_db
 
     case = await traded_case(sessions)
     progress = progress_for(second, case)
-    assert progress.refresh == "ORDERED"
+    assert refreshes(progress) == {ATLAS_SOURCE: "ORDERED"}
     assert progress.risk_refusal is None, progress
     assert progress.risk_outcome == "APPROVE"
     assert progress.execution_id is not None
@@ -227,7 +229,7 @@ async def test_without_an_observer_the_refusal_stands_and_the_order_survives(ris
 
     case = await traded_case(sessions)
     progress = progress_for(second, case)
-    assert progress.refresh == "ORDERED"
+    assert refreshes(progress) == {ATLAS_SOURCE: "ORDERED"}
     assert progress.risk_refusal == "SOURCE_OLDER_THAN_RISK_LIMIT"
     assert second.fills == 0
     assert await executions(sessions) == []
@@ -312,16 +314,18 @@ async def test_a_budget_that_runs_out_mid_refresh_stops_and_books_nothing(risk_d
     settings, first = await first_pass(sessions, now, model)
     await waited(first, sessions)
     later = await at_the_recheck(sessions, now)
-    tight = type(settings).model_validate({**settings.model_dump(), "paper_runner_max_steps": 12})
+    tight = type(settings).model_validate({**settings.model_dump(), "paper_runner_max_steps": 5})
 
     second = await run(sessions, tight, later, ports=ports_at(later, model))
 
     case = await traded_case(sessions)
     progress = progress_for(second, case)
-    assert progress.refresh == "ORDERED", "the budget ended after the order, not before it"
+    assert refreshes(progress) == {ATLAS_SOURCE: "ORDERED"}, (
+        "the budget ended after the order, not before it"
+    )
     assert progress.risk_refusal == "SOURCE_OLDER_THAN_RISK_LIMIT"
     assert second.stop is RunStop.STEP_BUDGET_REACHED
-    assert second.steps_taken == 12
+    assert second.steps_taken == 5
     assert second.fills == 0
     assert await executions(sessions) == []
     assert second.exit_code is ExitCode.COMPLETED

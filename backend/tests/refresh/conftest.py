@@ -13,6 +13,7 @@ from decimal import Decimal
 from sqlalchemy import select
 
 from src.core.clock import FixedClock
+from src.data.repository import aware
 from src.data.tables import (
     TradeCaseEvidenceRow,
     TradeCaseRow,
@@ -39,6 +40,9 @@ RECHECK = timedelta(seconds=95)
 # found on the second pass rather than being arranged.
 SPOT_UP = Decimal("1.20")
 
+# The payment asset's market is observed one second before the traded one.
+PAYMENT_AGE = FRESH + timedelta(seconds=1)
+
 
 async def record_market_at(sessions, instant, *, price=SPOT, label=""):
     """One recorded observation of the traded market, at that instant."""
@@ -48,11 +52,19 @@ async def record_market_at(sessions, instant, *, price=SPOT, label=""):
 
 
 async def record_payment_at(sessions, instant, *, label="quote"):
-    """The payment asset's own market, which ANCHOR needs to size a ladder."""
+    """The payment asset's own market, which ANCHOR needs to size a ladder.
+
+    Observed one second before the traded market on purpose. Intake ranks
+    candidates newest first and breaks ties on an identifier derived from the
+    observation, so equal instants would decide which market this run works on
+    by a coin flip — and a step budget measured against one of those two
+    outcomes would mean nothing. A second is far inside every age tolerance
+    involved.
+    """
     snapshot = recorded_snapshot(
         instant,
-        age=FRESH,
-        metadata_age=FRESH,
+        age=PAYMENT_AGE,
+        metadata_age=PAYMENT_AGE,
         base_asset_id=f"{CHAIN}:{NETWORK}:{QUOTE}",
         quote_address="0x" + "dd" * 20,
         pair_id=f"{CHAIN}:{NETWORK}:contract_address:{PAYMENT_POOL}",
@@ -135,6 +147,27 @@ def all_specialists(**overrides):
 
 def scripted():
     return ScriptedSpecialists()
+
+
+# The two origins this workflow declares refreshable, by the names the risk-data
+# vocabulary publishes for them.
+ATLAS_SOURCE = "ATLAS_ONCHAIN_EVIDENCE"
+ANCHOR_SOURCE = "ANCHOR_EXECUTION_EVIDENCE"
+
+
+def at(value):
+    """A stored instant as UTC, whatever the database handed back.
+
+    PostgreSQL returns these aware and the light SQLite suite returns them
+    naive, and a proof about *when* something was observed should not depend on
+    which one is running.
+    """
+    return aware(value)
+
+
+def refreshes(progress):
+    """What this run asked to have observed again, by source."""
+    return {item.origin: item.outcome for item in progress.refreshes}
 
 
 async def first_pass(sessions, instant, model, **overrides):
