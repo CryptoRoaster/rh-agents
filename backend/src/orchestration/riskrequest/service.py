@@ -667,6 +667,24 @@ def risk_market(
     )
 
 
+# The suffix a staleness detail carries, and the only way to read a source name
+# back out of one. Written once so the check that produces the label and the
+# contract that acts on it cannot drift apart.
+STALE_SUFFIX = "_OLDER_THAN_RISK_LIMIT"
+
+
+def stale_source(detail: str | None) -> str | None:
+    """The source a staleness detail names, if it names one.
+
+    A refusal detail is a code, not prose, so this is a lookup rather than
+    parsing. Anything that is not a staleness label — an observation from the
+    future, for instance — names no refreshable source and returns nothing.
+    """
+    if detail is None or not detail.endswith(STALE_SUFFIX):
+        return None
+    return detail[: -len(STALE_SUFFIX)]
+
+
 def too_old_for(market: MarketSnapshot, now: datetime, limits: RiskLimits) -> str | None:
     """Apply SENTINEL's own configured tolerance before SENTINEL is asked.
 
@@ -684,7 +702,7 @@ def too_old_for(market: MarketSnapshot, now: datetime, limits: RiskLimits) -> st
         if age < 0:
             return f"{label}_OBSERVED_IN_THE_FUTURE"
         if age > limits.max_snapshot_age_seconds:
-            return f"{label}_OLDER_THAN_RISK_LIMIT"
+            return f"{label}{STALE_SUFFIX}"
     return None
 
 

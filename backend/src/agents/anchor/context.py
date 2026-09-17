@@ -235,6 +235,8 @@ class AnchorContextReader:
         ):
             raise AnchorContextUnavailable("QUOTE_ASSET_USD_VALUE_UNAVAILABLE")
 
+        replaces = current.get(EvidenceType.LIQUIDITY_EXECUTION)
+
         ladder, requests = await self._ladder(market, valuation)
         return AnchorTaskInput(
             trade_case_id=trade_case_id,
@@ -250,6 +252,9 @@ class AnchorContextReader:
             quote_requests=requests,
             policy_version=self.policy.version,
             evaluated_at=now,
+            # Only ANCHOR's own evidence slot is read, so no other role's
+            # findings reach the worker.
+            supersedes_evidence_id=(None if replaces is None else replaces.evidence_id),
         )
 
     async def _ladder(

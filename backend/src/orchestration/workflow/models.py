@@ -1201,6 +1201,48 @@ class SpecialistTask(Immutable):
     idempotency_key: Identifier
 
 
+class SourceRefreshOutcome(StrEnum):
+    """What came of asking for one risk source to be observed again."""
+
+    # The observing task is armed. Nothing has been observed yet: a new reading
+    # exists only once its handler produces one and the evidence is recorded.
+    ORDERED = "ORDERED"
+    # Nothing in this workflow observes that source, so there is no task to arm.
+    SOURCE_NOT_REFRESHABLE = "SOURCE_NOT_REFRESHABLE"
+    # The case is not at the point where a refresh means anything: it is not
+    # waiting on a risk request, not blocked on a source that has merely aged
+    # out, or already finished.
+    CASE_NOT_READY = "CASE_NOT_READY"
+    # The case is blocked, and not on this source having merely aged. A negative
+    # assessment, an unavailable one, or evidence that established nothing are
+    # all real findings, and observing again is not the answer to any of them —
+    # including after they expire, because a finding does not become a gap by
+    # getting old.
+    SOURCE_NOT_STALE = "SOURCE_NOT_STALE"
+    # Somebody already ordered this and it has not produced a reading yet. A
+    # second order would be a duplicate of work already outstanding.
+    ALREADY_ORDERED = "ALREADY_ORDERED"
+    # The task exists but can no longer be claimed: its attempts are spent, it
+    # expired, or it ended terminally. Re-arming it would queue work that the
+    # runtime would refuse to hand out.
+    OBSERVER_UNAVAILABLE = "OBSERVER_UNAVAILABLE"
+
+
+class SourceRefreshOrder(Immutable):
+    """The answer to one refresh request, always typed and never a silent no-op."""
+
+    outcome: SourceRefreshOutcome
+    source: Identifier
+    trade_case_id: UUID
+    case_revision: int = Field(ge=1)
+    role: AgentRole | None = None
+    task_type: Identifier | None = None
+    task_id: UUID | None = None
+    # The attempt the observing task now stands at. Present only when one was
+    # actually armed, so a reader cannot mistake a refusal for a count.
+    attempt: int | None = Field(default=None, ge=1)
+
+
 class RiskBinding(Immutable):
     """A SENTINEL decision bound to one TradeCase and one risk-input digest.
 

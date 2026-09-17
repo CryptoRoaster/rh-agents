@@ -2,9 +2,23 @@
 
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 from src.core.models import AgentRole
 from src.orchestration.workflow.models import EvidenceType
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # Imported for annotations alone. The risk-data package reads this policy at
+    # runtime, so importing it back here would close a cycle; the values below
+    # are compared as the strings that vocabulary publishes, and a guard test
+    # holds the two together so they cannot drift apart silently.
+    from src.orchestration.riskdata.models import RiskDataGap
+
+
+# The one readiness-gap cause a new observation can answer. Everything else a
+# gap can say — never configured, never established, unproven coverage, dated in
+# the future — is a different problem with a different remedy.
+STALE_GAP = "STALE"
 
 
 @dataclass(frozen=True)
@@ -98,10 +112,76 @@ class TaskDefinition:
 
 
 @dataclass(frozen=True)
+class RefreshableSource:
+    """A risk input whose currency one specialist can restore by observing again.
+
+    Two contracts age these inputs, and a source can fall out of either.
+
+    `too_old_for` applies SENTINEL's own thirty-second bound to four named
+    sources before SENTINEL is asked. Three of them — the traded price, the
+    token metadata and the liquidity value — are read from the recorded market,
+    which nothing in this workflow observes on demand: no task exists that could
+    make a market be recorded again, and a run that pretended otherwise would be
+    inventing a source. The holder distribution is different, because it travels
+    inside ATLAS's on-chain evidence.
+
+    The readiness contract asks a second question of the same facts: is the
+    envelope carrying them still live? An execution assessment has a life
+    measured from the reference observation it was built on, so it expires there
+    rather than at SENTINEL's bound — a different check with its own refusal,
+    naming the origin that would have supplied the fact.
+
+    Both are stated here, in the one table, so neither a runner nor a risk
+    boundary keeps a private idea of who observes what. `origin` is the vocabulary
+    the readiness contract publishes; `stale_labels` are the labels SENTINEL's
+    own staleness check reports for facts from that origin.
+    """
+
+    # A `RiskFactOrigin` value. Held as the published string rather than the
+    # enum so this table stays importable from the workflow side.
+    origin: str
+    evidence_type: EvidenceType
+    stale_labels: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
 class WorkflowPolicy:
     version: str
     requirements: tuple[EvidenceRequirement, ...]
     tasks: tuple[TaskDefinition, ...]
+    # Risk sources this workflow can observe again. Empty means a source that
+    # has aged out is simply too old: the case waits for the world to be
+    # recorded again rather than for a task to be armed.
+    refreshable_sources: tuple[RefreshableSource, ...] = ()
+
+    def refreshable(self, origin: str) -> RefreshableSource | None:
+        """The declaration for one origin, or nothing if no task observes it."""
+        return next((item for item in self.refreshable_sources if item.origin == origin), None)
+
+    def refreshable_for_label(self, label: str) -> RefreshableSource | None:
+        """The declaration behind one of SENTINEL's own staleness labels."""
+        return next((item for item in self.refreshable_sources if label in item.stale_labels), None)
+
+    def refreshable_for_gap(self, gap: "RiskDataGap") -> RefreshableSource | None:
+        """The declaration behind one readiness gap — only where it is one.
+
+        A gap is refreshable only when its cause is age. Configuration that was
+        never supplied, a fact the evidence never established, a metric the
+        source could not prove and an observation dated in the future are all
+        real refusals with their own remedies, and none of them is answered by
+        asking somebody to look again. Reading `RISK_DATA_INCOMPLETE` as blanket
+        permission to re-observe would turn every one of them into work.
+        """
+        if gap.code.value != STALE_GAP:
+            return None
+        return self.refreshable(gap.expected_origin.value)
+
+    def refreshable_for_evidence(self, evidence_type: EvidenceType) -> RefreshableSource | None:
+        """The declaration for the observer of one evidence type."""
+        return next(
+            (item for item in self.refreshable_sources if item.evidence_type == evidence_type),
+            None,
+        )
 
     def derived_tasks(self, evidence_type: EvidenceType) -> tuple[TaskDefinition, ...]:
         """Tasks whose result is derived from evidence of this type.
@@ -231,5 +311,22 @@ TRADE_CASE_V1 = WorkflowPolicy(
             ),
         ),
         TaskDefinition(AgentRole.ANCHOR, "ASSESS_EXECUTION", True),
+    ),
+    # Two, and only two. Each is reached through the requirement above rather
+    # than named twice here, so the role and task type have one home.
+    #
+    # ATLAS observes the chain; the holder distribution it reports is the one
+    # source of SENTINEL's four that a task can produce again. ANCHOR observes
+    # execution; its assessment expires out of the readiness contract because it
+    # is built on quotes and a reference observation, which is exactly what it
+    # can go and obtain again.
+    #
+    # `RECORDED_MARKET_OBSERVATION` and `OPERATOR_CONFIGURED_ASSUMPTION` are
+    # deliberately absent and always will be. No task in this workflow records a
+    # market, and a configured assumption was never observed at all — declaring
+    # either would promise work that cannot be done.
+    refreshable_sources=(
+        RefreshableSource("ATLAS_ONCHAIN_EVIDENCE", EvidenceType.ONCHAIN, frozenset({"HOLDERS"})),
+        RefreshableSource("ANCHOR_EXECUTION_EVIDENCE", EvidenceType.LIQUIDITY_EXECUTION),
     ),
 )

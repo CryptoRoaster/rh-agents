@@ -196,6 +196,15 @@ class AnchorWorkerHandler:
         assert valuation is not None
         digest = execution_digest(task_input, assessment)
         capacity = assessment.largest_tested_acceptable_notional_usd
+        # The assessment identifies the evidence, and the generation it replaces
+        # identifies which assessment. Without the second half, re-assessing a
+        # market whose quotes have not moved would resubmit under the key the
+        # first answer already holds, carrying a different supersession — which
+        # the runtime correctly refuses as a conflict. With it, an unchanged
+        # market records an unchanged reading at its own unchanged instant, and a
+        # lost acknowledgement still resolves to exactly one piece of evidence.
+        replaces = task_input.supersedes_evidence_id
+        key = f"anchor:{digest}" if replaces is None else f"anchor:{digest}:{replaces}"
 
         # The Phase 2A scalars are left empty rather than filled with the
         # nearest-looking number, and that is the point.
@@ -224,7 +233,7 @@ class AnchorWorkerHandler:
             submission=EvidenceSubmission(
                 # Keyed by the assessment, so the same ladder resubmitted after a
                 # lost acknowledgement resolves to one piece of evidence.
-                idempotency_key=f"anchor:{digest}",
+                idempotency_key=key,
                 producer_role=AgentRole.ANCHOR,
                 evidence_type=EvidenceType.LIQUIDITY_EXECUTION,
                 provenance=EvidenceProvenance(
@@ -251,6 +260,7 @@ class AnchorWorkerHandler:
                     else EvidenceStatus.AVAILABLE
                 ),
                 reason_codes=(assessment.reason_code.value,),
+                supersedes_id=replaces,
                 payload=LiquidityExecutionPayload(
                     setup_evidence_id=task_input.setup_evidence_id,
                     trigger_evidence_id=task_input.trigger_evidence_id,

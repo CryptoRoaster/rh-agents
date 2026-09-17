@@ -324,3 +324,8 @@ class AnchorTaskInput(Immutable):
     quote_requests: int = Field(default=0, ge=0)
     policy_version: Identifier
     evaluated_at: AwareDatetime
+    # The assessment this one replaces, when ANCHOR is assessing execution for a
+    # case that already has an answer. Runtime bookkeeping for the envelope, and
+    # never an input to the assessment: what the market will serve does not
+    # depend on what it served before.
+    supersedes_evidence_id: UUID | None = None

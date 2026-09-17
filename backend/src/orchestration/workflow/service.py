@@ -27,10 +27,16 @@ from src.data.tables import (
     TradeCaseTransitionRow,
 )
 from src.markets.models import MarketIdentity
-from src.orchestration.workflow.engine import Evaluation, TradeCaseEvaluator, active_evidence
+from src.orchestration.workflow.engine import (
+    Evaluation,
+    TradeCaseEvaluator,
+    active_evidence,
+    aged_out,
+)
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
     TERMINAL_TASK_STATUSES,
+    Blocker,
     DiscoveryPayload,
     EvidenceEnvelope,
     EvidenceProvenance,
@@ -39,6 +45,8 @@ from src.orchestration.workflow.models import (
     EvidenceType,
     LiquidityExecutionPayload,
     RiskBinding,
+    SourceRefreshOrder,
+    SourceRefreshOutcome,
     SpecialistTask,
     SpecialistTaskStatus,
     TimelineEvent,
@@ -48,7 +56,12 @@ from src.orchestration.workflow.models import (
     WorkflowErrorCode,
     WorkflowFailure,
 )
-from src.orchestration.workflow.policy import TRADE_CASE_V1, WorkflowPolicy
+from src.orchestration.workflow.policy import (
+    TRADE_CASE_V1,
+    EvidenceRequirement,
+    RefreshableSource,
+    WorkflowPolicy,
+)
 from src.risk.authorization import RiskAuthorization, classify_decision
 
 TASK_TRANSITIONS: dict[SpecialistTaskStatus, frozenset[SpecialistTaskStatus]] = {
@@ -774,35 +787,230 @@ class TradeCaseService:
                 continue
             if task.expires_at is not None and now >= aware(task.expires_at):
                 continue
-            task.status = SpecialistTaskStatus.PENDING.value
-            task.attempt += 1
-            task.started_at = None
-            task.completed_at = None
-            task.failure_category = None
-            task.next_eligible_at = None
-            # The finished attempt's lease has no claim on the new one. Leaving
-            # it would make the re-armed task look busy until that lease's own
-            # expiry, which is a delay measured in whatever the lease duration
-            # happens to be rather than in anything meaningful.
-            task.lease_id = None
-            task.worker_instance_id = None
-            task.lease_started_at = None
-            task.lease_expires_at = None
-            task.lease_renewals = 0
-            task.reason_code = "DERIVED_INPUT_CHANGED"
-            self._event(
+            self._rearm(
                 session,
                 row,
-                "TASK_STATUS_CHANGED",
+                task,
                 "DERIVED_INPUT_CHANGED",
-                {
-                    "task_id": str(task.task_id),
-                    "role": task.role,
-                    "to": SpecialistTaskStatus.PENDING.value,
-                    "attempt": task.attempt,
-                    "changed_evidence_type": evidence_type.value,
-                },
+                {"changed_evidence_type": evidence_type.value},
             )
+
+    def _rearm(
+        self,
+        session: AsyncSession,
+        row: TradeCaseRow,
+        task: TradeCaseTaskRow,
+        reason_code: str,
+        detail: dict[str, object],
+    ) -> None:
+        """Put one finished task slot back on the queue.
+
+        Re-arming reuses the task's own row and bumps its attempt counter, so a
+        case keeps one slot per role rather than accumulating one per revision —
+        and the runtime's claim ceiling on that slot therefore bounds how often
+        it can ever be re-armed, without a second budget being invented here.
+
+        The caller decides *whether* a slot may be re-armed. This decides what
+        re-arming is, so every reason produces the same durable shape.
+        """
+        task.status = SpecialistTaskStatus.PENDING.value
+        task.attempt += 1
+        task.started_at = None
+        task.completed_at = None
+        task.failure_category = None
+        task.next_eligible_at = None
+        # The finished attempt's lease has no claim on the new one. Leaving
+        # it would make the re-armed task look busy until that lease's own
+        # expiry, which is a delay measured in whatever the lease duration
+        # happens to be rather than in anything meaningful.
+        task.lease_id = None
+        task.worker_instance_id = None
+        task.lease_started_at = None
+        task.lease_expires_at = None
+        task.lease_renewals = 0
+        task.reason_code = reason_code
+        self._event(
+            session,
+            row,
+            "TASK_STATUS_CHANGED",
+            reason_code,
+            {
+                "task_id": str(task.task_id),
+                "role": task.role,
+                "to": SpecialistTaskStatus.PENDING.value,
+                "attempt": task.attempt,
+                **detail,
+            },
+        )
+
+    async def refresh_source(
+        self, trade_case_id: UUID, origin: str, *, expected_revision: int | None = None
+    ) -> SourceRefreshOrder:
+        """Order a new observation of one risk source, through the task that owns it.
+
+        A case that reaches its trigger after a wait can be complete by every
+        workflow rule and still be judged on readings that have aged past what
+        depends on them — the holder distribution past SENTINEL's own bound, the
+        execution assessment past its own life. Neither is closed by reading the
+        same reading again: what is needed is a *new observation*, produced by
+        the handler that observes that source, recorded as evidence, and bound
+        to the case revision it was produced for.
+
+        This orders exactly that, and nothing more. It arms a task; it does not
+        observe, does not record evidence, does not touch a status and does not
+        decide anything about the case. Whatever the handler then finds goes
+        through the ordinary submission path, supersedes the reading it
+        replaces, and is re-evaluated by this service like any other evidence —
+        which is also why a source that has genuinely not changed stays exactly
+        as old as it was.
+
+        Five things bound it.
+
+        **Only a declared source.** `refreshable_sources` names the origins this
+        workflow can observe again and which evidence carries each. An origin no
+        task observes is refused rather than approximated.
+
+        **Only a case a fresher observation could still move.** Two states
+        qualify and no others. `READY_FOR_RISK`, where the risk boundary is
+        waiting on preconditions. And `BLOCKED` *on this source having expired* —
+        checked here against the envelope's own effective status rather than
+        taken from the caller, so a case blocked by a negative assessment, an
+        unavailable one, or evidence that established nothing is refused. Earlier
+        the ordinary tasks are running anyway; later the decision has been made,
+        and remaking its inputs would be reopening a settled question.
+
+        **Only a slot that finished.** A task still pending or running already
+        represents outstanding work, so a second order is refused instead of
+        queued. Two runs racing here serialize on the case row and the second
+        sees the first's order, which is what keeps a restart or a parallel run
+        from creating duplicate observation work.
+
+        **Only inside the existing claim budget.** Re-arming spends an attempt
+        of the slot's own ceiling, so a case cannot be refreshed without end;
+        when the ceiling is reached the order is refused rather than written and
+        then refused later by the claim.
+
+        **Never a status change.** The evidence set is unchanged until a new
+        reading is recorded, so the case stays exactly where it was and the
+        workflow remains the only thing that moves it.
+        """
+        async with self.sessions.begin() as session:
+            row = await self._locked_case(session, trade_case_id)
+            self._revision(row, expected_revision)
+            refreshable = self.policy.refreshable(origin)
+            if refreshable is None:
+                return self._refresh_refused(
+                    row, origin, SourceRefreshOutcome.SOURCE_NOT_REFRESHABLE
+                )
+            admissible = await self._refresh_admissible(session, row, refreshable)
+            if admissible is not None:
+                return self._refresh_refused(row, origin, admissible)
+            requirement = self.policy.requirement(refreshable.evidence_type)
+            task = await session.scalar(
+                select(TradeCaseTaskRow).where(
+                    TradeCaseTaskRow.trade_case_id == row.id,
+                    TradeCaseTaskRow.role == requirement.role.value,
+                    TradeCaseTaskRow.task_type == requirement.task_type,
+                )
+            )
+            if task is None:
+                return self._refresh_refused(row, origin, SourceRefreshOutcome.OBSERVER_UNAVAILABLE)
+            status = SpecialistTaskStatus(task.status)
+            if status in (SpecialistTaskStatus.PENDING, SpecialistTaskStatus.RUNNING):
+                return self._refresh_refused(
+                    row,
+                    origin,
+                    SourceRefreshOutcome.ALREADY_ORDERED,
+                    task=task,
+                    requirement=requirement,
+                )
+            now = self.clock.now()
+            expiries = (task.expires_at, row.expires_at)
+            if (
+                status is not SpecialistTaskStatus.SUCCEEDED
+                or any(item is not None and now >= aware(item) for item in expiries)
+                or task.attempt >= task.max_attempts
+            ):
+                return self._refresh_refused(
+                    row,
+                    origin,
+                    SourceRefreshOutcome.OBSERVER_UNAVAILABLE,
+                    task=task,
+                    requirement=requirement,
+                )
+            self._rearm(session, row, task, "RISK_SOURCE_TOO_OLD", {"source": origin})
+            return SourceRefreshOrder(
+                outcome=SourceRefreshOutcome.ORDERED,
+                source=origin,
+                trade_case_id=row.id,
+                case_revision=row.revision,
+                role=requirement.role,
+                task_type=requirement.task_type,
+                task_id=task.task_id,
+                attempt=task.attempt,
+            )
+
+    async def _refresh_admissible(
+        self,
+        session: AsyncSession,
+        row: TradeCaseRow,
+        refreshable: RefreshableSource,
+    ) -> SourceRefreshOutcome | None:
+        """Whether this case is in a state a new observation could still move.
+
+        `READY_FOR_RISK` needs no further argument: the risk boundary is waiting
+        on preconditions and named the source itself.
+
+        `BLOCKED` needs one, because a case is blocked for whatever the evaluator
+        found wrong with it. The published blockers say which evidence that was,
+        and `aged_out` says whether age is the only thing wrong with it — the
+        stored status and the verdict in the payload, not just the clock. An
+        assessment that refused this market is still refusing it when it
+        expires, and re-arming on that basis would be a second opinion bought
+        with nothing but time.
+        """
+        status = TradeCaseStatus(row.status)
+        if status is TradeCaseStatus.READY_FOR_RISK:
+            return None
+        if status is not TradeCaseStatus.BLOCKED:
+            return SourceRefreshOutcome.CASE_NOT_READY
+        blocked_on = {Blocker.model_validate(item).evidence_type for item in row.blockers}
+        if refreshable.evidence_type not in blocked_on:
+            return SourceRefreshOutcome.CASE_NOT_READY
+        rows = (
+            await session.scalars(
+                select(TradeCaseEvidenceRow).where(TradeCaseEvidenceRow.trade_case_id == row.id)
+            )
+        ).all()
+        current = active_evidence(tuple(evidence_from_row(item) for item in rows))
+        item = current.get(refreshable.evidence_type)
+        if item is None or not aged_out(item, self.clock.now()):
+            return SourceRefreshOutcome.SOURCE_NOT_STALE
+        return None
+
+    @staticmethod
+    def _refresh_refused(
+        row: TradeCaseRow,
+        source: str,
+        outcome: SourceRefreshOutcome,
+        *,
+        task: TradeCaseTaskRow | None = None,
+        requirement: EvidenceRequirement | None = None,
+    ) -> SourceRefreshOrder:
+        """A refusal that still names what was asked about, where that is known.
+
+        `attempt` is deliberately left out: nothing was armed, and reporting a
+        counter next to a refusal invites it to be read as progress.
+        """
+        return SourceRefreshOrder(
+            outcome=outcome,
+            source=source,
+            trade_case_id=row.id,
+            case_revision=row.revision,
+            role=None if requirement is None else requirement.role,
+            task_type=None if requirement is None else requirement.task_type,
+            task_id=None if task is None else task.task_id,
+        )
 
     async def transition_task(
         self,
