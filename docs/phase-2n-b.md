@@ -120,10 +120,21 @@ Five bounds:
 - **Only a declared origin** — anything else is `SOURCE_NOT_REFRESHABLE`.
 - **Only a case a fresher observation could still move.** `READY_FOR_RISK`, where
   the risk boundary is waiting on preconditions; or `BLOCKED` *on this source
-  having expired*, checked here against the envelope's own `effective_status`
-  rather than taken from the caller — so a case blocked by a negative assessment
-  is `SOURCE_NOT_STALE` and a decided case is `CASE_NOT_READY`. A negative
-  re-assessment stays negative; it is never re-armed into a second opinion.
+  having merely aged*, decided here rather than taken from the caller — so a case
+  blocked by a negative assessment is `SOURCE_NOT_STALE` and a decided case is
+  `CASE_NOT_READY`.
+
+  "Merely aged" is its own contract, `aged_out` in the workflow engine, and it is
+  not the same question as `effective_status`. That reports `STALE` for anything
+  past its validity whatever it says inside, which is the right answer to *may I
+  use this now?* and the wrong one to *would this have been usable if it were
+  current?* Only the second decides whether observing again could change
+  anything, so `aged_out` reads the stored status and the payload's own verdict
+  beside the clock. An assessment that refused this market is still refusing it
+  once it expires — and the evaluator's published blocker will by then say
+  `ANCHOR_STALE_EXECUTION_EVIDENCE`, because age outranks the verdict as soon as
+  both are true, which is exactly why the blocker code is not what decides this.
+  A negative finding does not become a gap by getting old.
 - **Only a slot that finished** — `PENDING` or `RUNNING` is `ALREADY_ORDERED`.
   Two runs racing serialize on the case row, which is what stops a restart or a
   parallel pass from creating duplicate observation work.
@@ -159,7 +170,11 @@ Each origin is ordered **at most once per case per run**, so the loop is bounded
 by the number of declared refreshable sources — two — and a case needing both
 cannot turn into a run alternating between two gaps until one of them passes.
 Ordering, working and re-asking are ordinary steps against the same step, time
-and case budgets. When a new observation does not arrive — the handler refused,
+and case budgets, and the budget is checked again *after* a refresh and
+immediately before the risk request: bringing a case back to `READY_FOR_RISK` is
+work, and a run that spent its last step doing it has nothing left to ask
+SENTINEL with. The refresh stands, committed and reported; the request belongs to
+the next explicit run, under the same key. When a new observation does not arrive — the handler refused,
 the source had not changed, the budget ran out — the refusal that was already
 there is what gets reported, unchanged, and what was ordered stays claimable for
 the next explicit pass.
@@ -187,6 +202,8 @@ from rows and attempts, not from summary counters.
 | A replay reads history and asks no source again | `test_a_replay_of_the_same_request_asks_no_source_again` |
 | An approval whose window closed is refused at the fill boundary | `test_an_approval_whose_window_closed_is_refused_at_the_fill` |
 | Every refusal of the order itself, and the two vocabularies held together | `test_contract.py` |
+| A refresh that spends the last step — or meets the deadline — stops before the risk request, and the next run continues under the same key | `test_hardening.py` |
+| A negative assessment stays unrefreshable after it expires, through both the workflow call and the run | `test_hardening.py` |
 
 ## Deliberately not done
 
@@ -194,9 +211,11 @@ from rows and attempts, not from summary counters.
   can produce again are declared. The market-derived facts come from the
   recorder, and making a market be recorded again is its job, not a run's; a
   configured assumption is not an observation at all.
-- **No loosened deadline.** SENTINEL's source bound, PULSE's interval and horizon,
-  evidence validity and ANCHOR's quote and reference tolerances are all
-  unchanged. The only change to how evidence is written is that ANCHOR now
+- **No loosened deadline, and no changed freshness semantics.** SENTINEL's source
+  bound, PULSE's interval and horizon, evidence validity and ANCHOR's quote and
+  reference tolerances are all unchanged, and `effective_status` still answers
+  exactly what it always answered — `aged_out` is a second, narrower question
+  asked beside it, not a redefinition of the first. The only change to how evidence is written is that ANCHOR now
   supersedes its own previous envelope instead of being unable to replace it.
 - **No migration.** Nothing was added to the schema; `alembic check` reports no
   new upgrade operations. Head stays at `0011`.

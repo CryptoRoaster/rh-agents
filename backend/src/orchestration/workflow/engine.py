@@ -127,6 +127,29 @@ def unusable_reason(item: EvidenceEnvelope, now: datetime) -> str | None:
     return None
 
 
+def aged_out(item: EvidenceEnvelope, now: datetime) -> bool:
+    """Whether age is the *only* thing wrong with this envelope.
+
+    `effective_status` reports `STALE` for anything past its validity, whatever
+    it says inside, and that is the right answer to the question every reader
+    asks it: *may I use this now?* It is the wrong answer to a different
+    question — *would this have been usable if it were current?* — and only the
+    second one decides whether observing again could change anything.
+
+    An envelope that was refused, or that established nothing, answers no. It
+    keeps answering no as it gets older, because time passing is not new
+    information about a market. Asked here rather than read off a blocker code,
+    because the evaluator reports the first thing wrong with an envelope and age
+    outranks the verdict once both are true: a finding re-labelled `STALE` still
+    has to be read as a finding.
+    """
+    if item.effective_status(now) is not EvidenceStatus.STALE:
+        return False
+    if item.status is not EvidenceStatus.AVAILABLE:
+        return False
+    return item.payload.acceptance() is EvidenceAcceptance.ACCEPTED
+
+
 class TradeCaseEvaluator:
     def __init__(self, policy: WorkflowPolicy = TRADE_CASE_V1) -> None:
         self.policy = policy

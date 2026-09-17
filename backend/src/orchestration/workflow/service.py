@@ -27,7 +27,12 @@ from src.data.tables import (
     TradeCaseTransitionRow,
 )
 from src.markets.models import MarketIdentity
-from src.orchestration.workflow.engine import Evaluation, TradeCaseEvaluator, active_evidence
+from src.orchestration.workflow.engine import (
+    Evaluation,
+    TradeCaseEvaluator,
+    active_evidence,
+    aged_out,
+)
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
     TERMINAL_TASK_STATUSES,
@@ -958,9 +963,11 @@ class TradeCaseService:
 
         `BLOCKED` needs one, because a case is blocked for whatever the evaluator
         found wrong with it. The published blockers say which evidence that was,
-        and the envelope itself says whether the matter is age — read here
-        through `effective_status`, so a negative assessment can never be
-        re-armed into a second opinion by a caller that says the word stale.
+        and `aged_out` says whether age is the only thing wrong with it — the
+        stored status and the verdict in the payload, not just the clock. An
+        assessment that refused this market is still refusing it when it
+        expires, and re-arming on that basis would be a second opinion bought
+        with nothing but time.
         """
         status = TradeCaseStatus(row.status)
         if status is TradeCaseStatus.READY_FOR_RISK:
@@ -977,7 +984,7 @@ class TradeCaseService:
         ).all()
         current = active_evidence(tuple(evidence_from_row(item) for item in rows))
         item = current.get(refreshable.evidence_type)
-        if item is None or item.effective_status(self.clock.now()) is not EvidenceStatus.STALE:
+        if item is None or not aged_out(item, self.clock.now()):
             return SourceRefreshOutcome.SOURCE_NOT_STALE
         return None
 

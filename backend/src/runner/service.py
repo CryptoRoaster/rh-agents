@@ -523,6 +523,21 @@ class BoundedPaperRun:
         # authorised — and if its short window has since closed, the fill says
         # so rather than being granted an extension.
         key = order_key(trade_case_id)
+        if not account.may_step(deadline):
+            # Bringing this case back to where a request is possible was work,
+            # and work spends the budget. Asked before the call rather than
+            # corrected after it: the refresh above is committed and stays
+            # committed, and the one request this case is entitled to belongs to
+            # whichever explicit run can still afford it — under the same key.
+            account.record(
+                CaseProgress(
+                    trade_case_id=trade_case_id,
+                    status=case.status.value,
+                    reason_code=_code(case.reason_code),
+                    refreshes=tuple(refreshes),
+                )
+            )
+            return
         account.steps += 1
         verdict = await self._attempt(
             stack.risk.request_risk_evaluation(trade_case_id, request_key=key),

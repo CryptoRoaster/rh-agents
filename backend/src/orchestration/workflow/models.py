@@ -1213,9 +1213,11 @@ class SourceRefreshOutcome(StrEnum):
     # waiting on a risk request, not blocked on a source that has merely aged
     # out, or already finished.
     CASE_NOT_READY = "CASE_NOT_READY"
-    # The case is blocked, and not on this source being old. A negative
+    # The case is blocked, and not on this source having merely aged. A negative
     # assessment, an unavailable one, or evidence that established nothing are
-    # all real findings, and observing again is not the answer to any of them.
+    # all real findings, and observing again is not the answer to any of them —
+    # including after they expire, because a finding does not become a gap by
+    # getting old.
     SOURCE_NOT_STALE = "SOURCE_NOT_STALE"
     # Somebody already ordered this and it has not produced a reading yet. A
     # second order would be a duplicate of work already outstanding.
