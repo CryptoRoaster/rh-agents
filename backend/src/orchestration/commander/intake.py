@@ -159,8 +159,17 @@ class CommanderIntakeService:
         """
         return uuid5(NAMESPACE_URL, f"rh-agents:{self.intake_key(candidate, predecessor)}")
 
-    async def run_cycle(self) -> IntakeOutcome:
-        """One bounded pass over recorded candidates."""
+    async def run_cycle(self, *, limit: int = 50) -> IntakeOutcome:
+        """One bounded pass over recorded candidates.
+
+        `limit` bounds how many candidates are *read and judged*, which is a
+        different quantity from how many may become cases — that one is
+        `policy.max_cases_per_cycle`. A caller working to its own budget says
+        how much of the recorded market this pass should look at; how much of it
+        may be taken on stays a policy decision.
+        """
+        if not 1 <= limit <= 50:
+            raise ValueError("One intake cycle must read between one and fifty candidates")
         if await self._halted():
             return IntakeOutcome(refused=(("*", IntakeRefusal.SYSTEM_PAUSED),))
 
@@ -168,7 +177,7 @@ class CommanderIntakeService:
         opened: list[TradeCase] = []
         refused: list[tuple[str, IntakeRefusal]] = []
         candidates = await self.markets.candidates(
-            include_fixtures=self.policy.allow_fixtures, limit=50
+            include_fixtures=self.policy.allow_fixtures, limit=limit
         )
         # Deterministic order, oldest observation first, so a bounded cycle
         # always takes the same candidates from the same set rather than

@@ -6,6 +6,7 @@ enough to prove the runtime; probabilistic reasoning arrives in a later phase.
 """
 
 import asyncio
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Protocol
@@ -180,6 +181,10 @@ class WorkerRunner:
         self.runtime_version = runtime_version
         self.poll_interval = poll_interval
         self.worker_instance_id: UUID | None = None
+        # The lease this runner is holding, or last held. A caller whose own
+        # attempt was cut off still needs to know which case it spent its
+        # budget on; `run_once` cannot return that once it has stopped waiting.
+        self.last_lease: TaskLease | None = None
 
     async def register(self) -> UUID:
         instance = await self.service.register_worker(
@@ -192,13 +197,24 @@ class WorkerRunner:
         self.worker_instance_id = instance.worker_instance_id
         return instance.worker_instance_id
 
-    async def run_once(self) -> TaskDisposition | None:
-        """Claim at most one task and carry it to a durable disposition."""
+    async def run_once(
+        self, *, trade_case_ids: Collection[UUID] | None = None
+    ) -> TaskDisposition | None:
+        """Claim at most one task and carry it to a durable disposition.
+
+        `trade_case_ids` narrows what may be claimed, for a caller working to a
+        budget. Applied where the claim happens rather than afterwards: a task
+        claimed and then dropped is a lease nobody is working.
+        """
         if self.worker_instance_id is None:
             raise WorkerFailure(WorkerErrorCode.WORKER_NOT_FOUND)
-        lease = await self.service.claim_next_task(self.worker_instance_id)
+        self.last_lease = None
+        lease = await self.service.claim_next_task(
+            self.worker_instance_id, trade_case_ids=trade_case_ids
+        )
         if lease is None:
             return None
+        self.last_lease = lease
         try:
             report = await self.handler.handle(lease, self.capabilities.build(lease))
         except asyncio.CancelledError:

@@ -10,6 +10,7 @@ Lock ordering is always TradeCase first, then task, matching the Phase 2A comman
 services, so worker claims can never deadlock against workflow commands.
 """
 
+from collections.abc import Collection
 from datetime import datetime
 from hashlib import sha256
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -217,7 +218,12 @@ class WorkerRuntimeService:
 
     # ---------------------------------------------------------------------- claim
 
-    async def claim_next_task(self, worker_instance_id: UUID) -> TaskLease | None:
+    async def claim_next_task(
+        self,
+        worker_instance_id: UUID,
+        *,
+        trade_case_ids: Collection[UUID] | None = None,
+    ) -> TaskLease | None:
         """Atomically take exclusive, time-bounded authority over one task.
 
         Candidates are read without a lock, then each is confirmed under the
@@ -225,6 +231,13 @@ class WorkerRuntimeService:
         SKIP LOCKED so independent workers proceed in parallel while two claimers of
         the same case serialize. PostgreSQL is authoritative here; SQLite cannot
         reproduce SKIP LOCKED and those tests are skipped.
+
+        `trade_case_ids` narrows the search to a caller's allowed working set.
+        Applied to the candidate query rather than after a claim, because taking
+        exclusive authority over somebody else's task and then dropping it holds
+        a lease nobody is working, for as long as the lease lasts. An empty
+        collection means the caller may work on nothing and is answered `None`
+        without touching the table.
         """
         async with self.sessions.begin() as session:
             worker = await self._active_worker(session, worker_instance_id)
@@ -235,16 +248,22 @@ class WorkerRuntimeService:
                 # claimable through the evidence-submission runtime in Phase 2B.
                 raise WorkerFailure(WorkerErrorCode.ROLE_NOT_AUTHORIZED)
             now = self.clock.now()
+            if trade_case_ids is not None and not trade_case_ids:
+                return None
+            statement = select(TradeCaseTaskRow).where(
+                TradeCaseTaskRow.role == role.value,
+                TradeCaseTaskRow.task_type == task_type,
+                TradeCaseTaskRow.status.in_(CLAIMABLE_TASK_STATUSES),
+            )
+            if trade_case_ids is not None:
+                statement = statement.where(
+                    TradeCaseTaskRow.trade_case_id.in_(list(trade_case_ids))
+                )
             candidates = (
                 await session.scalars(
-                    select(TradeCaseTaskRow)
-                    .where(
-                        TradeCaseTaskRow.role == role.value,
-                        TradeCaseTaskRow.task_type == task_type,
-                        TradeCaseTaskRow.status.in_(CLAIMABLE_TASK_STATUSES),
+                    statement.order_by(TradeCaseTaskRow.created_at, TradeCaseTaskRow.task_id).limit(
+                        self.policy.claim_batch
                     )
-                    .order_by(TradeCaseTaskRow.created_at, TradeCaseTaskRow.task_id)
-                    .limit(self.policy.claim_batch)
                 )
             ).all()
             for candidate in candidates:

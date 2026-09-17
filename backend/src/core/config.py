@@ -215,6 +215,28 @@ class Settings(BaseSettings):
     # Configuring them authorises nothing.
     paper_fee_bps: ConfiguredBps | None = None
     paper_slippage_bps: ConfiguredBps | None = None
+    # Phase 2N-A bounded PAPER run. Disabled by default like every other
+    # runnable thing here, and it starts nothing on its own: the flag says the
+    # operator consents to a run existing, and a run still only happens when
+    # somebody invokes `python -m src.runner.main --once`. The API never reads
+    # it, so booting the web process can never begin one.
+    paper_runner_enabled: bool = False
+    # Hard bounds on one run. Every one of them is an upper limit, never a
+    # target: a run that reaches a limit stops and says so, and what it did not
+    # reach is left for the next explicit run rather than retried in place.
+    # How many recorded candidates one pass may process, and how many of them
+    # may become cases. Two numbers because they are two questions: reading a
+    # market costs a read, opening a case creates work somebody has to finish
+    # or expire.
+    paper_runner_max_candidates: int = Field(default=5, ge=1, le=50)
+    paper_runner_max_new_cases: int = Field(default=3, ge=1, le=50)
+    paper_runner_max_steps: int = Field(default=40, ge=1, le=500)
+    paper_runner_max_cases: int = Field(default=3, ge=1, le=20)
+    # The whole run, and one external wait inside it. The second bounds what a
+    # single provider or model call may cost in wall-clock time; the first
+    # bounds the run regardless of what any individual step does.
+    paper_runner_max_seconds: int = Field(default=300, ge=5, le=3600)
+    paper_runner_step_timeout_seconds: int = Field(default=60, ge=1, le=300)
     # Where executable quotes come from. "disabled" fails closed: without a quote
     # source ANCHOR establishes no capacity at all, which is the correct outcome
     # rather than a gap to be filled with pool liquidity multiplied by a guess.
@@ -224,6 +246,21 @@ class Settings(BaseSettings):
     kyberswap_base_url: str = "https://aggregator-api.kyberswap.com"
     kyberswap_connect_timeout_seconds: int = Field(default=5, ge=1, le=30)
     kyberswap_read_timeout_seconds: int = Field(default=10, ge=1, le=60)
+
+    @model_validator(mode="after")
+    def paper_runner_configuration(self) -> "Settings":
+        """A run may only exist where PAPER execution was actually chosen.
+
+        Checked at settings level so the refusal happens before the process
+        reaches anything that could write, and so the same mistake is caught
+        identically wherever a `Settings` is built.
+        """
+        if self.paper_runner_enabled and self.trading_mode is not TradingMode.PAPER:
+            raise ValueError("The bounded paper run requires TRADING_MODE=PAPER")
+        if self.paper_runner_step_timeout_seconds > self.paper_runner_max_seconds:
+            # A single wait that may outlast the whole run is not a bound.
+            raise ValueError("A single step may not be allowed to outlast the run")
+        return self
 
     @model_validator(mode="after")
     def reasoning_configuration(self) -> "Settings":
