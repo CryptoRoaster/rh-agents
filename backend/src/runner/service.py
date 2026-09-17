@@ -214,6 +214,14 @@ class BoundedPaperRun:
         )
         try:
             await self._intake(account, deadline)
+            if account.intake_unknown:
+                # The cycle committed an unknown number of cases, and this run
+                # cannot say which. Carrying on would hand the case budget out a
+                # second time — the working set is read from the database, and
+                # what intake opened is not in it — so the pass ends here. What
+                # committed stays committed and is ordinary work for the next
+                # explicit run.
+                return self._summary(started, account)
             await self._work(account, deadline)
             await self._decide(account, deadline)
         except SystemPauseUnavailable:
@@ -258,6 +266,14 @@ class BoundedPaperRun:
             )
         except (SystemPauseUnavailable, asyncio.CancelledError):
             raise
+        except TimeoutError:
+            # Out of time inside the cycle. Both facts are true and both are
+            # reported: the run reached its deadline, and what intake had
+            # already committed cannot be counted.
+            account.intake_unknown = True
+            account.stop = RunStop.TIME_BUDGET_REACHED
+            account.fail("INTAKE_OUTCOME_UNKNOWN")
+            return
         except Exception:
             # The cycle commits one case at a time, so it may have opened some
             # before it stopped. This run cannot say how many without counting

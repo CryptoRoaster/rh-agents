@@ -207,10 +207,14 @@ Three distinctions the output makes deliberately:
   a fill that then fails cannot take a committed approval down with it, and a
   database that stops answering after a fill cannot make the run report zero
   fills for a fill that really happened.
-- **An unconfirmed intake is named, not counted.** The cycle commits one case at
-  a time, so a cycle that stopped part-way may have opened some. The run does not
-  count rows — another run's commits are not its own — it reports
-  `intake_outcome_unknown` and leaves the count at zero.
+- **An unconfirmed intake is named, not counted — and ends the pass.** The cycle
+  commits one case at a time, so a cycle that stopped part-way may have opened
+  some. The run does not count rows — another run's commits are not its own — it
+  reports `intake_outcome_unknown`, leaves the count at zero, and stops. Carrying
+  on would hand the case budget out a second time: the working set is read from
+  the database, and what that cycle opened is not in it. What committed stays
+  committed and is ordinary work for the next explicit run. A cycle that timed
+  out reports `TIME_BUDGET_REACHED` as well, and mutates nothing further either.
 
 Safe by construction: every value is an identifier this system already exposes, a
 count, or a typed reason code from a published vocabulary. No secret, provider
