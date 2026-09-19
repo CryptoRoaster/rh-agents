@@ -339,6 +339,7 @@ def test_the_summary_carries_no_secret_and_no_payload(risk_db):
         "cases_opened",
         "intake_outcome_unknown",
         "intake_refusals",
+        "acquisition",
         "steps_taken",
         "steps_timed_out",
         "cases",
