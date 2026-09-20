@@ -30,6 +30,12 @@ from tests.runner.conftest import (
     stack_for,
 )
 
+# The whole run, as this test module's own input. Generous on purpose:
+# everything before a deliberately hanging call has to fit inside it on a
+# machine running the rest of the suite beside it, and the property under test
+# is what happens when the bound is reached — not how narrow the bound is.
+RUN_SECONDS = 2.0
+
 
 async def stored_request(sessions, trade_case_id):
     async with sessions() as session:
@@ -188,6 +194,16 @@ async def test_an_unknown_outcome_is_reported_as_unknown(risk_db, now, trace):
     No success is invented and no failure either: the case is marked with an
     unknown outcome, and the next explicit run addresses the same order key and
     finds out what really happened.
+
+    The two facts this rests on are established by events rather than by
+    assuming how quickly a scheduler gets anywhere: the request really was
+    entered, and the run really cancelled it and waited for that cancellation.
+    An earlier version asserted on a case the run had to reach inside fifty
+    milliseconds, which under a loaded machine it sometimes did not — and the
+    test then failed while looking up a case that was legitimately absent,
+    saying nothing about the contract it was meant to protect. The deadline is
+    the test's own input and is now ample; the timeout being tested is the run's
+    own and is unchanged.
     """
     import asyncio
 
@@ -196,13 +212,25 @@ async def test_an_unknown_outcome_is_reported_as_unknown(risk_db, now, trace):
     settings = runner_settings()
     stack = stack_for(sessions, settings, now)
     case = await ready_case(stack.cases, now, trace, key="runner-unknown")
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
 
     async def never_answers(*arguments, **keywords):
-        await asyncio.Event().wait()
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        raise AssertionError("unreachable")  # pragma: no cover
 
     object.__setattr__(stack.risk, "request_risk_evaluation", never_answers)
 
-    summary = await BoundedPaperRun(stack, deadline=Deadline(0.05)).execute()
+    summary = await BoundedPaperRun(stack, deadline=Deadline(RUN_SECONDS)).execute()
+
+    # The call was reached, and the run cut it off rather than abandoning it.
+    assert entered.is_set(), "the risk request was never reached"
+    assert cancelled.is_set(), "the hanging request was abandoned rather than cancelled"
 
     progress = next(item for item in summary.cases if item.trade_case_id == case.id)
     assert progress.outcome_unknown is True
