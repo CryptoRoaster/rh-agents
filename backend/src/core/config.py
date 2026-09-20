@@ -237,6 +237,33 @@ class Settings(BaseSettings):
     # bounds the run regardless of what any individual step does.
     paper_runner_max_seconds: int = Field(default=300, ge=5, le=3600)
     paper_runner_step_timeout_seconds: int = Field(default=60, ge=1, le=300)
+    # Phase 2N-C bounded market acquisition. Disabled by default and separate
+    # from `paper_runner_enabled`, because consenting to a run is not consenting
+    # to that run calling a public market provider. With this off, a run behaves
+    # exactly as it did before: it reads whatever `src.markets.ingest` or a
+    # market watcher recorded, and asks nobody for anything.
+    #
+    # It is also deliberately not reachable from `src.markets.ingest`. That CLI
+    # keeps its own permissions and its own discovery-only semantics; nothing
+    # here widens them.
+    paper_runner_market_acquisition_enabled: bool = False
+    # How many markets one run may have observed again. The single most
+    # important bound here: every other cost is proportional to it.
+    paper_runner_acquisition_max_markets: int = Field(default=4, ge=1, le=20)
+    # How many bounded discovery reads may be performed, across all configured
+    # chains. Zero is meaningful and is not "no acquisition": it acquires only
+    # the markets the existing cases and positions already depend on, and looks
+    # for nothing new.
+    paper_runner_acquisition_max_discovery_requests: int = Field(default=1, ge=0, le=4)
+    # Provider requests and HTTP attempts, the second including retries. Both
+    # are applied to the provider's *own* budgets rather than beside them: the
+    # transport is built with the lower of the two, so a run can only ever
+    # tighten what the provider configuration already allows, never loosen it.
+    paper_runner_acquisition_max_provider_requests: int = Field(default=6, ge=1, le=10)
+    paper_runner_acquisition_max_http_attempts: int = Field(default=8, ge=1, le=10)
+    # The whole acquisition stage, measured monotonically and additionally
+    # bounded by whatever is left of the run's own runtime.
+    paper_runner_acquisition_max_seconds: int = Field(default=60, ge=1, le=600)
     # Where executable quotes come from. "disabled" fails closed: without a quote
     # source ANCHOR establishes no capacity at all, which is the correct outcome
     # rather than a gap to be filled with pool liquidity multiplied by a guess.
@@ -260,6 +287,20 @@ class Settings(BaseSettings):
         if self.paper_runner_step_timeout_seconds > self.paper_runner_max_seconds:
             # A single wait that may outlast the whole run is not a bound.
             raise ValueError("A single step may not be allowed to outlast the run")
+        if self.paper_runner_market_acquisition_enabled:
+            if not self.paper_runner_enabled:
+                # Acquisition is a stage of a run, not a thing of its own. A
+                # configuration that switched it on without switching a run on
+                # describes something that can never happen, and saying so at
+                # boot is better than silently doing nothing at use.
+                raise ValueError("Market acquisition requires the bounded paper run")
+            if self.market_provider != "geckoterminal":
+                # The fixture provider records nothing and has nothing to ask.
+                # Falling back to it would mean a run that believes it refreshed
+                # its markets and did not.
+                raise ValueError("Market acquisition requires a real market provider")
+            if self.paper_runner_acquisition_max_seconds > self.paper_runner_max_seconds:
+                raise ValueError("Acquisition may not be allowed to outlast the run")
         return self
 
     @model_validator(mode="after")

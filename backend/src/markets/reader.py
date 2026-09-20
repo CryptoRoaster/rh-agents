@@ -1,5 +1,6 @@
 """Read-only recorded market view. New unavailable data never falls back to older values."""
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, or_, select
@@ -7,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.clock import Clock, SystemClock
 from src.data.tables import MarketObservationRow as Row
-from src.markets.models import MarketCandidate, MarketSnapshot
+from src.markets.models import MarketCandidate, MarketIdentity, MarketSnapshot
 
 
 class MarketReader:
@@ -86,6 +87,70 @@ class MarketReader:
             identity=identity, include_fixtures=include_fixtures, limit=1
         )
         return snapshots[0] if snapshots else None
+
+    async def identities(
+        self,
+        identifiers: Sequence[str],
+        *,
+        include_fixtures: bool = False,
+        limit: int = 50,
+    ) -> tuple[MarketIdentity, ...]:
+        """Which markets were ever recorded under these identifiers.
+
+        Deliberately **not** a market reading, and the difference is the whole
+        point of keeping it here rather than widening `markets`. What comes back
+        is coordinates — provider, chain, network, pair, both assets, venue and
+        pool locator — and never a price, a liquidity figure or an availability
+        claim. It carries no freshness and cannot be mistaken for current data,
+        so asking it costs nothing the freshness contract protects.
+
+        That is exactly why it ignores age: the one caller that needs it is
+        about to ask a provider to observe these markets *again*, and a market
+        whose last reading aged out is the one most in need of that. Answering
+        only for fresh rows would make re-acquisition possible only where it was
+        unnecessary.
+
+        The newest row per stream decides, ranked before any identifier filter
+        for the same reason `markets` ranks first: a later event that renamed
+        nothing must still be what answers for its market. An `asset_id` may
+        legitimately match several pairs — a token trades in more than one pool
+        — and every one of them comes back, because choosing between them is the
+        caller's decision to make explicitly rather than the database's to make
+        by ordering.
+        """
+        if not 1 <= limit <= 100:
+            raise ValueError("Invalid identity limit")
+        wanted = [item for item in dict.fromkeys(identifiers) if item]
+        if not wanted:
+            return ()
+        ranked = select(
+            Row.id,
+            func.row_number()
+            .over(
+                partition_by=(Row.provider, Row.pair_id, Row.is_fixture),
+                order_by=(Row.observed_at.desc(), Row.recorded_at.desc(), Row.id.desc()),
+            )
+            .label("rank"),
+        )
+        newest = ranked.subquery()
+        statement = (
+            select(Row)
+            .join(newest, Row.id == newest.c.id)
+            .where(
+                newest.c.rank == 1,
+                or_(Row.asset_id.in_(wanted), Row.pair_id.in_(wanted)),
+            )
+        )
+        if not include_fixtures:
+            statement = statement.where(Row.is_fixture.is_(False))
+        statement = statement.order_by(
+            Row.observed_at.desc(), Row.recorded_at.desc(), Row.id.desc()
+        ).limit(limit)
+        async with self._sessions() as session:
+            rows = (await session.scalars(statement)).all()
+        return tuple(
+            MarketSnapshot.model_validate(row.payload).pair.market_identity for row in rows
+        )
 
     async def observations(
         self,

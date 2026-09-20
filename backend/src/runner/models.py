@@ -66,6 +66,10 @@ class RunStop(StrEnum):
     # Nothing left that this run may do: no claimable task, nothing ready, and
     # nothing approved. The ordinary ending.
     NOTHING_LEFT_TO_DO = "NOTHING_LEFT_TO_DO"
+    # A market observation may or may not have been recorded, and this run
+    # cannot say which. Everything after it would be a trading decision taken
+    # over data of unknown provenance, so the pass ends instead.
+    ACQUISITION_OUTCOME_UNKNOWN = "ACQUISITION_OUTCOME_UNKNOWN"
     STEP_BUDGET_REACHED = "STEP_BUDGET_REACHED"
     TIME_BUDGET_REACHED = "TIME_BUDGET_REACHED"
     CASE_BUDGET_REACHED = "CASE_BUDGET_REACHED"
@@ -129,6 +133,176 @@ class SourceRefresh(Immutable):
     attempt: int | None = Field(default=None, ge=1)
 
 
+class AcquisitionNeed(StrEnum):
+    """Why one market was on this run's acquisition list.
+
+    Reported per market because the four are not interchangeable. A market the
+    portfolio must be valued against is a precondition for *every* fill; one a
+    case needs is a precondition for that case alone; and a new candidate is not
+    a precondition for anything — it is work this run may take on if the budget
+    it did not spend on the first three allows.
+    """
+
+    # An open position's own market. Without it the portfolio cannot be marked,
+    # and SENTINEL refuses every case rather than judging a partial portfolio.
+    POSITION_VALUATION = "POSITION_VALUATION"
+    # The market an existing, non-terminal case is about.
+    CASE_MARKET = "CASE_MARKET"
+    # The market that prices a case's payment asset in dollars. A different
+    # reading from the pair's own, and one ANCHOR refuses to infer.
+    QUOTE_ASSET = "QUOTE_ASSET"
+    # Anything a bounded discovery read returned. Never a recommendation: what
+    # it produces is a recorded observation, which intake may or may not open a
+    # case from under its own rules.
+    NEW_CANDIDATE = "NEW_CANDIDATE"
+
+
+class AcquisitionOutcome(StrEnum):
+    """What came of asking about one market. Six answers, deliberately.
+
+    The distinctions that matter are between *what was durably written by this
+    run*, *what was already there*, *what was declined and will stay declined
+    until something changes*, *what broke*, and *what nobody can currently say*.
+    Collapsing any two of those would let a run report progress it did not make.
+    """
+
+    # This run's own write, confirmed durable by the recorder.
+    RECORDED = "RECORDED"
+    # Nothing new was written, and nothing needed to be: the event was already
+    # stored, or the same market had already been observed earlier in this very
+    # pass. A replay, and never counted as an observation this run made.
+    UNCHANGED = "UNCHANGED"
+    # A typed refusal before or during the request. No observation, and no
+    # reason to think a retry would change the answer.
+    REFUSED = "REFUSED"
+    # The provider or the database failed. Says nothing about the market.
+    FAILED = "FAILED"
+    # The call was cut off after it may have committed. This run does not know
+    # whether the observation exists, and says so rather than guessing.
+    UNKNOWN = "UNKNOWN"
+    # Planned, and never asked about, because a budget ran out first. Reported
+    # so a missing market is visibly a budget decision rather than a silence.
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"
+
+
+class AcquisitionStop(StrEnum):
+    """Why the acquisition stage ended."""
+
+    COMPLETED = "COMPLETED"
+    NOT_ENABLED = "NOT_ENABLED"
+    # The stage was switched on and this configuration cannot perform it. A
+    # mistake somebody made, and not a statement about any market.
+    CONFIGURATION_REFUSED = "CONFIGURATION_REFUSED"
+    # Nothing needed acquiring and no discovery was permitted.
+    NOTHING_TO_ACQUIRE = "NOTHING_TO_ACQUIRE"
+    MARKET_BUDGET_REACHED = "MARKET_BUDGET_REACHED"
+    REQUEST_BUDGET_REACHED = "REQUEST_BUDGET_REACHED"
+    TIME_BUDGET_REACHED = "TIME_BUDGET_REACHED"
+    # A stop was in force. No provider was called.
+    SYSTEM_STOPPED = "SYSTEM_STOPPED"
+    # The stop could not be read, or no stop source is configured at all.
+    # Different from being stopped, and treated the same way: unknown is not
+    # permission to spend somebody's provider budget.
+    SYSTEM_STOP_UNREADABLE = "SYSTEM_STOP_UNREADABLE"
+    PROVIDER_FAILED = "PROVIDER_FAILED"
+    DATABASE_UNAVAILABLE = "DATABASE_UNAVAILABLE"
+    OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN"
+
+
+class AcquisitionLimits(Immutable):
+    """The bounds one acquisition stage is held to.
+
+    Kept apart from `RunLimits` on purpose, and not merely for tidiness: a
+    candidate budget bounds how much recorded market intake may *judge*, a step
+    budget bounds how much work the specialists may do, and these bound what a
+    run may *ask a public provider for*. They bound different costs, paid to
+    different parties, and one number covering all of them would mean tightening
+    the provider spend by quietly doing less analysis.
+    """
+
+    # Distinct markets this run may have observed again. Duplicated needs cost
+    # nothing: one market is one observation however many things wanted it.
+    max_markets: int = Field(ge=1, le=20)
+    # Bounded discovery reads across all configured chains. Zero is a real and
+    # useful setting: acquire exactly what the open work depends on, and look
+    # for nothing new.
+    max_discovery_requests: int = Field(ge=0, le=4)
+    # Logical provider requests and HTTP attempts, the second including every
+    # retry and every helper query such as network resolution. Both are applied
+    # to the provider's own budgets rather than beside them.
+    max_provider_requests: int = Field(ge=1, le=10)
+    max_http_attempts: int = Field(ge=1, le=10)
+    max_seconds: int = Field(ge=1, le=600)
+
+    @property
+    def runtime(self) -> timedelta:
+        return timedelta(seconds=self.max_seconds)
+
+
+class AcquiredMarket(Immutable):
+    """One market on the list, and what became of it."""
+
+    pair_id: Identifier
+    chain: Identifier
+    # An `AcquisitionNeed` value.
+    need: Code
+    # An `AcquisitionOutcome` value.
+    outcome: Code
+    # A provider error code, a recorder refusal or a planning refusal. Always
+    # one of this system's own codes, never a provider message.
+    reason: Code | None = None
+
+
+class MarketAcquisition(Immutable):
+    """What one run asked the market provider for, and what it got.
+
+    Counted as it happens rather than assembled at the end, for the same reason
+    the run's own account is: an observation that was durably recorded stays
+    recorded whatever fails afterwards, and a summary built after a failure
+    would report zero and be wrong about the world.
+    """
+
+    kind: Literal["market_acquisition"] = "market_acquisition"
+    enabled: bool = Field(strict=True)
+    # An `AcquisitionStop` value.
+    stop: Code
+    # A second fact about that stop, where there is one. An unconfirmed system
+    # stop reads the same whether the source refused or the deadline ran out
+    # first, and those call for different investigations.
+    detail: Code | None = None
+    limits: AcquisitionLimits | None = None
+    # Distinct markets this run asked the provider about **by identity**,
+    # counted when the request is issued rather than when it is answered. A read
+    # that failed afterwards does not make the asking un-happen, and a summary
+    # that counted answers would report zero for a pass that really did spend
+    # somebody's request budget. Never the number of entries below: two needs
+    # pointing at one market are one request.
+    requested: int = Field(default=0, ge=0)
+    # Market-budget slots this run committed: one per distinct market asked
+    # about, plus the capacity a discovery read was permitted to bring back.
+    # Committed *before* the request, so a market that was not returned, or was
+    # returned and refused, cannot hand its slot to something else — the work it
+    # cost was already done.
+    budget_spent: int = Field(default=0, ge=0)
+    recorded: int = Field(default=0, ge=0)
+    unchanged: int = Field(default=0, ge=0)
+    refused: int = Field(default=0, ge=0)
+    failed: int = Field(default=0, ge=0)
+    unknown: int = Field(default=0, ge=0)
+    not_attempted: int = Field(default=0, ge=0)
+    # What the provider transport actually spent, read from its own counters.
+    # The second includes retries, so the two differ exactly when something was
+    # retried — which is the fact an operator needs and a single number hides.
+    provider_requests: int = Field(default=0, ge=0)
+    http_attempts: int = Field(default=0, ge=0)
+    markets: tuple[AcquiredMarket, ...] = Field(default=(), max_length=64)
+
+    @property
+    def outcome_unknown(self) -> bool:
+        """Whether anything this stage did may or may not have happened."""
+        return self.unknown > 0 or self.stop == AcquisitionStop.OUTCOME_UNKNOWN.value
+
+
 class CaseProgress(Immutable):
     """What happened to one case in this run."""
 
@@ -183,6 +357,10 @@ class RunSummary(Immutable):
     # because "there was no work" and "the work did not finish" are different
     # facts about a run and lead to different questions.
     steps_timed_out: int = Field(default=0, ge=0)
+    # What this run asked the market provider for before it traded anything.
+    # Absent when acquisition is switched off, which is the ordinary case and
+    # is what every run before this contract did.
+    acquisition: MarketAcquisition | None = None
     cases: tuple[CaseProgress, ...] = Field(default=(), max_length=64)
     risk_requests: int = Field(default=0, ge=0)
     fills: int = Field(default=0, ge=0)

@@ -27,6 +27,7 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.agents.anchor.context import AnchorContextReader
@@ -60,7 +61,8 @@ from src.orchestration.worker.runner import CapabilityProvider, WorkerHandler, W
 from src.orchestration.worker.service import WorkerRuntimeService
 from src.orchestration.workflow.service import TradeCaseService
 from src.reasoning.provider import ReasoningProvider
-from src.runner.models import RoleAvailability, RunLimits
+from src.runner.acquisition import BoundedMarketAcquisition
+from src.runner.models import AcquisitionLimits, RoleAvailability, RunLimits
 from src.runtime.models import chain_configs
 
 Closer = Callable[[], Awaitable[None]]
@@ -104,6 +106,11 @@ class RunnerPorts:
     origins: object | None = None
     social: object | None = None
     pause: SystemPausePort | None = None
+    # The HTTP boundary the market acquisition reaches through. Supplied only
+    # where a caller is replacing the outside edge itself; everything above it —
+    # transport, network directory, adapter, normalization, recorder — stays the
+    # production object. A configuration cannot produce one.
+    market_http: httpx.AsyncBaseTransport | None = None
     # Everything built here that owns a connection pool. Closed by
     # `runner_stack` on success, on error and on cancellation alike.
     closers: tuple[Closer, ...] = ()
@@ -117,6 +124,16 @@ def limits_from_settings(settings: Settings) -> RunLimits:
         max_cases=settings.paper_runner_max_cases,
         max_runtime_seconds=settings.paper_runner_max_seconds,
         step_timeout_seconds=settings.paper_runner_step_timeout_seconds,
+    )
+
+
+def acquisition_limits_from_settings(settings: Settings) -> AcquisitionLimits:
+    return AcquisitionLimits(
+        max_markets=settings.paper_runner_acquisition_max_markets,
+        max_discovery_requests=settings.paper_runner_acquisition_max_discovery_requests,
+        max_provider_requests=settings.paper_runner_acquisition_max_provider_requests,
+        max_http_attempts=settings.paper_runner_acquisition_max_http_attempts,
+        max_seconds=settings.paper_runner_acquisition_max_seconds,
     )
 
 
@@ -242,6 +259,14 @@ class RunnerStack:
     runners: tuple[WorkerRunner, ...]
     roles: tuple[RoleAvailability, ...]
     clock: Clock
+    # The durable stop, as the run's own handle on it. The services that write
+    # already hold it; the run needs it to refuse to *ask a provider anything*
+    # before it starts, which is earlier than any of them is consulted.
+    pause: SystemPausePort | None = None
+    # Present only where the operator switched market acquisition on. Absent is
+    # the ordinary case and means exactly what it did before this contract: the
+    # run trades whatever was already recorded and asks nobody for anything.
+    acquisition: BoundedMarketAcquisition | None = None
     closers: tuple[Closer, ...] = ()
 
     @property
@@ -331,6 +356,20 @@ def build_stack(
         clock=tick,
     )
     runners, roles = _runners(settings, sessions, runtime, markets, supplied, tick)
+    acquisition = None
+    if settings.paper_runner_market_acquisition_enabled:
+        # Composed from settings and nothing else, like every other port here.
+        # Its own transport is built when it runs and closed when it finishes,
+        # so a run that never reaches the stage opens no connection at all.
+        acquisition = BoundedMarketAcquisition(
+            settings,
+            sessions,
+            markets,
+            acquisition_limits_from_settings(settings),
+            pause=supplied.pause,
+            clock=tick,
+            http=supplied.market_http,
+        )
     return RunnerStack(
         settings=settings,
         sessions=sessions,
@@ -345,6 +384,8 @@ def build_stack(
         runners=runners,
         roles=roles,
         clock=tick,
+        pause=supplied.pause,
+        acquisition=acquisition,
         closers=supplied.closers,
     )
 

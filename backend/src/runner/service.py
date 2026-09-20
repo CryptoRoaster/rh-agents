@@ -70,10 +70,13 @@ from src.orchestration.workflow.models import (
     SourceRefreshOutcome,
     TradeCaseStatus,
 )
+from src.runner.acquisition import disabled as no_acquisition
 from src.runner.composition import RunnerStack
 from src.runner.models import (
+    AcquisitionStop,
     CaseProgress,
     ConfigurationRefused,
+    MarketAcquisition,
     RunLimits,
     RunReading,
     RunStop,
@@ -147,6 +150,8 @@ class Account:
 
     limits: RunLimits
     stop: RunStop = RunStop.NOTHING_LEFT_TO_DO
+    # What this run asked the market provider for, before it traded anything.
+    acquisition: MarketAcquisition | None = None
     candidates_seen: int = 0
     cases_opened: int = 0
     intake_refusals: tuple[str, ...] = ()
@@ -229,6 +234,11 @@ class BoundedPaperRun:
             else Deadline(stack.limits.max_runtime_seconds)
         )
         try:
+            if not await self._acquire(account, deadline):
+                # Either a stop was in force before anything was asked, or an
+                # observation may or may not have been recorded. Both end the
+                # pass before a single mutating trading stage runs.
+                return self._summary(started, account)
             await self._intake(account, deadline)
             if account.intake_unknown:
                 # The cycle committed an unknown number of cases, and this run
@@ -256,6 +266,57 @@ class BoundedPaperRun:
         return self._summary(started, account)
 
     # ------------------------------------------------------------- the pass
+
+    async def _acquire(self, account: Account, deadline: Deadline) -> bool:
+        """Observe the markets the open work depends on, and say whether to go on.
+
+        The stage is absent unless an operator switched it on, and an absent one
+        is reported as absent rather than omitted: a run that traded on data
+        nobody refreshed and a run that refreshed it look identical in a summary
+        that says nothing about either.
+
+        Acquisition is never a permission. It can only end the pass early, and
+        only for two reasons: a stop was in force, or something may have been
+        written and may not have been. Everything else — a provider that failed,
+        a budget that ran out, a market that came back unavailable — leaves the
+        run to proceed exactly as it would have without this stage, with the
+        existing contracts blocking whatever the data does not support.
+        """
+        stage = self.stack.acquisition
+        if stage is None:
+            account.acquisition = no_acquisition()
+            return True
+        account.acquisition = await stage.execute(deadline)
+        stop = account.acquisition.stop
+        if stop == AcquisitionStop.SYSTEM_STOP_UNREADABLE.value:
+            # A safety question this deployment cannot answer. Unknown is not
+            # permission, and it is also not a healthy run.
+            account.stop = RunStop.SYSTEM_STOPPED
+            account.fail("SYSTEM_STOP_UNREADABLE")
+            return False
+        if stop == AcquisitionStop.SYSTEM_STOPPED.value:
+            account.stop = RunStop.SYSTEM_STOPPED
+            return False
+        if stop == AcquisitionStop.DATABASE_UNAVAILABLE.value:
+            account.fail("DATABASE_UNAVAILABLE")
+            return False
+        if stop == AcquisitionStop.CONFIGURATION_REFUSED.value:
+            # Switched on and not performable. Carrying on would trade over
+            # whatever happened to be recorded while reporting a stage that
+            # never ran, so the pass ends and says which it was.
+            account.fail("ACQUISITION_NOT_CONFIGURED")
+            return False
+        if account.acquisition.outcome_unknown:
+            # The conservative stop. What committed stays committed and is
+            # ordinary work for the next explicit run, which finds out what
+            # really happened by observing the same market again.
+            account.stop = RunStop.ACQUISITION_OUTCOME_UNKNOWN
+            account.fail("ACQUISITION_OUTCOME_UNKNOWN")
+            return False
+        if deadline.expired:
+            account.stop = RunStop.TIME_BUDGET_REACHED
+            return False
+        return True
 
     async def _bounded(self, work: Coroutine[Any, Any, T], deadline: Deadline) -> T:
         """Await something that touches the world, never past the deadline.
@@ -816,6 +877,7 @@ class BoundedPaperRun:
             stop=account.stop,
             limits=self.stack.limits,
             roles=self.stack.roles,
+            acquisition=account.acquisition,
             candidates_seen=account.candidates_seen,
             cases_opened=account.cases_opened,
             intake_refusals=account.intake_refusals,
