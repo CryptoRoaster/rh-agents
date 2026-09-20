@@ -65,7 +65,7 @@ committed one second later still stops the run.
 | `MARKET_CHAINS` | `selected_chains(settings)` |
 | `RUN_BUDGETS`, `MARKET_ACQUISITION` | the limit builders, plus the settings validators that already refused impossible combinations |
 | `ROLE_*` (one per role) | `RunnerStack.roles` and `RunnerStack.misconfigured` |
-| `DATABASE_SCHEMA` | the head of the migration chain that ships with the code, against the revision the database records |
+| `DATABASE_SCHEMA` | the head of the migration chain that ships with the code, against the **whole set** of revisions the database records |
 | `ACCOUNT_PAUSE` | `AccountPauseReader.system_paused()` |
 | `CREDENTIALS_PRESENT` | the `Settings` validators, which refuse a selected provider without its credential |
 
@@ -76,8 +76,12 @@ committed one second later still stops the run.
 - **`NOT_CHECKED`** — answering would mean calling somebody. Reported with the
   reason `REQUIRES_EXTERNAL_CALL`, or `TRANSIENT_AT_RUN_TIME` for a fact that
   would be stale the instant it was printed.
-- **`UNAVAILABLE`** — the check could not be carried out. A fault in the check,
-  not a verdict about the configuration, and never to be read as "not ready".
+- **`UNAVAILABLE`** — the check could not be carried out: the database did not
+  answer inside the bound, or the check could not be started or was interrupted.
+  A fault in the check, not a verdict about the configuration, and never to be
+  read as "not ready". It carries an error code, which is what derives the
+  technical exit — **the printed report and the process code come from the same
+  reading**, so they cannot describe different events.
 
 The report never claims a key is valid, a provider reachable or a market
 current. A configured credential is reported as *configured*; a selected
@@ -85,6 +89,9 @@ provider as *selected*. What cannot be known locally is named:
 `CREDENTIAL_VALIDITY`, `MARKET_PROVIDER_REACHABLE`, `MODEL_PROVIDER_REACHABLE`,
 `CHAIN_RPC_REACHABLE`, `QUOTE_PROVIDER_REACHABLE`, `FACT_SOURCE_REACHABLE`,
 `MARKET_DATA_CURRENT`, each only where the configuration actually selects it.
+Whether a fact source is selected is asked of the factories that compose them —
+one configured holder or origin indexer is enough, and the answer comes from
+their routing tables rather than from a second requirement list.
 
 ### Exit codes
 
@@ -103,10 +110,20 @@ credentials, URLs and exception texts are not representable in the model.
 ## The schema fact, stated once
 
 `src/data/schema.py` derives the expected revision from the migration chain
-beside the code and reads the recorded one through a connection its caller owns
-and bounds. Presence of `alembic_version` is asked before the row is read,
+beside the code and reads the recorded ones through a connection its caller owns
+and bounds. Presence of `alembic_version` is asked before the rows are read,
 because a statement that fails leaves a PostgreSQL transaction poisoned for
 everything after it.
+
+**The comparison is over the whole recorded set**, through one shared
+`is_current(recorded, expected)`. A database matches only when what it records
+is exactly the one head: no extra revision is ignored, and no row is selected to
+produce a match. Reading a single row made the answer depend on which row the
+engine returned first — with the expected head and one other revision recorded,
+one insertion order reported the database as current and the other reported a
+mismatch. An empty set is `SCHEMA_NOT_MIGRATED`, a single wrong one
+`SCHEMA_REVISION_MISMATCH`, and more than one `SCHEMA_MULTIPLE_REVISIONS`; all
+three are blocked, and nothing is ever repaired.
 
 The API's `/ready` was **completed** rather than duplicated: it now compares
 against that same derived head instead of the hard-coded `"0006"`. This is the
@@ -139,6 +156,10 @@ real schema and pause reads.
 | An ambiguous chain binding blocks the role that needs it; more chains than permitted are refused | `test_an_ambiguous_chain_binding_blocks_the_role_that_needs_it`, `test_more_chains_than_the_provider_permits_are_refused` |
 | Budgets are reported as a run would hold itself to them; an impossible combination never reaches a check | `test_the_budgets_a_run_would_hold_itself_to_are_reported`, `test_a_budget_combination_that_cannot_exist_is_refused_at_settings` |
 | A missing revision and an unexpected one are both blocked | `test_an_unmigrated_database_is_blocked`, `test_an_unexpected_revision_is_blocked` |
+| Only exactly the expected head is accepted; an extra recorded revision is refused in either insertion order, and `/ready` agrees case by case | `tests/runner/test_preflight_hardening.py::test_a_revision_set_that_is_not_exactly_the_head_is_refused`, `…::test_exactly_the_expected_head_is_accepted`, `…::test_the_ready_endpoint_agrees_with_the_preflight` |
+| A startup failure and an interruption are reported as unavailable, with the document and the process code agreeing; a real configuration error stays a refusal | `…::test_a_startup_failure_is_reported_as_unavailable`, `…::test_an_interrupted_check_is_reported_as_unavailable`, `…::test_a_real_configuration_error_stays_a_refusal` |
+| A single configured fact source is reported as unverifiable, and none means nothing to report | `…::test_one_configured_fact_source_is_reported_as_unverifiable`, `…::test_no_fact_source_means_nothing_to_report` |
+| Slow preparation does not change the unknown-outcome proof | `tests/runner/test_recovery.py::test_slow_preparation_does_not_change_the_unknown_outcome` |
 | A paused account is blocked | `test_a_paused_account_is_blocked` |
 | A hanging local read is cut off, its cancellation awaited, and reported as unavailable rather than as a verdict | `test_a_check_that_hangs_is_cut_off_and_reported_as_unavailable` |
 | No row changes | `test_a_preflight_changes_no_row` |
@@ -149,15 +170,29 @@ real schema and pause reads.
 | Invalid settings are refused without echoing them | `test_invalid_settings_are_reported_without_echoing_them` |
 | The published entry point runs the real check over a real database and writes nothing | `test_the_cli_mode_runs_the_real_check` |
 
-**The load-sensitive 2N-A test is now deterministic.**
+**The load-sensitive 2N-A test no longer depends on preparation speed.**
 `tests/runner/test_recovery.py::test_an_unknown_outcome_is_reported_as_unknown`
-proved entry and cancellation by assuming a run would reach a case inside fifty
-milliseconds; under a loaded machine it sometimes did not, and then failed while
-looking up a case that was legitimately absent. It now proves both with events —
-the request really was entered, and the run really cancelled it and awaited that
-cancellation — and the deadline, which is the *test's own input* and not a
-production bound, is generous. No production timeout was raised, no timeout
-property removed and no test skipped.
+shared one short deadline between *preparing* the pass and the *wait* it exists
+to prove, so a loaded machine could spend the budget on intake and database
+reads and never reach the risk request at all — and the test then failed while
+looking up a case that was legitimately absent.
+
+The two are now separated. A `HeldDeadline` — the production `Deadline` with one
+property replaced, so `expired` and `within` stay the run's own — reports an
+hour of remaining time while the pass prepares, and the substituted service
+marks it as reached at the moment the run *creates* the decisive call, which is
+where the run then reads its remaining time. From there the only thing inside
+the measured interval is a coroutine that already exists. The runner's own
+timeout contract is what cancels it; nothing is cancelled from outside. Entry
+and completed cancellation are proved by events, no background task survives,
+and a companion test repeats the whole pass with half a second of deliberate
+preparation delay to show it changes nothing.
+
+The single remaining timing assumption is that an already-created coroutine
+begins within the measured interval, and it fails loudly rather than silently if
+it does not. No production timeout was changed, no real wait was lengthened —
+the measured one is shorter than before — no timeout property was removed and no
+test skipped.
 
 ## Migration
 

@@ -50,12 +50,12 @@ from src.data.database import connect
 from src.runner.composition import RunnerPorts, RunnerStack, runner_stack
 from src.runner.models import (
     ConfigurationRefused,
-    ExitCode,
     RunReading,
     TechnicalFailure,
 )
 from src.runner.preflight import PreflightReading, preflight
 from src.runner.preflight import refused as preflight_refused
+from src.runner.preflight import unavailable as preflight_unavailable
 from src.runner.service import BoundedPaperRun
 
 
@@ -161,19 +161,26 @@ def _preflight(settings: Settings) -> int:
 
     A check that cannot be carried out is a technical failure rather than a
     verdict, and it says so with the same exit code a broken run uses: an
-    operator must never read "could not tell" as "not ready".
+    operator must never read "could not tell" as "not ready". The code comes
+    from the report that was printed, never from a second decision beside it.
     """
     try:
         reading = asyncio.run(check_only(settings))
     except KeyboardInterrupt:
-        interrupted = preflight_refused("PREFLIGHT_INTERRUPTED")
-        print(render(interrupted))
-        return int(ExitCode.TECHNICAL_FAILURE)
+        # Somebody stopped the check. That is not a verdict about any setting.
+        reading = preflight_unavailable(
+            "PREFLIGHT_INTERRUPTED", "The check was interrupted before it finished."
+        )
     except (SQLAlchemyError, OSError, ValueError):
-        failed = preflight_refused("PREFLIGHT_STARTUP_FAILED")
-        print(render(failed))
-        return int(ExitCode.TECHNICAL_FAILURE)
+        # Nothing was established, and the report says exactly that. The reason
+        # is a code: no exception text, connection string or configured value
+        # reaches the output.
+        reading = preflight_unavailable(
+            "PREFLIGHT_STARTUP_FAILED", "The check could not be started."
+        )
     print(render(reading))
+    # One contract: the document and the process code are derived from the same
+    # reading, so they cannot describe different events.
     return int(reading.exit_code)
 
 

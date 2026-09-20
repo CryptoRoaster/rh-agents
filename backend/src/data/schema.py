@@ -51,25 +51,41 @@ def expected_revision() -> str:
     return heads[0]
 
 
-async def recorded_revision(connection: AsyncConnection) -> str | None:
-    """What the database says it has been migrated to, or nothing.
+async def recorded_revisions(connection: AsyncConnection) -> frozenset[str]:
+    """Every revision this database records, as a set.
 
-    `None` covers both "the table is not there" and "it is there and empty",
-    because neither is a revision and a caller has the same thing to say about
-    them: this database has not been migrated by anything that left a record.
+    All of them, deliberately. Alembic writes one row per head, so a coherent
+    database carrying a single-headed chain records exactly one — and a database
+    recording two is not "current plus something harmless", it is a database
+    nobody can say has been migrated by this code. Reading one row and calling
+    it the answer makes that case depend on which row the engine happened to
+    return first, which is a coin toss deciding whether a schema check passes.
 
-    Presence is asked before the row is read, rather than by letting a missing
+    An empty set covers both "the table is not there" and "it is there and
+    empty", because neither is a revision and a caller has the same thing to say
+    about them: nothing has left a record here.
+
+    Presence is asked before the rows are read, rather than by letting a missing
     table raise. A statement that fails leaves a PostgreSQL transaction poisoned
     for everything after it, so a check that answers "not migrated" by breaking
     the connection it borrowed would take its caller's later reads with it.
 
-    Read-only throughout: nothing is created, migrated or written on the way.
+    Read-only throughout: nothing is created, migrated, repaired or written.
     """
 
     def present(sync: Connection) -> bool:
         return inspect(sync).has_table("alembic_version")
 
     if not await connection.run_sync(present):
-        return None
-    row = (await connection.execute(text("SELECT version_num FROM alembic_version"))).first()
-    return None if row is None else str(row[0])
+        return frozenset()
+    rows = (await connection.execute(text("SELECT version_num FROM alembic_version"))).all()
+    return frozenset(str(row[0]) for row in rows if row[0] is not None)
+
+
+def is_current(recorded: frozenset[str], expected: str) -> bool:
+    """Whether a database is the one this code was written against.
+
+    Equality of the whole set, never membership. One extra revision is enough
+    to make the answer no, and no row is ever picked to produce a yes.
+    """
+    return recorded == {expected}

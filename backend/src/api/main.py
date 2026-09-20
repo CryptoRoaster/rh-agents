@@ -9,7 +9,7 @@ from src.api.workers import router as workers_router
 from src.core.config import Settings
 from src.core.models import RiskLimits
 from src.data.database import connect
-from src.data.schema import SchemaUnknown, expected_revision, recorded_revision
+from src.data.schema import SchemaUnknown, expected_revision, is_current, recorded_revisions
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -35,12 +35,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         migration — a readiness check that passes because it compares against a
         revision nobody has shipped for months is worse than none, because it is
         believed. One read, and nothing is created or migrated on the way.
+
+        The comparison is over the whole recorded set, through the same contract
+        the preflight uses, so the two cannot disagree about what "current"
+        means and neither can be satisfied by one convenient row.
         """
         engine, _ = connect(settings.database_url)
         try:
             expected = expected_revision()
             async with engine.connect() as connection:
-                if await recorded_revision(connection) != expected:
+                if not is_current(await recorded_revisions(connection), expected):
                     raise HTTPException(status_code=503, detail="Database migration is not current")
         except SchemaUnknown as error:
             raise HTTPException(status_code=503, detail="Expected migration unknown") from error

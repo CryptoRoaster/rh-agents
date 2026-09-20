@@ -59,7 +59,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.core.clock import Clock, SystemClock
 from src.core.config import Settings
 from src.data.database import connect
-from src.data.schema import SchemaUnknown, expected_revision, recorded_revision
+from src.data.schema import SchemaUnknown, expected_revision, is_current, recorded_revisions
 from src.markets.geckoterminal.errors import ProviderError
 from src.markets.geckoterminal.networks import selected_chains
 from src.orchestration.commander.context import AccountPauseReader, SystemPauseUnavailable
@@ -321,6 +321,10 @@ class Preflight:
         never from a constant: a readiness check comparing against a revision
         nobody has shipped for months passes for the wrong reason, and is
         trusted while doing it.
+
+        The comparison is over the whole recorded set. A database is the one
+        this code expects only when what it records is exactly the one head —
+        no extra revision is ignored, and no row is selected to produce a match.
         """
         try:
             expected = expected_revision()
@@ -333,7 +337,7 @@ class Preflight:
                 note="The migration chain beside this code could not be read.",
             )
         try:
-            found = await self._bounded(self._read_revision())
+            found = await self._bounded(self._read_revisions())
         except TimeoutError:
             errors.append("DATABASE_TIMEOUT")
             return _check(
@@ -350,26 +354,36 @@ class Preflight:
                 reason="DATABASE_UNAVAILABLE",
                 note="The database could not be read.",
             )
-        if found is None:
+        if not found:
             return _blocked(
                 "DATABASE_SCHEMA",
                 "SCHEMA_NOT_MIGRATED",
                 f"Nothing recorded; this code expects revision {expected}.",
             )
-        if found != expected:
+        if len(found) > 1:
+            # Two recorded revisions are not "the right one plus something
+            # harmless". Nobody can say what this database has been migrated by,
+            # and which of them a single read returned is a property of the
+            # engine rather than of the deployment.
+            return _blocked(
+                "DATABASE_SCHEMA",
+                "SCHEMA_MULTIPLE_REVISIONS",
+                f"{len(found)} revisions recorded; this code expects only {expected}.",
+            )
+        if not is_current(found, expected):
             # Behind, ahead and unrelated are all "not the schema this code was
             # written against", and none of them is safe to run over.
             return _blocked(
                 "DATABASE_SCHEMA",
                 "SCHEMA_REVISION_MISMATCH",
-                f"Database at revision {found}; this code expects {expected}.",
+                f"Database at revision {next(iter(found))}; this code expects {expected}.",
             )
         return _satisfied("DATABASE_SCHEMA", f"Database and code agree on revision {expected}.")
 
-    async def _read_revision(self) -> str | None:
+    async def _read_revisions(self) -> frozenset[str]:
         async with self._sessions() as session:
             connection = await session.connection()
-            return await recorded_revision(connection)
+            return await recorded_revisions(connection)
 
     async def _pause(self, errors: list[str]) -> Check:
         """The durable stop, read the way every other reader reads it.
@@ -461,14 +475,31 @@ class Preflight:
             found.append(_external("CHAIN_RPC_REACHABLE", "No RPC endpoint is contacted."))
         if settings.execution_quote_provider != "disabled":
             found.append(_external("QUOTE_PROVIDER_REACHABLE", "No quote is requested."))
-        if settings.signal_social_provider != "disabled" or "disabled" not in {
-            settings.atlas_rh_holder_provider,
-            settings.atlas_bsc_holder_provider,
-            settings.atlas_rh_origin_provider,
-            settings.atlas_bsc_origin_provider,
-        }:
+        if self._fact_sources(settings):
             found.append(_external("FACT_SOURCE_REACHABLE", "No indexer or social source is read."))
         return found
+
+    @staticmethod
+    def _fact_sources(settings: Settings) -> bool:
+        """Whether any indexer or social source is selected at all.
+
+        Asked of the factories that decide it, which put exactly the configured
+        providers into their routing tables and leave the rest out. One selected
+        holder source is one this check cannot reach, and a condition of this
+        shape once required *all four* before it noticed — so a deployment with
+        a single indexer was reported as having nothing external to verify.
+
+        Constructing a source starts nothing and calls nobody, which is the
+        factories' own stated contract.
+        """
+        from src.agents.atlas.sources.factory import holder_sources, origin_sources
+        from src.agents.signal.sources.factory import social_source
+
+        return bool(
+            holder_sources(settings).sources
+            or origin_sources(settings).sources
+            or social_source(settings) is not None
+        )
 
 
 async def preflight(
@@ -488,9 +519,30 @@ async def preflight(
 
 
 def refused(reason: str, note: str = "") -> PreflightReading:
-    """A reading for a configuration that could not be built at all."""
+    """A reading for a configuration that could not be built at all.
+
+    A refusal: somebody has to change a setting. Blocked, no error, and the
+    exit code the report itself derives says so.
+    """
     return PreflightReading(
         checked_at=datetime.now(UTC).isoformat(),
         ready=False,
         checks=(_blocked("SETTINGS", reason, note),),
+    )
+
+
+def unavailable(reason: str, note: str = "") -> PreflightReading:
+    """A reading for a check that could not be carried out at all.
+
+    Deliberately not a refusal. Nothing was established about the
+    configuration, so reporting it as blocked would tell an operator to go and
+    change a setting over an event that says nothing about any setting — and
+    would derive an exit code that contradicts the one the process returns.
+    The error is what carries it to the technical exit.
+    """
+    return PreflightReading(
+        checked_at=datetime.now(UTC).isoformat(),
+        ready=False,
+        checks=(_check("PREFLIGHT", CheckStatus.UNAVAILABLE, reason=reason, note=note),),
+        errors=(reason,),
     )

@@ -87,9 +87,10 @@ a status:
 - **`NOT_CHECKED`** — answering would mean calling somebody. A configured key is
   reported as *configured*, never as valid; a selected provider as *selected*,
   never as reachable.
-- **`UNAVAILABLE`** — the check could not be carried out, usually because the
-  database did not answer inside `PAPER_RUNNER_STEP_TIMEOUT_SECONDS`. **Not the
-  same as "not ready"** — it means nobody can currently tell.
+- **`UNAVAILABLE`** — the check could not be carried out: the database did not
+  answer inside `PAPER_RUNNER_STEP_TIMEOUT_SECONDS`, or the check could not be
+  started or was interrupted. **Not the same as "not ready"** — it means nobody
+  can currently tell, and it is what produces exit `1`.
 
 Exit codes:
 
@@ -101,8 +102,11 @@ Exit codes:
 
 What it checks: whether a run is permitted at all (mode, runner switch, kill
 switch), the configured chains, the run and acquisition budgets, every role and
-whether this configuration can compose it, the database revision against the
-migration head this code ships with, and the durable account pause.
+whether this configuration can compose it, the database's **whole** recorded
+revision set against the migration head this code ships with — an extra
+revision beside the expected one is refused, never ignored — and the durable
+account pause. `/ready` answers the schema question through the same contract,
+so the two cannot disagree.
 
 **A green preflight is not an authorization.** It describes a moment that has
 already passed. The executing CLI still runs its own refusals, SENTINEL still
