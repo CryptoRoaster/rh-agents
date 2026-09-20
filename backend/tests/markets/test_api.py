@@ -93,6 +93,7 @@ async def test_database_failure_returns_503(monkeypatch):
 async def test_readiness_requires_new_migration(monkeypatch, market_sessions):
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test_user@localhost/test_database")
     from src.api.main import create_app
+    from src.data.schema import expected_revision
 
     engine = market_sessions.kw["bind"]
 
@@ -112,7 +113,10 @@ async def test_readiness_requires_new_migration(monkeypatch, market_sessions):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         assert (await client.get("/ready")).status_code == 503
         async with market_sessions.begin() as session:
-            await session.execute(text("UPDATE alembic_version SET version_num = '0006'"))
+            await session.execute(
+                text("UPDATE alembic_version SET version_num = :head"),
+                {"head": expected_revision()},
+            )
         assert (await client.get("/ready")).status_code == 200
 
 
