@@ -63,6 +63,11 @@ def acquiring_settings(**overrides):
         "paper_runner_acquisition_max_provider_requests": 6,
         "paper_runner_acquisition_max_http_attempts": 8,
         "paper_runner_acquisition_max_seconds": 30,
+        # The transport's retry still happens and is still counted; what these
+        # tests are about is that it is bounded, never how long it pauses
+        # first. Waiting out a real backoff would add seconds to the suite and
+        # prove nothing that the attempt counter does not already show.
+        "geckoterminal_retry_delay_seconds": 0,
     }
     return runner_settings(**{**defaults, **overrides})
 
@@ -658,7 +663,16 @@ async def test_a_provider_failure_keeps_what_was_already_recorded(risk_db, now, 
 
 
 async def test_an_unknown_recording_outcome_stops_before_any_trading_stage(risk_db, now, trace):
-    """A write that may or may not have committed ends the pass, conservatively."""
+    """A write that may or may not have committed ends the pass, conservatively.
+
+    The stage's own time budget is what cuts the recording off, so the test
+    states a one-second one: the interval being waited out is the bound under
+    test, and nothing is learned by making the suite sit through a longer one.
+    Entry and completed cancellation are events rather than assumptions about
+    how quickly the loop gets there.
+    """
+    import asyncio
+
     from src.core.clock import FixedClock
     from src.runner.composition import build_stack
     from src.runner.service import BoundedPaperRun
@@ -667,16 +681,22 @@ async def test_an_unknown_recording_outcome_stops_before_any_trading_stage(risk_
     model = ScriptedSpecialists()
     provider = MarketProvider(discovery=[traded(SPOT), payment()])
     stack = build_stack(
-        full_acquiring_settings(),
+        full_acquiring_settings(paper_runner_acquisition_max_seconds=1),
         sessions,
         ports=acquiring_ports(now, model, provider),
         clock=FixedClock(now),
     )
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
 
     async def never_answers(*arguments, **keywords):
-        import asyncio
-
-        await asyncio.sleep(3600)
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        raise AssertionError("unreachable")  # pragma: no cover
 
     from src.runner import acquisition as module
 
@@ -686,6 +706,9 @@ async def test_an_unknown_recording_outcome_stops_before_any_trading_stage(risk_
         summary = await BoundedPaperRun(stack).execute()
     finally:
         module.record_pair_reporting = original
+
+    assert entered.is_set(), "the recording was never reached"
+    assert cancelled.is_set(), "the hanging recording was abandoned rather than cancelled"
 
     assert summary.acquisition.stop == AcquisitionStop.OUTCOME_UNKNOWN.value, summary.acquisition
     assert summary.acquisition.unknown == 1
