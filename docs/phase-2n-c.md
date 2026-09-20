@@ -77,7 +77,14 @@ directions:
 - **a system stop, read before any provider call.** Paused, or a stop that
   cannot be read at all, means nobody is called and the pass ends —
   `SYSTEM_STOPPED`, and an unreadable stop is additionally a technical failure,
-  because unknown is not permission and is also not a healthy deployment;
+  because unknown is not permission and is also not a healthy deployment. The
+  question is itself bounded by the nearer of the acquisition and run deadlines,
+  and is not asked at all once that has passed: it is a read against a database
+  that may be unreachable, and an unbounded await on one would hold the whole
+  pass open for as long as that database liked. A query cut off that way is both
+  facts at once, and both are reported — `SYSTEM_STOP_UNREADABLE` with
+  `TIME_BUDGET_REACHED` as its detail. The cancellation is awaited, so nothing
+  continues against the database afterwards;
 - **an outcome nobody can state.** A recording call cut off after it may have
   committed ends the pass *before any further mutating trading stage*, with
   `ACQUISITION_OUTCOME_UNKNOWN`. Everything after it would be a decision taken
@@ -114,6 +121,20 @@ deliberately *not* a market reading: it returns coordinates only, never a price,
 a liquidity figure or an availability claim, which is why it may ignore age. A
 market whose last reading aged out is exactly the one that needs observing
 again.
+
+**The answer is bound to the planned identity.** For every market the run
+*planned*, the canonical identity the provider's answer normalizes to is
+compared with the identity that was planned, before anything is recorded —
+through `MarketIdentity`'s own equality, not a second definition. This is not
+covered by the checks under it: `observe()` compares the pair identifier, which
+for a pool address carries the chain, the network and the pool and nothing else,
+and `record_pair_reporting` compares the snapshot with the pair from the *same*
+answer, which agrees with itself by construction. An answer that kept the
+requested pool and named a different base asset, payment asset or venue is
+therefore refused with `MARKET_IDENTITY_MISMATCH`, nothing is written, and the
+market is left exactly as it was. Nothing is repaired, mapped or guessed. A
+discovered market has no planned identity to be held to: it *is* what the answer
+said, and intake judges it under its own rules.
 
 **Refused rather than substituted**, each with its own code and no request made:
 `PROVIDER_NOT_CONFIGURED`, `CHAIN_NOT_CONFIGURED` (never served from another
@@ -158,6 +179,21 @@ deadline.
 read asks for at most as many pools as this run may still record, and the
 targeted batch is fixed before it is sent. Nothing fetched is ever thrown away:
 truncating a response means paying for observations and discarding them.
+
+**The market budget is committed when work is triggered, not when it succeeds.**
+One slot per distinct market as the targeted request goes out, and, for a
+discovery read, the size of the answer it was permitted to return — reserved
+before it runs, because the request was made under that permission whatever
+comes back. A market that was not returned, or was returned and refused, keeps
+its slot: releasing it would let one market's budget buy a second request, and
+the work the first one cost has already been done. Deduplication is unaffected —
+two needs pointing at one market are one request and one slot.
+
+Four kinds of counter, kept apart: `provider_requests` and `http_attempts` are
+the transport's own (the second includes retries); `requested` and
+`budget_spent` are markets, counted when the request is issued, so a read that
+fails afterwards cannot make the asking un-happen; `recorded`, `unchanged`,
+`refused`, `failed`, `unknown` and `not_attempted` are results.
 
 Cancellation is awaited and the transport is closed on success, failure and
 cancellation alike, so no background work and no connection pool outlives the
@@ -224,6 +260,11 @@ source. **A fixture test is not evidence that the real provider works.**
 | An unknown recording outcome stops before any mutating trading stage | `test_an_unknown_recording_outcome_stops_before_any_trading_stage` |
 | A stop in force, and an unreadable stop, spend no provider request | `test_a_paused_system_is_not_asked_to_spend_a_provider_request`, `test_an_unreadable_stop_is_reported_as_a_fault_and_stops_the_pass` |
 | A stage that cannot be performed ends the pass rather than being skipped | `test_a_stage_this_configuration_cannot_perform_ends_the_pass` |
+| An answer that keeps the asked pool but swaps the base asset, the payment asset or the venue is refused, and nothing is written | `tests/runner/test_acquisition_hardening.py::test_a_swapped_base_asset_under_the_asked_pool_is_refused`, `…_quote_asset_…`, `…_venue_…` |
+| A market asked about and not returned, or returned and refused, still costs its budget — including across chains | `…::test_a_market_asked_about_and_not_returned_still_costs_its_budget`, `…::test_a_refused_recording_still_costs_its_budget`, `…::test_a_spent_budget_stops_the_second_chain_before_its_request` |
+| Discovery commits the capacity it was allowed to bring back, and a doubled need still costs one | `…::test_discovery_reserves_what_it_is_allowed_to_bring_back`, `…::test_one_market_wanted_twice_still_costs_one` |
+| A failed read does not erase the markets it asked about | `…::test_a_failed_read_does_not_erase_the_markets_it_asked_about` |
+| An expired deadline asks no stop source; a stop source that hangs is cut off, awaited, and ends the pass with nothing traded | `…::test_an_expired_deadline_never_asks_the_stop_source`, `…::test_a_stop_query_that_hangs_is_bounded_and_ends_the_pass` |
 | No database lock is held across a provider request | `tests/runner/test_acquisition_concurrency.py::test_no_provider_request_is_made_while_a_row_is_locked` (PostgreSQL only) |
 | Restart and concurrent runs stay recorder-idempotent, with at most one fill per order | `tests/runner/test_acquisition_concurrency.py` (PostgreSQL only) |
 | A historical replay is answered with no new acquisition | `test_a_historical_replay_needs_no_new_acquisition` |

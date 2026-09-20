@@ -266,11 +266,24 @@ class MarketAcquisition(Immutable):
     enabled: bool = Field(strict=True)
     # An `AcquisitionStop` value.
     stop: Code
+    # A second fact about that stop, where there is one. An unconfirmed system
+    # stop reads the same whether the source refused or the deadline ran out
+    # first, and those call for different investigations.
+    detail: Code | None = None
     limits: AcquisitionLimits | None = None
-    # Markets this run asked the provider about by identity, plus the markets a
-    # discovery read returned. Never the number of entries below: two needs
+    # Distinct markets this run asked the provider about **by identity**,
+    # counted when the request is issued rather than when it is answered. A read
+    # that failed afterwards does not make the asking un-happen, and a summary
+    # that counted answers would report zero for a pass that really did spend
+    # somebody's request budget. Never the number of entries below: two needs
     # pointing at one market are one request.
     requested: int = Field(default=0, ge=0)
+    # Market-budget slots this run committed: one per distinct market asked
+    # about, plus the capacity a discovery read was permitted to bring back.
+    # Committed *before* the request, so a market that was not returned, or was
+    # returned and refused, cannot hand its slot to something else — the work it
+    # cost was already done.
+    budget_spent: int = Field(default=0, ge=0)
     recorded: int = Field(default=0, ge=0)
     unchanged: int = Field(default=0, ge=0)
     refused: int = Field(default=0, ge=0)

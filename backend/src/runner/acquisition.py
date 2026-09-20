@@ -424,9 +424,17 @@ class Ledger:
 
     limits: AcquisitionLimits
     stop: AcquisitionStop = AcquisitionStop.COMPLETED
+    # A second fact about the stop, where there is one.
+    detail: str | None = None
     entries: list[AcquiredMarket] = field(default_factory=list)
+    # Distinct markets asked about by identity, counted as the request goes out.
     requested: int = 0
-    acquired: set[str] = field(default_factory=set)
+    # Market-budget slots committed. Committed when work is *triggered*, never
+    # when it succeeds: an answer that did not arrive, and one that arrived and
+    # was refused, both cost exactly what asking cost, and releasing the slot
+    # would let one market's budget buy a second request.
+    spent: int = 0
+    asked: set[str] = field(default_factory=set)
 
     def note(
         self,
@@ -449,8 +457,33 @@ class Ledger:
 
     @property
     def room(self) -> int:
-        """How many further distinct markets this run may still observe."""
-        return max(0, self.limits.max_markets - len(self.acquired))
+        """How much of the market budget is still uncommitted."""
+        return max(0, self.limits.max_markets - self.spent)
+
+    def commit(self, targets: list[AcquisitionTarget]) -> None:
+        """Spend one slot per distinct market, before a single one is asked for.
+
+        A market already asked about in this pass costs nothing further: two
+        needs pointing at one market are one request, and deduplication is what
+        makes that true rather than an accident of ordering.
+        """
+        for target in targets:
+            if target.identity.pair_id in self.asked:
+                continue
+            self.asked.add(target.identity.pair_id)
+            self.spent += 1
+            self.requested += 1
+
+    def reserve(self, capacity: int) -> None:
+        """Commit capacity a read is permitted to bring back, before it runs.
+
+        Discovery names no markets in advance, so what is committed is the size
+        of the answer it was allowed to return. Whatever it actually returns,
+        the request was made under that permission and the permission is spent —
+        the alternative is a pass that asks for three and, on being handed one,
+        believes it may go and ask for three more.
+        """
+        self.spent += capacity
 
 
 class BoundedMarketAcquisition:
@@ -515,15 +548,19 @@ class BoundedMarketAcquisition:
         transport: GeckoTerminalTransport | None = None
         try:
             chains = selected_chains(self._configured)
-            halted = await self._halted()
+            if window.expired:
+                # Out of time before the first question. Asking one now would
+                # start work that is already over budget, and the stop source is
+                # somebody else's database.
+                ledger.stop = AcquisitionStop.TIME_BUDGET_REACHED
+                return self._summary(ledger, transport)
+            halted, detail = await self._halted(window)
             if halted is not None:
                 # Read before anything is asked. A stop that is in force, or one
                 # that cannot be read at all, means no provider is called —
                 # unknown is not permission here either.
                 ledger.stop = halted
-                return self._summary(ledger, transport)
-            if window.expired:
-                ledger.stop = AcquisitionStop.TIME_BUDGET_REACHED
+                ledger.detail = detail
                 return self._summary(ledger, transport)
             plan = await self._plan(chains, window)
             ledger.entries.extend(plan.refused)
@@ -555,7 +592,7 @@ class BoundedMarketAcquisition:
                 await transport.__aexit__(None, None, None)
         return self._summary(ledger, transport)
 
-    async def _halted(self) -> AcquisitionStop | None:
+    async def _halted(self, window: Window) -> tuple[AcquisitionStop | None, str | None]:
         """Whether a durable stop forbids calling anybody, and which kind.
 
         Fails closed on every uncertainty, exactly as intake does: a missing
@@ -563,14 +600,36 @@ class BoundedMarketAcquisition:
         permission. A provider request is attention and money spent on behalf of
         a system that may have been stopped.
 
-        The two are still reported apart. Being stopped is an operator's
+        The kinds are still reported apart. Being stopped is an operator's
         decision working as intended; not being able to tell is a deployment
         that cannot answer a safety question, and reading one as the other would
         hide a broken installation behind a deliberate pause.
+
+        The question itself is bounded by the same window everything else here
+        is. It is a read against a database that may be unreachable, and an
+        unbounded await on it would hold the whole pass open for as long as that
+        database liked — past the run's own deadline, with the run unable to end
+        or to report anything. A query cut off that way is *both* facts at once:
+        the deadline was reached, and the stop was never confirmed. The second
+        decides what happens, because unconfirmed is not permission; the first
+        travels beside it, because an operator investigating a slow database and
+        one investigating a broken pause source do different things.
+
+        `wait_for` cancels the query and awaits that cancellation, so nothing
+        continues against the database once this returns.
         """
         if self._pause is None:
-            return AcquisitionStop.SYSTEM_STOP_UNREADABLE
-        return AcquisitionStop.SYSTEM_STOPPED if await self._pause.system_paused() else None
+            return AcquisitionStop.SYSTEM_STOP_UNREADABLE, None
+        try:
+            paused = await asyncio.wait_for(
+                self._pause.system_paused(), timeout=max(0.001, window.remaining)
+            )
+        except TimeoutError:
+            return (
+                AcquisitionStop.SYSTEM_STOP_UNREADABLE,
+                AcquisitionStop.TIME_BUDGET_REACHED.value,
+            )
+        return (AcquisitionStop.SYSTEM_STOPPED if paused else None), None
 
     async def _plan(self, chains: tuple[Chain, ...], window: Window) -> AcquisitionPlan:
         planner = AcquisitionPlanner(self._sessions, self._markets, chains, self._limits)
@@ -657,6 +716,9 @@ class BoundedMarketAcquisition:
                 ledger.stop = AcquisitionStop.MARKET_BUDGET_REACHED
             if not batch:
                 continue
+            # Committed before the request leaves, so nothing about the answer
+            # can give the budget back.
+            ledger.commit(batch)
             built = adapter(chain, self._settings.geckoterminal_pools_per_chain)
             try:
                 confirmed = await asyncio.wait_for(
@@ -678,7 +740,6 @@ class BoundedMarketAcquisition:
                     continue
                 ledger.stop = AcquisitionStop.PROVIDER_FAILED
                 return False
-            ledger.requested += len(batch)
             answered = {pair.pair_id: pair for pair in confirmed}
             for target in wanted:
                 if target.identity.pair_id not in asked:
@@ -714,7 +775,11 @@ class BoundedMarketAcquisition:
             if window.expired:
                 ledger.stop = AcquisitionStop.TIME_BUDGET_REACHED
                 return False
-            built = adapter(chain, min(self._settings.geckoterminal_pools_per_chain, ledger.room))
+            allowance = min(self._settings.geckoterminal_pools_per_chain, ledger.room)
+            # Reserved before the read, for the same reason the targeted batch
+            # is: the request is made under this permission whatever comes back.
+            ledger.reserve(allowance)
+            built = adapter(chain, allowance)
             try:
                 found = await asyncio.wait_for(
                     built.discover(), timeout=max(0.001, window.remaining)
@@ -736,7 +801,6 @@ class BoundedMarketAcquisition:
                     continue
                 ledger.stop = AcquisitionStop.PROVIDER_FAILED
                 return False
-            ledger.requested += len(found)
             for pair in found:
                 target = AcquisitionTarget(
                     identity=pair.market_identity,
@@ -763,7 +827,27 @@ class BoundedMarketAcquisition:
         event that was already stored — because two needs pointed at one market,
         or because something recorded it before — is a replay and is reported as
         one rather than as an observation this run made.
+
+        A market that was *planned* is additionally held to the identity it was
+        planned as. The checks below it are real but narrower than they look:
+        `observe` compares the pair identifier, which for a pool address carries
+        the chain, the network and the pool and nothing else; and
+        `record_pair_reporting` compares the snapshot against the pair from the
+        same answer, which agrees with itself by construction. So an answer that
+        kept the requested pool and named a different base asset, payment asset
+        or venue would pass both and be stored against a market it is not. The
+        comparison here is the recorded identity's own equality — one contract,
+        not a second definition — and nothing is repaired, mapped or guessed:
+        a disagreement is refused and the market is left as it was.
+
+        A discovered market has no planned identity to be held to. It *is* what
+        the answer said, judged by intake under its own rules.
         """
+        if target.need is not AcquisitionNeed.NEW_CANDIDATE and (
+            pair.market_identity != target.identity
+        ):
+            ledger.note(target, AcquisitionOutcome.REFUSED, "MARKET_IDENTITY_MISMATCH")
+            return True
         try:
             written = await asyncio.wait_for(
                 record_pair_reporting(provider, pair, recorder),
@@ -784,7 +868,6 @@ class BoundedMarketAcquisition:
             # refusal, and never a market substituted for another.
             ledger.note(target, AcquisitionOutcome.REFUSED, "MARKET_IDENTITY_MISMATCH")
             return True
-        ledger.acquired.add(target.identity.pair_id)
         if written.inserted:
             ledger.note(target, AcquisitionOutcome.RECORDED)
         else:
@@ -822,8 +905,10 @@ class BoundedMarketAcquisition:
                 if unknown and ledger.stop is AcquisitionStop.COMPLETED
                 else ledger.stop.value
             ),
+            detail=ledger.detail,
             limits=self._limits,
             requested=ledger.requested,
+            budget_spent=ledger.spent,
             recorded=ledger.counted(AcquisitionOutcome.RECORDED),
             unchanged=ledger.counted(AcquisitionOutcome.UNCHANGED),
             refused=ledger.counted(AcquisitionOutcome.REFUSED),
