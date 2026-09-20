@@ -1,5 +1,4 @@
 from fastapi import FastAPI, HTTPException
-from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.agents.registry import COMPONENTS
@@ -10,6 +9,7 @@ from src.api.workers import router as workers_router
 from src.core.config import Settings
 from src.core.models import RiskLimits
 from src.data.database import connect
+from src.data.schema import SchemaUnknown, expected_revision, recorded_revision
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -27,12 +27,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/ready")
     async def ready() -> dict[str, str]:
+        """Whether this database is the one this code was written against.
+
+        The expected revision is the head of the migration chain that ships with
+        the code, read from the migrations themselves. It used to be a constant,
+        which was correct on the day it was typed and silently wrong at the next
+        migration — a readiness check that passes because it compares against a
+        revision nobody has shipped for months is worse than none, because it is
+        believed. One read, and nothing is created or migrated on the way.
+        """
         engine, _ = connect(settings.database_url)
         try:
+            expected = expected_revision()
             async with engine.connect() as connection:
-                revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
-                if revision != "0006":
+                if await recorded_revision(connection) != expected:
                     raise HTTPException(status_code=503, detail="Database migration is not current")
+        except SchemaUnknown as error:
+            raise HTTPException(status_code=503, detail="Expected migration unknown") from error
         except (SQLAlchemyError, OSError) as error:
             raise HTTPException(
                 status_code=503, detail="Database unavailable or unmigrated"
