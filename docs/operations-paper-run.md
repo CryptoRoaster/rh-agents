@@ -72,6 +72,17 @@ not consenting to that run calling a public API.
 Without acquisition a run trades only what `python -m src.markets.ingest --once`
 or a market watcher has already recorded.
 
+**Reading the acquisition account.** `budget_spent` is capacity this run
+committed before asking — for a discovery read, the size of the answer it was
+permitted to return — and `recorded` is what was durably written. Neither says
+what the provider delivered, and `budget_spent=2` with `recorded=1` is **not**
+"two pools offered, one kept". For that, read the `discovery` block: one entry
+per read, naming its chain, the capacity it `reserved`, how many pools the
+adapter `considered` and `returned`, and how many it `rejected` under which
+fixed codes. A read that did not return says `completed=false` with a reason and
+reports no counters, because it never finished counting. How many pools the
+provider's document carried is not counted anywhere and is not inferred.
+
 ## 3. The preflight
 
 ```sh

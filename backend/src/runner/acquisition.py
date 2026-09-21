@@ -107,6 +107,8 @@ from src.runner.models import (
     AcquisitionNeed,
     AcquisitionOutcome,
     AcquisitionStop,
+    DiscoveryRead,
+    DiscoveryRejection,
     MarketAcquisition,
 )
 
@@ -427,6 +429,10 @@ class Ledger:
     # A second fact about the stop, where there is one.
     detail: str | None = None
     entries: list[AcquiredMarket] = field(default_factory=list)
+    # One account per bounded discovery read, appended the moment the read is
+    # over. Never rebuilt at the end: a read that finished stays reported
+    # whatever the next one does.
+    reads: list[DiscoveryRead] = field(default_factory=list)
     # Distinct markets asked about by identity, counted as the request goes out.
     requested: int = 0
     # Market-budget slots committed. Committed when work is *triggered*, never
@@ -454,6 +460,45 @@ class Ledger:
 
     def counted(self, outcome: AcquisitionOutcome) -> int:
         return len([item for item in self.entries if item.outcome == outcome.value])
+
+    def read(
+        self, chain: Chain, reserved: int, adapter: GeckoTerminalAdapter, returned: int
+    ) -> None:
+        """The account of one read that returned, taken from the adapter once.
+
+        Read here and nowhere else, immediately after the read is over and
+        before anything is recorded from it. The adapter is this read's own —
+        one is built per read and `discover()` clears its counters when it
+        starts — so these numbers describe this read and no other, and taking
+        them a second time somewhere later could only double-count.
+        """
+        self.reads.append(
+            DiscoveryRead(
+                chain=chain.name,
+                reserved=reserved,
+                completed=True,
+                considered=adapter.discovered,
+                rejected=adapter.failed,
+                returned=returned,
+                rejections=tuple(
+                    DiscoveryRejection(reason=code.upper(), count=count)
+                    for code, count in sorted(adapter.rejections.items())
+                ),
+            )
+        )
+
+    def unfinished_read(self, chain: Chain, reserved: int, reason: str) -> None:
+        """A read that did not return, reported as only what is known of it.
+
+        The chain and the capacity it committed are facts this stage established
+        before asking. The adapter's counters are not: `discover()` clears them
+        on entry and fills them as it parses, so a read that raised or was cut
+        off leaves tallies of a pass that never finished. They are left absent
+        rather than reported as zero.
+        """
+        self.reads.append(
+            DiscoveryRead(chain=chain.name, reserved=reserved, completed=False, reason=reason)
+        )
 
     @property
     def room(self) -> int:
@@ -785,9 +830,11 @@ class BoundedMarketAcquisition:
                     built.discover(), timeout=max(0.001, window.remaining)
                 )
             except TimeoutError:
+                ledger.unfinished_read(chain, allowance, AcquisitionStop.TIME_BUDGET_REACHED.value)
                 ledger.stop = AcquisitionStop.TIME_BUDGET_REACHED
                 return False
             except ProviderError as error:
+                ledger.unfinished_read(chain, allowance, _provider_code(error))
                 ledger.entries.append(
                     AcquiredMarket(
                         pair_id="*",
@@ -801,6 +848,9 @@ class BoundedMarketAcquisition:
                     continue
                 ledger.stop = AcquisitionStop.PROVIDER_FAILED
                 return False
+            # Before a single recording, so that what the read established
+            # survives whatever the recorder then meets.
+            ledger.read(chain, allowance, built, len(found))
             for pair in found:
                 target = AcquisitionTarget(
                     identity=pair.market_identity,
@@ -921,6 +971,10 @@ class BoundedMarketAcquisition:
             provider_requests=0 if transport is None else transport.logical_requests,
             http_attempts=0 if transport is None else transport.http_attempts,
             markets=tuple(ledger.entries[:64]),
+            # What each bounded discovery read asked for and what the adapter
+            # made of the answer. Reported apart from the totals above, which
+            # mix discovery with the targeted reads and cannot be split back up.
+            discovery=tuple(ledger.reads[:4]),
         )
 
 

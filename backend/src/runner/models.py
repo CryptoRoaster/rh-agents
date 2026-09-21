@@ -253,6 +253,66 @@ class AcquiredMarket(Immutable):
     reason: Code | None = None
 
 
+class DiscoveryRejection(Immutable):
+    """One typed reason the adapter declined a delivered pool, and how often.
+
+    The code is the provider boundary's own fixed one, upper-cased into this
+    summary's vocabulary exactly as every other provider code here is. Nothing
+    from a response reaches it: the boundary has codes rather than messages
+    precisely so a payload cannot travel inside one.
+    """
+
+    reason: Code
+    count: int = Field(ge=1)
+
+
+class DiscoveryRead(Immutable):
+    """One bounded discovery read, and what the existing adapter made of it.
+
+    Reported per read rather than summed, because the totals above cannot be
+    divided back up. `budget_spent` carries reserved capacity from every read
+    *and* one slot per targeted market; `recorded` carries what discovery and
+    the targeted reads both produced. So `budget_spent=2` beside `recorded=1`
+    said nothing about whether the provider sent one pool or sent two and the
+    adapter refused one — which is the distinction these fields exist for.
+
+    **What each number means, exactly.** They are the adapter's own counters,
+    read once per read, and they are narrower than they look:
+
+    * `reserved` is market-budget capacity committed *before* the request, and
+      therefore the most pools this read was permitted to bring back. It is a
+      permission, never a delivery.
+    * `considered` is how many pool resources the adapter took up from the
+      answer: after its own per-request bound, and after byte-identical
+      duplicate resources were dropped. It is **not** how many pools the
+      provider's document carried — this system does not count that, and a
+      number it did not count is not inferred from a difference here.
+    * `rejected` is how many of those the adapter declined, each under a typed
+      code in `rejections`. An adapter rejection is not a recorder refusal and
+      not a transport failure; those are reported as `REFUSED` and `FAILED`
+      entries in `markets`, and are counted nowhere here.
+    * `returned` is how many markets the read handed back to be recorded, taken
+      from the answer itself rather than computed as `considered - rejected`.
+
+    **When the read did not finish.** `completed` is false, `reason` carries the
+    boundary's code, and every counter above is absent rather than zero: a read
+    that did not return did not finish counting, and reporting its partial
+    tallies would state as fact something nobody observed. A read that did
+    finish keeps its account whatever fails afterwards.
+    """
+
+    chain: Identifier
+    # Market-budget capacity committed for this read before it was made.
+    reserved: int = Field(default=0, ge=0)
+    completed: bool = Field(strict=True)
+    considered: int | None = Field(default=None, ge=0)
+    rejected: int | None = Field(default=None, ge=0)
+    returned: int | None = Field(default=None, ge=0)
+    rejections: tuple[DiscoveryRejection, ...] = Field(default=(), max_length=16)
+    # Why the read did not complete. Absent when it did.
+    reason: Code | None = None
+
+
 class MarketAcquisition(Immutable):
     """What one run asked the market provider for, and what it got.
 
@@ -296,6 +356,11 @@ class MarketAcquisition(Immutable):
     provider_requests: int = Field(default=0, ge=0)
     http_attempts: int = Field(default=0, ge=0)
     markets: tuple[AcquiredMarket, ...] = Field(default=(), max_length=64)
+    # One entry per bounded discovery read, in the order the reads were made.
+    # Separate from `markets` because a read is not a market: it is the event
+    # that may or may not have produced some, and the counts above deliberately
+    # cannot be split back into per-read facts.
+    discovery: tuple[DiscoveryRead, ...] = Field(default=(), max_length=4)
 
     @property
     def outcome_unknown(self) -> bool:
