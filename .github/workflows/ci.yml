@@ -10,7 +10,21 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Sized from observed runs, not from a guess. Across the twenty most recent
+    # backend jobs the whole job took 437s at its fastest and 864s at its
+    # slowest — 14m24s, thirty-six seconds under a fifteen-minute budget — and
+    # two jobs were cut off by that budget having reached 100% of the
+    # PostgreSQL suite, with no test failure and no stall. The variance sits in
+    # the suites themselves: the PostgreSQL step has been measured between 260s
+    # and 788s on identical work, a factor of three that is the hosted runner's
+    # and not this repository's.
+    #
+    # 25 minutes is 1.7x the slowest complete job ever observed and 1.4x the
+    # sum of every step's own observed maximum, so the full suites, both lint
+    # gates and mypy finish even on a runner as slow as the worst one seen. It
+    # is deliberately not larger: this bound still exists to end a genuine
+    # deadlock, and nothing here weakens a check or skips a step.
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: backend
