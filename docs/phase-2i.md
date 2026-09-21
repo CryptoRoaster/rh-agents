@@ -116,6 +116,30 @@ wearing the costume of a safety measure, and none is in the contract VECTOR
 wrote. If confirmation is ever wanted it belongs in a separately versioned policy
 that says so out loud.
 
+### A price the comparison cannot represent
+
+The market layer records whatever a provider reports — its `Amount` permits a
+hundred significant digits — while everything downstream of a trigger holds money
+in the ledger's `Numeric(38, 18)`, which is the envelope `PriceObservation`
+declares. A real BNB Smart Chain pool reported a price with nineteen decimal
+places, and the two contracts disagreed about it.
+
+**The recorded observation is unaffected.** It was stored, it stays stored, and
+it is still what the market layer says about that pool. What changes is only what
+PULSE can build from it: `price_observation()` returns `None`, so the reading
+does not appear in the window and `latest` is `None` for that check. That is the
+same absence as an unavailable price, reported through the same wait, and it is
+deliberately not a rounded number — quantizing would change what the market said
+in the one place where a comparison decides whether an order is armed, and would
+arm on a figure the ledger could not then store.
+
+Only the envelope refusal is read this way (`decimal_max_places`,
+`decimal_max_digits`, `decimal_whole_digits` on the `price` field). Every other
+validation failure is a wiring fault and still raises: a market answering about
+the wrong pair must not turn into a monitor quietly seeing no price. A price
+outside the envelope therefore remains unusable for PULSE; this widens no
+supported precision.
+
 ## What is checked, and in what order
 
 Order is deliberate. Identity and units come first, because a price from another

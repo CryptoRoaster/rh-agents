@@ -175,10 +175,15 @@ refused by the transport itself with `REQUEST_BUDGET_EXHAUSTED`. The stage's
 time window is additionally held to whatever is left of the run's own monotonic
 deadline.
 
-**Every bound is applied to the request, never to the response.** The discovery
-read asks for at most as many pools as this run may still record, and the
-targeted batch is fixed before it is sent. Nothing fetched is ever thrown away:
-truncating a response means paying for observations and discarding them.
+**Every bound is decided before the request, never from the answer.** The
+targeted batch is fixed before it is sent — the pools it names are the pools it
+asks for — and the discovery read is built to take up at most as many pools as
+this run may still record. One honest qualification, because the code says so:
+the new-pool request carries no size parameter, so that discovery bound is
+applied by the adapter as it takes rows up from the answer, not by the provider
+as it composes one. **How many pools the document actually carried is therefore
+not counted anywhere**, and it is not inferred from a difference between numbers
+that were counted. Nothing already normalized is discarded.
 
 **The market budget is committed when work is triggered, not when it succeeds.**
 One slot per distinct market as the targeted request goes out, and, for a
@@ -215,6 +220,41 @@ same market was already observed in this pass), **`REFUSED`**, **`FAILED`**,
 **`UNKNOWN`** and **`NOT_ATTEMPTED`**. Beside them: how many markets were
 *requested*, and the provider transport's **own** counters for logical requests
 and HTTP attempts, so a retry is visible rather than hidden inside one number.
+
+### What one discovery read brought back
+
+`budget_spent` and `recorded` are about the *pass*, and they cannot be divided
+back up: the first mixes capacity reserved for discovery with one slot per
+targeted market, the second mixes what discovery produced with what the targeted
+reads did. So `budget_spent=2` beside `recorded=1` never meant "the provider sent
+two pools and one was kept" — and nothing in that pair distinguishes a quiet
+market from a contract breach.
+
+Each bounded discovery read therefore reports its own account, in `discovery`,
+one entry per read and bound to the chain it was for:
+
+| Field | What it actually is |
+| --- | --- |
+| `chain` | the configured chain this read was made for |
+| `reserved` | market-budget capacity committed *before* the request: the most pools this read was permitted to bring back. A permission, never a delivery |
+| `considered` | pool resources the adapter took up from the answer, after its own bound and after byte-identical duplicates were dropped. **Not** how many pools the document carried |
+| `rejected` | how many of those the adapter declined |
+| `rejections` | one fixed code per reason, with a count. The provider boundary's own closed set, upper-cased |
+| `returned` | markets the read handed back to be recorded, taken from the answer itself rather than computed as `considered - rejected` |
+
+Three refusals that used to read alike are now apart. An **adapter rejection**
+lives here; a **recorder refusal** is a `REFUSED` entry in `markets`; a
+**transport failure** is a `FAILED` entry and a stop. None of them is counted in
+more than one place, and no existing counter changed meaning.
+
+The counters are the adapter's own, read once, immediately after the read
+returns and before anything is recorded from it. One adapter is built per read
+and `discover()` clears its counters when it starts, so an account belongs to
+exactly one read. A read that finished keeps its account whatever fails
+afterwards; a read that did **not** return reports `completed=false`, the
+boundary's code in `reason`, and no counters at all — a read that did not return
+did not finish counting, and a partial tally reported as fact would be a number
+nobody observed.
 
 `MarketRecorder.record_reporting()` is what makes `RECORDED` honest. It reports
 whether *this* call performed the insert, via `RETURNING` on the conflict
@@ -263,6 +303,10 @@ source. **A fixture test is not evidence that the real provider works.**
 | An answer that keeps the asked pool but swaps the base asset, the payment asset or the venue is refused, and nothing is written | `tests/runner/test_acquisition_hardening.py::test_a_swapped_base_asset_under_the_asked_pool_is_refused`, `…_quote_asset_…`, `…_venue_…` |
 | A market asked about and not returned, or returned and refused, still costs its budget — including across chains | `…::test_a_market_asked_about_and_not_returned_still_costs_its_budget`, `…::test_a_refused_recording_still_costs_its_budget`, `…::test_a_spent_budget_stops_the_second_chain_before_its_request` |
 | Discovery commits the capacity it was allowed to bring back, and a doubled need still costs one | `…::test_discovery_reserves_what_it_is_allowed_to_bring_back`, `…::test_one_market_wanted_twice_still_costs_one` |
+| Fewer pools delivered is not a rejection, and a rejected pool is reported beside the recorded one | `tests/runner/test_discovery_diagnostics.py::test_fewer_pools_delivered_is_not_reported_as_a_rejection`, `…::test_a_rejected_pool_is_reported_beside_the_one_that_was_recorded` |
+| An answer refused in full records nothing, under its own typed codes | `…::test_an_answer_the_adapter_refuses_entirely_records_nothing` |
+| Two reads are reported once each, never pooled, and a later failure keeps the earlier account | `…::test_two_reads_are_reported_once_each_and_never_pooled`, `…::test_a_failed_second_read_keeps_the_first_read_s_diagnostics` |
+| The diagnostics cost no budget, no request and no row, and carry only codes and counts | `…::test_a_rejected_pool_costs_exactly_what_a_quiet_answer_costs`, `…::test_the_reported_diagnostics_carry_only_codes_and_counts` |
 | A failed read does not erase the markets it asked about | `…::test_a_failed_read_does_not_erase_the_markets_it_asked_about` |
 | An expired deadline asks no stop source; a stop source that hangs is cut off, awaited, and ends the pass with nothing traded | `…::test_an_expired_deadline_never_asks_the_stop_source`, `…::test_a_stop_query_that_hangs_is_bounded_and_ends_the_pass` |
 | No database lock is held across a provider request | `tests/runner/test_acquisition_concurrency.py::test_no_provider_request_is_made_while_a_row_is_locked` (PostgreSQL only) |
