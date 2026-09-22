@@ -172,7 +172,9 @@ So "the spawn raised" does **not** mean "nothing was started". Without a gate, a
 Codex process could already be running, could already have started descendants,
 and the parent would own nothing it could terminate or even name.
 
-The child the probe starts is therefore not Codex. It is `launch_gate.py`: it
+The child the probe starts is therefore not Codex. It is `launch_gate.py`,
+started with `-I -S` so that no `PYTHONPATH`, user-site directory, `.pth` file
+or `sitecustomize` runs in the window before the parent owns the handle. It
 becomes the session and process group leader, and then does nothing but wait on
 an inherited file descriptor. Codex is executed — via `os.execv`, keeping the
 pid, the group and every pipe — only after the parent holds the `Process` handle
@@ -224,11 +226,38 @@ is empty, which is why the group is only signalled while it is known to exist.
 
 ## Filesystem and tool boundary
 
-**`--sandbox read-only` is a write boundary, not a read boundary.** It does not
-stop a reading tool from opening `.env`, a database configuration or
-`~/.codex/auth.json`. Treating the two as the same thing would be the mistake.
+**`--sandbox read-only` is a write boundary, not a read boundary — and this is
+now proven from the sources, not inferred.** Two facts settle it.
 
-The read boundary rests on a different claim: no reading tool is offered.
+`protocol/src/protocol.rs` answers the read question for every policy variant
+the same way:
+
+```rust
+pub fn has_full_disk_read_access(&self) -> bool {
+    true
+}
+```
+
+and `sandboxing/src/seatbelt.rs` acts on it:
+
+```rust
+let (file_read_policy, ...) = if file_system_sandbox_policy.has_full_disk_read_access() {
+    ("; allow read-only file operations\n(allow file-read*)".to_string(), ...)
+```
+
+So the seatbelt profile generated for `read-only` contains a blanket
+`(allow file-read*)`. The doc comment on `new_workspace_write_policy` says the
+same thing in prose: "a policy that can read the entire disk". The policy
+machinery does have `unreadable_roots` and `unreadable_globs`, but no
+configuration key reaches them and `read-only` short-circuits past them.
+
+Second: the seatbelt wraps **commands the agent runs**, not the agent. The
+profile is assembled into a `/usr/bin/sandbox-exec` command line by
+`sandboxing/src/manager.rs`. The Codex process itself runs with the caller's
+ordinary privileges.
+
+The read boundary therefore rests entirely on a different claim: no reading
+tool is offered. That is a configuration property, not an operating-system one.
 
 | Tool | How it is removed | Evidence |
 |---|---|---|
@@ -237,7 +266,46 @@ The read boundary rests on a different claim: no reading tool is offered.
 | web search | `-c tools.web_search=false`, `--disable standalone_web_search` | `tools.web_search` in the config schema |
 | MCP resource tools | `-c mcp_servers={}` | `add_mcp_resource_tools` registers nothing without servers |
 | apps, plugins, browser use, computer use, code mode, multi-agent | `--disable` per flag | feature flags in the config schema |
-| **`apply_patch`** | **not removable** | gated only on an environment existing and on `model_info.apply_patch_tool_type` |
+| **`apply_patch`** | **not removable** | gated only on an environment existing and on `model_info.apply_patch_tool_type`, which every model in the 0.153.4 catalog sets to `freeform`. Its spec is a grammar for patches, with no read operation, and `handlers/apply_patch.rs` refuses any path `can_write_path_with_cwd` rejects — under `read-only` that is every path. |
+| **code mode** | **not removable by flag** | see below |
+
+### The model catalog outranks the flags
+
+`core/src/tools/mod.rs`:
+
+```rust
+pub(crate) fn requested_tool_mode(turn_context, model_info) -> ToolMode {
+    model_info.tool_mode.unwrap_or_else(|| { ...features... })
+}
+```
+
+`unwrap_or_else` is the whole story: when the catalog entry names a tool mode,
+the feature flags are never consulted. `effective_tool_mode` downgrades
+`CodeMode` to `Direct` when code mode is unavailable but never touches
+`CodeModeOnly`, and `register_code_mode_executors` gates on the mode rather than
+on `Feature::CodeMode`.
+
+`codex debug models --bundled` — an offline dump of the catalog compiled into
+the binary — shows what that means in practice:
+
+| model | `tool_mode` | consequence |
+|---|---|---|
+| `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, both `gpt-daybreak-*` | `code_mode_only` | code-mode executors registered **despite** `--disable code_mode` |
+| `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.2` | *null* | falls through to the flags, so `Direct` |
+
+Code mode is a local code-execution surface. A model that can run code can read
+files, and no flag in `command.py` removes it from a `code_mode_only` model.
+
+`src/evaluation/codex/catalog.py` therefore reads that catalog before any
+attempt and refuses anything outside an explicit allowlist: a declared
+`tool_mode`, a non-empty `experimental_supported_tools`, an unknown
+`apply_patch_tool_type`, a model that is not in the catalog, or a catalog that
+cannot be read at all. Being unable to check is treated exactly like checking
+and not liking the answer.
+
+This matters because none of it is observable from a model's reply. A tool that
+was offered and never invoked emits no event, so "the run looked clean" is not
+evidence about what was on offer.
 
 The workspace is a fresh empty directory outside the repository, and
 `build_arguments` refuses a workspace inside a forbidden root. Instruction

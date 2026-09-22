@@ -344,7 +344,7 @@ def spawn_held_back(
     """
 
     async def spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
-        direct = list(args)[3:]
+        direct = list(args)[5:]
         options = {key: value for key, value in kwargs.items() if key != "pass_fds"}
         process = await asyncio.create_subprocess_exec(*direct, **options)  # type: ignore[arg-type]
         for _ in range(250):
@@ -465,7 +465,7 @@ async def test_repeated_cancellation_cannot_take_a_spawn_out_of_ownership(
 
     async def spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
         # Steps around the launch gate on purpose; see `spawn_held_back`.
-        direct = list(args)[3:]
+        direct = list(args)[5:]
         options = {key: value for key, value in kwargs.items() if key != "pass_fds"}
         process = await asyncio.create_subprocess_exec(*direct, **options)  # type: ignore[arg-type]
         holder["process"] = process
@@ -552,7 +552,7 @@ async def test_cancellation_during_cleanup_cannot_cut_it_short(
     monkeypatch.setattr(process_module, "_terminate", terminate_watcher(terminating, reports))
 
     async def spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
-        direct = list(args)[3:]
+        direct = list(args)[5:]
         options = {key: value for key, value in kwargs.items() if key != "pass_fds"}
         process = await asyncio.create_subprocess_exec(*direct, **options)  # type: ignore[arg-type]
         holder["process"] = process
@@ -720,7 +720,7 @@ async def test_a_failed_spawn_is_never_reported_as_an_empty_group(
     async def failing_after_real_start(
         *args: object, **kwargs: object
     ) -> asyncio.subprocess.Process:
-        direct = list(args)[3:]
+        direct = list(args)[5:]
         options = {key: value for key, value in kwargs.items() if key != "pass_fds"}
         process = await asyncio.create_subprocess_exec(*direct, **options)  # type: ignore[arg-type]
         holder["leader"] = process

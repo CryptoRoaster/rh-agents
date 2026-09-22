@@ -60,6 +60,7 @@ class EvaluationFailure(StrEnum):
 
     CLI_VERSION_UNSUPPORTED = "CLI_VERSION_UNSUPPORTED"
     VERSION_CHECK_FAILED = "VERSION_CHECK_FAILED"
+    TOOL_SURFACE_UNSUPPORTED = "TOOL_SURFACE_UNSUPPORTED"
     LAUNCHER_UNSUPPORTED = "LAUNCHER_UNSUPPORTED"
     SCHEMA_UNSUPPORTED = "SCHEMA_UNSUPPORTED"
     EFFORT_NOT_SUPPORTED = "EFFORT_NOT_SUPPORTED"
@@ -137,6 +138,7 @@ class ProcessLimits(Immutable):
 
     max_exec_starts: Literal[1] = 1
     max_version_starts: Literal[1] = 1
+    max_catalog_starts: Literal[1] = 1
     max_preflight_starts: Literal[1] = 1
 
 

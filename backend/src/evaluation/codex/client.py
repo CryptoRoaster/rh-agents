@@ -28,9 +28,11 @@ from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 
+from src.evaluation.codex.catalog import check_tool_surface
 from src.evaluation.codex.command import (
     CommandBuildError,
     build_arguments,
+    build_catalog_arguments,
     build_preflight_arguments,
     build_version_arguments,
     child_environment,
@@ -59,6 +61,7 @@ from src.evaluation.codex.stream import EventAccumulator, StreamError
 
 PREFLIGHT_BUDGET_SECONDS = 10.0
 VERSION_BUDGET_SECONDS = 10.0
+CATALOG_BUDGET_SECONDS = 20.0
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,7 @@ class CodexClientConfig:
     run_preflight: bool = True
     preflight_budget_seconds: float = PREFLIGHT_BUDGET_SECONDS
     version_budget_seconds: float = VERSION_BUDGET_SECONDS
+    catalog_budget_seconds: float = CATALOG_BUDGET_SECONDS
 
 
 @dataclass
@@ -91,6 +95,7 @@ class CodexEvaluationClient:
     config: CodexClientConfig
     exec_starts: int = field(default=0, init=False)
     version_starts: int = field(default=0, init=False)
+    catalog_starts: int = field(default=0, init=False)
     preflight_starts: int = field(default=0, init=False)
 
     async def evaluate[Output: BaseModel](
@@ -134,6 +139,10 @@ class CodexEvaluationClient:
         )
 
         rejection = await self._verify_version(environment, request.limits, deadline)
+        if rejection is not None:
+            return rejection
+
+        rejection = await self._verify_tool_surface(environment, deadline)
         if rejection is not None:
             return rejection
 
@@ -242,6 +251,51 @@ class CodexEvaluationClient:
             return self._reject(
                 EvaluationFailure.CLI_VERSION_UNSUPPORTED,
                 outcome.version,
+                deadline,
+                outcome.cleanup,
+            )
+        return None
+
+    async def _verify_tool_surface(
+        self, environment: dict[str, str], deadline: Deadline
+    ) -> EvaluationRejected | None:
+        """Refuse a model whose catalog entry would widen the tool surface.
+
+        The catalog decides the tool plan before any flag does, and nothing in a
+        model's answer would reveal what it was offered. Reading the bundled
+        catalog is the only check that does not depend on the model's silence.
+        """
+        if self.catalog_starts >= self.config.process_limits.max_catalog_starts:
+            return self._reject(
+                EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, "CATALOG_BUDGET_EXHAUSTED", deadline
+            )
+        try:
+            arguments = build_catalog_arguments(launcher=self.config.launcher)
+        except CommandBuildError as error:
+            return self._reject(error.failure, error.reason_code, deadline)
+
+        probe = self._probe_deadline(self.config.catalog_budget_seconds, deadline)
+        if probe is None:
+            return self._reject(
+                EvaluationFailure.DEADLINE_EXCEEDED, "NO_TIME_FOR_CATALOG_CHECK", deadline
+            )
+
+        self.catalog_starts += 1
+        try:
+            outcome = await check_tool_surface(
+                arguments=arguments,
+                environment=environment,
+                working_directory=self.config.workspace,
+                deadline=probe,
+                model=self.config.model,
+            )
+        except ProcessError as error:
+            return self._reject(error.failure, error.reason_code, deadline, error.cleanup)
+
+        if outcome.reason is not None:
+            return self._reject(
+                EvaluationFailure.TOOL_SURFACE_UNSUPPORTED,
+                outcome.reason,
                 deadline,
                 outcome.cleanup,
             )

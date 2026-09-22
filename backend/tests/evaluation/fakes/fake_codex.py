@@ -95,6 +95,22 @@ def answer(scenario: dict[str, object]) -> str:
 def main() -> int:
     scenario_path = Path.cwd() / "scenario.json"
     scenario: dict[str, object] = json.loads(scenario_path.read_text(encoding="utf-8"))
+    if sys.argv[1:4] == ["debug", "models", "--bundled"]:
+        # The bundled catalog dump. Defaults to an entry the harness accepts, so
+        # a test only has to say when it wants a wider tool surface.
+        entry = {
+            "slug": scenario.get("catalog_model", "gpt-5.6-sol"),
+            "tool_mode": scenario.get("catalog_tool_mode"),
+            "shell_type": "unified_exec",
+            "apply_patch_tool_type": scenario.get("catalog_apply_patch", "freeform"),
+            "experimental_supported_tools": scenario.get("catalog_experimental", []),
+        }
+        if scenario.get("catalog_broken"):
+            sys.stdout.write("not json\n")
+            return 0
+        sys.stdout.write(json.dumps({"models": [entry]}) + "\n")
+        return 0
+
     if sys.argv[1:2] == ["--version"]:
         # The build probe has its own scenario key so a test can pair any
         # reported version with any attempt answer.

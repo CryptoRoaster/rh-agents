@@ -198,6 +198,16 @@ def build_preflight_arguments(*, launcher: CodexLauncher) -> list[str]:
     return [str(launcher.executable), "login", "status"]
 
 
+def build_catalog_arguments(*, launcher: CodexLauncher) -> list[str]:
+    """Assemble the bundled-catalog dump.
+
+    `--bundled` is what keeps this offline: it prints the catalog compiled into
+    the binary instead of refreshing one, so the probe makes no request at all.
+    """
+    validate_launcher(launcher)
+    return [str(launcher.executable), "debug", "models", "--bundled"]
+
+
 def build_version_arguments(*, launcher: CodexLauncher) -> list[str]:
     """Assemble the build-identification probe.
 

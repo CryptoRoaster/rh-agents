@@ -312,6 +312,13 @@ async def _spawn(
     spawn = asyncio.ensure_future(
         spawn_process(
             sys.executable,
+            # -I isolates the interpreter (no PYTHONPATH, no user site) and -S
+            # skips site processing, so no `.pth` file, user-site path or
+            # sitecustomize runs in the window before the parent owns the
+            # handle. The gate imports nothing but builtin modules, so it loses
+            # nothing by starting this way.
+            "-I",
+            "-S",
             str(LAUNCH_GATE_SCRIPT),
             str(gate_read),
             *arguments,

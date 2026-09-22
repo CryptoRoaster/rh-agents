@@ -388,3 +388,39 @@ async def test_a_slow_schema_validation_does_not_fund_a_domain_validator(
     assert outcome.reason is EvaluationFailure.DEADLINE_EXCEEDED
     assert outcome.detail_code == "SCHEMA_VALIDATION_OVERRAN"
     assert started is False
+
+
+async def test_the_catalog_probe_is_counted_apart_from_the_attempt(probe: Probe) -> None:
+    probe.scenario("success")
+    client = probe.client()
+    assert isinstance(await client.evaluate(probe.request()), EvaluationCompleted)
+    assert client.catalog_starts == 1
+    assert client.version_starts == 1
+    assert client.exec_starts == 1
+
+
+@pytest.mark.parametrize(
+    ("extra", "detail"),
+    [
+        ({"catalog_tool_mode": "code_mode_only"}, "TOOL_MODE_CODE_MODE_ONLY"),
+        ({"catalog_experimental": ["clock"]}, "EXPERIMENTAL_TOOL_CLOCK"),
+        ({"catalog_apply_patch": "something_new"}, "APPLY_PATCH_SOMETHING_NEW"),
+        ({"catalog_model": "other-model"}, "MODEL_NOT_IN_CATALOG"),
+        ({"catalog_broken": True}, "MODEL_NOT_IN_CATALOG"),
+    ],
+)
+async def test_a_wider_tool_surface_never_runs_an_attempt(
+    probe: Probe, extra: dict[str, object], detail: str
+) -> None:
+    """Fail-closed: an unwanted surface, an unknown value or no answer all refuse.
+
+    None of this is visible in a model's reply -- a tool that was offered and
+    left unused emits no event -- so the catalog is the only place to look.
+    """
+    probe.scenario("success", **extra)
+    client = probe.client()
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.TOOL_SURFACE_UNSUPPORTED
+    assert outcome.detail_code == detail
+    assert client.exec_starts == 0

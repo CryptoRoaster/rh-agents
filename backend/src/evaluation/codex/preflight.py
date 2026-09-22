@@ -79,7 +79,7 @@ class VersionResult:
     cleanup: CleanupReport
 
 
-async def _capture(
+async def capture_probe(
     *,
     arguments: list[str],
     environment: dict[str, str],
@@ -139,7 +139,7 @@ async def check_cli_version(
     deadline: Deadline,
 ) -> VersionResult:
     """Ask the launcher which build it is. `None` means it did not say."""
-    output = await _capture(
+    output = await capture_probe(
         arguments=arguments,
         environment=environment,
         working_directory=working_directory,
@@ -162,7 +162,7 @@ async def check_chatgpt_login(
     deadline: Deadline,
 ) -> PreflightResult:
     """Return whether the CLI reports an active ChatGPT session."""
-    output = await _capture(
+    output = await capture_probe(
         arguments=arguments,
         environment=environment,
         working_directory=working_directory,
