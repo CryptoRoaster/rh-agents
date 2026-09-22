@@ -157,6 +157,18 @@ def main() -> int:
         turn_completed()
         return 0
 
+    if name == "hang_with_sigterm_immune_descendant":
+        # Leader and descendant both outlive SIGTERM handling, so clearing the
+        # group really has to wait out the grace period and then SIGKILL.
+        spawn_descendant(
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)"
+        )
+        Path(str(scenario["pgid_out"])).write_text(str(os.getpgid(0)), encoding="utf-8")
+        thread_started()
+        emit({"type": "turn.started"})
+        time.sleep(600)
+        return 0
+
     if name == "sigterm_immune_descendant":
         # The descendant ignores SIGTERM, so only SIGKILL ends it and only a
         # check after the fact can tell whether the group is really empty.

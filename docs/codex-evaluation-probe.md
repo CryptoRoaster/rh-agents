@@ -158,14 +158,38 @@ Cleanup runs on its own `CleanupBudget` rather than on the attempt's deadline,
 because after a spawn overrun the deadline is already at zero and terminating a
 process needs time that no longer exists there.
 
-### Ownership during an unfinished spawn
+### The launch gate
 
 The dangerous window is not a running child; it is a child that already exists
-while `create_subprocess_exec` has not yet handed back a `Process`. Cancelling
-there does not undo the spawn. asyncio closes the transport, which calls `kill`
-on the direct child — not `killpg` — and a descendant started in that window
-survives it. Once the spawn task ends as cancelled the handle is gone, so no
-group is ever recorded, signalled or checked for that tree.
+while `create_subprocess_exec` has not yet handed back a `Process`. asyncio
+forks before it connects the pipes: in `unix_events._make_subprocess_transport`
+the transport is created and only then is the pipe-connection waiter awaited,
+and if that waiter fails the cleanup is `transp.close()` plus `await
+transp._wait()` — and `BaseSubprocessTransport.close()` calls `self._proc.kill()`,
+the direct child, not the group. The caller gets an exception and no handle.
+
+So "the spawn raised" does **not** mean "nothing was started". Without a gate, a
+Codex process could already be running, could already have started descendants,
+and the parent would own nothing it could terminate or even name.
+
+The child the probe starts is therefore not Codex. It is `launch_gate.py`: it
+becomes the session and process group leader, and then does nothing but wait on
+an inherited file descriptor. Codex is executed — via `os.execv`, keeping the
+pid, the group and every pipe — only after the parent holds the `Process` handle
+and has recorded the process group. If the transport fails first, the parent
+closes its end instead; the gate reads EOF and exits without ever starting
+Codex.
+
+A failed spawn is consequently never reported as an empty group. It is
+`UNVERIFIED`, because nothing looked. What makes it *safe* is the gate, not the
+report.
+
+### Ownership during an unfinished spawn
+
+Cancelling a pending spawn does not undo it, for the same reason: asyncio kills
+the direct child and a descendant started in that window survives. Once the
+spawn task ends as cancelled the handle is gone, so no group is ever recorded,
+signalled or checked for that tree.
 
 The probe therefore waits for the spawn to settle, and the wait ends when the
 spawn settles and at no other point. There is **no time cap and no cancellation
@@ -175,10 +199,18 @@ has forked and the pipes are connected — it never waits for the child to do
 anything. With a real Codex process, giving up instead would mean a tree that
 keeps talking to the network after the harness believed it had stopped.
 
-A caller's cancellation is **recorded, not obeyed**. Each `CancelledError` is
-absorbed, the task is un-cancelled so recovery can keep awaiting, and the
-cancellation is delivered to the caller once the child has been terminated and
-its group checked. Cancelling says "stop"; it does not say "let go".
+A caller's cancellation is **recorded, not obeyed**, and that holds for the
+whole sequence — claiming the handle, recording the group, terminating the
+leader, reaping it, clearing the group and verifying it is empty. Cleanup runs
+as its own task and is awaited through a shield, so a cancellation delivered to
+the caller never reaches it; each `CancelledError` is noted as owed, the task is
+un-cancelled so the wait can resume, and the same cleanup task is waited on
+again. Only when it has finished is the cancellation delivered.
+
+Catching `CancelledError` inside the individual steps is not a substitute: that
+only lets one step give up early, which is how a cancelled attempt could end
+with `CHILD_NOT_REAPED` or an unverified group. Cancelling says "stop"; it does
+not say "let go".
 
 Waiting that long spends the cleanup reserve, so termination then gets a fresh
 `EMERGENCY_CLEANUP_SECONDS` allowance. Without it `_terminate` would inherit an

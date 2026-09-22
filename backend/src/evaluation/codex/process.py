@@ -55,12 +55,14 @@ import asyncio
 import contextlib
 import os
 import signal
+import sys
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from src.evaluation.codex import launch_gate
 from src.evaluation.codex.deadline import Deadline
 from src.evaluation.codex.models import (
     CleanupReport,
@@ -74,6 +76,7 @@ GROUP_POLL_SECONDS = 0.02
 # Polling granularity while waiting for a spawn to settle. The waiting itself is
 # deliberately uncapped; see `_claim_spawn`.
 SPAWN_CLAIM_SLICE_SECONDS = 0.25
+LAUNCH_GATE_SCRIPT = Path(launch_gate.__file__)
 # A fresh allowance for cleaning up a spawn that arrived after its budget was
 # already spent. Without it `_terminate` would inherit an exhausted deadline and
 # could neither reap the child nor check its group: the budget would be honoured
@@ -113,6 +116,40 @@ class CleanupBudget:
     @property
     def exhausted(self) -> bool:
         return self.remaining <= 0.0
+
+
+async def _run_cleanup(
+    coroutine: Coroutine[Any, Any, CleanupReport],
+) -> tuple[CleanupReport, bool]:
+    """Run a cleanup to completion, whatever the caller does meanwhile.
+
+    Cleanup runs as its own task and is awaited through a shield, so a
+    cancellation delivered to the caller never reaches it. Each `CancelledError`
+    is recorded as owed and the wait resumes on the *same* task -- restarting or
+    cancelling it would be the shortcut the safety contract exists to forbid.
+
+    Catching `CancelledError` inside the individual steps is not a substitute.
+    That only lets one step give up early, which is how a cancelled attempt used
+    to end with `CHILD_NOT_REAPED` or an unverified group.
+
+    Returns the report and whether a cancellation is owed to the caller.
+    """
+    task = asyncio.ensure_future(coroutine)
+    owed = False
+    while True:
+        try:
+            return await asyncio.shield(task), owed
+        except asyncio.CancelledError:
+            owed = True
+            _absorb_cancellation()
+            if task.done():
+                return task.result(), owed
+
+
+async def _cleanup(
+    process: asyncio.subprocess.Process, pgid: int, budget: CleanupBudget
+) -> tuple[CleanupReport, bool]:
+    return await _run_cleanup(_terminate(process, pgid, budget))
 
 
 def _absorb_cancellation() -> None:
@@ -159,6 +196,14 @@ class AbortedByConsumer(Exception):
 
 
 @dataclass(frozen=True)
+class SpawnedChild:
+    """A child the parent owns, still waiting for permission to become Codex."""
+
+    process: asyncio.subprocess.Process
+    gate_write: int
+
+
+@dataclass(frozen=True)
 class ProcessResult:
     exit_code: int
     stderr_tail: bytes
@@ -177,7 +222,7 @@ async def run_bounded(
     spawn_process: SpawnProcess = asyncio.create_subprocess_exec,
 ) -> ProcessResult:
     """Run one child to completion under one deadline and fixed output caps."""
-    process = await _spawn(
+    spawned = await _spawn(
         arguments=arguments,
         environment=environment,
         working_directory=working_directory,
@@ -185,7 +230,11 @@ async def run_bounded(
         deadline=deadline,
         spawn_process=spawn_process,
     )
+    process = spawned.process
     pgid = _group_of(process)
+    # Ownership first, then execution: the gate has been holding the process
+    # group and nothing else, and only now may it become Codex.
+    _release_gate(spawned.gate_write)
 
     stderr_tail = b""
     try:
@@ -198,22 +247,30 @@ async def run_bounded(
         )
         exit_code = await _await_exit(process, deadline)
     except asyncio.CancelledError:
-        # The caller gave up. Clean up first, then let the cancellation through
-        # unchanged; swallowing it would strand the caller's own shutdown.
+        # The caller gave up. Cleanup finishes first, in full; the cancellation
+        # is delivered afterwards rather than swallowed.
         _absorb_cancellation()
-        await _terminate(process, pgid, cleanup_budget(deadline))
+        await _cleanup(process, pgid, cleanup_budget(deadline))
         raise
     except ProcessError as error:
-        cleanup = await _terminate(process, pgid, cleanup_budget(deadline))
+        cleanup, owed = await _cleanup(process, pgid, cleanup_budget(deadline))
+        if owed:
+            raise asyncio.CancelledError from None
         raise ProcessError(error.failure, error.reason_code, cleanup) from None
     except Exception as error:
-        cleanup = await _terminate(process, pgid, cleanup_budget(deadline))
+        cleanup, owed = await _cleanup(process, pgid, cleanup_budget(deadline))
+        if owed:
+            raise asyncio.CancelledError from None
         raise AbortedByConsumer(error, cleanup) from None
     except BaseException:
-        await _terminate(process, pgid, cleanup_budget(deadline))
+        await _cleanup(process, pgid, cleanup_budget(deadline))
         raise
 
-    cleanup = await _terminate(process, pgid, cleanup_budget(deadline))
+    cleanup, owed = await _cleanup(process, pgid, cleanup_budget(deadline))
+    if owed:
+        # A cancellation arrived while the group was being cleared. It was held
+        # until the tree was gone, and it is delivered now.
+        raise asyncio.CancelledError
     if not cleanup.complete:
         raise ProcessError(
             EvaluationFailure.CLEANUP_INCOMPLETE,
@@ -231,12 +288,32 @@ async def _spawn(
     limits: OutputLimits,
     deadline: Deadline,
     spawn_process: SpawnProcess = asyncio.create_subprocess_exec,
-) -> asyncio.subprocess.Process:
-    """Create the child inside the work budget, without losing it on a race."""
+) -> SpawnedChild:
+    """Create the child inside the work budget, without losing it on a race.
+
+    The child is the launch gate, not Codex. It takes the process group and then
+    waits, so the window in which a spawn can fail while a Codex process and its
+    descendants are already running does not exist: nothing is executed until
+    the caller holds the handle and releases the gate.
+    """
     if deadline.work_exhausted:
         raise ProcessError(EvaluationFailure.DEADLINE_EXCEEDED, "NO_TIME_TO_START", CleanupReport())
+    if not arguments or not os.access(arguments[0], os.X_OK):
+        # Checked before anything is forked, so this failure really does mean
+        # that nothing was started.
+        raise ProcessError(
+            EvaluationFailure.PROCESS_START_FAILED,
+            "EXECUTABLE_NOT_RUNNABLE",
+            CleanupReport(group=GroupState.EMPTY),
+        )
+
+    gate_read, gate_write = os.pipe()
+    os.set_inheritable(gate_read, True)
     spawn = asyncio.ensure_future(
         spawn_process(
+            sys.executable,
+            str(LAUNCH_GATE_SCRIPT),
+            str(gate_read),
             *arguments,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -245,17 +322,20 @@ async def _spawn(
             cwd=str(working_directory),
             start_new_session=True,
             limit=limits.max_line_bytes,
+            pass_fds=(gate_read,),
         )
     )
     try:
         # Shielded so a timeout or an outer cancellation cannot detach a child
         # the kernel has already created.
-        return await asyncio.wait_for(asyncio.shield(spawn), timeout=deadline.remaining_for_work)
+        process = await asyncio.wait_for(asyncio.shield(spawn), timeout=deadline.remaining_for_work)
     # TimeoutError is a subclass of OSError, so it has to be caught first or a
     # missed deadline would be misreported as a failure to start -- and the
     # spawn would be left running with nobody to claim it.
     except TimeoutError:
+        _close_fd(gate_write)
         cleanup, cancelled = await _abandon_spawn(spawn, deadline)
+        _close_fd(gate_read)
         if cancelled:
             # The caller asked to stop while recovery was running. Recovery was
             # finished first; the cancellation is delivered now, not dropped.
@@ -265,14 +345,42 @@ async def _spawn(
         ) from None
     except asyncio.CancelledError:
         _absorb_cancellation()
+        _close_fd(gate_write)
         await _abandon_spawn(spawn, deadline)
+        _close_fd(gate_read)
         raise
     except (OSError, ValueError) as error:
+        # The creation failed after the fork may already have happened. Closing
+        # the gate is what makes that safe: the child, if there is one, reads
+        # EOF and exits without ever executing Codex. What it does not give us
+        # is a handle, so the group is unverified rather than empty.
+        _close_fd(gate_write)
+        _close_fd(gate_read)
         raise ProcessError(
             EvaluationFailure.PROCESS_START_FAILED,
             type(error).__name__.upper(),
-            CleanupReport(group=GroupState.EMPTY),
+            CleanupReport(group=GroupState.UNVERIFIED, error_code="SPAWN_FAILED_AFTER_FORK"),
         ) from None
+
+    _close_fd(gate_read)
+    return SpawnedChild(process=process, gate_write=gate_write)
+
+
+def _release_gate(gate_write: int) -> None:
+    """Let the gate become Codex. Called only once the handle is owned."""
+    try:
+        os.write(gate_write, launch_gate.RELEASE_BYTE)
+    except OSError:
+        pass
+    finally:
+        _close_fd(gate_write)
+
+
+def _close_fd(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
 
 
 async def _abandon_spawn(
@@ -305,22 +413,26 @@ async def _abandon_spawn(
         else cleanup_budget(deadline)
     )
     if process is None:
-        # The spawn settled without producing a process: it raised, or someone
-        # outside this module cancelled it. Nothing was created that could be
-        # left behind.
-        failed = spawn.cancelled() or spawn.exception() is not None
+        # The spawn settled without handing over a process: it raised, or
+        # someone outside this module cancelled it. That does NOT prove nothing
+        # was started -- the fork can precede the failure -- so the group is
+        # reported as unverified rather than empty. What makes it safe is the
+        # launch gate: without a handle the gate is never released, so no Codex
+        # process exists to keep running.
         return (
             CleanupReport(
-                group=GroupState.EMPTY if failed else GroupState.UNVERIFIED,
+                group=GroupState.UNVERIFIED,
                 overran_reserve=overran,
-                error_code=None if failed else "SPAWN_NOT_RECOVERED",
+                error_code="SPAWN_NOT_RECOVERED",
             ),
             cancelled,
         )
-    report = await _terminate(process, _group_of(process), budget)
+    report, owed = await _cleanup(process, _group_of(process), budget)
     if overran and not report.overran_reserve:
         report = report.model_copy(update={"overran_reserve": True})
-    return report, cancelled
+    # A cancellation that only arrives while the group is being cleared counts
+    # just as much as one that arrived while the handle was still pending.
+    return report, cancelled or owed
 
 
 async def _claim_spawn(

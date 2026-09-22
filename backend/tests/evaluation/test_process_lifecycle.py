@@ -8,6 +8,7 @@ account of what was attempted rather than an operating-system guarantee.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -80,10 +81,11 @@ async def run(
 
 
 async def group_is_gone(pgid_file: Path) -> bool:
-    for _ in range(50):
+    for _ in range(250):
         if pgid_file.exists():  # noqa: ASYNC240 - test-local polling, not runtime code
             break
         await asyncio.sleep(0.02)
+    assert pgid_file.exists(), "the scenario never recorded its process group"  # noqa: ASYNC240
     pgid = int(pgid_file.read_text(encoding="utf-8"))  # noqa: ASYNC240
     for _ in range(100):
         try:
@@ -107,7 +109,7 @@ async def test_a_clean_run_reports_a_complete_cleanup(tmp_path: Path) -> None:
 async def test_a_timeout_ends_the_process_group(tmp_path: Path) -> None:
     pgid_file = tmp_path / "pgid"
     with pytest.raises(ProcessError) as caught:
-        await run(tmp_path, "hang", total=1.5, reserve=0.6, pgid_out=str(pgid_file))
+        await run(tmp_path, "hang", total=4.0, reserve=0.6, pgid_out=str(pgid_file))
     assert caught.value.failure is EvaluationFailure.DEADLINE_EXCEEDED
     assert caught.value.cleanup.signalled is True
     assert caught.value.cleanup.reaped is True
@@ -117,7 +119,7 @@ async def test_a_timeout_ends_the_process_group(tmp_path: Path) -> None:
 async def test_a_grandchild_in_the_group_is_ended_too(tmp_path: Path) -> None:
     pgid_file = tmp_path / "pgid"
     with pytest.raises(ProcessError):
-        await run(tmp_path, "hang_with_grandchild", total=1.5, reserve=0.6, pgid_out=str(pgid_file))
+        await run(tmp_path, "hang_with_grandchild", total=4.0, reserve=0.6, pgid_out=str(pgid_file))
     assert await group_is_gone(pgid_file)
 
 
@@ -326,20 +328,33 @@ async def test_cancellation_during_the_spawn_is_re_raised(tmp_path: Path) -> Non
         await task
 
 
-def spawn_held_back(pgid_file: Path, hold_seconds: float) -> SpawnProcess:
-    """A spawn that completes for real, then withholds the handle for a while.
+def spawn_held_back(
+    pgid_file: Path, hold_seconds: float, *, release: asyncio.Event | None = None
+) -> SpawnProcess:
+    """A spawn that starts the real command, then withholds the handle.
 
-    This is the window cancellation cannot repair: the child and its descendant
-    are already running while the caller still has no `Process` to own.
+    It deliberately steps around the launch gate -- dropping the interpreter,
+    the gate script and the gate descriptor from the argument list -- and runs
+    the command itself. That recreates the exact state the gate exists to
+    prevent: a real leader, a real descendant, and a caller holding nothing.
+
+    Production code can no longer reach that state, which is the point of the
+    gate. Ownership recovery still has to survive it, so the tests keep a way to
+    produce it on purpose.
     """
 
     async def spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
-        process = await asyncio.create_subprocess_exec(*args, **kwargs)  # type: ignore[arg-type]
+        direct = list(args)[3:]
+        options = {key: value for key, value in kwargs.items() if key != "pass_fds"}
+        process = await asyncio.create_subprocess_exec(*direct, **options)  # type: ignore[arg-type]
         for _ in range(250):
             if pgid_file.exists():  # noqa: ASYNC240 - test-local polling
                 break
             await asyncio.sleep(0.02)
-        await asyncio.sleep(hold_seconds)
+        if release is not None:
+            await release.wait()
+        else:
+            await asyncio.sleep(hold_seconds)
         return process
 
     return spawn
@@ -449,7 +464,10 @@ async def test_repeated_cancellation_cannot_take_a_spawn_out_of_ownership(
     monkeypatch.setattr(process_module, "_terminate", recording_terminate)
 
     async def spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
-        process = await asyncio.create_subprocess_exec(*args, **kwargs)  # type: ignore[arg-type]
+        # Steps around the launch gate on purpose; see `spawn_held_back`.
+        direct = list(args)[3:]
+        options = {key: value for key, value in kwargs.items() if key != "pass_fds"}
+        process = await asyncio.create_subprocess_exec(*direct, **options)  # type: ignore[arg-type]
         holder["process"] = process
         for _ in range(250):
             if pgid_file.exists():  # noqa: ASYNC240 - test-local polling
@@ -492,3 +510,246 @@ async def test_repeated_cancellation_cannot_take_a_spawn_out_of_ownership(
     assert reports[-1].group_cleared is True
     assert await group_is_gone(pgid_file)
     assert not [item for item in asyncio.all_tasks() if item is not asyncio.current_task()]
+
+
+def terminate_watcher(
+    started: asyncio.Event, reports: list[CleanupReport]
+) -> Callable[..., object]:
+    """Wrap `_terminate` so a test can cancel exactly while it is running."""
+    real = process_module._terminate
+
+    async def watched(
+        process: asyncio.subprocess.Process, pgid: int, budget: CleanupBudget
+    ) -> CleanupReport:
+        started.set()
+        report = await real(process, pgid, budget)
+        reports.append(report)
+        return report
+
+    return watched
+
+
+async def test_cancellation_during_cleanup_cannot_cut_it_short(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation in both phases: before ownership, and during termination.
+
+    Guarding only `_claim_spawn` left the second half open. A cancellation that
+    arrived once the handle was owned used to reach `_wait_for_exit` and
+    `_poll_group`, which returned early and produced CHILD_NOT_REAPED or an
+    unverified group -- cleanup cut short by the very signal that is supposed to
+    wait for it.
+    """
+    pgid_file = tmp_path / "pgid"
+    # The descendant ignores SIGTERM, so clearing the group has to wait out the
+    # grace period. A cleanup that gave up on cancellation would stop there.
+    directory = workspace(tmp_path, "hang_with_sigterm_immune_descendant", pgid_out=str(pgid_file))
+    release = asyncio.Event()
+    terminating = asyncio.Event()
+    reports: list[CleanupReport] = []
+    holder: dict[str, asyncio.subprocess.Process] = {}
+
+    monkeypatch.setattr(process_module, "_terminate", terminate_watcher(terminating, reports))
+
+    async def spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        direct = list(args)[3:]
+        options = {key: value for key, value in kwargs.items() if key != "pass_fds"}
+        process = await asyncio.create_subprocess_exec(*direct, **options)  # type: ignore[arg-type]
+        holder["process"] = process
+        for _ in range(250):
+            if pgid_file.exists():  # noqa: ASYNC240 - test-local polling
+                break
+            await asyncio.sleep(0.02)
+        await release.wait()
+        return process
+
+    task = asyncio.create_task(
+        run_bounded(
+            arguments=[str(tmp_path / "codex")],
+            environment=environment(tmp_path),
+            working_directory=directory,
+            stdin_payload=b"{}",
+            limits=OutputLimits(),
+            deadline=Deadline(total_seconds=30.0, cleanup_reserve_seconds=2.0),
+            on_stdout_line=lambda _line: None,
+            spawn_process=spawn,
+        )
+    )
+
+    for _ in range(250):
+        if pgid_file.exists():  # noqa: ASYNC240 - test-local polling
+            break
+        await asyncio.sleep(0.02)
+    assert pgid_file.exists()  # noqa: ASYNC240
+
+    # Phase one: cancel while the handle is still withheld.
+    for _ in range(5):
+        task.cancel()
+        await asyncio.sleep(0.02)
+
+    release.set()
+    await terminating.wait()
+
+    # Phase two: keep cancelling throughout termination, across the SIGTERM
+    # grace and the SIGKILL check. This pins the end-to-end contract -- the
+    # caller is answered only after the tree is gone. The narrower proof that a
+    # cancellation cannot be dropped mid-cleanup is the emergency-cleanup test
+    # below, which fails outright without the shield.
+    for _ in range(30):
+        task.cancel()
+        await asyncio.sleep(0.02)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert holder["process"].returncode is not None, "leader was not reaped"
+    assert reports, "cleanup never ran"
+    assert reports[-1].reaped is True
+    assert reports[-1].group is GroupState.EMPTY
+    assert reports[-1].group_cleared is True
+    assert await group_is_gone(pgid_file)
+    assert not [item for item in asyncio.all_tasks() if item is not asyncio.current_task()]
+
+
+async def test_cancellation_during_emergency_cleanup_beats_the_deadline_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancellation on the timeout path is delivered, not overwritten.
+
+    The spawn deadline expires, the handle is recovered afterwards, and the
+    caller cancels while the emergency cleanup runs. What comes back has to be
+    the caller's CancelledError -- reporting DEADLINE_EXCEEDED would answer a
+    question nobody asked any more.
+    """
+    pgid_file = tmp_path / "pgid"
+    directory = workspace(tmp_path, "hang_with_grandchild", pgid_out=str(pgid_file))
+    terminating = asyncio.Event()
+    reports: list[CleanupReport] = []
+
+    monkeypatch.setattr(process_module, "_terminate", terminate_watcher(terminating, reports))
+
+    task = asyncio.create_task(
+        run_bounded(
+            arguments=[str(tmp_path / "codex")],
+            environment=environment(tmp_path),
+            working_directory=directory,
+            stdin_payload=b"{}",
+            limits=OutputLimits(),
+            # Work 1.5 s, reserve 0.5 s; the handle arrives well after both.
+            deadline=Deadline(total_seconds=2.0, cleanup_reserve_seconds=0.5),
+            on_stdout_line=lambda _line: None,
+            spawn_process=spawn_held_back(pgid_file, hold_seconds=2.5),
+        )
+    )
+
+    await terminating.wait()
+    for _ in range(8):
+        task.cancel()
+        await asyncio.sleep(0.02)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert reports[-1].group is GroupState.EMPTY
+    assert reports[-1].group_cleared is True
+    assert await group_is_gone(pgid_file)
+    assert not [item for item in asyncio.all_tasks() if item is not asyncio.current_task()]
+
+
+async def test_a_spawn_failing_after_the_fork_never_starts_the_command(
+    tmp_path: Path,
+) -> None:
+    """The launch gate, doing the job it exists for.
+
+    asyncio forks before it connects the pipes, so a spawn can raise while a
+    child is already running -- and, without the gate, while that child has
+    already started descendants of its own. Here the failure happens after the
+    fork, and the command still never executes: the gate was holding the process
+    group and waiting, and the parent closed its end instead of releasing it.
+    """
+    pgid_file = tmp_path / "pgid"
+    directory = workspace(tmp_path, "hang_with_grandchild", pgid_out=str(pgid_file))
+    holder: dict[str, asyncio.subprocess.Process] = {}
+
+    async def failing_after_fork(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        # Goes through the gate exactly as production does, then fails the way
+        # a pipe-connection error would.
+        process = await asyncio.create_subprocess_exec(*args, **kwargs)  # type: ignore[arg-type]
+        holder["gate"] = process
+        await asyncio.sleep(0.2)
+        raise OSError("pipe connection failed")
+
+    with pytest.raises(ProcessError) as caught:
+        await run_bounded(
+            arguments=[str(tmp_path / "codex")],
+            environment=environment(tmp_path),
+            working_directory=directory,
+            stdin_payload=b"{}",
+            limits=OutputLimits(),
+            deadline=Deadline(total_seconds=20.0, cleanup_reserve_seconds=2.0),
+            on_stdout_line=lambda _line: None,
+            spawn_process=failing_after_fork,
+        )
+
+    assert caught.value.failure is EvaluationFailure.PROCESS_START_FAILED
+    # Nothing ran: the scenario writes this file as its first act.
+    assert not pgid_file.exists()  # noqa: ASYNC240
+    # And the report does not pretend to know the group is empty.
+    assert caught.value.cleanup.group is GroupState.UNVERIFIED
+    assert caught.value.cleanup.error_code == "SPAWN_FAILED_AFTER_FORK"
+    assert caught.value.cleanup.group_cleared is False
+
+    # The gate read EOF and exited on its own once the parent closed its end.
+    assert await asyncio.wait_for(holder["gate"].wait(), timeout=5) == 0
+
+
+async def test_a_failed_spawn_is_never_reported_as_an_empty_group(
+    tmp_path: Path,
+) -> None:
+    """A spawn that raises does not prove that nothing was started.
+
+    Reproduced with the gate stepped around, so a real leader and a real
+    descendant exist at the moment the spawn fails. Claiming `EMPTY` here -- as
+    the report used to -- would be a statement about a process tree nobody ever
+    looked at.
+    """
+    pgid_file = tmp_path / "pgid"
+    directory = workspace(tmp_path, "hang_with_grandchild", pgid_out=str(pgid_file))
+    holder: dict[str, asyncio.subprocess.Process] = {}
+
+    async def failing_after_real_start(
+        *args: object, **kwargs: object
+    ) -> asyncio.subprocess.Process:
+        direct = list(args)[3:]
+        options = {key: value for key, value in kwargs.items() if key != "pass_fds"}
+        process = await asyncio.create_subprocess_exec(*direct, **options)  # type: ignore[arg-type]
+        holder["leader"] = process
+        for _ in range(250):
+            if pgid_file.exists():  # noqa: ASYNC240 - test-local polling
+                break
+            await asyncio.sleep(0.02)
+        raise OSError("pipe connection failed")
+
+    with pytest.raises(ProcessError) as caught:
+        await run_bounded(
+            arguments=[str(tmp_path / "codex")],
+            environment=environment(tmp_path),
+            working_directory=directory,
+            stdin_payload=b"{}",
+            limits=OutputLimits(),
+            deadline=Deadline(total_seconds=20.0, cleanup_reserve_seconds=2.0),
+            on_stdout_line=lambda _line: None,
+            spawn_process=failing_after_real_start,
+        )
+
+    assert pgid_file.exists(), "the scenario did start"  # noqa: ASYNC240
+    assert caught.value.cleanup.group is not GroupState.EMPTY
+    assert caught.value.cleanup.group is GroupState.UNVERIFIED
+    assert caught.value.cleanup.group_cleared is False
+
+    # This test created the tree deliberately, so this test removes it.
+    pgid = int(pgid_file.read_text(encoding="utf-8"))  # noqa: ASYNC240
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pgid, signal.SIGKILL)
+    await asyncio.wait_for(holder["leader"].wait(), timeout=5)
+    assert await group_is_gone(pgid_file)
