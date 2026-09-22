@@ -418,3 +418,77 @@ async def test_cleanup_that_succeeds_late_is_cleared_but_not_complete(
     assert report.group_cleared is True
     assert report.overran_reserve is True
     assert report.complete is False
+
+
+async def test_repeated_cancellation_cannot_take_a_spawn_out_of_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression: cancellation may ask to stop, never to let go.
+
+    A leader and a descendant are already running while the caller still has no
+    handle. The caller then cancels far more often than the old absorption
+    counter allowed. Recovery has to finish anyway: the counter used to break
+    out of the wait here and leave the tree unowned, with no group ever recorded
+    or checked.
+    """
+    pgid_file = tmp_path / "pgid"
+    directory = workspace(tmp_path, "hang_with_grandchild", pgid_out=str(pgid_file))
+    release = asyncio.Event()
+    holder: dict[str, asyncio.subprocess.Process] = {}
+    reports: list[CleanupReport] = []
+
+    real_terminate = process_module._terminate
+
+    async def recording_terminate(
+        process: asyncio.subprocess.Process, pgid: int, budget: CleanupBudget
+    ) -> CleanupReport:
+        report = await real_terminate(process, pgid, budget)
+        reports.append(report)
+        return report
+
+    monkeypatch.setattr(process_module, "_terminate", recording_terminate)
+
+    async def spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        process = await asyncio.create_subprocess_exec(*args, **kwargs)  # type: ignore[arg-type]
+        holder["process"] = process
+        for _ in range(250):
+            if pgid_file.exists():  # noqa: ASYNC240 - test-local polling
+                break
+            await asyncio.sleep(0.02)
+        await release.wait()
+        return process
+
+    task = asyncio.create_task(
+        run_bounded(
+            arguments=[str(tmp_path / "codex")],
+            environment=environment(tmp_path),
+            working_directory=directory,
+            stdin_payload=b"{}",
+            limits=OutputLimits(),
+            deadline=Deadline(total_seconds=30.0, cleanup_reserve_seconds=2.0),
+            on_stdout_line=lambda _line: None,
+            spawn_process=spawn,
+        )
+    )
+
+    for _ in range(250):
+        if pgid_file.exists():  # noqa: ASYNC240 - test-local polling
+            break
+        await asyncio.sleep(0.02)
+    assert pgid_file.exists()  # noqa: ASYNC240 - leader and descendant are up
+
+    # Twelve cancellations: well past the eight the old counter tolerated.
+    for _ in range(12):
+        task.cancel()
+        await asyncio.sleep(0.03)
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert holder["process"].returncode is not None, "leader was not reaped"
+    assert reports, "recovery never reached cleanup"
+    assert reports[-1].group is GroupState.EMPTY
+    assert reports[-1].group_cleared is True
+    assert await group_is_gone(pgid_file)
+    assert not [item for item in asyncio.all_tasks() if item is not asyncio.current_task()]

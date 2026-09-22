@@ -12,26 +12,30 @@ endless line would otherwise defeat a per-stream cap.
 discarded rather than parsed, so a truncated stream can never be mistaken for a
 short one.
 
-**The spawn itself is inside the budget.** Creating a subprocess is an await
-like any other; left unbounded it could outlast the deadline it is supposed to
-obey. It is also a cancellation race: a spawn cancelled halfway can still
-succeed in the kernel, and dropping the handle at that moment would leak a
-process nobody owns. The spawn therefore runs shielded under the work budget,
-and a timeout or an outer cancellation claims the handle before cleaning up.
+**The spawn itself is inside the budget, but recovery is not.** Creating a
+subprocess is an await like any other; left unbounded it could outlast the
+deadline it is supposed to obey, so the creation runs shielded under the work
+budget. Recovering the handle afterwards obeys no budget at all, and that
+asymmetry is deliberate: the deadline governs how much *work* is allowed and
+when a result may still be accepted, not how long it may take to make sure
+nothing is left running.
 
-Claiming is preferred over cancelling for a concrete reason. Cancelling a
-subprocess creation does not undo it. The child may already be running, and
-asyncio's cancellation path closes the transport, which kills the *direct* child
-and waits for it -- `kill`, not `killpg`. A descendant started in that window
-survives, and once the spawn task ends as cancelled the handle is unrecoverable,
-so no group is ever recorded, signalled or verified for that tree. The same
-cancellation also inherits asyncio's wait for the child to exit, which a
-long-lived child turns into a long wait, during cleanup and again at loop close.
+Cancelling a spawn is never the answer. It does not undo the creation: the child
+may already exist, and asyncio's cancellation path closes the transport, which
+kills the *direct* child and waits for it -- `kill`, not `killpg`. A descendant
+started in that window survives, and once the spawn task ends as cancelled the
+handle is unrecoverable, so no group is ever recorded, signalled or verified for
+that tree. With a real Codex process that means network and model activity
+continuing after the harness believes it stopped.
 
-So a spawn is claimed even past the cleanup reserve, up to a ceiling, and the
-overrun is reported. Only beyond the ceiling is the handle given up, and the
-report then says `UNVERIFIED`, because at that point a process may remain and
-claiming otherwise would be a guess.
+So `_claim_spawn` waits until the spawn settles, and until nothing else. There
+is no time cap and no cancellation count: both are ways of walking away from a
+process that already exists. A caller's cancellation is absorbed and remembered,
+and delivered once the child is terminated and its group checked. The practical
+cost is small, because a subprocess creation settles as soon as the kernel has
+forked and the pipes are connected -- it never waits for the child to do
+anything. The practical consequence is that one attempt can exceed its total
+wall clock, and that is the intended trade.
 
 **Cleanup targets the group, not just the child.** The process group id is
 recorded at spawn time and kept, because `os.getpgid` stops answering once the
@@ -70,10 +74,6 @@ GROUP_POLL_SECONDS = 0.02
 # Polling granularity while waiting for a spawn to settle. The waiting itself is
 # deliberately uncapped; see `_claim_spawn`.
 SPAWN_CLAIM_SLICE_SECONDS = 0.25
-# How many outer cancellations are absorbed while waiting for a spawn. Reached
-# only when a caller cancels repeatedly, and even then the spawn is never
-# cancelled from here.
-SPAWN_CANCEL_ABSORPTIONS = 8
 # A fresh allowance for cleaning up a spawn that arrived after its budget was
 # already spent. Without it `_terminate` would inherit an exhausted deadline and
 # could neither reap the child nor check its group: the budget would be honoured
@@ -113,6 +113,19 @@ class CleanupBudget:
     @property
     def exhausted(self) -> bool:
         return self.remaining <= 0.0
+
+
+def _absorb_cancellation() -> None:
+    """Clear the current task's cancelling state so cleanup can still await.
+
+    A task that has been cancelled but has not un-cancelled itself makes the
+    next `wait_for` give up immediately. Cleanup runs entirely on awaits, so
+    without this the very code that removes the process would be the code that
+    refuses to run. The cancellation is re-raised by the caller afterwards.
+    """
+    current = asyncio.current_task()
+    if current is not None:
+        current.uncancel()
 
 
 def cleanup_budget(deadline: Deadline) -> CleanupBudget:
@@ -187,6 +200,7 @@ async def run_bounded(
     except asyncio.CancelledError:
         # The caller gave up. Clean up first, then let the cancellation through
         # unchanged; swallowing it would strand the caller's own shutdown.
+        _absorb_cancellation()
         await _terminate(process, pgid, cleanup_budget(deadline))
         raise
     except ProcessError as error:
@@ -241,11 +255,16 @@ async def _spawn(
     # missed deadline would be misreported as a failure to start -- and the
     # spawn would be left running with nobody to claim it.
     except TimeoutError:
-        cleanup = await _abandon_spawn(spawn, deadline)
+        cleanup, cancelled = await _abandon_spawn(spawn, deadline)
+        if cancelled:
+            # The caller asked to stop while recovery was running. Recovery was
+            # finished first; the cancellation is delivered now, not dropped.
+            raise asyncio.CancelledError from None
         raise ProcessError(
             EvaluationFailure.DEADLINE_EXCEEDED, "START_BUDGET_EXHAUSTED", cleanup
         ) from None
     except asyncio.CancelledError:
+        _absorb_cancellation()
         await _abandon_spawn(spawn, deadline)
         raise
     except (OSError, ValueError) as error:
@@ -258,10 +277,10 @@ async def _spawn(
 
 async def _abandon_spawn(
     spawn: "asyncio.Future[asyncio.subprocess.Process]", deadline: Deadline
-) -> CleanupReport:
+) -> tuple[CleanupReport, bool]:
     """Recover a child from an abandoned spawn and terminate it.
 
-    Ownership is not given up here. Cancelling a subprocess creation does not
+    Ownership is never given up here. Cancelling a subprocess creation does not
     undo it: the child may already be running, and asyncio's cancellation path
     closes the transport, which kills the direct child and waits for it -- with
     `kill`, not `killpg`. A descendant started in that window survives, and once
@@ -270,62 +289,76 @@ async def _abandon_spawn(
     live Codex process would also mean network and model activity continuing
     after the harness believes it has stopped.
 
-    So the handle is waited for until the spawn settles. If that runs past the
-    cleanup reserve, the overrun is reported and termination gets a fresh
-    emergency allowance -- an exhausted budget would otherwise "honour the
-    deadline" by leaving the process alive.
+    So the handle is waited for until the spawn settles, and a caller's
+    cancellation cannot shorten that. If the wait runs past the cleanup reserve,
+    the overrun is reported and termination gets a fresh emergency allowance --
+    an exhausted budget would otherwise "honour the deadline" by leaving the
+    process alive.
+
+    Returns the cleanup report and whether a cancellation was absorbed while
+    recovering, so the caller can deliver it once the tree is actually gone.
     """
-    process, overran = await _claim_spawn(spawn, deadline)
+    process, overran, cancelled = await _claim_spawn(spawn, deadline)
     budget = (
         CleanupBudget(total_seconds=EMERGENCY_CLEANUP_SECONDS)
         if overran
         else cleanup_budget(deadline)
     )
     if process is None:
-        return CleanupReport(
-            group=GroupState.UNVERIFIED,
-            overran_reserve=overran,
-            error_code="SPAWN_NEVER_SETTLED",
+        # The spawn settled without producing a process: it raised, or someone
+        # outside this module cancelled it. Nothing was created that could be
+        # left behind.
+        failed = spawn.cancelled() or spawn.exception() is not None
+        return (
+            CleanupReport(
+                group=GroupState.EMPTY if failed else GroupState.UNVERIFIED,
+                overran_reserve=overran,
+                error_code=None if failed else "SPAWN_NOT_RECOVERED",
+            ),
+            cancelled,
         )
     report = await _terminate(process, _group_of(process), budget)
     if overran and not report.overran_reserve:
-        return report.model_copy(update={"overran_reserve": True})
-    return report
+        report = report.model_copy(update={"overran_reserve": True})
+    return report, cancelled
 
 
 async def _claim_spawn(
     spawn: "asyncio.Future[asyncio.subprocess.Process]", deadline: Deadline
-) -> tuple[asyncio.subprocess.Process | None, bool]:
+) -> tuple[asyncio.subprocess.Process | None, bool, bool]:
     """Wait for a spawn to settle and take ownership of whatever it produced.
 
-    There is no time limit on the waiting, and that is the point. A subprocess
-    creation settles as soon as the kernel has forked and the pipes are
-    connected; it does not wait for the child to do anything. Capping the wait
-    would only trade a bounded delay for an unbounded process tree.
+    The loop ends when the spawn settles and at no other point. There is no
+    time cap and no cancellation count, because both would be ways of walking
+    away from a process that already exists. A subprocess creation settles as
+    soon as the kernel has forked and the pipes are connected -- it does not
+    wait for the child to do anything -- so waiting costs a moment, while giving
+    up costs an unowned process tree.
 
-    Returns the process, if one exists, and whether the caller's cleanup reserve
-    had already run out when it arrived.
+    Cancellation is recorded, not obeyed. Each `CancelledError` is absorbed and
+    the task is un-cancelled so the recovery can keep running; the caller gets
+    its cancellation once the child is terminated and its group checked.
+
+    Returns the process if one exists, whether the cleanup reserve was already
+    gone by then, and whether a cancellation is owed to the caller.
     """
-    absorbed = 0
+    cancelled = False
+    current = asyncio.current_task()
     while not spawn.done():
         try:
             await asyncio.wait([spawn], timeout=SPAWN_CLAIM_SLICE_SECONDS)
         except asyncio.CancelledError:
-            absorbed += 1
-            if absorbed > SPAWN_CANCEL_ABSORPTIONS:
-                # A caller that keeps cancelling gets its cancellation, but the
-                # spawn is left running rather than cancelled: asyncio would
-                # then kill only the direct child, and nothing could reach the
-                # group afterwards.
-                break
+            cancelled = True
+            if current is not None:
+                # Clear the cancelling state, or the next await would refuse to
+                # run and recovery would stall exactly where it must not.
+                current.uncancel()
     # Asked once the waiting is over: was the reserve already gone by the time
     # this process owned the handle?
     overran = deadline.cleanup_exhausted
-    if not spawn.done():
-        return None, True
     if spawn.cancelled() or spawn.exception() is not None:
-        return None, overran
-    return spawn.result(), overran
+        return None, overran, cancelled
+    return spawn.result(), overran, cancelled
 
 
 async def _run_pipes(

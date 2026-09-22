@@ -41,7 +41,15 @@ Three things, each enforced locally:
    concurrently and capped separately, a single line has its own cap, and the
    one payload the parser retains has a cap distinct from the stream caps.
 
-### What the deadline cannot do
+### What the deadline governs, and what it does not
+
+The deadline bounds **work**: how long the attempt may run and whether a result
+may still be accepted. It does not bound **ownership recovery or cleanup**.
+Making sure no process is left running is allowed to take longer than the
+attempt was given, so a spawn recovery can push one attempt past its total wall
+clock. That is deliberate. Nothing here should be read as a hard overall
+wall-clock guarantee — the guarantee is about accepting results, not about
+finishing.
 
 Schema parsing and the injected domain validator are ordinary synchronous
 calls. The event loop cannot preempt them, so a validator that runs long is not
@@ -159,25 +167,24 @@ on the direct child — not `killpg` — and a descendant started in that window
 survives it. Once the spawn task ends as cancelled the handle is gone, so no
 group is ever recorded, signalled or checked for that tree.
 
-The probe therefore waits for the spawn to settle, with **no time limit on the
-waiting**. That is a deliberate trade, and it is the safer one: a subprocess
-creation settles as soon as the kernel has forked and the pipes are connected —
-it does not wait for the child to do anything — so capping the wait would only
-exchange a bounded delay for an unbounded process tree. With a real Codex
-process that tree would also keep talking to the network after the harness
-believed it had stopped.
+The probe therefore waits for the spawn to settle, and the wait ends when the
+spawn settles and at no other point. There is **no time cap and no cancellation
+count**, because both are ways of walking away from a process that already
+exists. The cost is small: a subprocess creation settles as soon as the kernel
+has forked and the pipes are connected — it never waits for the child to do
+anything. With a real Codex process, giving up instead would mean a tree that
+keeps talking to the network after the harness believed it had stopped.
+
+A caller's cancellation is **recorded, not obeyed**. Each `CancelledError` is
+absorbed, the task is un-cancelled so recovery can keep awaiting, and the
+cancellation is delivered to the caller once the child has been terminated and
+its group checked. Cancelling says "stop"; it does not say "let go".
 
 Waiting that long spends the cleanup reserve, so termination then gets a fresh
 `EMERGENCY_CLEANUP_SECONDS` allowance. Without it `_terminate` would inherit an
 exhausted deadline and could neither reap the child nor check its group: the
 budget would be honoured and the process would survive. The overrun is reported
 either way.
-
-The one remaining path that gives up a handle needs a caller to cancel
-repeatedly — more than `SPAWN_CANCEL_ABSORPTIONS` times while the spawn is still
-pending. Even then the spawn is not cancelled from here, because that would
-leave asyncio killing only the direct child, and the report says `UNVERIFIED`
-with `SPAWN_NEVER_SETTLED`.
 
 Two limits stay explicit: a descendant that called `setsid` has left the group
 and is invisible here, and a group id can in principle be reused once the group
