@@ -7,6 +7,7 @@ process cannot show any of that, and a green run here is not evidence for it.
 """
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,11 @@ from src.evaluation.codex.models import (
     EvaluationRejected,
     OutputLimits,
 )
-from tests.evaluation.conftest import LAUNCHER_INJECTED_ENVIRONMENT_KEYS, Probe
+from tests.evaluation.conftest import (
+    LAUNCHER_INJECTED_ENVIRONMENT_KEYS,
+    Probe,
+    orbit_domain_validator,
+)
 
 
 class FreeForm(BaseModel):
@@ -165,12 +170,48 @@ async def test_an_unsupported_effort_is_refused_not_remapped(probe: Probe) -> No
     assert outcome.detail_code == "max"
 
 
-async def test_an_unsupported_cli_version_never_starts_a_process(probe: Probe) -> None:
+async def test_the_launcher_is_asked_which_build_it_is(probe: Probe) -> None:
     probe.scenario("success")
-    client = probe.client(cli_version="0.155.1")
+    client = probe.client()
+    assert isinstance(await client.evaluate(probe.request()), EvaluationCompleted)
+    # The version probe is its own process with its own counter.
+    assert client.version_starts == 1
+    assert client.exec_starts == 1
+
+
+async def test_a_launcher_reporting_another_build_never_runs_an_attempt(
+    probe: Probe,
+) -> None:
+    probe.scenario("success", version="codex-cli 0.155.1")
+    client = probe.client()
     outcome = await client.evaluate(probe.request())
     assert isinstance(outcome, EvaluationRejected)
     assert outcome.reason is EvaluationFailure.CLI_VERSION_UNSUPPORTED
+    # The measured version is reported, not the one we hoped for.
+    assert outcome.detail_code == "0.155.1"
+    assert client.version_starts == 1
+    assert client.exec_starts == 0
+
+
+async def test_a_launcher_that_reports_no_version_never_runs_an_attempt(
+    probe: Probe,
+) -> None:
+    probe.scenario("success", version=None)
+    client = probe.client()
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.VERSION_CHECK_FAILED
+    assert outcome.detail_code == "VERSION_NOT_REPORTED"
+    assert client.exec_starts == 0
+
+
+async def test_a_failing_version_probe_never_runs_an_attempt(probe: Probe) -> None:
+    probe.scenario("success", version="__fail__")
+    client = probe.client()
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.VERSION_CHECK_FAILED
+    assert outcome.detail_code == "EXIT_2"
     assert client.exec_starts == 0
 
 
@@ -227,3 +268,51 @@ async def test_the_child_inherits_no_credential_from_the_parent(probe: Probe) ->
     ):
         assert banned not in seen
     assert seen["CODEX_HOME"] == str(probe.codex_home)
+
+
+async def test_a_validator_that_overruns_the_deadline_is_never_a_late_success(
+    probe: Probe,
+) -> None:
+    """The regression: synchronous validation cannot be cancelled, only caught.
+
+    `time.sleep` in a validator blocks the event loop outright. Nothing can
+    interrupt it, so the only honest handling is to notice the overrun once it
+    returns and refuse the result that arrived too late.
+    """
+    probe.scenario("success")
+    bound = orbit_domain_validator(probe.task_input)
+
+    def slow(output: OrbitAssessment) -> None:
+        bound(output)
+        time.sleep(2.0)
+
+    outcome = await probe.client().evaluate(
+        probe.request(deadline_seconds=2.0, cleanup_reserve_seconds=0.5, domain_validator=slow)
+    )
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.DEADLINE_EXCEEDED
+    assert outcome.detail_code == "VALIDATION_OVERRAN"
+
+
+async def test_the_same_budget_accepts_a_validator_that_returns_in_time(
+    probe: Probe,
+) -> None:
+    probe.scenario("success")
+    outcome = await probe.client().evaluate(
+        probe.request(deadline_seconds=2.0, cleanup_reserve_seconds=0.5)
+    )
+    assert isinstance(outcome, EvaluationCompleted)
+
+
+async def test_the_version_probe_runs_with_the_same_scrubbed_environment(
+    probe: Probe,
+) -> None:
+    recorded = probe.workspace.parent / "version-env.json"
+    probe.scenario("success", version_environment_out=str(recorded))
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+
+    seen = json.loads(Path(recorded).read_text(encoding="utf-8"))  # noqa: ASYNC240
+    assert set(seen) - LAUNCHER_INJECTED_ENVIRONMENT_KEYS == set(ALLOWED_ENVIRONMENT_KEYS)
+    for banned in ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"):
+        assert banned not in seen

@@ -19,7 +19,6 @@ from src.agents.orbit.models import OrbitAssessment, OrbitTaskInput
 from src.agents.orbit.validation import OrbitValidationError, validate_assessment
 from src.evaluation.codex.client import CodexClientConfig, CodexEvaluationClient
 from src.evaluation.codex.models import (
-    SUPPORTED_CLI_VERSION,
     CodexLauncher,
     DomainValidationError,
     EvaluationRequest,
@@ -114,7 +113,6 @@ class Probe:
     def config(self, **overrides: Any) -> CodexClientConfig:
         settings: dict[str, Any] = {
             "launcher": self.launcher(),
-            "cli_version": SUPPORTED_CLI_VERSION,
             "codex_home": self.codex_home,
             "home": self.home,
             "tmpdir": self.tmpdir,

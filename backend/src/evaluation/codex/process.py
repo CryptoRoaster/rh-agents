@@ -1,25 +1,42 @@
-"""Start one child, read it under caps, and always account for its end.
+"""Start one child, read it under caps, and always account for its whole group.
 
-Three rules shape this module.
+Four rules shape this module.
 
-Both pipes are drained concurrently and both are capped. `communicate()` is not
-used: it buffers without limit, and a child that writes faster than it exits
+**Both pipes are drained concurrently and both are capped.** `communicate()` is
+not used: it buffers without limit, and a child that writes faster than it exits
 would grow the parent's memory until something else broke first. A single
 unterminated line is capped separately from the stream total, because one
 endless line would otherwise defeat a per-stream cap.
 
-An overflow ends the attempt. Whatever was read up to that point is discarded
-rather than parsed, so a truncated stream can never be mistaken for a short one.
+**An overflow ends the attempt.** Whatever was read up to that point is
+discarded rather than parsed, so a truncated stream can never be mistaken for a
+short one.
 
-Cleanup always runs -- after success, after a timeout, after an error during
-startup, and after an outer cancellation -- and it always reports what it
-achieved. The child is started in its own session so a signal reaches the whole
-process group rather than only the direct child, which matters because the npm
-entry point re-spawns the real binary. Even so, a clean report is not an
-operating-system guarantee: it says a signal was delivered and the direct child
-was reaped inside the reserved time. A descendant that left its process group is
-beyond what this can see, and an overrun is reported instead of ignored.
+**The spawn itself is inside the budget.** Creating a subprocess is an await
+like any other; left unbounded it could outlast the deadline it is supposed to
+obey. It is also a cancellation race: a spawn cancelled halfway can still
+succeed in the kernel, and dropping the handle at that moment would leak a
+process nobody owns. The spawn therefore runs shielded under the work budget,
+and a timeout or an outer cancellation claims the handle before cleaning up.
 
+Claiming is preferred over cancelling for a concrete reason. Cancelling a
+subprocess creation makes asyncio wait for the child it already started to
+exit, so a child that sleeps for ten minutes turns cancellation into a ten
+minute wait -- once during cleanup and again when the event loop closes. Waiting
+the few milliseconds a spawn needs and then killing the process is both faster
+and more honest.
+
+**Cleanup targets the group, not just the child.** The process group id is
+recorded at spawn time and kept, because `os.getpgid` stops answering once the
+leader is gone. A leader exiting on its own is not the end of the story: it can
+leave descendants behind in the same group, so the group is cleared and then
+checked whatever the leader did. `GroupState` records what that check found, and
+`UNVERIFIED` is used when the cleanup budget ran out before the group could be
+confirmed empty -- that is not a synonym for success.
+
+Two limits stay explicit. A descendant that called `setsid` has left the group
+and is invisible here, and a group id can in principle be reused once the group
+is empty, which is why the group is only signalled while it is known to exist.
 An outer `CancelledError` is re-raised after cleanup finishes, never swallowed.
 """
 
@@ -27,15 +44,21 @@ import asyncio
 import contextlib
 import os
 import signal
-from collections.abc import Callable, Coroutine
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from src.evaluation.codex.deadline import Deadline
-from src.evaluation.codex.models import CleanupReport, EvaluationFailure, OutputLimits
+from src.evaluation.codex.models import (
+    CleanupReport,
+    EvaluationFailure,
+    GroupState,
+    OutputLimits,
+)
 
 TERMINATE_GRACE_SECONDS = 0.5
+GROUP_POLL_SECONDS = 0.02
 
 
 class ProcessError(Exception):
@@ -81,25 +104,14 @@ async def run_bounded(
     on_stdout_line: Callable[[bytes], None],
 ) -> ProcessResult:
     """Run one child to completion under one deadline and fixed output caps."""
-    if deadline.work_exhausted:
-        raise ProcessError(EvaluationFailure.DEADLINE_EXCEEDED, "NO_TIME_TO_START", CleanupReport())
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *arguments,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=environment,
-            cwd=str(working_directory),
-            start_new_session=True,
-            limit=limits.max_line_bytes,
-        )
-    except (OSError, ValueError) as error:
-        raise ProcessError(
-            EvaluationFailure.PROCESS_START_FAILED,
-            type(error).__name__.upper(),
-            CleanupReport(),
-        ) from None
+    process = await _spawn(
+        arguments=arguments,
+        environment=environment,
+        working_directory=working_directory,
+        limits=limits,
+        deadline=deadline,
+    )
+    pgid = _group_of(process)
 
     stderr_tail = b""
     try:
@@ -114,24 +126,123 @@ async def run_bounded(
     except asyncio.CancelledError:
         # The caller gave up. Clean up first, then let the cancellation through
         # unchanged; swallowing it would strand the caller's own shutdown.
-        await _terminate(process, deadline)
+        await _terminate(process, pgid, deadline)
         raise
     except ProcessError as error:
-        cleanup = await _terminate(process, deadline)
+        cleanup = await _terminate(process, pgid, deadline)
         raise ProcessError(error.failure, error.reason_code, cleanup) from None
     except Exception as error:
-        cleanup = await _terminate(process, deadline)
+        cleanup = await _terminate(process, pgid, deadline)
         raise AbortedByConsumer(error, cleanup) from None
     except BaseException:
-        await _terminate(process, deadline)
+        await _terminate(process, pgid, deadline)
         raise
 
-    cleanup = await _terminate(process, deadline)
+    cleanup = await _terminate(process, pgid, deadline)
     if not cleanup.complete:
         raise ProcessError(
-            EvaluationFailure.CLEANUP_INCOMPLETE, cleanup.error_code or "CLEANUP_OVERRAN", cleanup
+            EvaluationFailure.CLEANUP_INCOMPLETE,
+            cleanup.error_code or "CLEANUP_OVERRAN",
+            cleanup,
         )
     return ProcessResult(exit_code=exit_code, stderr_tail=stderr_tail, cleanup=cleanup)
+
+
+async def _spawn(
+    *,
+    arguments: list[str],
+    environment: dict[str, str],
+    working_directory: Path,
+    limits: OutputLimits,
+    deadline: Deadline,
+) -> asyncio.subprocess.Process:
+    """Create the child inside the work budget, without losing it on a race."""
+    if deadline.work_exhausted:
+        raise ProcessError(EvaluationFailure.DEADLINE_EXCEEDED, "NO_TIME_TO_START", CleanupReport())
+    spawn = asyncio.ensure_future(
+        asyncio.create_subprocess_exec(
+            *arguments,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=environment,
+            cwd=str(working_directory),
+            start_new_session=True,
+            limit=limits.max_line_bytes,
+        )
+    )
+    try:
+        # Shielded so a timeout or an outer cancellation cannot detach a child
+        # the kernel has already created.
+        return await asyncio.wait_for(asyncio.shield(spawn), timeout=deadline.remaining_for_work)
+    # TimeoutError is a subclass of OSError, so it has to be caught first or a
+    # missed deadline would be misreported as a failure to start -- and the
+    # spawn would be left running with nobody to claim it.
+    except TimeoutError:
+        cleanup = await _abandon_spawn(spawn, deadline)
+        raise ProcessError(
+            EvaluationFailure.DEADLINE_EXCEEDED, "START_BUDGET_EXHAUSTED", cleanup
+        ) from None
+    except asyncio.CancelledError:
+        await _abandon_spawn(spawn, deadline)
+        raise
+    except (OSError, ValueError) as error:
+        raise ProcessError(
+            EvaluationFailure.PROCESS_START_FAILED,
+            type(error).__name__.upper(),
+            CleanupReport(group=GroupState.EMPTY),
+        ) from None
+
+
+async def _abandon_spawn(
+    spawn: "asyncio.Future[asyncio.subprocess.Process]", deadline: Deadline
+) -> CleanupReport:
+    """Recover a child from an abandoned spawn and terminate it.
+
+    Claiming the handle comes first and gets the whole cleanup budget, because
+    cancelling a subprocess creation is the worse option: asyncio responds by
+    waiting for the child it already started to exit, and a child that sleeps
+    for ten minutes makes that wait ten minutes long -- inside cleanup, and
+    again when the event loop shuts down. Waiting the few milliseconds a spawn
+    actually needs, and then killing the process properly, avoids both.
+    """
+    process = await _claim_spawn(spawn, deadline)
+    if process is None:
+        return CleanupReport(group=GroupState.UNVERIFIED, error_code="SPAWN_ABANDONED")
+    return await _terminate(process, _group_of(process), deadline)
+
+
+async def _claim_spawn(
+    spawn: "asyncio.Future[asyncio.subprocess.Process]", deadline: Deadline
+) -> asyncio.subprocess.Process | None:
+    """Take ownership of a spawn the caller stopped waiting for."""
+    budget = max(0.0, deadline.remaining_for_cleanup)
+    if budget > 0 and not spawn.done():
+        # `asyncio.wait` neither raises the task's exception nor cancels it.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait([spawn], timeout=budget)
+    if not spawn.done():
+        # Out of time. Cancel, but never await the cancellation: asyncio may be
+        # waiting on the child's exit, and this path must not inherit that wait.
+        # A process that still arrives is killed by the callback instead.
+        spawn.add_done_callback(_kill_late_arrival)
+        spawn.cancel()
+        return None
+    if spawn.cancelled() or spawn.exception() is not None:
+        return None
+    return spawn.result()
+
+
+def _kill_late_arrival(spawn: "asyncio.Future[asyncio.subprocess.Process]") -> None:
+    """Kill a child that finished spawning after its owner had given up.
+
+    Synchronous on purpose: a done-callback cannot await, and the only thing
+    still worth doing is making sure the group does not outlive the attempt.
+    """
+    if spawn.cancelled() or spawn.exception() is not None:
+        return
+    process = spawn.result()
+    _signal_group(_group_of(process), signal.SIGKILL)
 
 
 async def _run_pipes(
@@ -145,9 +256,7 @@ async def _run_pipes(
     stderr_chunks: list[bytes] = []
     tasks = [
         asyncio.create_task(_feed_stdin(process, stdin_payload)),
-        asyncio.create_task(
-            _pump_stdout(process, limits, on_stdout_line),
-        ),
+        asyncio.create_task(_pump_stdout(process, limits, on_stdout_line)),
         asyncio.create_task(_pump_stderr(process, limits, stderr_chunks)),
     ]
     try:
@@ -197,7 +306,7 @@ async def _pump_stdout(
         return
     total = 0
     while True:
-        line = await _read_line(reader, EvaluationFailure.STDOUT_OVERFLOW)
+        line = await _read_line(reader)
         if not line:
             return
         total += len(line)
@@ -229,7 +338,7 @@ async def _pump_stderr(
         chunks.append(chunk)
 
 
-async def _read_line(reader: asyncio.StreamReader, overflow: EvaluationFailure) -> bytes:
+async def _read_line(reader: asyncio.StreamReader) -> bytes:
     try:
         return await reader.readline()
     except (ValueError, asyncio.LimitOverrunError):
@@ -249,28 +358,125 @@ async def _await_exit(process: asyncio.subprocess.Process, deadline: Deadline) -
         ) from None
 
 
-async def _terminate(process: asyncio.subprocess.Process, deadline: Deadline) -> CleanupReport:
-    """Signal the process group, reap the child, and say what was achieved."""
-    if process.returncode is not None:
-        return CleanupReport(signalled=False, reaped=True, exit_code=process.returncode)
+def _group_of(process: asyncio.subprocess.Process) -> int:
+    """Record the child's process group while the leader is still answering.
 
-    signalled = _signal_group(process, signal.SIGTERM)
-    reaped, code = await _wait_for_exit(
-        process, min(TERMINATE_GRACE_SECONDS, deadline.remaining_for_cleanup)
-    )
-    if not reaped:
-        _signal_group(process, signal.SIGKILL)
-        reaped, code = await _wait_for_exit(process, deadline.remaining_for_cleanup)
+    `start_new_session=True` makes the child a session and group leader, so its
+    group id equals its pid. Asking the kernel is still preferred; the pid is
+    the fallback for the case where the child has already exited, because a
+    group outlives its leader as long as any member is left.
+    """
+    try:
+        return os.getpgid(process.pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        return process.pid
 
+
+async def _terminate(
+    process: asyncio.subprocess.Process, pgid: int, deadline: Deadline
+) -> CleanupReport:
+    """Reap the child, clear its group, and report what was established."""
+    signalled = False
+    if process.returncode is None:
+        signalled = _signal_group(pgid, signal.SIGTERM)
+        reaped, code = await _wait_for_exit(
+            process, min(TERMINATE_GRACE_SECONDS, deadline.remaining_for_cleanup)
+        )
+        if not reaped:
+            _signal_group(pgid, signal.SIGKILL)
+            reaped, code = await _wait_for_exit(process, deadline.remaining_for_cleanup)
+    else:
+        # The leader finished on its own. That says nothing about the rest of
+        # its group, so cleanup continues rather than returning here.
+        reaped, code = True, process.returncode
+
+    group, group_signalled = await _clear_group(pgid, deadline)
     if reaped:
         _release_pipes(process)
+
+    error: str | None = None
+    if not reaped:
+        error = "CHILD_NOT_REAPED"
+    elif group is GroupState.OCCUPIED:
+        error = "GROUP_NOT_EMPTY"
+    elif group is GroupState.UNVERIFIED:
+        error = "GROUP_NOT_VERIFIED"
+
     return CleanupReport(
-        signalled=signalled,
+        signalled=signalled or group_signalled,
         reaped=reaped,
         exit_code=code,
-        overran_reserve=deadline.cleanup_exhausted and not reaped,
-        error_code=None if reaped else "CHILD_NOT_REAPED",
+        group=group,
+        overran_reserve=deadline.cleanup_exhausted
+        and (not reaped or group is not GroupState.EMPTY),
+        error_code=error,
     )
+
+
+async def _clear_group(pgid: int, deadline: Deadline) -> tuple[GroupState, bool]:
+    """Signal whatever is left in the group and confirm the group is empty."""
+    if not _group_alive(pgid):
+        return GroupState.EMPTY, False
+
+    signalled = _signal_group(pgid, signal.SIGTERM)
+    state = await _poll_group(pgid, min(TERMINATE_GRACE_SECONDS, deadline.remaining_for_cleanup))
+    if state is GroupState.EMPTY:
+        return state, signalled
+
+    # Something in the group ignored SIGTERM, or was too slow to act on it.
+    killed = _signal_group(pgid, signal.SIGKILL)
+    state = await _poll_group(pgid, deadline.remaining_for_cleanup)
+    return state, signalled or killed
+
+
+async def _poll_group(pgid: int, budget: float) -> GroupState:
+    """Wait for the group to empty, and never guess when time runs out."""
+    if budget <= 0:
+        return GroupState.EMPTY if not _group_alive(pgid) else GroupState.UNVERIFIED
+    until = time.monotonic() + budget
+    while time.monotonic() < until:
+        if not _group_alive(pgid):
+            return GroupState.EMPTY
+        try:
+            await asyncio.sleep(GROUP_POLL_SECONDS)
+        except asyncio.CancelledError:
+            # Cleanup was cut short. Report what is currently true rather than
+            # assuming the signals took effect.
+            return GroupState.EMPTY if not _group_alive(pgid) else GroupState.UNVERIFIED
+    return GroupState.EMPTY if not _group_alive(pgid) else GroupState.OCCUPIED
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        # Something is there that this process may not signal. Treat it as
+        # present rather than reporting an empty group we cannot see into.
+        return True
+    return True
+
+
+def _signal_group(pgid: int, number: int) -> bool:
+    try:
+        os.killpg(pgid, number)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
+
+
+async def _wait_for_exit(
+    process: asyncio.subprocess.Process, budget: float
+) -> tuple[bool, int | None]:
+    if budget <= 0:
+        return process.returncode is not None, process.returncode
+    try:
+        # Shielded so an outer cancellation cannot abandon an unreaped child.
+        code = await asyncio.wait_for(asyncio.shield(asyncio.ensure_future(process.wait())), budget)
+    except (TimeoutError, asyncio.CancelledError):
+        return process.returncode is not None, process.returncode
+    return True, code
 
 
 def _release_pipes(process: asyncio.subprocess.Process) -> None:
@@ -286,25 +492,3 @@ def _release_pipes(process: asyncio.subprocess.Process) -> None:
         return
     with contextlib.suppress(Exception):
         transport.close()
-
-
-def _signal_group(process: asyncio.subprocess.Process, number: int) -> bool:
-    try:
-        os.killpg(os.getpgid(process.pid), number)
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-    return True
-
-
-async def _wait_for_exit(
-    process: asyncio.subprocess.Process, budget: float
-) -> tuple[bool, int | None]:
-    if budget <= 0:
-        return process.returncode is not None, process.returncode
-    waiter: Coroutine[Any, Any, int] = process.wait()
-    try:
-        # Shielded so an outer cancellation cannot abandon an unreaped child.
-        code = await asyncio.wait_for(asyncio.shield(asyncio.ensure_future(waiter)), budget)
-    except (TimeoutError, asyncio.CancelledError):
-        return process.returncode is not None, process.returncode
-    return True, code

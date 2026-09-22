@@ -32,6 +32,7 @@ from src.evaluation.codex.command import (
     CommandBuildError,
     build_arguments,
     build_preflight_arguments,
+    build_version_arguments,
     child_environment,
 )
 from src.evaluation.codex.deadline import Deadline
@@ -51,12 +52,13 @@ from src.evaluation.codex.models import (
     ProcessLimits,
     SchemaUnsupportedError,
 )
-from src.evaluation.codex.preflight import check_chatgpt_login
+from src.evaluation.codex.preflight import check_chatgpt_login, check_cli_version
 from src.evaluation.codex.process import AbortedByConsumer, ProcessError, run_bounded
 from src.evaluation.codex.schema import strict_schema
 from src.evaluation.codex.stream import EventAccumulator, StreamError
 
 PREFLIGHT_BUDGET_SECONDS = 10.0
+VERSION_BUDGET_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -68,7 +70,6 @@ class CodexClientConfig:
     """
 
     launcher: CodexLauncher
-    cli_version: str
     codex_home: Path
     home: Path
     tmpdir: Path
@@ -80,6 +81,7 @@ class CodexClientConfig:
     process_limits: ProcessLimits = ProcessLimits()
     run_preflight: bool = True
     preflight_budget_seconds: float = PREFLIGHT_BUDGET_SECONDS
+    version_budget_seconds: float = VERSION_BUDGET_SECONDS
 
 
 @dataclass
@@ -88,6 +90,7 @@ class CodexEvaluationClient:
 
     config: CodexClientConfig
     exec_starts: int = field(default=0, init=False)
+    version_starts: int = field(default=0, init=False)
     preflight_starts: int = field(default=0, init=False)
 
     async def evaluate[Output: BaseModel](
@@ -107,10 +110,6 @@ class CodexEvaluationClient:
     async def _attempt[Output: BaseModel](
         self, request: EvaluationRequest[Output], deadline: Deadline
     ) -> EvaluationOutcome[Output]:
-        if self.config.cli_version != SUPPORTED_CLI_VERSION:
-            return self._reject(
-                EvaluationFailure.CLI_VERSION_UNSUPPORTED, self.config.cli_version, deadline
-            )
         if self.config.effort is not None and self.config.effort not in SUPPORTED_EFFORTS:
             # Never remapped onto a neighbouring value: a silently downgraded
             # effort would make the recorded configuration a lie.
@@ -133,6 +132,10 @@ class CodexEvaluationClient:
             tmpdir=self.config.tmpdir,
             path_entries=self.config.launcher.path_entries,
         )
+
+        rejection = await self._verify_version(environment, request.limits, deadline)
+        if rejection is not None:
+            return rejection
 
         if self.config.run_preflight:
             rejection = await self._preflight(environment, request.limits, deadline)
@@ -191,6 +194,65 @@ class CodexEvaluationClient:
 
         return self._finish(request, accumulator, result.exit_code, result.cleanup, deadline)
 
+    async def _verify_version(
+        self, environment: dict[str, str], limits: OutputLimits, deadline: Deadline
+    ) -> EvaluationRejected | None:
+        """Ask the launcher on disk which build it is, and refuse anything else.
+
+        A configured version string would only record an expectation. What
+        decides is the answer of the executable that would actually run, since
+        a different build may carry a different event contract, different
+        default tools or different flag names.
+        """
+        if self.version_starts >= self.config.process_limits.max_version_starts:
+            return self._reject(
+                EvaluationFailure.VERSION_CHECK_FAILED, "VERSION_BUDGET_EXHAUSTED", deadline
+            )
+        try:
+            arguments = build_version_arguments(launcher=self.config.launcher)
+        except CommandBuildError as error:
+            return self._reject(error.failure, error.reason_code, deadline)
+
+        probe = self._probe_deadline(self.config.version_budget_seconds, deadline)
+        if probe is None:
+            return self._reject(
+                EvaluationFailure.DEADLINE_EXCEEDED, "NO_TIME_FOR_VERSION_CHECK", deadline
+            )
+
+        self.version_starts += 1
+        try:
+            outcome = await check_cli_version(
+                arguments=arguments,
+                environment=environment,
+                working_directory=self.config.workspace,
+                limits=limits,
+                deadline=probe,
+            )
+        except ProcessError as error:
+            return self._reject(error.failure, error.reason_code, deadline, error.cleanup)
+
+        if outcome.version is None:
+            return self._reject(
+                EvaluationFailure.VERSION_CHECK_FAILED,
+                "VERSION_NOT_REPORTED",
+                deadline,
+                outcome.cleanup,
+            )
+        if outcome.version != SUPPORTED_CLI_VERSION:
+            return self._reject(
+                EvaluationFailure.CLI_VERSION_UNSUPPORTED,
+                outcome.version,
+                deadline,
+                outcome.cleanup,
+            )
+        return None
+
+    def _probe_deadline(self, budget_seconds: float, deadline: Deadline) -> Deadline | None:
+        budget = min(budget_seconds, deadline.remaining_for_work)
+        if budget <= 0:
+            return None
+        return Deadline(total_seconds=budget, cleanup_reserve_seconds=min(1.0, budget / 4))
+
     async def _preflight(
         self, environment: dict[str, str], limits: OutputLimits, deadline: Deadline
     ) -> EvaluationRejected | None:
@@ -203,12 +265,11 @@ class CodexEvaluationClient:
         except CommandBuildError as error:
             return self._reject(error.failure, error.reason_code, deadline)
 
-        budget = min(self.config.preflight_budget_seconds, deadline.remaining_for_work)
-        if budget <= 0:
+        probe = self._probe_deadline(self.config.preflight_budget_seconds, deadline)
+        if probe is None:
             return self._reject(
                 EvaluationFailure.DEADLINE_EXCEEDED, "NO_TIME_FOR_PREFLIGHT", deadline
             )
-        probe = Deadline(total_seconds=budget, cleanup_reserve_seconds=min(1.0, budget / 4))
 
         self.preflight_starts += 1
         try:
@@ -235,6 +296,12 @@ class CodexEvaluationClient:
         cleanup: CleanupReport,
         deadline: Deadline,
     ) -> EvaluationOutcome[Output]:
+        if deadline.expired:
+            # The budget was already gone when the child finished. Parsing an
+            # answer now could only produce a result that arrived too late.
+            return self._reject(
+                EvaluationFailure.DEADLINE_EXCEEDED, "RESULT_AFTER_DEADLINE", deadline, cleanup
+            )
         try:
             answer = accumulator.require_consistent_completion()
         except StreamError as error:
@@ -263,6 +330,14 @@ class CodexEvaluationClient:
         except DomainValidationError as error:
             return self._reject(
                 EvaluationFailure.OUTPUT_DOMAIN_INVALID, error.reason_code, deadline, cleanup
+            )
+
+        if deadline.expired:
+            # Schema parsing and the injected validator are synchronous calls the
+            # event loop cannot preempt, so an overrun can only be noticed once
+            # they return. It is noticed here, and it is never completed anyway.
+            return self._reject(
+                EvaluationFailure.DEADLINE_EXCEEDED, "VALIDATION_OVERRAN", deadline, cleanup
             )
 
         return EvaluationCompleted(

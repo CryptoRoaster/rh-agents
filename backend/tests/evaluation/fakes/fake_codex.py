@@ -35,6 +35,22 @@ ASSESSMENT = {
 }
 
 
+def spawn_descendant(code: str) -> None:
+    """Start a process in this process group with its pipes detached.
+
+    Detaching matters: a descendant holding the inherited stdout would keep the
+    parent's pipe open after the parent exits, and the reader would wait for an
+    EOF that never comes. The point of these scenarios is the process group, not
+    a stuck pipe.
+    """
+    subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def emit(event: dict[str, object]) -> None:
     sys.stdout.write(json.dumps(event) + "\n")
     sys.stdout.flush()
@@ -79,6 +95,24 @@ def answer(scenario: dict[str, object]) -> str:
 def main() -> int:
     scenario_path = Path.cwd() / "scenario.json"
     scenario: dict[str, object] = json.loads(scenario_path.read_text(encoding="utf-8"))
+    if sys.argv[1:2] == ["--version"]:
+        # The build probe has its own scenario key so a test can pair any
+        # reported version with any attempt answer.
+        recorder = scenario.get("version_environment_out")
+        if isinstance(recorder, str):
+            Path(recorder).write_text(
+                json.dumps(dict(os.environ), sort_keys=True), encoding="utf-8"
+            )
+        reported = scenario.get("version", "codex-cli 0.153.4")
+        if reported is None:
+            sys.stdout.write("codex-cli\n")
+            return 0
+        if reported == "__fail__":
+            sys.stderr.write("cannot determine version\n")
+            return 2
+        sys.stdout.write(f"{reported}\n")
+        return 0
+
     if sys.argv[1:3] == ["login", "status"]:
         # The login probe is a separate invocation with its own scenario key, so
         # a test can pair any login answer with any attempt answer.
@@ -104,11 +138,36 @@ def main() -> int:
         return 0
 
     if name == "hang_with_grandchild":
-        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        spawn_descendant("import time; time.sleep(600)")
         Path(str(scenario["pgid_out"])).write_text(str(os.getpgid(0)), encoding="utf-8")
         thread_started()
         emit({"type": "turn.started"})
         time.sleep(600)
+        return 0
+
+    if name == "parent_exits_grandchild_runs":
+        # The leader finishes cleanly and leaves a descendant behind in the same
+        # process group. Reaping the child alone would leave that descendant
+        # running, which is exactly what cleanup has to catch.
+        spawn_descendant("import time; time.sleep(600)")
+        Path(str(scenario["pgid_out"])).write_text(str(os.getpgid(0)), encoding="utf-8")
+        thread_started()
+        emit({"type": "turn.started"})
+        agent_message(answer(scenario))
+        turn_completed()
+        return 0
+
+    if name == "sigterm_immune_descendant":
+        # The descendant ignores SIGTERM, so only SIGKILL ends it and only a
+        # check after the fact can tell whether the group is really empty.
+        spawn_descendant(
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)"
+        )
+        Path(str(scenario["pgid_out"])).write_text(str(os.getpgid(0)), encoding="utf-8")
+        thread_started()
+        emit({"type": "turn.started"})
+        agent_message(answer(scenario))
+        turn_completed()
         return 0
 
     if name == "stdout_flood":

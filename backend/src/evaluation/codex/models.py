@@ -15,6 +15,13 @@ at most one `codex exec` start, no resume, no restart, one monotonic deadline,
 and bounded reading of every child channel. It promises nothing about the number
 of model requests, HTTP attempts or generated tokens; the CLI does not expose
 those, and claiming them would be false.
+
+One limit of the deadline is worth stating plainly rather than burying. Schema
+parsing and the injected domain validator are ordinary synchronous calls. The
+event loop cannot preempt them, so a validator that runs long is not cut short;
+it is detected once it returns, and the attempt is then rejected instead of
+completed. The deadline bounds when a result may be accepted, not how long every
+step is allowed to occupy the thread.
 """
 
 from collections.abc import Callable
@@ -52,6 +59,7 @@ class EvaluationFailure(StrEnum):
     """
 
     CLI_VERSION_UNSUPPORTED = "CLI_VERSION_UNSUPPORTED"
+    VERSION_CHECK_FAILED = "VERSION_CHECK_FAILED"
     LAUNCHER_UNSUPPORTED = "LAUNCHER_UNSUPPORTED"
     SCHEMA_UNSUPPORTED = "SCHEMA_UNSUPPORTED"
     EFFORT_NOT_SUPPORTED = "EFFORT_NOT_SUPPORTED"
@@ -122,11 +130,13 @@ class OutputLimits(Immutable):
 class ProcessLimits(Immutable):
     """Process starts this harness allows, counted per kind.
 
-    The evaluation attempt and the login-status probe are separate processes with
-    separate budgets. Collapsing them would hide one start behind the other.
+    The attempt, the version probe and the login probe are three separate
+    processes with three separate budgets. Collapsing them would hide one start
+    behind another, and "at most one `codex exec`" would stop meaning anything.
     """
 
     max_exec_starts: Literal[1] = 1
+    max_version_starts: Literal[1] = 1
     max_preflight_starts: Literal[1] = 1
 
 
@@ -170,24 +180,49 @@ class ObservedToolActivity(Immutable):
     count: int = Field(ge=1)
 
 
+class GroupState(StrEnum):
+    """What was established about the child's process group after cleanup.
+
+    `UNVERIFIED` is the honest answer when the cleanup budget ran out before the
+    group could be checked. It is not a synonym for `EMPTY`: signals are cheap
+    and were still delivered, but nothing confirmed they took effect.
+    """
+
+    EMPTY = "EMPTY"
+    OCCUPIED = "OCCUPIED"
+    UNVERIFIED = "UNVERIFIED"
+
+
 class CleanupReport(Immutable):
-    """What actually happened to the child after the attempt ended.
+    """What actually happened to the child's process group after the attempt.
 
     A clean report is not an operating-system guarantee that the process tree is
-    gone. It states that a signal was delivered to the process group and that
-    the direct child was reaped within the reserved cleanup time. Descendants
-    that escaped their process group are outside what this harness can observe.
+    gone. It states three things that were observed: a signal was delivered to
+    the process group recorded at spawn time, the direct child was reaped, and a
+    later check found the group empty.
+
+    The direct child exiting on its own is explicitly NOT enough. A child can
+    leave descendants behind in its group, so cleanup runs against the group
+    even when the leader is already gone, and `group` reports what was found
+    afterwards. Descendants that left the group with `setsid` are outside what
+    this harness can see, and `complete` never claims otherwise.
     """
 
     signalled: bool = False
     reaped: bool = False
     exit_code: int | None = None
+    group: GroupState = GroupState.UNVERIFIED
     overran_reserve: bool = False
     error_code: Code | None = None
 
     @property
     def complete(self) -> bool:
-        return self.reaped and not self.overran_reserve and self.error_code is None
+        return (
+            self.reaped
+            and self.group is GroupState.EMPTY
+            and not self.overran_reserve
+            and self.error_code is None
+        )
 
 
 @dataclass(frozen=True)
@@ -210,6 +245,11 @@ class EvaluationRequest[Output: BaseModel]:
     `domain_validator` is injected by the caller and holds the original task
     input bound in its closure. The harness stays free of any ORBIT import while
     still refusing output that contradicts the input it was derived from.
+
+    It is called synchronously and is not interruptible: asyncio cannot preempt
+    a running Python call, so a slow validator overruns the deadline rather than
+    being cancelled by it. The overrun is caught afterwards and turns the
+    attempt into a rejection, never into a late success.
     """
 
     instructions: str

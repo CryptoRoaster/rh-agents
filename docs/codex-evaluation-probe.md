@@ -31,14 +31,29 @@ that is only logged and then ignored is worse than a field that does not exist.
 Three things, each enforced locally:
 
 1. **At most one `codex exec` start.** No resume, no restart after any outcome.
-   A second call to `evaluate` is refused, not retried. The login probe is a
-   separate process with its own budget and its own counter.
+   A second call to `evaluate` is refused, not retried. The version probe and
+   the login probe are separate processes, each with its own counter and its own
+   budget.
 2. **One monotonic deadline**, started before the process is spawned, covering
    spawn, stdin, both pipes, parsing, schema validation and domain validation,
    with a slice reserved up front for cleanup.
 3. **Bounded reading of every channel.** stdout and stderr are drained
    concurrently and capped separately, a single line has its own cap, and the
    one payload the parser retains has a cap distinct from the stream caps.
+
+### What the deadline cannot do
+
+Schema parsing and the injected domain validator are ordinary synchronous
+calls. The event loop cannot preempt them, so a validator that runs long is not
+cut short. The deadline is rechecked after they return, and an overrun becomes a
+`DEADLINE_EXCEEDED` rejection rather than a late success. The deadline bounds
+when a result may be accepted, not how long every step may occupy the thread.
+Saying otherwise would claim an interruptibility asyncio does not provide.
+
+The spawn is inside the budget too, and claiming a spawned handle is preferred
+over cancelling it. Cancelling a subprocess creation makes asyncio wait for the
+child it already started to exit, so a long-lived child turns cancellation into
+a long wait -- during cleanup, and again at loop shutdown.
 
 ## What it explicitly does not promise
 
@@ -84,6 +99,33 @@ binary, so it cannot start unless `node` is on the PATH given to the child. The
 self-contained platform binary needs no interpreter. `LauncherKind` makes the
 difference explicit and `validate_launcher` refuses a shim the minimal
 environment could not start, instead of quietly widening the environment.
+
+## Process group cleanup
+
+Cleanup targets the **group**, not just the direct child. The group id is
+recorded at spawn time and kept, because `os.getpgid` stops answering once the
+leader is gone.
+
+A leader exiting on its own settles nothing: a process group outlives its
+leader as long as any member is left, so a child that spawned a descendant and
+then exited cleanly leaves that descendant running. Cleanup therefore signals
+and then re-checks the group whatever the leader did, and `CleanupReport.group`
+records what the check found:
+
+| State | Meaning |
+|---|---|
+| `EMPTY` | the group was checked and nothing is left in it |
+| `OCCUPIED` | something survived SIGTERM and SIGKILL within the budget |
+| `UNVERIFIED` | the cleanup budget ran out before the group could be checked |
+
+`UNVERIFIED` is not a synonym for success. Signals are cheap and were still
+delivered, but nothing confirmed they took effect. `complete` is true only for
+`EMPTY`, so neither an occupied nor an unchecked group is ever reported as a
+clean finish.
+
+Two limits stay explicit: a descendant that called `setsid` has left the group
+and is invisible here, and a group id can in principle be reused once the group
+is empty, which is why the group is only signalled while it is known to exist.
 
 ## Filesystem and tool boundary
 
@@ -140,11 +182,19 @@ probe and reading its result -- and that method is not part of this harness.
 
 ## Version binding
 
-`SUPPORTED_CLI_VERSION = "0.153.4"`. A different build is refused before any
-process starts. Argument tests bound only our own argument construction — a
+`SUPPORTED_CLI_VERSION = "0.153.4"`, and the build is **measured, not
+configured**. Before anything else runs, a separate counted and bounded probe
+asks the launcher on disk (`codex --version`) which build it is, and its answer
+decides. A configured version string would only record an expectation: a stale
+or edited setting would let this harness run against a CLI whose event contract,
+default tools and flag names it has never seen.
+
+An unreadable version is treated the same as a wrong one. No attempt starts.
+
+This matters because argument tests bound only our own argument construction — a
 later build could enable a tool by default, rename a flag or ignore an override
-and every argument assertion would still pass. The version pin, not the argument
-test, is what stops an unchecked run against a build this harness never saw.
+and every argument assertion would still pass. The measured version, not the
+argument test, is what stops a run against a build this harness never saw.
 
 ## Validation
 

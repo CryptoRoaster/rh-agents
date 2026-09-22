@@ -17,8 +17,18 @@ from pathlib import Path
 import pytest
 
 from src.evaluation.codex.deadline import Deadline
-from src.evaluation.codex.models import EvaluationFailure, OutputLimits
-from src.evaluation.codex.process import AbortedByConsumer, ProcessError, run_bounded
+from src.evaluation.codex.models import (
+    CleanupReport,
+    EvaluationFailure,
+    GroupState,
+    OutputLimits,
+)
+from src.evaluation.codex.process import (
+    AbortedByConsumer,
+    ProcessError,
+    _poll_group,
+    run_bounded,
+)
 from tests.evaluation.conftest import CHILD_PATH_ENTRIES, write_launcher
 
 
@@ -190,3 +200,110 @@ async def test_no_time_left_means_no_process_is_started(tmp_path: Path) -> None:
             on_stdout_line=lambda _line: None,
         )
     assert caught.value.reason_code == "NO_TIME_TO_START"
+
+
+async def test_a_finished_leader_does_not_end_cleanup_of_its_group(
+    tmp_path: Path,
+) -> None:
+    """The regression: reaping the child is not the same as clearing the group."""
+    pgid_file = tmp_path / "pgid"
+    result = await run(tmp_path, "parent_exits_grandchild_runs", pgid_out=str(pgid_file))
+    assert result.exit_code == 0  # type: ignore[attr-defined]
+    cleanup = result.cleanup  # type: ignore[attr-defined]
+    assert cleanup.reaped is True
+    # The leader exited on its own, yet the group still had to be signalled.
+    assert cleanup.signalled is True
+    assert cleanup.group is GroupState.EMPTY
+    assert cleanup.complete is True
+    assert await group_is_gone(pgid_file)
+
+
+async def test_a_descendant_that_ignores_sigterm_is_still_removed(
+    tmp_path: Path,
+) -> None:
+    pgid_file = tmp_path / "pgid"
+    result = await run(tmp_path, "sigterm_immune_descendant", pgid_out=str(pgid_file))
+    cleanup = result.cleanup  # type: ignore[attr-defined]
+    assert cleanup.group is GroupState.EMPTY
+    assert cleanup.complete is True
+    assert await group_is_gone(pgid_file)
+
+
+async def test_an_occupied_group_is_never_reported_as_complete() -> None:
+    occupied = CleanupReport(reaped=True, group=GroupState.OCCUPIED)
+    assert occupied.complete is False
+    unverified = CleanupReport(reaped=True, group=GroupState.UNVERIFIED)
+    assert unverified.complete is False
+    empty = CleanupReport(reaped=True, group=GroupState.EMPTY)
+    assert empty.complete is True
+
+
+async def test_a_group_that_cannot_be_checked_is_unverified_not_empty() -> None:
+    """With no budget left, an occupied group is reported as unverified.
+
+    Signals are cheap and still get delivered, but nothing confirmed they took
+    effect, and `UNVERIFIED` is what says so.
+    """
+    process = await asyncio.create_subprocess_exec(
+        "/bin/sh", "-c", "sleep 30", start_new_session=True
+    )
+    pgid = os.getpgid(process.pid)
+    try:
+        assert await _poll_group(pgid, 0.0) is GroupState.UNVERIFIED
+        assert await _poll_group(pgid, 0.1) is GroupState.OCCUPIED
+    finally:
+        os.killpg(pgid, signal.SIGKILL)
+        await process.wait()
+    assert await _poll_group(pgid, 0.5) is GroupState.EMPTY
+
+
+async def test_a_spawn_that_outlives_its_budget_leaves_no_process_behind(
+    tmp_path: Path,
+) -> None:
+    """The start is inside the budget, and losing the race must not leak a child."""
+    directory = workspace(tmp_path, "hang", pgid_out=str(tmp_path / "pgid"))
+
+    class Clock:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self) -> float:
+            # Construction sees 0; every later reading sees 8.999, leaving one
+            # millisecond of work budget and a full second for cleanup.
+            self.calls += 1
+            return 0.0 if self.calls == 1 else 8.999
+
+    deadline = Deadline(total_seconds=10.0, cleanup_reserve_seconds=1.0, monotonic=Clock())
+    with pytest.raises(ProcessError) as caught:
+        await run_bounded(
+            arguments=[str(tmp_path / "codex")],
+            environment=environment(tmp_path),
+            working_directory=directory,
+            stdin_payload=b"{}",
+            limits=OutputLimits(),
+            deadline=deadline,
+            on_stdout_line=lambda _line: None,
+        )
+    assert caught.value.failure is EvaluationFailure.DEADLINE_EXCEEDED
+    assert caught.value.reason_code == "START_BUDGET_EXHAUSTED"
+    # The child the kernel may already have created was recovered and removed.
+    assert caught.value.cleanup.group is GroupState.EMPTY
+
+
+async def test_cancellation_during_the_spawn_is_re_raised(tmp_path: Path) -> None:
+    directory = workspace(tmp_path, "hang", pgid_out=str(tmp_path / "pgid"))
+    task = asyncio.create_task(
+        run_bounded(
+            arguments=[str(tmp_path / "codex")],
+            environment=environment(tmp_path),
+            working_directory=directory,
+            stdin_payload=b"{}",
+            limits=OutputLimits(),
+            deadline=Deadline(total_seconds=20.0, cleanup_reserve_seconds=2.0),
+            on_stdout_line=lambda _line: None,
+        )
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

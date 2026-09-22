@@ -196,3 +196,14 @@ def build_preflight_arguments(*, launcher: CodexLauncher) -> list[str]:
     """
     validate_launcher(launcher)
     return [str(launcher.executable), "login", "status"]
+
+
+def build_version_arguments(*, launcher: CodexLauncher) -> list[str]:
+    """Assemble the build-identification probe.
+
+    Also its own process with its own budget. What this returns decides whether
+    an attempt may run at all, so it asks the launcher on disk rather than
+    trusting a configured string.
+    """
+    validate_launcher(launcher)
+    return [str(launcher.executable), "--version"]

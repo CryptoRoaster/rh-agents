@@ -11,6 +11,11 @@ has already run out. The reserve is a reservation, not a guarantee: the
 operating system is under no obligation to finish within it, which is why
 `Deadline.cleanup_exhausted` exists and why an overrun is reported rather than
 hidden.
+
+What the deadline cannot do is interrupt synchronous work. Schema parsing and
+the injected domain validator are plain function calls; the event loop has no
+way to preempt them. For those, `expired` is checked once they return, and an
+overrun turns into a rejection rather than a late success.
 """
 
 import time
@@ -69,3 +74,14 @@ class Deadline:
     @property
     def cleanup_exhausted(self) -> bool:
         return self.remaining_for_cleanup <= 0.0
+
+    @property
+    def expired(self) -> bool:
+        """Whether the whole budget, cleanup reserve included, is used up.
+
+        Checked after synchronous work the event loop could not preempt, such as
+        schema parsing and the injected domain validator. Those calls cannot be
+        cancelled mid-flight, so the only honest handling is to notice the
+        overrun once they return and refuse to accept the result.
+        """
+        return self.elapsed_seconds >= self.total_seconds
