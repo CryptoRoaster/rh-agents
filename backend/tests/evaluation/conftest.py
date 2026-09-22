@@ -88,7 +88,27 @@ class Probe:
         ):
             directory.mkdir(parents=True, exist_ok=True)
         self.launcher_path = write_launcher(root)
+        self.model_catalog_path = root / "model-catalog.json"
+        self.catalog()
         self.task_input = task_input()
+
+    def catalog(self, **overrides: Any) -> None:
+        """Write the catalog the attempt is pinned to.
+
+        Its default entry is the one the harness accepts, so a test only has to
+        say when it wants a wider surface. The fake's `debug models --bundled`
+        output says the opposite on purpose: anything that still passes has
+        judged this file and not that dump.
+        """
+        entry: dict[str, Any] = {
+            "slug": "gpt-5.4",
+            "tool_mode": None,
+            "shell_type": "unified_exec",
+            "apply_patch_tool_type": "freeform",
+            "experimental_supported_tools": [],
+        }
+        entry.update(overrides)
+        self.model_catalog_path.write_text(json.dumps({"models": [entry]}), encoding="utf-8")
 
     def scenario(self, name: str = "success", **extra: Any) -> None:
         payload: dict[str, Any] = {
@@ -118,7 +138,8 @@ class Probe:
             "tmpdir": self.tmpdir,
             "workspace": self.workspace,
             "scratch": self.scratch,
-            "model": "gpt-5.6-sol",
+            "model": "gpt-5.4",
+            "model_catalog_path": self.model_catalog_path,
             "effort": "low",
             "run_preflight": False,
         }

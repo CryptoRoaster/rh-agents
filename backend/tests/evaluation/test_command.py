@@ -34,6 +34,7 @@ def arguments(tmp_path: Path, **overrides: object) -> list[str]:
         "model": "gpt-5.6-sol",
         "effort": "low",
         "instructions": "Answer as JSON only.",
+        "model_catalog_path": tmp_path / "model-catalog.json",
     }
     settings.update(overrides)
     (tmp_path / "workspace").mkdir(exist_ok=True)
@@ -86,6 +87,7 @@ def test_workspace_inside_a_forbidden_root_is_refused(tmp_path: Path) -> None:
             model="gpt-5.6-sol",
             effort=None,
             instructions="x",
+            model_catalog_path=tmp_path / "model-catalog.json",
             forbidden_roots=(repository,),
         )
     assert caught.value.reason_code == "WORKSPACE_INSIDE_FORBIDDEN_ROOT"
@@ -135,3 +137,23 @@ def test_child_environment_holds_only_the_allowed_keys(tmp_path: Path) -> None:
         "DATABASE_URL",
     ):
         assert banned not in built
+
+
+def test_the_model_catalog_is_always_pinned(tmp_path: Path) -> None:
+    """Without the pin, `exec` would resolve ModelInfo through the ModelsManager.
+
+    That path is `RefreshStrategy::OnlineIfUncached`: a fresh cache entry or a
+    remote `/models` response could carry a different `tool_mode` than the file
+    the harness judged. `model_catalog_json` makes the provider build a
+    `StaticModelsManager` instead, which never refreshes and never reads the
+    cache.
+    """
+    catalog = tmp_path / "model-catalog.json"
+    built = arguments(tmp_path, model_catalog_path=catalog)
+    assert f"model_catalog_json={toml_string(str(catalog))}" in built
+
+
+def test_a_relative_catalog_path_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(CommandBuildError) as caught:
+        arguments(tmp_path, model_catalog_path=Path("model-catalog.json"))
+    assert caught.value.reason_code == "CATALOG_PATH_NOT_ABSOLUTE"

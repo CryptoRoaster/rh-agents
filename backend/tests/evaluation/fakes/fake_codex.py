@@ -96,19 +96,26 @@ def main() -> int:
     scenario_path = Path.cwd() / "scenario.json"
     scenario: dict[str, object] = json.loads(scenario_path.read_text(encoding="utf-8"))
     if sys.argv[1:4] == ["debug", "models", "--bundled"]:
-        # The bundled catalog dump. Defaults to an entry the harness accepts, so
-        # a test only has to say when it wants a wider tool surface.
-        entry = {
-            "slug": scenario.get("catalog_model", "gpt-5.6-sol"),
-            "tool_mode": scenario.get("catalog_tool_mode"),
-            "shell_type": "unified_exec",
-            "apply_patch_tool_type": scenario.get("catalog_apply_patch", "freeform"),
-            "experimental_supported_tools": scenario.get("catalog_experimental", []),
-        }
-        if scenario.get("catalog_broken"):
-            sys.stdout.write("not json\n")
-            return 0
-        sys.stdout.write(json.dumps({"models": [entry]}) + "\n")
+        # Deliberately the opposite of what the pinned catalog says. Nothing in
+        # the harness may consult this: a root session resolves ModelInfo
+        # through the ModelsManager, not through the bundled dump, so a guard
+        # that read this would be judging a catalog the turn never uses.
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "models": [
+                        {
+                            "slug": scenario.get("catalog_model", "gpt-5.4"),
+                            "tool_mode": "code_mode_only",
+                            "shell_type": "unified_exec",
+                            "apply_patch_tool_type": "freeform",
+                            "experimental_supported_tools": [],
+                        }
+                    ]
+                }
+            )
+            + "\n"
+        )
         return 0
 
     if sys.argv[1:2] == ["--version"]:

@@ -141,6 +141,7 @@ def build_arguments(
     model: str,
     effort: str | None,
     instructions: str,
+    model_catalog_path: Path,
     forbidden_roots: tuple[Path, ...] = (),
 ) -> list[str]:
     """Assemble one non-interactive invocation that reads its data from stdin.
@@ -150,6 +151,13 @@ def build_arguments(
     out of the workspace matters even when no reading tool is enabled.
     """
     validate_launcher(launcher)
+    if not model_catalog_path.is_absolute():
+        # `model_catalog_json` is an AbsolutePathBuf in the CLI. A relative path
+        # would be rejected there, or resolved against a different directory,
+        # and the pin would silently not be the file that was judged.
+        raise CommandBuildError(
+            EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, "CATALOG_PATH_NOT_ABSOLUTE"
+        )
     resolved = working_directory.resolve()
     for root in forbidden_roots:
         if resolved == root.resolve() or root.resolve() in resolved.parents:
@@ -181,6 +189,11 @@ def build_arguments(
         arguments += ["-c", override]
     if effort is not None:
         arguments += ["-c", f"model_reasoning_effort={toml_string(effort)}"]
+    # Pins the run's model catalog to one file. `config_model_catalog` makes the
+    # provider build a `StaticModelsManager`, which ignores the refresh strategy,
+    # never consults the on-disk cache and treats `refresh_if_new_etag` as a
+    # no-op -- so the entry this harness judged is the entry the turn uses.
+    arguments += ["-c", f"model_catalog_json={toml_string(str(model_catalog_path))}"]
     arguments += ["-c", f"developer_instructions={toml_string(instructions)}"]
     # A bare "-" makes the CLI read the prompt from stdin, so untrusted market
     # data never lands in argv, which is readable process-wide.
@@ -196,16 +209,6 @@ def build_preflight_arguments(*, launcher: CodexLauncher) -> list[str]:
     """
     validate_launcher(launcher)
     return [str(launcher.executable), "login", "status"]
-
-
-def build_catalog_arguments(*, launcher: CodexLauncher) -> list[str]:
-    """Assemble the bundled-catalog dump.
-
-    `--bundled` is what keeps this offline: it prints the catalog compiled into
-    the binary instead of refreshing one, so the probe makes no request at all.
-    """
-    validate_launcher(launcher)
-    return [str(launcher.executable), "debug", "models", "--bundled"]
 
 
 def build_version_arguments(*, launcher: CodexLauncher) -> list[str]:

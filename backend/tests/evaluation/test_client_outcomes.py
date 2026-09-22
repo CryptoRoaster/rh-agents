@@ -14,7 +14,11 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 
 from src.agents.orbit.models import OrbitAssessment, OrbitClassification
-from src.evaluation.codex.command import ALLOWED_ENVIRONMENT_KEYS
+from src.evaluation.codex.command import (
+    ALLOWED_ENVIRONMENT_KEYS,
+    build_arguments,
+    toml_string,
+)
 from src.evaluation.codex.models import (
     EvaluationCompleted,
     EvaluationFailure,
@@ -50,7 +54,7 @@ async def test_configured_values_are_never_passed_off_as_reported_ones(probe: Pr
     probe.scenario("success")
     outcome = await probe.client().evaluate(probe.request())
     assert isinstance(outcome, EvaluationCompleted)
-    assert outcome.configuration.configured_model == "gpt-5.6-sol"
+    assert outcome.configuration.configured_model == "gpt-5.4"
     assert outcome.configuration.configured_effort == "low"
     # The documented event contract carries neither, so both stay absent.
     assert outcome.configuration.reported_model is None
@@ -390,37 +394,88 @@ async def test_a_slow_schema_validation_does_not_fund_a_domain_validator(
     assert started is False
 
 
-async def test_the_catalog_probe_is_counted_apart_from_the_attempt(probe: Probe) -> None:
+async def test_the_pinned_catalog_decides_not_the_bundled_dump(probe: Probe) -> None:
+    """The regression for the gap between inspected and effective catalog.
+
+    The fake's `debug models --bundled` output says `tool_mode:
+    "code_mode_only"`; the pinned catalog says null. A root session resolves
+    ModelInfo through the ModelsManager, so judging the bundled dump would have
+    judged a catalog the turn never uses. This run must follow the pinned file.
+    """
     probe.scenario("success")
+    probe.catalog(tool_mode=None)
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+
+
+async def test_a_pinned_catalog_with_code_mode_never_reaches_exec(probe: Probe) -> None:
+    """And the other direction, which is the one that matters.
+
+    Bundled could say anything; what decides is the file `codex exec` is pinned
+    to. When that file declares a tool mode, no attempt starts.
+    """
+    probe.scenario("success")
+    probe.catalog(tool_mode="code_mode_only")
     client = probe.client()
-    assert isinstance(await client.evaluate(probe.request()), EvaluationCompleted)
-    assert client.catalog_starts == 1
-    assert client.version_starts == 1
-    assert client.exec_starts == 1
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.TOOL_SURFACE_UNSUPPORTED
+    assert outcome.detail_code == "TOOL_MODE_CODE_MODE_ONLY"
+    assert client.exec_starts == 0
+    assert client.version_starts == 0
+
+
+async def test_exec_is_pinned_to_the_very_file_that_was_judged(probe: Probe) -> None:
+    """Judging one catalog and running against another is not a check."""
+    built = build_arguments(
+        launcher=probe.launcher(),
+        working_directory=probe.workspace,
+        schema_path=probe.scratch / "schema.json",
+        model="gpt-5.4",
+        effort="low",
+        instructions="x",
+        model_catalog_path=probe.model_catalog_path,
+    )
+    override = next(item for item in built if item.startswith("model_catalog_json="))
+    assert override == f"model_catalog_json={toml_string(str(probe.model_catalog_path))}"
 
 
 @pytest.mark.parametrize(
-    ("extra", "detail"),
+    ("overrides", "detail"),
     [
-        ({"catalog_tool_mode": "code_mode_only"}, "TOOL_MODE_CODE_MODE_ONLY"),
-        ({"catalog_experimental": ["clock"]}, "EXPERIMENTAL_TOOL_CLOCK"),
-        ({"catalog_apply_patch": "something_new"}, "APPLY_PATCH_SOMETHING_NEW"),
-        ({"catalog_model": "other-model"}, "MODEL_NOT_IN_CATALOG"),
-        ({"catalog_broken": True}, "MODEL_NOT_IN_CATALOG"),
+        ({"tool_mode": "code_mode_only"}, "TOOL_MODE_CODE_MODE_ONLY"),
+        ({"tool_mode": "direct"}, "TOOL_MODE_DIRECT"),
+        ({"experimental_supported_tools": ["clock"]}, "EXPERIMENTAL_TOOL_CLOCK"),
+        ({"apply_patch_tool_type": "something_new"}, "APPLY_PATCH_SOMETHING_NEW"),
+        ({"slug": "another-model"}, "MODEL_NOT_IN_CATALOG"),
+        ({"tool_mode": {"unexpected": "shape"}}, "TOOL_MODE_MALFORMED"),
+        ({"apply_patch_tool_type": 7}, "APPLY_PATCH_MALFORMED"),
+        ({"experimental_supported_tools": "clock"}, "EXPERIMENTAL_TOOLS_MALFORMED"),
     ],
 )
-async def test_a_wider_tool_surface_never_runs_an_attempt(
-    probe: Probe, extra: dict[str, object], detail: str
+async def test_a_wider_or_malformed_surface_never_runs_an_attempt(
+    probe: Probe, overrides: dict[str, object], detail: str
 ) -> None:
-    """Fail-closed: an unwanted surface, an unknown value or no answer all refuse.
+    """Fail-closed: an unwanted surface, an unknown value and a wrong type all refuse.
 
-    None of this is visible in a model's reply -- a tool that was offered and
-    left unused emits no event -- so the catalog is the only place to look.
+    A wrong type is not the same fact as `null`. Reading `{"unexpected":
+    "shape"}` as "absent" would turn a parsing accident into a permission.
     """
-    probe.scenario("success", **extra)
+    probe.scenario("success")
+    probe.catalog(**overrides)
     client = probe.client()
     outcome = await client.evaluate(probe.request())
     assert isinstance(outcome, EvaluationRejected)
     assert outcome.reason is EvaluationFailure.TOOL_SURFACE_UNSUPPORTED
     assert outcome.detail_code == detail
+    assert client.exec_starts == 0
+
+
+async def test_an_unreadable_pinned_catalog_never_runs_an_attempt(probe: Probe) -> None:
+    probe.scenario("success")
+    probe.model_catalog_path.unlink()
+    client = probe.client()
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "CATALOG_UNREADABLE"
     assert client.exec_starts == 0

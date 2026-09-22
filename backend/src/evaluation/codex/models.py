@@ -138,7 +138,6 @@ class ProcessLimits(Immutable):
 
     max_exec_starts: Literal[1] = 1
     max_version_starts: Literal[1] = 1
-    max_catalog_starts: Literal[1] = 1
     max_preflight_starts: Literal[1] = 1
 
 

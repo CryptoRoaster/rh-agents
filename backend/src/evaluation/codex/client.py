@@ -28,11 +28,10 @@ from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 
-from src.evaluation.codex.catalog import check_tool_surface
+from src.evaluation.codex.catalog import judge_catalog_file
 from src.evaluation.codex.command import (
     CommandBuildError,
     build_arguments,
-    build_catalog_arguments,
     build_preflight_arguments,
     build_version_arguments,
     child_environment,
@@ -61,7 +60,6 @@ from src.evaluation.codex.stream import EventAccumulator, StreamError
 
 PREFLIGHT_BUDGET_SECONDS = 10.0
 VERSION_BUDGET_SECONDS = 10.0
-CATALOG_BUDGET_SECONDS = 20.0
 
 
 @dataclass(frozen=True)
@@ -78,6 +76,7 @@ class CodexClientConfig:
     tmpdir: Path
     workspace: Path
     scratch: Path
+    model_catalog_path: Path
     model: str
     effort: str | None = None
     forbidden_roots: tuple[Path, ...] = ()
@@ -85,7 +84,6 @@ class CodexClientConfig:
     run_preflight: bool = True
     preflight_budget_seconds: float = PREFLIGHT_BUDGET_SECONDS
     version_budget_seconds: float = VERSION_BUDGET_SECONDS
-    catalog_budget_seconds: float = CATALOG_BUDGET_SECONDS
 
 
 @dataclass
@@ -95,7 +93,6 @@ class CodexEvaluationClient:
     config: CodexClientConfig
     exec_starts: int = field(default=0, init=False)
     version_starts: int = field(default=0, init=False)
-    catalog_starts: int = field(default=0, init=False)
     preflight_starts: int = field(default=0, init=False)
 
     async def evaluate[Output: BaseModel](
@@ -138,11 +135,12 @@ class CodexEvaluationClient:
             path_entries=self.config.launcher.path_entries,
         )
 
-        rejection = await self._verify_version(environment, request.limits, deadline)
+        # Cheapest gate first: a file read, no process at all.
+        rejection = self._verify_tool_surface(deadline)
         if rejection is not None:
             return rejection
 
-        rejection = await self._verify_tool_surface(environment, deadline)
+        rejection = await self._verify_version(environment, request.limits, deadline)
         if rejection is not None:
             return rejection
 
@@ -161,6 +159,7 @@ class CodexEvaluationClient:
                 model=self.config.model,
                 effort=self.config.effort,
                 instructions=request.instructions,
+                model_catalog_path=self.config.model_catalog_path,
                 forbidden_roots=self.config.forbidden_roots,
             )
         except CommandBuildError as error:
@@ -256,48 +255,19 @@ class CodexEvaluationClient:
             )
         return None
 
-    async def _verify_tool_surface(
-        self, environment: dict[str, str], deadline: Deadline
-    ) -> EvaluationRejected | None:
-        """Refuse a model whose catalog entry would widen the tool surface.
+    def _verify_tool_surface(self, deadline: Deadline) -> EvaluationRejected | None:
+        """Refuse a model whose pinned catalog entry would widen the tool surface.
 
-        The catalog decides the tool plan before any flag does, and nothing in a
-        model's answer would reveal what it was offered. Reading the bundled
-        catalog is the only check that does not depend on the model's silence.
+        The file judged here is the file `codex exec` is pinned to, so there is
+        no window in which a cache entry or a remote `/models` response could
+        substitute a different `tool_mode`. Reading it needs no process, which
+        is the point: a probe would only reopen the gap between what was
+        inspected and what runs.
         """
-        if self.catalog_starts >= self.config.process_limits.max_catalog_starts:
+        verdict = judge_catalog_file(self.config.model_catalog_path, self.config.model)
+        if verdict.reason is not None:
             return self._reject(
-                EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, "CATALOG_BUDGET_EXHAUSTED", deadline
-            )
-        try:
-            arguments = build_catalog_arguments(launcher=self.config.launcher)
-        except CommandBuildError as error:
-            return self._reject(error.failure, error.reason_code, deadline)
-
-        probe = self._probe_deadline(self.config.catalog_budget_seconds, deadline)
-        if probe is None:
-            return self._reject(
-                EvaluationFailure.DEADLINE_EXCEEDED, "NO_TIME_FOR_CATALOG_CHECK", deadline
-            )
-
-        self.catalog_starts += 1
-        try:
-            outcome = await check_tool_surface(
-                arguments=arguments,
-                environment=environment,
-                working_directory=self.config.workspace,
-                deadline=probe,
-                model=self.config.model,
-            )
-        except ProcessError as error:
-            return self._reject(error.failure, error.reason_code, deadline, error.cleanup)
-
-        if outcome.reason is not None:
-            return self._reject(
-                EvaluationFailure.TOOL_SURFACE_UNSUPPORTED,
-                outcome.reason,
-                deadline,
-                outcome.cleanup,
+                EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, verdict.reason, deadline
             )
         return None
 

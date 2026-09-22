@@ -286,7 +286,7 @@ the feature flags are never consulted. `effective_tool_mode` downgrades
 on `Feature::CodeMode`.
 
 `codex debug models --bundled` — an offline dump of the catalog compiled into
-the binary — shows what that means in practice:
+the binary — shows what that means for the shipped entries:
 
 | model | `tool_mode` | consequence |
 |---|---|---|
@@ -296,16 +296,50 @@ the binary — shows what that means in practice:
 Code mode is a local code-execution surface. A model that can run code can read
 files, and no flag in `command.py` removes it from a `code_mode_only` model.
 
-`src/evaluation/codex/catalog.py` therefore reads that catalog before any
-attempt and refuses anything outside an explicit allowlist: a declared
-`tool_mode`, a non-empty `experimental_supported_tools`, an unknown
-`apply_patch_tool_type`, a model that is not in the catalog, or a catalog that
-cannot be read at all. Being unable to check is treated exactly like checking
-and not liking the answer.
+### Judging the catalog the turn actually uses
 
-This matters because none of it is observable from a model's reply. A tool that
-was offered and never invoked emits no event, so "the run looked clean" is not
-evidence about what was on offer.
+Reading the *bundled* dump would not have been enough, and that was a real hole.
+A root session resolves `ModelInfo` through the `ModelsManager` with
+`RefreshStrategy::OnlineIfUncached`, so a fresh cache entry or a remote
+`/models` response could carry a different `tool_mode` than the catalog compiled
+into the binary. Inspecting one catalog while the turn runs against another is
+not a check.
+
+The CLI supports pinning, and the harness uses it.
+`model-provider/src/provider.rs`:
+
+```rust
+fn models_manager(&self, codex_home, config_model_catalog) -> SharedModelsManager {
+    match config_model_catalog {
+        Some(model_catalog) => Arc::new(StaticModelsManager::new(auth, model_catalog)),
+        None => { /* OpenAiModelsEndpoint: cache, then remote */ }
+    }
+}
+```
+
+`StaticModelsManager::raw_model_catalog` ignores the refresh strategy entirely,
+returns the catalog it was constructed with, and implements `refresh_if_new_etag`
+as a no-op. `config_model_catalog` reaches it from `model_catalog_json` through
+`load_model_catalog` and `thread_manager::build_models_manager`; the only call
+site that hardcodes `None` is a test helper.
+
+So every attempt passes `-c model_catalog_json=<absolute path>`, and
+`catalog.py` judges **that same file**. No process reads it: a probe would only
+reopen the gap between what was inspected and what runs. A relative path is
+refused, because `model_catalog_json` is an `AbsolutePathBuf` and a relative one
+would resolve elsewhere or be rejected — either way the pin would not be the
+file that was judged.
+
+The guard refuses anything outside an explicit allowlist: a declared
+`tool_mode`, a non-empty `experimental_supported_tools`, an unknown
+`apply_patch_tool_type`, a model missing from the catalog, a file that cannot be
+read, and any field of the wrong type. A wrong type is never read as absent:
+`{"unexpected": "shape"}` is not `null`, and treating it as `null` would turn a
+parsing accident into a permission.
+
+None of this is observable from a model's reply. A tool that was offered and
+never invoked emits no event, so "the run looked clean" is not evidence about
+what was on offer.
 
 The workspace is a fresh empty directory outside the repository, and
 `build_arguments` refuses a workspace inside a forbidden root. Instruction
@@ -326,8 +360,13 @@ Three claims remain **unproven**, and no test in this suite can prove them:
    not measured. `observed_tool_activity` records tool *use*; an offered but
    unused tool emits no event, so an empty result is not evidence of a
    tool-free run.
-2. **How far the sandbox restricts reading.** Unexamined. The harness relies on
-   no reading tool being offered, which is a configuration argument.
+2. **The read boundary is now examined, and there is none.**
+   `SandboxPolicy::has_full_disk_read_access` returns `true` for every variant
+   and `seatbelt.rs` turns that into a blanket `(allow file-read*)`, so
+   `read-only` restricts writes and nothing else. The seatbelt also wraps
+   commands the agent runs rather than the agent itself. What remains is not an
+   open question but a stated limit: read safety rests on no reading tool being
+   offered, which is a configuration property rather than an enforced one.
 3. **`apply_patch` stays on offer.** Its effect is blocked by the read-only
    sandbox; the offer is not.
 
