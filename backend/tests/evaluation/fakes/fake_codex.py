@@ -92,7 +92,33 @@ def answer(scenario: dict[str, object]) -> str:
     return json.dumps(payload)
 
 
+def inspect_pinned_catalog() -> str | None:
+    """Read what `model_catalog_json` actually points at, from inside the child.
+
+    This is what makes the snapshot tests end-to-end. The harness judges bytes
+    in the parent; only a child that opens the reference can show that the same
+    bytes arrived here, through `pass_fds` and across `os.execv`.
+    """
+    for index, item in enumerate(sys.argv):
+        if item == "-c" and index + 1 < len(sys.argv):
+            override = sys.argv[index + 1]
+            if override.startswith("model_catalog_json="):
+                reference = override[len("model_catalog_json=") :].strip('"')
+                try:
+                    with open(reference, encoding="utf-8") as handle:
+                        return handle.read()
+                except OSError as error:
+                    return f"<unreadable: {error}>"
+    return None
+
+
 def main() -> int:
+    seen_catalog = inspect_pinned_catalog()
+    if seen_catalog is not None and "code_mode_only" in seen_catalog:
+        # The child was handed a catalog the harness never approved.
+        sys.stderr.write("child received an unapproved catalog\n")
+        return 9
+
     scenario_path = Path.cwd() / "scenario.json"
     scenario: dict[str, object] = json.loads(scenario_path.read_text(encoding="utf-8"))
     if sys.argv[1:4] == ["debug", "models", "--bundled"]:

@@ -5,8 +5,8 @@ from pathlib import Path
 
 from src.evaluation.codex.catalog import (
     judge_catalog,
-    judge_open_catalog,
-    open_catalog,
+    judge_snapshot,
+    snapshot_catalog,
 )
 
 # Copied from `codex debug models --bundled` of the supported build. The fields
@@ -106,8 +106,8 @@ def test_an_unreadable_catalog_is_refused() -> None:
     )
 
 
-def test_a_missing_catalog_file_cannot_be_opened(tmp_path: Path) -> None:
-    assert open_catalog(tmp_path / "absent.json") is None
+def test_a_missing_catalog_file_cannot_be_snapshotted(tmp_path: Path) -> None:
+    assert snapshot_catalog(tmp_path / "absent.json", tmp_path) is None
 
 
 def test_the_judged_bytes_survive_the_path_being_replaced(tmp_path: Path) -> None:
@@ -119,7 +119,7 @@ def test_the_judged_bytes_survive_the_path_being_replaced(tmp_path: Path) -> Non
     """
     path = tmp_path / "catalog.json"
     path.write_text(catalog(REAL_LEGACY_ENTRY), encoding="utf-8")
-    opened = open_catalog(path)
+    opened = snapshot_catalog(path, tmp_path)
     assert opened is not None
     try:
         swap = tmp_path / "swap.json"
@@ -130,7 +130,7 @@ def test_the_judged_bytes_survive_the_path_being_replaced(tmp_path: Path) -> Non
 
         assert "code_mode_only" in path.read_text(encoding="utf-8")
         assert "code_mode_only" not in opened.payload
-        assert judge_open_catalog(opened, "gpt-5.4", None).reason is None
+        assert judge_snapshot(opened, "gpt-5.4", None).reason is None
         assert Path(opened.reference).read_text(encoding="utf-8") == opened.payload
     finally:
         opened.close()
@@ -140,25 +140,29 @@ def test_a_digest_pin_refuses_content_that_was_not_reviewed(tmp_path: Path) -> N
     """The whole approved snapshot is the contract, not the three fields read."""
     path = tmp_path / "catalog.json"
     path.write_text(catalog(REAL_LEGACY_ENTRY), encoding="utf-8")
-    opened = open_catalog(path)
+    opened = snapshot_catalog(path, tmp_path)
     assert opened is not None
     try:
-        assert judge_open_catalog(opened, "gpt-5.4", opened.digest).reason is None
-        assert judge_open_catalog(opened, "gpt-5.4", "0" * 64).reason == "CATALOG_DIGEST_MISMATCH"
+        assert judge_snapshot(opened, "gpt-5.4", opened.digest).reason is None
+        assert judge_snapshot(opened, "gpt-5.4", "0" * 64).reason == "CATALOG_DIGEST_MISMATCH"
     finally:
         opened.close()
 
 
-def test_a_responses_lite_model_is_refused() -> None:
-    """Lite turns on standalone web search regardless of the feature flag.
+def test_a_responses_lite_model_is_accepted() -> None:
+    """Lite is not a reason to refuse, and treating it as one was a mistake.
 
-    `standalone_web_search_enabled` is `namespace_tools_enabled &&
-    provider.capabilities().web_search && (use_responses_lite ||
-    Feature::StandaloneWebSearch)`, so `--disable standalone_web_search` does
-    not settle it for a lite model.
+    It does feed `standalone_web_search_enabled`, but
+    `append_extension_tool_executors` also requires `web_search_mode_on`, and
+    `web_search="disabled"` makes that false, so the standalone executor is
+    dropped whatever the model declares. Lite also *shrinks* the surface:
+    `hosted_model_tool_specs` returns `Vec::new()` for a lite model.
     """
     entry = dict(REAL_LEGACY_ENTRY, use_responses_lite=True)
-    assert judge_catalog(catalog(entry), "gpt-5.4").reason == "RESPONSES_LITE_ENABLED"
+    verdict = judge_catalog(catalog(entry), "gpt-5.4")
+    assert verdict.reason is None
+    assert verdict.surface is not None
+    assert verdict.surface.use_responses_lite is True
 
 
 def test_a_missing_or_malformed_responses_lite_flag_is_refused() -> None:
@@ -169,8 +173,8 @@ def test_a_missing_or_malformed_responses_lite_flag_is_refused() -> None:
         assert judge_catalog(catalog(entry), "gpt-5.4").reason == "RESPONSES_LITE_MALFORMED"
 
 
-def test_the_frontier_entry_fails_on_the_first_reason_it_hits() -> None:
-    """It is refused twice over: `code_mode_only` and responses lite."""
+def test_the_frontier_entry_is_refused_for_its_tool_mode_alone() -> None:
+    """One reason, not two: `code_mode_only`. Lite is not a refusal."""
     verdict = judge_catalog(catalog(REAL_SOL_ENTRY), "gpt-5.6-sol")
     assert verdict.reason == "TOOL_MODE_CODE_MODE_ONLY"
     assert verdict.surface is not None

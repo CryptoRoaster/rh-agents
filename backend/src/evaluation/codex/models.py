@@ -98,6 +98,20 @@ class DomainValidationError(Exception):
         super().__init__(reason_code)
 
 
+class RunMode(StrEnum):
+    """Whether an attempt may reach a real model, and what that demands.
+
+    `FIXTURE` drives a stand-in process, so a catalog digest is optional --
+    there is no approved snapshot to hold anything to. `REAL` would reach the
+    model, and there the whole reviewed `ModelInfo` snapshot is the contract:
+    without a pinned digest the guard is only sampling a few fields of a file
+    that can be anything, so `REAL` refuses before a single process starts.
+    """
+
+    FIXTURE = "FIXTURE"
+    REAL = "REAL"
+
+
 class LauncherKind(StrEnum):
     """How the CLI is started, because the two forms need different environments.
 

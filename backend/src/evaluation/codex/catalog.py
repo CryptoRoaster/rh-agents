@@ -53,16 +53,37 @@ irrelevant by a gate this harness sets explicitly:
 |---|---|
 | `tool_mode` | **judged** -- outranks every feature flag |
 | `experimental_supported_tools` | **judged** -- adds clock / user input / test tools |
-| `use_responses_lite` | **judged** -- turns on standalone web search by itself |
+| `use_responses_lite` | type-checked only; see below |
 | `apply_patch_tool_type` | **judged** -- an unknown value is refused |
 | `shell_type` | gated: `add_shell_tools` returns on `!Feature::ShellTool`
   in a short-circuiting OR, before the field is read |
 | `supports_search_tool`, `web_search_tool_type` | gated: `web_search="disabled"`
-  sets the mode, and the lite path above is judged |
+  makes `web_search_mode_on` false, which drops the standalone executor, and
+  hosted specs are not requested |
 | `multi_agent_version` | gated: `multi_agent` and `multi_agent_v2` disabled |
 | `input_modalities` | gated: image handling needs `view_image` /
   `image_generation`, both disabled |
 | `model_messages` | descriptions only; registers nothing |
+
+`use_responses_lite` is checked for type and then accepted either way. It does
+enter `standalone_web_search_enabled`:
+
+    namespace_tools_enabled && provider.capabilities().web_search
+      && (model_info.use_responses_lite || Feature::StandaloneWebSearch)
+
+but that is not the last word. `append_extension_tool_executors` also computes
+
+    let web_search_mode_on = config.web_search_mode.value() != WebSearchMode::Disabled;
+    if is_standalone_web_search && (!standalone_web_search_enabled || !web_search_mode_on) {
+        continue;
+    }
+
+and the harness sets `web_search="disabled"`, so the standalone executor is
+dropped whatever the model declares. In the other direction lite *reduces* the
+surface: `hosted_model_tool_specs` returns `Vec::new()` immediately for a lite
+model. Its remaining effect is on turn metadata. Refusing it as a security
+matter would have been wrong, and an earlier version of this guard did exactly
+that.
 
 Fail-closed throughout. A missing file, unreadable JSON, a missing model, a
 field of the wrong type and an unknown value are all refusals. A wrong type is
@@ -73,6 +94,7 @@ treating it as `null` would turn a parsing accident into a permission.
 import hashlib
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -89,12 +111,19 @@ MISSING = object()
 
 
 @dataclass(frozen=True)
-class OpenCatalog:
-    """An open catalog: the descriptor the child inherits and the judged bytes.
+class CatalogSnapshot:
+    """A private, read-only copy of the bytes that were judged.
 
-    Holding the descriptor is what makes the binding about content rather than
-    about a name. `reference` is the path the child is given, and it resolves
-    through this open file description.
+    Keeping the operator's own descriptor would not have been enough. A
+    descriptor binds to an inode, not to bytes: `open(path, O_WRONLY|O_TRUNC)`
+    followed by a write changes what an already-open read handle sees, so an
+    in-place edit after the check would reach the child. Replacing the path is
+    only one of the two ways to do that, and the earlier fix addressed only
+    that one.
+
+    So the judged bytes are copied into a fresh file, flushed, reopened
+    read-only, and then unlinked. What the child inherits has no name left to
+    write through and no write permission of its own.
     """
 
     fd: int
@@ -112,36 +141,62 @@ class OpenCatalog:
             pass
 
 
-def open_catalog(path: Path) -> OpenCatalog | None:
-    """Open the catalog once and keep the descriptor the child will inherit.
+def snapshot_catalog(path: Path, snapshot_dir: Path) -> CatalogSnapshot | None:
+    """Read the operator's catalog once and freeze those exact bytes.
 
-    Returns None when it cannot be opened or read; the caller refuses.
+    Returns None when the file cannot be read or the snapshot cannot be made;
+    the caller refuses either way.
     """
     try:
-        fd = os.open(path, os.O_RDONLY)
+        raw = path.read_bytes()
     except OSError:
         return None
+
+    writer = -1
+    temporary = ""
     try:
-        os.set_inheritable(fd, True)
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        os.lseek(fd, 0, os.SEEK_SET)
-        raw = b"".join(chunks)
+        writer, temporary = tempfile.mkstemp(dir=snapshot_dir, prefix="catalog-", suffix=".json")
+        os.write(writer, raw)
+        os.fsync(writer)
     except OSError:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if writer != -1:
+            _close(writer)
+        if temporary:
+            _unlink(temporary)
         return None
-    return OpenCatalog(
+    _close(writer)
+
+    try:
+        # Read-only on purpose: the descriptor the child inherits must not carry
+        # a write capability of its own.
+        fd = os.open(temporary, os.O_RDONLY)
+    except OSError:
+        _unlink(temporary)
+        return None
+    os.set_inheritable(fd, True)
+    # Once unlinked there is no path left through which the snapshot could be
+    # rewritten, in place or otherwise.
+    _unlink(temporary)
+
+    return CatalogSnapshot(
         fd=fd,
         payload=raw.decode("utf-8", errors="replace"),
         digest=hashlib.sha256(raw).hexdigest(),
     )
+
+
+def _close(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 @dataclass(frozen=True)
@@ -163,8 +218,8 @@ class CatalogVerdict:
     reason: str | None
 
 
-def judge_open_catalog(
-    catalog: OpenCatalog, model: str, expected_digest: str | None
+def judge_snapshot(
+    catalog: CatalogSnapshot, model: str, expected_digest: str | None
 ) -> CatalogVerdict:
     """Judge the bytes that were actually read, digest first.
 
@@ -225,14 +280,6 @@ def unsupported_reason(surface: ToolSurface) -> str | None:
     extra = set(surface.experimental_supported_tools) - ALLOWED_EXPERIMENTAL_TOOLS
     if extra:
         return f"EXPERIMENTAL_TOOL_{_code(sorted(extra)[0])}"
-    if surface.use_responses_lite:
-        # `standalone_web_search_enabled` is
-        #   namespace_tools_enabled && provider.capabilities().web_search
-        #     && (model_info.use_responses_lite || Feature::StandaloneWebSearch)
-        # so a lite model turns standalone web search on by itself, whatever
-        # `--disable standalone_web_search` says. Every current model in the
-        # 0.153.4 catalog sets it; the older ones do not.
-        return "RESPONSES_LITE_ENABLED"
     if (
         surface.apply_patch_tool_type is not None
         and surface.apply_patch_tool_type not in KNOWN_APPLY_PATCH_TYPES
@@ -281,11 +328,11 @@ __all__ = [
     "ALLOWED_EXPERIMENTAL_TOOLS",
     "ALLOWED_TOOL_MODE",
     "KNOWN_APPLY_PATCH_TYPES",
+    "CatalogSnapshot",
     "CatalogVerdict",
-    "OpenCatalog",
     "ToolSurface",
     "judge_catalog",
-    "judge_open_catalog",
-    "open_catalog",
+    "judge_snapshot",
+    "snapshot_catalog",
     "unsupported_reason",
 ]

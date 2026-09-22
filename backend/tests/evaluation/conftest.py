@@ -24,6 +24,7 @@ from src.evaluation.codex.models import (
     EvaluationRequest,
     LauncherKind,
     OutputLimits,
+    RunMode,
 )
 from tests.evaluation.fixtures.orbit_candidate import task_input
 
@@ -134,6 +135,7 @@ class Probe:
     def config(self, **overrides: Any) -> CodexClientConfig:
         settings: dict[str, Any] = {
             "launcher": self.launcher(),
+            "run_mode": RunMode.FIXTURE,
             "codex_home": self.codex_home,
             "home": self.home,
             "tmpdir": self.tmpdir,

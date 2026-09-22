@@ -6,7 +6,9 @@ surface, its filesystem isolation, or how subscription usage is metered. A fake
 process cannot show any of that, and a green run here is not evidence for it.
 """
 
+import hashlib
 import json
+import os
 import time
 from pathlib import Path
 from unittest import mock
@@ -23,6 +25,7 @@ from src.evaluation.codex.models import (
     EvaluationFailure,
     EvaluationRejected,
     OutputLimits,
+    RunMode,
 )
 from tests.evaluation.conftest import (
     LAUNCHER_INJECTED_ENVIRONMENT_KEYS,
@@ -424,54 +427,94 @@ async def test_a_pinned_catalog_with_code_mode_never_reaches_exec(probe: Probe) 
     assert client.version_starts == 0
 
 
-async def test_replacing_the_catalog_after_the_check_changes_nothing(
+async def test_mutating_the_operator_catalog_after_the_check_changes_nothing(
     probe: Probe,
 ) -> None:
-    """The regression for "same path is not same bytes".
+    """The regression for "an open fd is not an immutable snapshot".
 
-    The guard takes its snapshot, the path is then atomically replaced with a
-    catalog declaring `code_mode_only`, and the attempt still runs -- because
-    the child inherits the descriptor the guard read, not the directory entry.
-    A pathname pin would have handed the replacement to `codex exec`.
+    Two ways to change a file after it has been judged: replace the path, or
+    rewrite the same inode. A descriptor held on the operator's own file stops
+    the first and not the second, because it binds to the inode. The judged
+    bytes are therefore copied into a private file, reopened read-only and
+    unlinked; both mutations then miss.
     """
     probe.scenario("success")
     probe.catalog(tool_mode=None)
     client = probe.client()
 
-    original_open = catalog_module.open_catalog
-    swapped: dict[str, bool] = {}
-
-    def open_then_swap(path: Path) -> catalog_module.OpenCatalog | None:
-        opened = original_open(path)
-        replacement = path.with_suffix(".swap")
-        replacement.write_text(
-            json.dumps(
+    original = catalog_module.snapshot_catalog
+    mutated: dict[str, bool] = {}
+    hostile = json.dumps(
+        {
+            "models": [
                 {
-                    "models": [
-                        {
-                            "slug": "gpt-5.4",
-                            "tool_mode": "code_mode_only",
-                            "apply_patch_tool_type": "freeform",
-                            "experimental_supported_tools": [],
-                        }
-                    ]
+                    "slug": "gpt-5.4",
+                    "tool_mode": "code_mode_only",
+                    "apply_patch_tool_type": "freeform",
+                    "experimental_supported_tools": [],
+                    "use_responses_lite": False,
                 }
-            ),
-            encoding="utf-8",
-        )
-        replacement.replace(path)
-        swapped["done"] = True
-        return opened
+            ]
+        }
+    )
+
+    def snapshot_then_mutate(path: Path, snapshot_dir: Path) -> object:
+        taken = original(path, snapshot_dir)
+        # In place: same inode, no rename. An operator fd would follow this.
+        with path.open("r+", encoding="utf-8") as handle:
+            handle.truncate(0)
+            handle.write(hostile)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # And the other way too, to keep both paths covered.
+        swap = path.with_suffix(".swap")
+        swap.write_text(hostile, encoding="utf-8")
+        swap.replace(path)
+        mutated["done"] = True
+        return taken
 
     with (
-        mock.patch.object(catalog_module, "open_catalog", open_then_swap),
-        mock.patch.object(client_module, "open_catalog", open_then_swap),
+        mock.patch.object(catalog_module, "snapshot_catalog", snapshot_then_mutate),
+        mock.patch.object(client_module, "snapshot_catalog", snapshot_then_mutate),
     ):
         outcome = await client.evaluate(probe.request())
 
-    assert swapped.get("done") is True
+    assert mutated.get("done") is True
     assert "code_mode_only" in probe.model_catalog_path.read_text(encoding="utf-8")
     assert isinstance(outcome, EvaluationCompleted)
+
+
+async def test_a_real_run_without_a_pinned_digest_starts_nothing(probe: Probe) -> None:
+    """The reviewed snapshot is the contract, so a real turn needs the pin.
+
+    Without it the guard would be sampling three fields of a file that can be
+    anything. Refused before the version probe, the login probe or exec.
+    """
+    probe.scenario("success")
+    client = probe.client(run_mode=RunMode.REAL, expected_catalog_sha256=None)
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.TOOL_SURFACE_UNSUPPORTED
+    assert outcome.detail_code == "CATALOG_DIGEST_REQUIRED"
+    assert client.exec_starts == 0
+    assert client.version_starts == 0
+    assert client.preflight_starts == 0
+
+
+async def test_a_real_run_with_the_right_digest_proceeds(probe: Probe) -> None:
+    probe.scenario("success")
+    digest = hashlib.sha256(probe.model_catalog_path.read_bytes()).hexdigest()
+    client = probe.client(run_mode=RunMode.REAL, expected_catalog_sha256=digest)
+    assert isinstance(await client.evaluate(probe.request()), EvaluationCompleted)
+
+
+async def test_a_real_run_with_a_stale_digest_starts_nothing(probe: Probe) -> None:
+    probe.scenario("success")
+    client = probe.client(run_mode=RunMode.REAL, expected_catalog_sha256="0" * 64)
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "CATALOG_DIGEST_MISMATCH"
+    assert client.exec_starts == 0
 
 
 @pytest.mark.parametrize(

@@ -28,7 +28,11 @@ from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 
-from src.evaluation.codex.catalog import OpenCatalog, judge_open_catalog, open_catalog
+from src.evaluation.codex.catalog import (
+    CatalogSnapshot,
+    judge_snapshot,
+    snapshot_catalog,
+)
 from src.evaluation.codex.command import (
     CommandBuildError,
     build_arguments,
@@ -51,6 +55,7 @@ from src.evaluation.codex.models import (
     EvaluationRequest,
     OutputLimits,
     ProcessLimits,
+    RunMode,
     SchemaUnsupportedError,
 )
 from src.evaluation.codex.preflight import check_chatgpt_login, check_cli_version
@@ -71,6 +76,7 @@ class CodexClientConfig:
     """
 
     launcher: CodexLauncher
+    run_mode: RunMode
     codex_home: Path
     home: Path
     tmpdir: Path
@@ -113,6 +119,12 @@ class CodexEvaluationClient:
     async def _attempt[Output: BaseModel](
         self, request: EvaluationRequest[Output], deadline: Deadline
     ) -> EvaluationOutcome[Output]:
+        if self.config.run_mode is RunMode.REAL and self.config.expected_catalog_sha256 is None:
+            # A real turn without a pinned digest would trust whatever the file
+            # happens to contain. Refused before the first process starts.
+            return self._reject(
+                EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, "CATALOG_DIGEST_REQUIRED", deadline
+            )
         if self.config.effort is not None and self.config.effort not in SUPPORTED_EFFORTS:
             # Never remapped onto a neighbouring value: a silently downgraded
             # effort would make the recorded configuration a lie.
@@ -138,7 +150,7 @@ class CodexEvaluationClient:
 
         # Cheapest gate first: one open, one read, no process at all. The
         # descriptor stays open so the attempt inherits it.
-        catalog = open_catalog(self.config.model_catalog_path)
+        catalog = snapshot_catalog(self.config.model_catalog_path, self.config.scratch)
         try:
             return await self._attempt_with_catalog(request, deadline, catalog, environment, schema)
         finally:
@@ -149,7 +161,7 @@ class CodexEvaluationClient:
         self,
         request: EvaluationRequest[Output],
         deadline: Deadline,
-        catalog: OpenCatalog | None,
+        catalog: CatalogSnapshot | None,
         environment: dict[str, str],
         schema: dict[str, object],
     ) -> EvaluationOutcome[Output]:
@@ -278,7 +290,7 @@ class CodexEvaluationClient:
         return None
 
     def _verify_tool_surface(
-        self, catalog: OpenCatalog, deadline: Deadline
+        self, catalog: CatalogSnapshot, deadline: Deadline
     ) -> EvaluationRejected | None:
         """Refuse a catalog whose entry would widen the tool surface.
 
@@ -287,9 +299,7 @@ class CodexEvaluationClient:
         bytes checked here and the bytes `StaticModelsManager` is built from are
         the same bytes -- replacing the path afterwards changes nothing.
         """
-        verdict = judge_open_catalog(
-            catalog, self.config.model, self.config.expected_catalog_sha256
-        )
+        verdict = judge_snapshot(catalog, self.config.model, self.config.expected_catalog_sha256)
         if verdict.reason is not None:
             return self._reject(
                 EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, verdict.reason, deadline

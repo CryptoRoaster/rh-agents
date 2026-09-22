@@ -290,6 +290,32 @@ true`. The real control is the top-level `web_search` mode, so the harness sets
 defaults to **enabled** — `.is_none_or(|config| config.enabled)` — so silence
 there meant the tool was on. Both are now set explicitly.
 
+#### What `use_responses_lite` does and does not do
+
+An earlier version of this guard refused `use_responses_lite` models, arguing
+standalone web search stayed reachable. That was wrong. The field does enter
+
+```rust
+standalone_web_search_enabled = namespace_tools_enabled
+    && provider.capabilities().web_search
+    && (model_info.use_responses_lite || Feature::StandaloneWebSearch)
+```
+
+but `append_extension_tool_executors` has the last word:
+
+```rust
+let web_search_mode_on = config.web_search_mode.value() != WebSearchMode::Disabled;
+if is_standalone_web_search && (!standalone_web_search_enabled || !web_search_mode_on) {
+    continue;
+}
+```
+
+With `web_search="disabled"` that is false, so the standalone executor is
+dropped whatever the model declares. Lite also *reduces* the surface elsewhere:
+`hosted_model_tool_specs` returns `Vec::new()` immediately for a lite model. Its
+remaining effect is on turn metadata. The guard type-checks the field and
+accepts either value.
+
 A test hands the complete override set to the supported build through `codex
 debug models --bundled`, which loads the config and prints the bundled catalog
 without a turn, a model request or a network call. Being accepted at the
@@ -353,14 +379,23 @@ So every attempt pins the catalog — and pins the **bytes**, not the name. Same
 pathname is not same content: a path can be replaced between the guard's read
 and the child's read, and a check with a window in it is not a check.
 
-The file is opened once with `O_RDONLY`, those bytes are judged, and the
-still-open descriptor is handed to the child through `pass_fds` alongside the
-gate's release pipe. `model_catalog_json` then points at `/dev/fd/<n>`, which
-resolves through the open file description rather than the directory entry, and
-the descriptor survives the gate's `os.execv` because `pass_fds` clears
-`FD_CLOEXEC`. Replacing the path afterwards changes nothing the child can see;
-a regression does exactly that and the attempt still runs on the reviewed
-snapshot.
+There are two ways to change a file after it has been judged, and holding the
+operator's own descriptor only stops one of them. A descriptor binds to an
+**inode**, not to bytes: `open(path, O_WRONLY|O_TRUNC)` followed by a write
+changes what an already-open read handle sees. Replacing the path is the other
+way. An earlier version of this harness handled only the second.
+
+So the judged bytes are frozen rather than referenced. The operator file is read
+once; those exact bytes are hashed and judged; they are written to a fresh file,
+`fsync`ed, and the writer is closed; the copy is reopened **read-only** and then
+**unlinked**. What the child inherits through `pass_fds` has no name left to
+write through and carries no write capability of its own.
+`model_catalog_json` points at `/dev/fd/<n>`, which resolves through that open
+file description, and the descriptor survives the gate's `os.execv` because
+`pass_fds` clears `FD_CLOEXEC`. Regressions mutate the operator file both ways —
+in place on the same inode, and by atomic replacement — and the child still
+reads the reviewed bytes; the fake verifies that from inside the child rather
+than the parent asserting it about itself.
 
 A descriptor reference requires `PLATFORM_BINARY`. Our own gate execs that
 binary and keeps the descriptor; the npm entry point spawns a separate Node
@@ -368,9 +403,15 @@ process, and nothing shows Node forwards a descriptor it was never told about.
 That case is refused rather than assumed.
 
 The approved content is pinned by digest as well. `expected_catalog_sha256`
-makes the whole `ModelInfo` snapshot part of the contract instead of the three
-fields this guard happens to sample, so changing the catalog becomes a
-reviewable change rather than an edit to an operational file.
+makes the whole `ModelInfo` snapshot part of the contract instead of the few
+fields this guard samples, so changing the catalog becomes a reviewable change
+rather than an edit to an operational file.
+
+For a real turn the digest is **mandatory**. `RunMode.REAL` without
+`expected_catalog_sha256` is refused before the version probe, the login probe
+or `exec` — without the pin the guard would be sampling a file that can be
+anything. `RunMode.FIXTURE` may omit it, because a stand-in process has no
+approved snapshot to be held to.
 
 The guard refuses anything outside an explicit allowlist: a declared
 `tool_mode`, a non-empty `experimental_supported_tools`, an unknown
