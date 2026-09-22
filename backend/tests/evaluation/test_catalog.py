@@ -3,7 +3,11 @@
 import json
 from pathlib import Path
 
-from src.evaluation.codex.catalog import judge_catalog, judge_catalog_file
+from src.evaluation.codex.catalog import (
+    judge_catalog,
+    judge_open_catalog,
+    open_catalog,
+)
 
 # Copied from `codex debug models --bundled` of the supported build. The fields
 # are the ones `core/src/tools/spec_plan.rs` reads when it builds the tool plan.
@@ -13,6 +17,7 @@ REAL_SOL_ENTRY = {
     "shell_type": "unified_exec",
     "apply_patch_tool_type": "freeform",
     "experimental_supported_tools": [],
+    "use_responses_lite": True,
 }
 REAL_LEGACY_ENTRY = {
     "slug": "gpt-5.4",
@@ -20,6 +25,7 @@ REAL_LEGACY_ENTRY = {
     "shell_type": "unified_exec",
     "apply_patch_tool_type": "freeform",
     "experimental_supported_tools": [],
+    "use_responses_lite": False,
 }
 
 
@@ -100,7 +106,72 @@ def test_an_unreadable_catalog_is_refused() -> None:
     )
 
 
-def test_a_missing_catalog_file_is_refused(tmp_path: Path) -> None:
-    verdict = judge_catalog_file(tmp_path / "absent.json", "gpt-5.4")
-    assert verdict.surface is None
-    assert verdict.reason == "CATALOG_UNREADABLE"
+def test_a_missing_catalog_file_cannot_be_opened(tmp_path: Path) -> None:
+    assert open_catalog(tmp_path / "absent.json") is None
+
+
+def test_the_judged_bytes_survive_the_path_being_replaced(tmp_path: Path) -> None:
+    """The binding is to content, not to a name.
+
+    A guard that re-read the path before the run would have a window between the
+    two reads. Holding the descriptor closes it: the bytes stay reachable
+    through `/dev/fd/<n>` no matter what the directory entry becomes.
+    """
+    path = tmp_path / "catalog.json"
+    path.write_text(catalog(REAL_LEGACY_ENTRY), encoding="utf-8")
+    opened = open_catalog(path)
+    assert opened is not None
+    try:
+        swap = tmp_path / "swap.json"
+        swap.write_text(
+            catalog(dict(REAL_LEGACY_ENTRY, tool_mode="code_mode_only")), encoding="utf-8"
+        )
+        swap.replace(path)
+
+        assert "code_mode_only" in path.read_text(encoding="utf-8")
+        assert "code_mode_only" not in opened.payload
+        assert judge_open_catalog(opened, "gpt-5.4", None).reason is None
+        assert Path(opened.reference).read_text(encoding="utf-8") == opened.payload
+    finally:
+        opened.close()
+
+
+def test_a_digest_pin_refuses_content_that_was_not_reviewed(tmp_path: Path) -> None:
+    """The whole approved snapshot is the contract, not the three fields read."""
+    path = tmp_path / "catalog.json"
+    path.write_text(catalog(REAL_LEGACY_ENTRY), encoding="utf-8")
+    opened = open_catalog(path)
+    assert opened is not None
+    try:
+        assert judge_open_catalog(opened, "gpt-5.4", opened.digest).reason is None
+        assert judge_open_catalog(opened, "gpt-5.4", "0" * 64).reason == "CATALOG_DIGEST_MISMATCH"
+    finally:
+        opened.close()
+
+
+def test_a_responses_lite_model_is_refused() -> None:
+    """Lite turns on standalone web search regardless of the feature flag.
+
+    `standalone_web_search_enabled` is `namespace_tools_enabled &&
+    provider.capabilities().web_search && (use_responses_lite ||
+    Feature::StandaloneWebSearch)`, so `--disable standalone_web_search` does
+    not settle it for a lite model.
+    """
+    entry = dict(REAL_LEGACY_ENTRY, use_responses_lite=True)
+    assert judge_catalog(catalog(entry), "gpt-5.4").reason == "RESPONSES_LITE_ENABLED"
+
+
+def test_a_missing_or_malformed_responses_lite_flag_is_refused() -> None:
+    entry = {k: v for k, v in REAL_LEGACY_ENTRY.items() if k != "use_responses_lite"}
+    assert judge_catalog(catalog(entry), "gpt-5.4").reason == "RESPONSES_LITE_MALFORMED"
+    for bad in ("true", 1, None, {}):
+        entry = dict(REAL_LEGACY_ENTRY, use_responses_lite=bad)
+        assert judge_catalog(catalog(entry), "gpt-5.4").reason == "RESPONSES_LITE_MALFORMED"
+
+
+def test_the_frontier_entry_fails_on_the_first_reason_it_hits() -> None:
+    """It is refused twice over: `code_mode_only` and responses lite."""
+    verdict = judge_catalog(catalog(REAL_SOL_ENTRY), "gpt-5.6-sol")
+    assert verdict.reason == "TOOL_MODE_CODE_MODE_ONLY"
+    assert verdict.surface is not None
+    assert verdict.surface.use_responses_lite is True

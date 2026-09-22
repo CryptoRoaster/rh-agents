@@ -30,30 +30,68 @@ from src.evaluation.codex.models import CodexLauncher, EvaluationFailure, Launch
 
 # Feature flags this harness turns off. Each one is a tool or instruction
 # channel that `core/src/tools/spec_plan.rs` gates on a feature.
+# Feature flags this harness turns off. Each one is a tool, an agent, a memory
+# or an instruction channel that 0.153.4 gates on a feature, and each key was
+# checked against `codex features list` of the supported build.
+#
+# The list deliberately mirrors what Codex itself disables for a minimised
+# structured turn in `tui/src/temporary_structured_request.rs`, plus the
+# surfaces that request does not need to consider. Several of these default to
+# ON: `image_generation`, `tool_suggest`, `shell_snapshot`, `goals`, `hooks`,
+# `skill_search`, `apps`, `plugins`, `browser_use`, `computer_use`,
+# `sleep_tool`, `unified_exec`, `shell_tool` and `multi_agent` are all stable
+# and enabled by default, so leaving any of them out would leave it on.
 DISABLED_FEATURES = (
-    "shell_tool",
-    "unified_exec",
-    "view_image",
     "apps",
-    "plugins",
     "browser_use",
-    "computer_use",
     "code_mode",
+    "code_mode_only",
+    "computer_use",
+    "context_management",
+    "current_time_reminder",
+    "deferred_executor",
+    "enable_fanout",
+    "goals",
+    "hooks",
+    "image_generation",
+    "memories",
     "multi_agent",
+    "multi_agent_v2",
+    "plugins",
+    "request_permissions_tool",
+    "shell_snapshot",
+    "shell_tool",
+    "skill_search",
+    "sleep_tool",
     "standalone_web_search",
     "token_budget",
-    "sleep_tool",
-    "current_time_reminder",
-    "request_permissions_tool",
+    "tool_suggest",
+    "unified_exec",
+    "view_image",
+    "web_search_cached",
+    "web_search_request",
 )
 
 # Config overrides that close instruction sources and pin the login method.
 BASE_CONFIG_OVERRIDES = (
     'forced_login_method="chatgpt"',
-    "tools.web_search=false",
-    "tools.update_plan=false",
+    # The top-level mode is the real control. `tools.web_search` is a
+    # `WebSearchToolConfig` (domains, context size, location), and its legacy
+    # boolean form is parsed and then discarded -- `Some(Enabled(enabled)) =>
+    # { let _ = enabled; None }` -- so `tools.web_search=false` disables
+    # nothing. Without an explicit mode the resolver falls back to
+    # `WebSearchMode::Cached`, and the default provider advertises web search,
+    # so hosted search could still be registered.
+    'web_search="disabled"',
+    # `UpdatePlanToolConfig { enabled }`, so the toggle is one level down.
+    "tools.update_plan.enabled=false",
+    # `ExperimentalRequestUserInput { enabled }` defaults to **true**:
+    # `.is_none_or(|config| config.enabled)`. Silence here means on.
+    "tools.experimental_request_user_input.enabled=false",
     "project_doc_max_bytes=0",
     "skills.include_instructions=false",
+    "orchestrator.skills.enabled=false",
+    "orchestrator.mcp.enabled=false",
     "mcp_servers={}",
     'approval_policy="never"',
 )
@@ -73,6 +111,10 @@ FORBIDDEN_ARGUMENTS = (
 )
 
 ALLOWED_ENVIRONMENT_KEYS = ("CODEX_HOME", "HOME", "PATH", "TMPDIR", "LANG")
+
+# `/dev/fd/<n>` resolves through the open file description rather than a
+# directory entry, which is what makes the catalog pin about bytes.
+FD_REFERENCE_PREFIX = "/dev/fd/"
 
 
 def toml_string(value: str) -> str:
@@ -141,7 +183,7 @@ def build_arguments(
     model: str,
     effort: str | None,
     instructions: str,
-    model_catalog_path: Path,
+    model_catalog_reference: str,
     forbidden_roots: tuple[Path, ...] = (),
 ) -> list[str]:
     """Assemble one non-interactive invocation that reads its data from stdin.
@@ -151,13 +193,23 @@ def build_arguments(
     out of the workspace matters even when no reading tool is enabled.
     """
     validate_launcher(launcher)
-    if not model_catalog_path.is_absolute():
+    if not Path(model_catalog_reference).is_absolute():
         # `model_catalog_json` is an AbsolutePathBuf in the CLI. A relative path
         # would be rejected there, or resolved against a different directory,
-        # and the pin would silently not be the file that was judged.
+        # and the pin would not be what was judged.
         raise CommandBuildError(
             EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, "CATALOG_PATH_NOT_ABSOLUTE"
         )
+    if model_catalog_reference.startswith(FD_REFERENCE_PREFIX):
+        # A descriptor reference only survives if the launcher hands the
+        # descriptor on unchanged. The platform binary is exec'd by our own gate
+        # and does; the npm entry point re-spawns through Node, and that Node
+        # process passing a foreign descriptor through its own spawn has not
+        # been demonstrated. Refusing is the fail-closed answer.
+        if launcher.kind is not LauncherKind.PLATFORM_BINARY:
+            raise CommandBuildError(
+                EvaluationFailure.LAUNCHER_UNSUPPORTED, "FD_CATALOG_NEEDS_PLATFORM_BINARY"
+            )
     resolved = working_directory.resolve()
     for root in forbidden_roots:
         if resolved == root.resolve() or root.resolve() in resolved.parents:
@@ -193,7 +245,7 @@ def build_arguments(
     # provider build a `StaticModelsManager`, which ignores the refresh strategy,
     # never consults the on-disk cache and treats `refresh_if_new_etag` as a
     # no-op -- so the entry this harness judged is the entry the turn uses.
-    arguments += ["-c", f"model_catalog_json={toml_string(str(model_catalog_path))}"]
+    arguments += ["-c", f"model_catalog_json={toml_string(model_catalog_reference)}"]
     arguments += ["-c", f"developer_instructions={toml_string(instructions)}"]
     # A bare "-" makes the CLI read the prompt from stdin, so untrusted market
     # data never lands in argv, which is readable process-wide.

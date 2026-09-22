@@ -220,6 +220,7 @@ async def run_bounded(
     deadline: Deadline,
     on_stdout_line: Callable[[bytes], None],
     spawn_process: SpawnProcess = asyncio.create_subprocess_exec,
+    extra_fds: tuple[int, ...] = (),
 ) -> ProcessResult:
     """Run one child to completion under one deadline and fixed output caps."""
     spawned = await _spawn(
@@ -229,6 +230,7 @@ async def run_bounded(
         limits=limits,
         deadline=deadline,
         spawn_process=spawn_process,
+        extra_fds=extra_fds,
     )
     process = spawned.process
     pgid = _group_of(process)
@@ -288,6 +290,7 @@ async def _spawn(
     limits: OutputLimits,
     deadline: Deadline,
     spawn_process: SpawnProcess = asyncio.create_subprocess_exec,
+    extra_fds: tuple[int, ...] = (),
 ) -> SpawnedChild:
     """Create the child inside the work budget, without losing it on a race.
 
@@ -329,7 +332,10 @@ async def _spawn(
             cwd=str(working_directory),
             start_new_session=True,
             limit=limits.max_line_bytes,
-            pass_fds=(gate_read,),
+            # The gate's release pipe, plus any descriptor the caller needs the
+            # child to inherit -- the open catalog, so `/dev/fd/<n>` resolves
+            # through the same open file description the harness judged.
+            pass_fds=(gate_read, *extra_fds),
         )
     )
     try:

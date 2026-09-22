@@ -263,11 +263,37 @@ tool is offered. That is a configuration property, not an operating-system one.
 |---|---|---|
 | shell, `unified_exec`, `write_stdin` | `--disable shell_tool`, `--disable unified_exec` | `add_shell_tools` returns early when `Feature::ShellTool` is off (`core/src/tools/spec_plan.rs:1074-1082`) |
 | `view_image` | `--disable view_image` | feature-gated in `add_core_utility_tools` |
-| web search | `-c tools.web_search=false`, `--disable standalone_web_search` | `tools.web_search` in the config schema |
+| web search | `-c web_search="disabled"` plus `--disable standalone_web_search`, `web_search_cached`, `web_search_request` | see below |
 | MCP resource tools | `-c mcp_servers={}` | `add_mcp_resource_tools` registers nothing without servers |
 | apps, plugins, browser use, computer use, code mode, multi-agent | `--disable` per flag | feature flags in the config schema |
 | **`apply_patch`** | **not removable** | gated only on an environment existing and on `model_info.apply_patch_tool_type`, which every model in the 0.153.4 catalog sets to `freeform`. Its spec is a grammar for patches, with no read operation, and `handlers/apply_patch.rs` refuses any path `can_write_path_with_cwd` rejects — under `read-only` that is every path. |
 | **code mode** | **not removable by flag** | see below |
+
+### Two toggles that did nothing
+
+`tools.web_search=false` **does not disable web search.** That key is a
+`WebSearchToolConfig` (domains, context size, location); its legacy boolean form
+is parsed and then discarded —
+
+```rust
+Some(WebSearchToolConfigInput::Enabled(enabled)) => { let _ = enabled; None }
+```
+
+— and without an explicit mode `resolve_web_search_mode(...)` falls back to
+`WebSearchMode::Cached` while the default provider advertises `web_search:
+true`. The real control is the top-level `web_search` mode, so the harness sets
+`web_search="disabled"` and disables the deprecated feature gates as well.
+
+`tools.update_plan=false` was the wrong shape too: the type is
+`UpdatePlanToolConfig { enabled }`, so the path is
+`tools.update_plan.enabled=false`. And `experimental_request_user_input`
+defaults to **enabled** — `.is_none_or(|config| config.enabled)` — so silence
+there meant the tool was on. Both are now set explicitly.
+
+A test hands the complete override set to the supported build through `codex
+debug models --bundled`, which loads the config and prints the bundled catalog
+without a turn, a model request or a network call. Being accepted at the
+argument layer is not the same as being understood.
 
 ### The model catalog outranks the flags
 
@@ -323,12 +349,28 @@ as a no-op. `config_model_catalog` reaches it from `model_catalog_json` through
 `load_model_catalog` and `thread_manager::build_models_manager`; the only call
 site that hardcodes `None` is a test helper.
 
-So every attempt passes `-c model_catalog_json=<absolute path>`, and
-`catalog.py` judges **that same file**. No process reads it: a probe would only
-reopen the gap between what was inspected and what runs. A relative path is
-refused, because `model_catalog_json` is an `AbsolutePathBuf` and a relative one
-would resolve elsewhere or be rejected — either way the pin would not be the
-file that was judged.
+So every attempt pins the catalog — and pins the **bytes**, not the name. Same
+pathname is not same content: a path can be replaced between the guard's read
+and the child's read, and a check with a window in it is not a check.
+
+The file is opened once with `O_RDONLY`, those bytes are judged, and the
+still-open descriptor is handed to the child through `pass_fds` alongside the
+gate's release pipe. `model_catalog_json` then points at `/dev/fd/<n>`, which
+resolves through the open file description rather than the directory entry, and
+the descriptor survives the gate's `os.execv` because `pass_fds` clears
+`FD_CLOEXEC`. Replacing the path afterwards changes nothing the child can see;
+a regression does exactly that and the attempt still runs on the reviewed
+snapshot.
+
+A descriptor reference requires `PLATFORM_BINARY`. Our own gate execs that
+binary and keeps the descriptor; the npm entry point spawns a separate Node
+process, and nothing shows Node forwards a descriptor it was never told about.
+That case is refused rather than assumed.
+
+The approved content is pinned by digest as well. `expected_catalog_sha256`
+makes the whole `ModelInfo` snapshot part of the contract instead of the three
+fields this guard happens to sample, so changing the catalog becomes a
+reviewable change rather than an edit to an operational file.
 
 The guard refuses anything outside an explicit allowlist: a declared
 `tool_mode`, a non-empty `experimental_supported_tools`, an unknown

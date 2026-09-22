@@ -28,7 +28,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 
-from src.evaluation.codex.catalog import judge_catalog_file
+from src.evaluation.codex.catalog import OpenCatalog, judge_open_catalog, open_catalog
 from src.evaluation.codex.command import (
     CommandBuildError,
     build_arguments,
@@ -77,6 +77,7 @@ class CodexClientConfig:
     workspace: Path
     scratch: Path
     model_catalog_path: Path
+    expected_catalog_sha256: str | None
     model: str
     effort: str | None = None
     forbidden_roots: tuple[Path, ...] = ()
@@ -135,8 +136,28 @@ class CodexEvaluationClient:
             path_entries=self.config.launcher.path_entries,
         )
 
-        # Cheapest gate first: a file read, no process at all.
-        rejection = self._verify_tool_surface(deadline)
+        # Cheapest gate first: one open, one read, no process at all. The
+        # descriptor stays open so the attempt inherits it.
+        catalog = open_catalog(self.config.model_catalog_path)
+        try:
+            return await self._attempt_with_catalog(request, deadline, catalog, environment, schema)
+        finally:
+            if catalog is not None:
+                catalog.close()
+
+    async def _attempt_with_catalog[Output: BaseModel](
+        self,
+        request: EvaluationRequest[Output],
+        deadline: Deadline,
+        catalog: OpenCatalog | None,
+        environment: dict[str, str],
+        schema: dict[str, object],
+    ) -> EvaluationOutcome[Output]:
+        if catalog is None:
+            return self._reject(
+                EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, "CATALOG_UNREADABLE", deadline
+            )
+        rejection = self._verify_tool_surface(catalog, deadline)
         if rejection is not None:
             return rejection
 
@@ -159,7 +180,7 @@ class CodexEvaluationClient:
                 model=self.config.model,
                 effort=self.config.effort,
                 instructions=request.instructions,
-                model_catalog_path=self.config.model_catalog_path,
+                model_catalog_reference=catalog.reference,
                 forbidden_roots=self.config.forbidden_roots,
             )
         except CommandBuildError as error:
@@ -186,6 +207,7 @@ class CodexEvaluationClient:
                 limits=request.limits,
                 deadline=deadline,
                 on_stdout_line=accumulator.feed,
+                extra_fds=(catalog.fd,),
             )
         except ProcessError as error:
             return self._reject(error.failure, error.reason_code, deadline, error.cleanup)
@@ -255,16 +277,19 @@ class CodexEvaluationClient:
             )
         return None
 
-    def _verify_tool_surface(self, deadline: Deadline) -> EvaluationRejected | None:
-        """Refuse a model whose pinned catalog entry would widen the tool surface.
+    def _verify_tool_surface(
+        self, catalog: OpenCatalog, deadline: Deadline
+    ) -> EvaluationRejected | None:
+        """Refuse a catalog whose entry would widen the tool surface.
 
-        The file judged here is the file `codex exec` is pinned to, so there is
-        no window in which a cache entry or a remote `/models` response could
-        substitute a different `tool_mode`. Reading it needs no process, which
-        is the point: a probe would only reopen the gap between what was
-        inspected and what runs.
+        Judged from the bytes already read through the open descriptor, not by
+        re-reading a path. The descriptor is what the child inherits, so the
+        bytes checked here and the bytes `StaticModelsManager` is built from are
+        the same bytes -- replacing the path afterwards changes nothing.
         """
-        verdict = judge_catalog_file(self.config.model_catalog_path, self.config.model)
+        verdict = judge_open_catalog(
+            catalog, self.config.model, self.config.expected_catalog_sha256
+        )
         if verdict.reason is not None:
             return self._reject(
                 EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, verdict.reason, deadline

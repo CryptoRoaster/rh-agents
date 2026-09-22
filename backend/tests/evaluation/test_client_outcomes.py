@@ -9,16 +9,15 @@ process cannot show any of that, and a green run here is not evidence for it.
 import json
 import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from pydantic import BaseModel, ConfigDict
 
 from src.agents.orbit.models import OrbitAssessment, OrbitClassification
-from src.evaluation.codex.command import (
-    ALLOWED_ENVIRONMENT_KEYS,
-    build_arguments,
-    toml_string,
-)
+from src.evaluation.codex import catalog as catalog_module
+from src.evaluation.codex import client as client_module
+from src.evaluation.codex.command import ALLOWED_ENVIRONMENT_KEYS
 from src.evaluation.codex.models import (
     EvaluationCompleted,
     EvaluationFailure,
@@ -425,19 +424,54 @@ async def test_a_pinned_catalog_with_code_mode_never_reaches_exec(probe: Probe) 
     assert client.version_starts == 0
 
 
-async def test_exec_is_pinned_to_the_very_file_that_was_judged(probe: Probe) -> None:
-    """Judging one catalog and running against another is not a check."""
-    built = build_arguments(
-        launcher=probe.launcher(),
-        working_directory=probe.workspace,
-        schema_path=probe.scratch / "schema.json",
-        model="gpt-5.4",
-        effort="low",
-        instructions="x",
-        model_catalog_path=probe.model_catalog_path,
-    )
-    override = next(item for item in built if item.startswith("model_catalog_json="))
-    assert override == f"model_catalog_json={toml_string(str(probe.model_catalog_path))}"
+async def test_replacing_the_catalog_after_the_check_changes_nothing(
+    probe: Probe,
+) -> None:
+    """The regression for "same path is not same bytes".
+
+    The guard takes its snapshot, the path is then atomically replaced with a
+    catalog declaring `code_mode_only`, and the attempt still runs -- because
+    the child inherits the descriptor the guard read, not the directory entry.
+    A pathname pin would have handed the replacement to `codex exec`.
+    """
+    probe.scenario("success")
+    probe.catalog(tool_mode=None)
+    client = probe.client()
+
+    original_open = catalog_module.open_catalog
+    swapped: dict[str, bool] = {}
+
+    def open_then_swap(path: Path) -> catalog_module.OpenCatalog | None:
+        opened = original_open(path)
+        replacement = path.with_suffix(".swap")
+        replacement.write_text(
+            json.dumps(
+                {
+                    "models": [
+                        {
+                            "slug": "gpt-5.4",
+                            "tool_mode": "code_mode_only",
+                            "apply_patch_tool_type": "freeform",
+                            "experimental_supported_tools": [],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        replacement.replace(path)
+        swapped["done"] = True
+        return opened
+
+    with (
+        mock.patch.object(catalog_module, "open_catalog", open_then_swap),
+        mock.patch.object(client_module, "open_catalog", open_then_swap),
+    ):
+        outcome = await client.evaluate(probe.request())
+
+    assert swapped.get("done") is True
+    assert "code_mode_only" in probe.model_catalog_path.read_text(encoding="utf-8")
+    assert isinstance(outcome, EvaluationCompleted)
 
 
 @pytest.mark.parametrize(

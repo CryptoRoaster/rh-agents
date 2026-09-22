@@ -106,6 +106,7 @@ class Probe:
             "shell_type": "unified_exec",
             "apply_patch_tool_type": "freeform",
             "experimental_supported_tools": [],
+            "use_responses_lite": False,
         }
         entry.update(overrides)
         self.model_catalog_path.write_text(json.dumps({"models": [entry]}), encoding="utf-8")
@@ -140,6 +141,7 @@ class Probe:
             "scratch": self.scratch,
             "model": "gpt-5.4",
             "model_catalog_path": self.model_catalog_path,
+            "expected_catalog_sha256": None,
             "effort": "low",
             "run_preflight": False,
         }
