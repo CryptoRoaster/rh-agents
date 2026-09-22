@@ -264,14 +264,20 @@ async def test_a_spawn_that_outlives_its_budget_leaves_no_process_behind(
     directory = workspace(tmp_path, "hang", pgid_out=str(tmp_path / "pgid"))
 
     class Clock:
+        """Drive the spawn deterministically instead of racing a real timer.
+
+        Reading 1 is construction. Reading 2 answers "is the work budget gone?"
+        with a millisecond left, so the spawn is attempted at all. Reading 3
+        supplies the timeout itself as zero, so `wait_for` gives up before any
+        subprocess can appear -- on every machine, rather than on whichever one
+        loses a millisecond race. Later readings keep a second for cleanup.
+        """
+
         def __init__(self) -> None:
-            self.calls = 0
+            self.readings = [0.0, 8.999]
 
         def __call__(self) -> float:
-            # Construction sees 0; every later reading sees 8.999, leaving one
-            # millisecond of work budget and a full second for cleanup.
-            self.calls += 1
-            return 0.0 if self.calls == 1 else 8.999
+            return self.readings.pop(0) if self.readings else 9.0
 
     deadline = Deadline(total_seconds=10.0, cleanup_reserve_seconds=1.0, monotonic=Clock())
     with pytest.raises(ProcessError) as caught:
@@ -286,8 +292,10 @@ async def test_a_spawn_that_outlives_its_budget_leaves_no_process_behind(
         )
     assert caught.value.failure is EvaluationFailure.DEADLINE_EXCEEDED
     assert caught.value.reason_code == "START_BUDGET_EXHAUSTED"
-    # The child the kernel may already have created was recovered and removed.
+    # Whatever the kernel had already created was claimed and removed; an
+    # abandoned spawn would leave the group behind and show up here.
     assert caught.value.cleanup.group is GroupState.EMPTY
+    assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
 
 
 async def test_cancellation_during_the_spawn_is_re_raised(tmp_path: Path) -> None:
