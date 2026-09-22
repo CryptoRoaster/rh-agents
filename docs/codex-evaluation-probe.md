@@ -76,10 +76,16 @@ and no token is read into the Python process.
 The login probe reads **stderr as well as stdout**. In 0.153.4,
 `run_login_status` (`codex-rs/cli/src/login.rs`) reports every outcome with
 `eprintln!`, so the status line never appears on stdout. The exit code is no
-substitute: an API-key session exits 0 just like a ChatGPT one. Only the exact
-line `Logged in using ChatGPT` is accepted as a subscription session — access
-token, personal access token and Bedrock modes are logged-in states too, and
-none of them is what this probe is for.
+substitute: an API-key session exits 0 just like a ChatGPT one.
+
+The match is an **exact line**, and the two channels are kept apart. A substring
+test would accept the marker quoted inside an error message or as the prefix of
+a longer status such as `Logged in using ChatGPT Enterprise workspace acme`, and
+concatenating the buffers could splice one stream's tail onto the other's head
+and manufacture a line neither ever emitted. Only `Logged in using ChatGPT`, as
+a whole line on one channel, counts as a subscription session — access token,
+personal access token and Bedrock modes are logged-in states too, and none of
+them is what this probe is for.
 
 Two layers, in this order:
 
@@ -127,11 +133,22 @@ records what the check found:
 | `UNVERIFIED` | the cleanup budget ran out before the group could be checked |
 
 `UNVERIFIED` is not a synonym for success. Signals are cheap and were still
-delivered, but nothing confirmed they took effect. The report answers two
-questions separately: `group_cleared` says the child was reaped and the group
-was found empty, and `complete` additionally says that happened inside the
-reserve. An overrun therefore does not read as a leak, and a leak does not hide
-behind a fast finish.
+delivered, but nothing confirmed they took effect.
+
+The report answers two independent questions and never lets one answer the
+other:
+
+- `group_cleared` — the child was reaped and the group was checked and found
+  empty;
+- `overran_reserve` — cleanup used up the time it was allowed. Read once, at
+  the end, from the clock alone. A successful outcome does not clear it, so a
+  group cleared late is still reported as cleared late.
+
+`complete` is both: cleared, and cleared in time.
+
+Cleanup runs on its own `CleanupBudget` rather than on the attempt's deadline,
+because after a spawn overrun the deadline is already at zero and terminating a
+process needs time that no longer exists there.
 
 ### Ownership during an unfinished spawn
 
@@ -142,11 +159,25 @@ on the direct child — not `killpg` — and a descendant started in that window
 survives it. Once the spawn task ends as cancelled the handle is gone, so no
 group is ever recorded, signalled or checked for that tree.
 
-The probe therefore keeps claiming the handle past the cleanup reserve, up to
-`SPAWN_CLAIM_CEILING_SECONDS`, and reports the overrun. Only beyond the ceiling
-is the spawn given up, and the report then says `UNVERIFIED` with
-`SPAWN_ABANDONED`: **a process may remain in that case**, and nothing in this
-harness claims otherwise.
+The probe therefore waits for the spawn to settle, with **no time limit on the
+waiting**. That is a deliberate trade, and it is the safer one: a subprocess
+creation settles as soon as the kernel has forked and the pipes are connected —
+it does not wait for the child to do anything — so capping the wait would only
+exchange a bounded delay for an unbounded process tree. With a real Codex
+process that tree would also keep talking to the network after the harness
+believed it had stopped.
+
+Waiting that long spends the cleanup reserve, so termination then gets a fresh
+`EMERGENCY_CLEANUP_SECONDS` allowance. Without it `_terminate` would inherit an
+exhausted deadline and could neither reap the child nor check its group: the
+budget would be honoured and the process would survive. The overrun is reported
+either way.
+
+The one remaining path that gives up a handle needs a caller to cancel
+repeatedly — more than `SPAWN_CANCEL_ABSORPTIONS` times while the spawn is still
+pending. Even then the spawn is not cancelled from here, because that would
+leave asyncio killing only the direct child, and the report says `UNVERIFIED`
+with `SPAWN_NEVER_SETTLED`.
 
 Two limits stay explicit: a descendant that called `setsid` has left the group
 and is invisible here, and a group id can in principle be reused once the group

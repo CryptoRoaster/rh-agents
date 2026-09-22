@@ -338,7 +338,17 @@ async def test_the_login_probe_reads_the_channel_the_cli_actually_uses(
 
 @pytest.mark.parametrize(
     "login",
-    ["login_status_api_key", "login_status_access_token", "login_status_failure"],
+    [
+        "login_status_api_key",
+        "login_status_access_token",
+        "login_status_failure",
+        # A longer status beginning with the marker: accepted by a substring
+        # test, rejected by an exact line match.
+        "login_status_chatgpt_prefixed",
+        # The marker exists only if the two channels are glued together, which
+        # is why they are matched separately.
+        "login_status_split_channels",
+    ],
 )
 async def test_no_other_login_mode_counts_as_a_chatgpt_session(probe: Probe, login: str) -> None:
     probe.scenario("success", login=login)

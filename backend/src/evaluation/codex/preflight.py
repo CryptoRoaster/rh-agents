@@ -21,6 +21,11 @@ watching stdout alone would see nothing at all. The exit code cannot stand in
 for it either -- an API-key session also exits 0 -- so the marker has to be
 matched, and it has to be matched on the channel the CLI actually uses.
 
+The channels stay apart and the match is on a whole line. Concatenating the two
+buffers could splice one stream's tail onto the other's head and produce a line
+neither ever emitted, and a substring test would accept the marker wherever it
+appeared -- quoted inside an error, or as the prefix of a longer status.
+
 Neither probe starts a turn or calls a model.
 """
 
@@ -43,8 +48,23 @@ VERSION_PATTERN = re.compile(r"\b(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.]+)?)\b")
 
 @dataclass(frozen=True)
 class ProbeOutput:
-    text: str
+    """What a probe wrote, kept as lines and with the channels kept apart.
+
+    Two channels are never concatenated into one buffer. Joining them could
+    splice the tail of one onto the head of the other and manufacture a line
+    neither stream ever emitted -- including, in the worst case, the very marker
+    the login probe is looking for.
+    """
+
+    stdout_lines: tuple[str, ...]
+    stderr_lines: tuple[str, ...]
     cleanup: CleanupReport
+
+    def emitted(self) -> tuple[str, ...]:
+        return self.stdout_lines + self.stderr_lines
+
+    def text(self) -> str:
+        return "\n".join(self.emitted())
 
 
 @dataclass(frozen=True)
@@ -98,8 +118,16 @@ async def _capture(
         raise ProcessError(failure, f"EXIT_{result.exit_code}", result.cleanup)
     # Both channels, because the CLI answers on stderr and this probe must not
     # depend on guessing which one a given subcommand happens to use.
-    combined = b"".join(collected) + result.stderr_tail[:budget]
-    return ProbeOutput(text=combined.decode("utf-8", errors="replace"), cleanup=result.cleanup)
+    return ProbeOutput(
+        stdout_lines=_lines(b"".join(collected)),
+        stderr_lines=_lines(result.stderr_tail[:budget]),
+        cleanup=result.cleanup,
+    )
+
+
+def _lines(raw: bytes) -> tuple[str, ...]:
+    text = raw.decode("utf-8", errors="replace")
+    return tuple(line.strip() for line in text.splitlines() if line.strip())
 
 
 async def check_cli_version(
@@ -119,7 +147,7 @@ async def check_cli_version(
         deadline=deadline,
         failure=EvaluationFailure.VERSION_CHECK_FAILED,
     )
-    found = VERSION_PATTERN.search(output.text)
+    found = VERSION_PATTERN.search(output.text())
     return VersionResult(
         version=found.group(1) if found is not None else None, cleanup=output.cleanup
     )
@@ -142,4 +170,10 @@ async def check_chatgpt_login(
         deadline=deadline,
         failure=EvaluationFailure.PREFLIGHT_FAILED,
     )
-    return PreflightResult(chatgpt_session=CHATGPT_MARKER in output.text, cleanup=output.cleanup)
+    # An exact line, not a substring: a marker quoted inside an error message,
+    # or the prefix of a longer status, must not pass for a session. Lines are
+    # matched per channel, so nothing can be spliced together across the two.
+    return PreflightResult(
+        chatgpt_session=any(line == CHATGPT_MARKER for line in output.emitted()),
+        cleanup=output.cleanup,
+    )

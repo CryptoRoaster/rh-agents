@@ -312,6 +312,20 @@ def main() -> int:
         sys.stderr.write("Logged in using an API key - sk-ab...yz\n")
         return 0
 
+    if name == "login_status_chatgpt_prefixed":
+        # A longer status that merely starts with the marker. A substring test
+        # would accept it; an exact line match must not.
+        sys.stderr.write("Logged in using ChatGPT Enterprise workspace acme\n")
+        return 0
+
+    if name == "login_status_split_channels":
+        # The marker only exists if the two channels are concatenated. Neither
+        # stream ever emitted that line.
+        sys.stdout.write("Logged in using ")
+        sys.stdout.flush()
+        sys.stderr.write("ChatGPT\n")
+        return 0
+
     if name == "login_status_access_token":
         sys.stderr.write("Logged in using access token\n")
         return 0

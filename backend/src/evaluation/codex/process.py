@@ -53,7 +53,7 @@ import os
 import signal
 import time
 from collections.abc import Callable, Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -67,15 +67,57 @@ from src.evaluation.codex.models import (
 
 TERMINATE_GRACE_SECONDS = 0.5
 GROUP_POLL_SECONDS = 0.02
-# How far past the cleanup reserve a spawn may still be claimed. Ownership is
-# worth more than punctuality here: a claimed handle can be terminated and
-# verified, an abandoned one cannot be touched again.
-SPAWN_CLAIM_CEILING_SECONDS = 5.0
+# Polling granularity while waiting for a spawn to settle. The waiting itself is
+# deliberately uncapped; see `_claim_spawn`.
+SPAWN_CLAIM_SLICE_SECONDS = 0.25
+# How many outer cancellations are absorbed while waiting for a spawn. Reached
+# only when a caller cancels repeatedly, and even then the spawn is never
+# cancelled from here.
+SPAWN_CANCEL_ABSORPTIONS = 8
+# A fresh allowance for cleaning up a spawn that arrived after its budget was
+# already spent. Without it `_terminate` would inherit an exhausted deadline and
+# could neither reap the child nor check its group: the budget would be honoured
+# and the process tree would survive.
+EMERGENCY_CLEANUP_SECONDS = 5.0
 
 # Injected only so a test can hold the handle back while the child and its
 # descendants already exist. That window is the one cancellation cannot repair,
 # and it is unreachable from outside otherwise.
 SpawnProcess = Callable[..., Coroutine[Any, Any, asyncio.subprocess.Process]]
+
+
+@dataclass
+class CleanupBudget:
+    """Time available for terminating and verifying, on its own clock.
+
+    Separate from `Deadline` because cleanup sometimes has to outlive it. A
+    spawn claimed after its reserve was spent leaves nothing for the work that
+    actually removes the process, so that case gets a fresh allowance instead of
+    a budget already at zero.
+
+    `exhausted` is a statement about time alone. It says nothing about whether
+    cleanup succeeded, and success never clears it.
+    """
+
+    total_seconds: float
+    monotonic: Callable[[], float] = time.monotonic
+    started_at: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.started_at = self.monotonic()
+
+    @property
+    def remaining(self) -> float:
+        return max(0.0, self.total_seconds - (self.monotonic() - self.started_at))
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining <= 0.0
+
+
+def cleanup_budget(deadline: Deadline) -> CleanupBudget:
+    """The cleanup allowance the attempt's own deadline still leaves."""
+    return CleanupBudget(total_seconds=deadline.remaining_for_cleanup)
 
 
 class ProcessError(Exception):
@@ -145,19 +187,19 @@ async def run_bounded(
     except asyncio.CancelledError:
         # The caller gave up. Clean up first, then let the cancellation through
         # unchanged; swallowing it would strand the caller's own shutdown.
-        await _terminate(process, pgid, deadline)
+        await _terminate(process, pgid, cleanup_budget(deadline))
         raise
     except ProcessError as error:
-        cleanup = await _terminate(process, pgid, deadline)
+        cleanup = await _terminate(process, pgid, cleanup_budget(deadline))
         raise ProcessError(error.failure, error.reason_code, cleanup) from None
     except Exception as error:
-        cleanup = await _terminate(process, pgid, deadline)
+        cleanup = await _terminate(process, pgid, cleanup_budget(deadline))
         raise AbortedByConsumer(error, cleanup) from None
     except BaseException:
-        await _terminate(process, pgid, deadline)
+        await _terminate(process, pgid, cleanup_budget(deadline))
         raise
 
-    cleanup = await _terminate(process, pgid, deadline)
+    cleanup = await _terminate(process, pgid, cleanup_budget(deadline))
     if not cleanup.complete:
         raise ProcessError(
             EvaluationFailure.CLEANUP_INCOMPLETE,
@@ -219,25 +261,33 @@ async def _abandon_spawn(
 ) -> CleanupReport:
     """Recover a child from an abandoned spawn and terminate it.
 
-    Claiming the handle comes first, and it outranks the cleanup reserve.
-    Cancelling a subprocess creation does not undo it: the child may already be
-    running, and asyncio's own cancellation path closes the transport, which
-    kills the direct child and waits for it -- with `kill`, not `killpg`. A
-    descendant started in the meantime survives that, and once the spawn task
-    ends as cancelled nothing can recover the handle, so no process group is
-    ever recorded, signalled or verified for that tree.
+    Ownership is not given up here. Cancelling a subprocess creation does not
+    undo it: the child may already be running, and asyncio's cancellation path
+    closes the transport, which kills the direct child and waits for it -- with
+    `kill`, not `killpg`. A descendant started in that window survives, and once
+    the spawn task ends as cancelled the handle is unrecoverable, so no group is
+    ever recorded, signalled or checked for that tree. Returning early with a
+    live Codex process would also mean network and model activity continuing
+    after the harness believes it has stopped.
 
-    Waiting is therefore the safer trade. If the wait runs past the reserve the
-    overrun is reported, because an honest overrun beats a leaked process tree.
+    So the handle is waited for until the spawn settles. If that runs past the
+    cleanup reserve, the overrun is reported and termination gets a fresh
+    emergency allowance -- an exhausted budget would otherwise "honour the
+    deadline" by leaving the process alive.
     """
     process, overran = await _claim_spawn(spawn, deadline)
+    budget = (
+        CleanupBudget(total_seconds=EMERGENCY_CLEANUP_SECONDS)
+        if overran
+        else cleanup_budget(deadline)
+    )
     if process is None:
         return CleanupReport(
             group=GroupState.UNVERIFIED,
             overran_reserve=overran,
-            error_code="SPAWN_ABANDONED",
+            error_code="SPAWN_NEVER_SETTLED",
         )
-    report = await _terminate(process, _group_of(process), deadline)
+    report = await _terminate(process, _group_of(process), budget)
     if overran and not report.overran_reserve:
         return report.model_copy(update={"overran_reserve": True})
     return report
@@ -246,28 +296,33 @@ async def _abandon_spawn(
 async def _claim_spawn(
     spawn: "asyncio.Future[asyncio.subprocess.Process]", deadline: Deadline
 ) -> tuple[asyncio.subprocess.Process | None, bool]:
-    """Take ownership of a spawn the caller stopped waiting for.
+    """Wait for a spawn to settle and take ownership of whatever it produced.
 
-    Returns the process and whether claiming it cost more than the reserve.
-    Only after the ceiling is the spawn given up, and the caller then reports
-    `UNVERIFIED`: at that point a process may well remain, and saying anything
-    else would be a guess.
+    There is no time limit on the waiting, and that is the point. A subprocess
+    creation settles as soon as the kernel has forked and the pipes are
+    connected; it does not wait for the child to do anything. Capping the wait
+    would only trade a bounded delay for an unbounded process tree.
+
+    Returns the process, if one exists, and whether the caller's cleanup reserve
+    had already run out when it arrived.
     """
-    reserve = max(0.0, deadline.remaining_for_cleanup)
-    if reserve > 0 and not spawn.done():
-        # `asyncio.wait` neither raises the task's exception nor cancels it.
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.wait([spawn], timeout=reserve)
-
-    overran = False
+    absorbed = 0
+    while not spawn.done():
+        try:
+            await asyncio.wait([spawn], timeout=SPAWN_CLAIM_SLICE_SECONDS)
+        except asyncio.CancelledError:
+            absorbed += 1
+            if absorbed > SPAWN_CANCEL_ABSORPTIONS:
+                # A caller that keeps cancelling gets its cancellation, but the
+                # spawn is left running rather than cancelled: asyncio would
+                # then kill only the direct child, and nothing could reach the
+                # group afterwards.
+                break
+    # Asked once the waiting is over: was the reserve already gone by the time
+    # this process owned the handle?
+    overran = deadline.cleanup_exhausted
     if not spawn.done():
-        overran = True
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.wait([spawn], timeout=SPAWN_CLAIM_CEILING_SECONDS)
-
-    if not spawn.done():
-        spawn.cancel()
-        return None, overran
+        return None, True
     if spawn.cancelled() or spawn.exception() is not None:
         return None, overran
     return spawn.result(), overran
@@ -401,24 +456,27 @@ def _group_of(process: asyncio.subprocess.Process) -> int:
 
 
 async def _terminate(
-    process: asyncio.subprocess.Process, pgid: int, deadline: Deadline
+    process: asyncio.subprocess.Process, pgid: int, budget: CleanupBudget
 ) -> CleanupReport:
-    """Reap the child, clear its group, and report what was established."""
+    """Reap the child, clear its group, and report what was established.
+
+    Whether cleanup succeeded and whether it was on time are answered
+    separately. `group_cleared` reports the first, `overran_reserve` the second,
+    and a successful outcome never erases an overrun.
+    """
     signalled = False
     if process.returncode is None:
         signalled = _signal_group(pgid, signal.SIGTERM)
-        reaped, code = await _wait_for_exit(
-            process, min(TERMINATE_GRACE_SECONDS, deadline.remaining_for_cleanup)
-        )
+        reaped, code = await _wait_for_exit(process, min(TERMINATE_GRACE_SECONDS, budget.remaining))
         if not reaped:
             _signal_group(pgid, signal.SIGKILL)
-            reaped, code = await _wait_for_exit(process, deadline.remaining_for_cleanup)
+            reaped, code = await _wait_for_exit(process, budget.remaining)
     else:
         # The leader finished on its own. That says nothing about the rest of
         # its group, so cleanup continues rather than returning here.
         reaped, code = True, process.returncode
 
-    group, group_signalled = await _clear_group(pgid, deadline)
+    group, group_signalled = await _clear_group(pgid, budget)
     if reaped:
         _release_pipes(process)
 
@@ -435,25 +493,26 @@ async def _terminate(
         reaped=reaped,
         exit_code=code,
         group=group,
-        overran_reserve=deadline.cleanup_exhausted
-        and (not reaped or group is not GroupState.EMPTY),
+        # Read once, at the end, and about time only. A group that was cleared
+        # late is still a group that was cleared late.
+        overran_reserve=budget.exhausted,
         error_code=error,
     )
 
 
-async def _clear_group(pgid: int, deadline: Deadline) -> tuple[GroupState, bool]:
+async def _clear_group(pgid: int, budget: CleanupBudget) -> tuple[GroupState, bool]:
     """Signal whatever is left in the group and confirm the group is empty."""
     if not _group_alive(pgid):
         return GroupState.EMPTY, False
 
     signalled = _signal_group(pgid, signal.SIGTERM)
-    state = await _poll_group(pgid, min(TERMINATE_GRACE_SECONDS, deadline.remaining_for_cleanup))
+    state = await _poll_group(pgid, min(TERMINATE_GRACE_SECONDS, budget.remaining))
     if state is GroupState.EMPTY:
         return state, signalled
 
     # Something in the group ignored SIGTERM, or was too slow to act on it.
     killed = _signal_group(pgid, signal.SIGKILL)
-    state = await _poll_group(pgid, deadline.remaining_for_cleanup)
+    state = await _poll_group(pgid, budget.remaining)
     return state, signalled or killed
 
 
