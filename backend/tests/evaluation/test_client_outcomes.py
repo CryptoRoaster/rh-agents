@@ -316,3 +316,65 @@ async def test_the_version_probe_runs_with_the_same_scrubbed_environment(
     assert set(seen) - LAUNCHER_INJECTED_ENVIRONMENT_KEYS == set(ALLOWED_ENVIRONMENT_KEYS)
     for banned in ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"):
         assert banned not in seen
+
+
+async def test_the_login_probe_reads_the_channel_the_cli_actually_uses(
+    probe: Probe,
+) -> None:
+    """The regression: 0.153.4 answers on stderr, with stdout left empty.
+
+    `run_login_status` reports every outcome with `eprintln!`, so a probe that
+    watched stdout alone would see nothing and reject a perfectly valid ChatGPT
+    session. The exit code cannot stand in for the marker either -- an API-key
+    session also exits 0.
+    """
+    probe.scenario("success", login="login_status_chatgpt")
+    client = probe.client(run_preflight=True)
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+    assert client.preflight_starts == 1
+    assert client.exec_starts == 1
+
+
+@pytest.mark.parametrize(
+    "login",
+    ["login_status_api_key", "login_status_access_token", "login_status_failure"],
+)
+async def test_no_other_login_mode_counts_as_a_chatgpt_session(probe: Probe, login: str) -> None:
+    probe.scenario("success", login=login)
+    client = probe.client(run_preflight=True)
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.PREFLIGHT_FAILED
+    assert client.exec_starts == 0
+
+
+async def test_a_slow_schema_validation_does_not_fund_a_domain_validator(
+    probe: Probe,
+) -> None:
+    """The deadline stops at the first boundary where control comes back."""
+    probe.scenario("success")
+    started = False
+
+    class SlowAssessment(OrbitAssessment):
+        @classmethod
+        def model_validate(cls, obj: object, **kwargs: object) -> "SlowAssessment":
+            time.sleep(2.0)
+            return super().model_validate(obj, **kwargs)  # type: ignore[no-any-return,arg-type]
+
+    def sentinel(_output: OrbitAssessment) -> None:
+        nonlocal started
+        started = True
+
+    outcome = await probe.client().evaluate(
+        probe.request(
+            output_model=SlowAssessment,
+            domain_validator=sentinel,
+            deadline_seconds=2.0,
+            cleanup_reserve_seconds=0.5,
+        )
+    )
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.DEADLINE_EXCEEDED
+    assert outcome.detail_code == "SCHEMA_VALIDATION_OVERRAN"
+    assert started is False

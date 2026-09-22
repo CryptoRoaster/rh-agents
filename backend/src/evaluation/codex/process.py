@@ -20,11 +20,18 @@ process nobody owns. The spawn therefore runs shielded under the work budget,
 and a timeout or an outer cancellation claims the handle before cleaning up.
 
 Claiming is preferred over cancelling for a concrete reason. Cancelling a
-subprocess creation makes asyncio wait for the child it already started to
-exit, so a child that sleeps for ten minutes turns cancellation into a ten
-minute wait -- once during cleanup and again when the event loop closes. Waiting
-the few milliseconds a spawn needs and then killing the process is both faster
-and more honest.
+subprocess creation does not undo it. The child may already be running, and
+asyncio's cancellation path closes the transport, which kills the *direct* child
+and waits for it -- `kill`, not `killpg`. A descendant started in that window
+survives, and once the spawn task ends as cancelled the handle is unrecoverable,
+so no group is ever recorded, signalled or verified for that tree. The same
+cancellation also inherits asyncio's wait for the child to exit, which a
+long-lived child turns into a long wait, during cleanup and again at loop close.
+
+So a spawn is claimed even past the cleanup reserve, up to a ceiling, and the
+overrun is reported. Only beyond the ceiling is the handle given up, and the
+report then says `UNVERIFIED`, because at that point a process may remain and
+claiming otherwise would be a guess.
 
 **Cleanup targets the group, not just the child.** The process group id is
 recorded at spawn time and kept, because `os.getpgid` stops answering once the
@@ -45,9 +52,10 @@ import contextlib
 import os
 import signal
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from src.evaluation.codex.deadline import Deadline
 from src.evaluation.codex.models import (
@@ -59,6 +67,15 @@ from src.evaluation.codex.models import (
 
 TERMINATE_GRACE_SECONDS = 0.5
 GROUP_POLL_SECONDS = 0.02
+# How far past the cleanup reserve a spawn may still be claimed. Ownership is
+# worth more than punctuality here: a claimed handle can be terminated and
+# verified, an abandoned one cannot be touched again.
+SPAWN_CLAIM_CEILING_SECONDS = 5.0
+
+# Injected only so a test can hold the handle back while the child and its
+# descendants already exist. That window is the one cancellation cannot repair,
+# and it is unreachable from outside otherwise.
+SpawnProcess = Callable[..., Coroutine[Any, Any, asyncio.subprocess.Process]]
 
 
 class ProcessError(Exception):
@@ -102,6 +119,7 @@ async def run_bounded(
     limits: OutputLimits,
     deadline: Deadline,
     on_stdout_line: Callable[[bytes], None],
+    spawn_process: SpawnProcess = asyncio.create_subprocess_exec,
 ) -> ProcessResult:
     """Run one child to completion under one deadline and fixed output caps."""
     process = await _spawn(
@@ -110,6 +128,7 @@ async def run_bounded(
         working_directory=working_directory,
         limits=limits,
         deadline=deadline,
+        spawn_process=spawn_process,
     )
     pgid = _group_of(process)
 
@@ -155,12 +174,13 @@ async def _spawn(
     working_directory: Path,
     limits: OutputLimits,
     deadline: Deadline,
+    spawn_process: SpawnProcess = asyncio.create_subprocess_exec,
 ) -> asyncio.subprocess.Process:
     """Create the child inside the work budget, without losing it on a race."""
     if deadline.work_exhausted:
         raise ProcessError(EvaluationFailure.DEADLINE_EXCEEDED, "NO_TIME_TO_START", CleanupReport())
     spawn = asyncio.ensure_future(
-        asyncio.create_subprocess_exec(
+        spawn_process(
             *arguments,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -199,50 +219,58 @@ async def _abandon_spawn(
 ) -> CleanupReport:
     """Recover a child from an abandoned spawn and terminate it.
 
-    Claiming the handle comes first and gets the whole cleanup budget, because
-    cancelling a subprocess creation is the worse option: asyncio responds by
-    waiting for the child it already started to exit, and a child that sleeps
-    for ten minutes makes that wait ten minutes long -- inside cleanup, and
-    again when the event loop shuts down. Waiting the few milliseconds a spawn
-    actually needs, and then killing the process properly, avoids both.
+    Claiming the handle comes first, and it outranks the cleanup reserve.
+    Cancelling a subprocess creation does not undo it: the child may already be
+    running, and asyncio's own cancellation path closes the transport, which
+    kills the direct child and waits for it -- with `kill`, not `killpg`. A
+    descendant started in the meantime survives that, and once the spawn task
+    ends as cancelled nothing can recover the handle, so no process group is
+    ever recorded, signalled or verified for that tree.
+
+    Waiting is therefore the safer trade. If the wait runs past the reserve the
+    overrun is reported, because an honest overrun beats a leaked process tree.
     """
-    process = await _claim_spawn(spawn, deadline)
+    process, overran = await _claim_spawn(spawn, deadline)
     if process is None:
-        return CleanupReport(group=GroupState.UNVERIFIED, error_code="SPAWN_ABANDONED")
-    return await _terminate(process, _group_of(process), deadline)
+        return CleanupReport(
+            group=GroupState.UNVERIFIED,
+            overran_reserve=overran,
+            error_code="SPAWN_ABANDONED",
+        )
+    report = await _terminate(process, _group_of(process), deadline)
+    if overran and not report.overran_reserve:
+        return report.model_copy(update={"overran_reserve": True})
+    return report
 
 
 async def _claim_spawn(
     spawn: "asyncio.Future[asyncio.subprocess.Process]", deadline: Deadline
-) -> asyncio.subprocess.Process | None:
-    """Take ownership of a spawn the caller stopped waiting for."""
-    budget = max(0.0, deadline.remaining_for_cleanup)
-    if budget > 0 and not spawn.done():
+) -> tuple[asyncio.subprocess.Process | None, bool]:
+    """Take ownership of a spawn the caller stopped waiting for.
+
+    Returns the process and whether claiming it cost more than the reserve.
+    Only after the ceiling is the spawn given up, and the caller then reports
+    `UNVERIFIED`: at that point a process may well remain, and saying anything
+    else would be a guess.
+    """
+    reserve = max(0.0, deadline.remaining_for_cleanup)
+    if reserve > 0 and not spawn.done():
         # `asyncio.wait` neither raises the task's exception nor cancels it.
         with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.wait([spawn], timeout=budget)
+            await asyncio.wait([spawn], timeout=reserve)
+
+    overran = False
     if not spawn.done():
-        # Out of time. Cancel, but never await the cancellation: asyncio may be
-        # waiting on the child's exit, and this path must not inherit that wait.
-        # A process that still arrives is killed by the callback instead.
-        spawn.add_done_callback(_kill_late_arrival)
+        overran = True
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait([spawn], timeout=SPAWN_CLAIM_CEILING_SECONDS)
+
+    if not spawn.done():
         spawn.cancel()
-        return None
+        return None, overran
     if spawn.cancelled() or spawn.exception() is not None:
-        return None
-    return spawn.result()
-
-
-def _kill_late_arrival(spawn: "asyncio.Future[asyncio.subprocess.Process]") -> None:
-    """Kill a child that finished spawning after its owner had given up.
-
-    Synchronous on purpose: a done-callback cannot await, and the only thing
-    still worth doing is making sure the group does not outlive the attempt.
-    """
-    if spawn.cancelled() or spawn.exception() is not None:
-        return
-    process = spawn.result()
-    _signal_group(_group_of(process), signal.SIGKILL)
+        return None, overran
+    return spawn.result(), overran
 
 
 async def _run_pipes(

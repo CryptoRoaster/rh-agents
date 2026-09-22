@@ -300,16 +300,24 @@ def main() -> int:
         turn_completed()
         return 0
 
+    # `run_login_status` in codex-rs/cli/src/login.rs reports every outcome with
+    # `eprintln!`, so stdout stays empty and the answer arrives on stderr. Both
+    # logged-in cases exit 0, which is why the exit code alone cannot tell a
+    # ChatGPT session from an API key.
     if name == "login_status_chatgpt":
-        sys.stdout.write("Logged in using ChatGPT\n")
+        sys.stderr.write("Logged in using ChatGPT\n")
         return 0
 
     if name == "login_status_api_key":
-        sys.stdout.write("Logged in using an API key\n")
+        sys.stderr.write("Logged in using an API key - sk-ab...yz\n")
+        return 0
+
+    if name == "login_status_access_token":
+        sys.stderr.write("Logged in using access token\n")
         return 0
 
     if name == "login_status_failure":
-        sys.stderr.write("not logged in\n")
+        sys.stderr.write("Not logged in\n")
         return 1
 
     thread_started()

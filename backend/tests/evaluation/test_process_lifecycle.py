@@ -8,6 +8,7 @@ account of what was attempted rather than an operating-system guarantee.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from src.evaluation.codex import process as process_module
 from src.evaluation.codex.deadline import Deadline
 from src.evaluation.codex.models import (
     CleanupReport,
@@ -26,6 +28,7 @@ from src.evaluation.codex.models import (
 from src.evaluation.codex.process import (
     AbortedByConsumer,
     ProcessError,
+    SpawnProcess,
     _poll_group,
     run_bounded,
 )
@@ -315,3 +318,117 @@ async def test_cancellation_during_the_spawn_is_re_raised(tmp_path: Path) -> Non
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+def deadline_that_expires_at_the_spawn() -> Deadline:
+    """A budget that is gone exactly when the spawn timeout is read.
+
+    Reading 1 is construction. Reading 2 answers "is the work budget gone?" with
+    a millisecond left, so the spawn is attempted. Reading 3 supplies the
+    timeout itself as zero, so `wait_for` gives up immediately. Later readings
+    leave a second of cleanup budget.
+    """
+    readings = [0.0, 8.999]
+
+    def clock() -> float:
+        return readings.pop(0) if readings else 9.0
+
+    return Deadline(total_seconds=10.0, cleanup_reserve_seconds=1.0, monotonic=clock)
+
+
+def spawn_held_back(pgid_file: Path, hold_seconds: float) -> SpawnProcess:
+    """A spawn that completes for real, then withholds the handle for a while.
+
+    This is the window cancellation cannot repair: the child and its descendant
+    are already running while the caller still has no `Process` to own. The
+    deterministic timeout test cannot reach it, because it guarantees no child
+    exists yet.
+    """
+
+    async def spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        process = await asyncio.create_subprocess_exec(*args, **kwargs)  # type: ignore[arg-type]
+        for _ in range(250):
+            if pgid_file.exists():  # noqa: ASYNC240 - test-local polling
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(hold_seconds)
+        return process
+
+    return spawn
+
+
+async def test_a_spawn_claimed_after_the_deadline_still_clears_its_group(
+    tmp_path: Path,
+) -> None:
+    """The regression: ownership must survive a deadline hit mid-spawn."""
+    pgid_file = tmp_path / "pgid"
+    directory = workspace(tmp_path, "hang_with_grandchild", pgid_out=str(pgid_file))
+
+    with pytest.raises(ProcessError) as caught:
+        await run_bounded(
+            arguments=[str(tmp_path / "codex")],
+            environment=environment(tmp_path),
+            working_directory=directory,
+            stdin_payload=b"{}",
+            limits=OutputLimits(),
+            deadline=deadline_that_expires_at_the_spawn(),
+            on_stdout_line=lambda _line: None,
+            # Longer than the cleanup reserve on purpose: claiming only within
+            # the reserve is exactly what used to cancel and lose the tree.
+            spawn_process=spawn_held_back(pgid_file, hold_seconds=1.5),
+        )
+
+    cleanup = caught.value.cleanup
+    assert caught.value.failure is EvaluationFailure.DEADLINE_EXCEEDED
+    # Claimed, reaped, and the group checked -- not cancelled and hoped about.
+    assert cleanup.reaped is True
+    assert cleanup.signalled is True
+    assert cleanup.group is GroupState.EMPTY
+    assert cleanup.group_cleared is True
+    # Holding on past the reserve is the trade that made that possible, and it
+    # is reported rather than hidden.
+    assert cleanup.overran_reserve is True
+    assert cleanup.complete is False
+    assert await group_is_gone(pgid_file)
+    assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+
+
+async def test_a_spawn_given_up_past_the_ceiling_is_never_called_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the ceiling the handle is lost, and the report says so.
+
+    `UNVERIFIED` here is the honest answer: nothing was reaped, no group was
+    checked, and a process may well remain. What must not happen is a report
+    that calls this a clean finish.
+    """
+    monkeypatch.setattr(process_module, "SPAWN_CLAIM_CEILING_SECONDS", 0.05)
+    pgid_file = tmp_path / "pgid"
+    directory = workspace(tmp_path, "hang_with_grandchild", pgid_out=str(pgid_file))
+
+    with pytest.raises(ProcessError) as caught:
+        await run_bounded(
+            arguments=[str(tmp_path / "codex")],
+            environment=environment(tmp_path),
+            working_directory=directory,
+            stdin_payload=b"{}",
+            limits=OutputLimits(),
+            deadline=deadline_that_expires_at_the_spawn(),
+            on_stdout_line=lambda _line: None,
+            spawn_process=spawn_held_back(pgid_file, hold_seconds=1.5),
+        )
+
+    cleanup = caught.value.cleanup
+    assert cleanup.group is GroupState.UNVERIFIED
+    assert cleanup.error_code == "SPAWN_ABANDONED"
+    assert cleanup.overran_reserve is True
+    assert cleanup.reaped is False
+    assert cleanup.complete is False
+
+    # The test owns what the harness admitted it could not clean up.
+    pgid = int(pgid_file.read_text(encoding="utf-8"))  # noqa: ASYNC240
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pgid, signal.SIGKILL)
+    pending = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+    if pending:
+        await asyncio.wait(pending, timeout=5)

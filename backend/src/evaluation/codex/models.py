@@ -216,13 +216,19 @@ class CleanupReport(Immutable):
     error_code: Code | None = None
 
     @property
+    def group_cleared(self) -> bool:
+        """The child was reaped and its group was checked and found empty.
+
+        Kept apart from `complete` so an overrun does not read as a leak. A
+        cleanup can take longer than its reserve and still have removed
+        everything, and the two facts deserve separate answers.
+        """
+        return self.reaped and self.group is GroupState.EMPTY and self.error_code is None
+
+    @property
     def complete(self) -> bool:
-        return (
-            self.reaped
-            and self.group is GroupState.EMPTY
-            and not self.overran_reserve
-            and self.error_code is None
-        )
+        """Cleared, and cleared inside the reserve."""
+        return self.group_cleared and not self.overran_reserve
 
 
 @dataclass(frozen=True)

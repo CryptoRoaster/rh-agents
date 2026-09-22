@@ -325,6 +325,13 @@ class CodexEvaluationClient:
             return self._reject(
                 EvaluationFailure.OUTPUT_SCHEMA_MISMATCH, "LOCAL_SCHEMA_MISMATCH", deadline, cleanup
             )
+        if deadline.expired:
+            # First point where control is back. Starting the domain validator
+            # now would add work that could not change the outcome, so the
+            # overrun stops here rather than after a second blocking call.
+            return self._reject(
+                EvaluationFailure.DEADLINE_EXCEEDED, "SCHEMA_VALIDATION_OVERRAN", deadline, cleanup
+            )
         try:
             request.domain_validator(output)
         except DomainValidationError as error:

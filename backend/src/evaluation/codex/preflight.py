@@ -14,6 +14,13 @@ has never seen. So the launcher is asked, and its answer is what decides.
 The login probe reads the CLI's own answer. It does not open, copy or parse any
 auth file, and no token is ever read into this process.
 
+Both probes read stdout *and* stderr. That is not defensive padding: in Codex
+0.153.4 `run_login_status` (`codex-rs/cli/src/login.rs`) reports every outcome
+with `eprintln!`, so the ChatGPT status line arrives on stderr and a probe
+watching stdout alone would see nothing at all. The exit code cannot stand in
+for it either -- an API-key session also exits 0 -- so the marker has to be
+matched, and it has to be matched on the channel the CLI actually uses.
+
 Neither probe starts a turn or calls a model.
 """
 
@@ -26,6 +33,10 @@ from src.evaluation.codex.deadline import Deadline
 from src.evaluation.codex.models import CleanupReport, EvaluationFailure, OutputLimits
 from src.evaluation.codex.process import ProcessError, run_bounded
 
+# Exactly the line 0.153.4 emits for AuthMode::Chatgpt and ChatgptAuthTokens.
+# The other "Logged in using ..." lines -- API key, access token, personal
+# access token, Bedrock -- also exit 0, so nothing but this marker may be taken
+# as a ChatGPT subscription session.
 CHATGPT_MARKER = "Logged in using ChatGPT"
 VERSION_PATTERN = re.compile(r"\b(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.]+)?)\b")
 
@@ -57,7 +68,7 @@ async def _capture(
     deadline: Deadline,
     failure: EvaluationFailure,
 ) -> ProbeOutput:
-    """Run a probe and return its stdout, bounded the same way the attempt is."""
+    """Run a probe and return what it wrote, bounded the same way the attempt is."""
     collected: list[bytes] = []
     budget = limits.max_final_message_bytes
     held = 0
@@ -85,10 +96,10 @@ async def _capture(
 
     if result.exit_code != 0:
         raise ProcessError(failure, f"EXIT_{result.exit_code}", result.cleanup)
-    return ProbeOutput(
-        text=b"".join(collected).decode("utf-8", errors="replace"),
-        cleanup=result.cleanup,
-    )
+    # Both channels, because the CLI answers on stderr and this probe must not
+    # depend on guessing which one a given subcommand happens to use.
+    combined = b"".join(collected) + result.stderr_tail[:budget]
+    return ProbeOutput(text=combined.decode("utf-8", errors="replace"), cleanup=result.cleanup)
 
 
 async def check_cli_version(

@@ -45,15 +45,15 @@ Three things, each enforced locally:
 
 Schema parsing and the injected domain validator are ordinary synchronous
 calls. The event loop cannot preempt them, so a validator that runs long is not
-cut short. The deadline is rechecked after they return, and an overrun becomes a
-`DEADLINE_EXCEEDED` rejection rather than a late success. The deadline bounds
-when a result may be accepted, not how long every step may occupy the thread.
-Saying otherwise would claim an interruptibility asyncio does not provide.
+cut short. The deadline bounds when a result may be accepted, not how long every
+step may occupy the thread. Saying otherwise would claim an interruptibility
+asyncio does not provide.
 
-The spawn is inside the budget too, and claiming a spawned handle is preferred
-over cancelling it. Cancelling a subprocess creation makes asyncio wait for the
-child it already started to exit, so a long-lived child turns cancellation into
-a long wait -- during cleanup, and again at loop shutdown.
+What it does instead is stop at every boundary where control comes back: before
+parsing, between schema validation and domain validation, and after both. A
+schema validation that overruns therefore does not fund a domain validator that
+could only overrun further; the attempt is rejected at the first observable
+point with `SCHEMA_VALIDATION_OVERRAN`.
 
 ## What it explicitly does not promise
 
@@ -72,6 +72,14 @@ substitutes a value it did not observe.
 
 Only the official ChatGPT login path. No auth file is opened, copied or parsed,
 and no token is read into the Python process.
+
+The login probe reads **stderr as well as stdout**. In 0.153.4,
+`run_login_status` (`codex-rs/cli/src/login.rs`) reports every outcome with
+`eprintln!`, so the status line never appears on stdout. The exit code is no
+substitute: an API-key session exits 0 just like a ChatGPT one. Only the exact
+line `Logged in using ChatGPT` is accepted as a subscription session — access
+token, personal access token and Bedrock modes are logged-in states too, and
+none of them is what this probe is for.
 
 Two layers, in this order:
 
@@ -119,9 +127,26 @@ records what the check found:
 | `UNVERIFIED` | the cleanup budget ran out before the group could be checked |
 
 `UNVERIFIED` is not a synonym for success. Signals are cheap and were still
-delivered, but nothing confirmed they took effect. `complete` is true only for
-`EMPTY`, so neither an occupied nor an unchecked group is ever reported as a
-clean finish.
+delivered, but nothing confirmed they took effect. The report answers two
+questions separately: `group_cleared` says the child was reaped and the group
+was found empty, and `complete` additionally says that happened inside the
+reserve. An overrun therefore does not read as a leak, and a leak does not hide
+behind a fast finish.
+
+### Ownership during an unfinished spawn
+
+The dangerous window is not a running child; it is a child that already exists
+while `create_subprocess_exec` has not yet handed back a `Process`. Cancelling
+there does not undo the spawn. asyncio closes the transport, which calls `kill`
+on the direct child — not `killpg` — and a descendant started in that window
+survives it. Once the spawn task ends as cancelled the handle is gone, so no
+group is ever recorded, signalled or checked for that tree.
+
+The probe therefore keeps claiming the handle past the cleanup reserve, up to
+`SPAWN_CLAIM_CEILING_SECONDS`, and reports the overrun. Only beyond the ceiling
+is the spawn given up, and the report then says `UNVERIFIED` with
+`SPAWN_ABANDONED`: **a process may remain in that case**, and nothing in this
+harness claims otherwise.
 
 Two limits stay explicit: a descendant that called `setsid` has left the group
 and is invisible here, and a group id can in principle be reused once the group
