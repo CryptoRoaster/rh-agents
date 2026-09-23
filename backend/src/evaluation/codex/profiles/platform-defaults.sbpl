@@ -1,3 +1,24 @@
+; Platform minimum for a sandboxed process on macOS.
+;
+; Copied from Codex 0.153.4 (`sandboxing/src/seatbelt_base_policy.sbpl` and
+; `seatbelt_read_only_platform_defaults.sbpl`) so the harness does not
+; re-derive what the vendor already vetted, with four rules removed:
+;
+;   (allow file-read* (extension "com.apple.app-sandbox.read"))
+;   (allow file-read* file-write* (extension "com.apple.app-sandbox.read-write"))
+;     An inherited App Sandbox extension would grant paths outside our roots,
+;     which is the one thing this profile exists to prevent. Verified offline:
+;     `codex --version` starts without them.
+;
+;   (allow file-read* (subpath "/opt/homebrew/lib"))
+;   (allow file-read* (subpath "/usr/local/lib"))
+;     Not needed by the platform binary; it carries its own resources.
+;     Verified the same way.
+;
+; These are runtime and loader paths, not user data: the read boundary this
+; profile establishes is about HOME, the repository and credentials, and
+; none of those are reachable through the rules below.
+
 (deny default)
 
 ; child processes inherit the policy of their parent
@@ -270,8 +291,6 @@
 (allow file-read-metadata (subpath "/usr/libexec"))
 
 (allow file-read* (subpath "/Library/Preferences"))
-(allow file-read* (subpath "/opt/homebrew/lib"))
-(allow file-read* (subpath "/usr/local/lib"))
 
 ; Terminal basics and device handles.
 (allow file-read* (regex "^/dev/fd/(0|1|2)$"))
@@ -295,5 +314,3 @@
 (allow file-read-metadata (literal "/System/Volumes/Data/Users") (vnode-type DIRECTORY))
 
 ; App sandbox extensions
-(allow file-read* (extension "com.apple.app-sandbox.read"))
-(allow file-read* file-write* (extension "com.apple.app-sandbox.read-write"))

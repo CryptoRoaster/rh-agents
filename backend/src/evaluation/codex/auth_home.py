@@ -16,9 +16,17 @@ parsed, logged, asserted on or reported. And it never writes into the user's
 own home: a token refresh during an attempt lands in the isolated copy, which
 is then discarded, so the session the user holds outside is untouched.
 
-What this cannot establish offline is whether the copied state is *sufficient*
-for a real login. That needs a real turn, which is why `AUTH_HOME_ISOLATION`
-stays an unverified gate until one is separately authorised.
+Two questions are kept apart here, because folding them together once produced
+a gate nothing could ever clear. Whether the home is *isolated* is checkable
+offline and is `AUTH_HOME_ISOLATION`: the directory exists, holds exactly this
+one file, and both modes are restrictive. Whether the copied state actually
+authenticates against the provider is not checkable without a request, and it
+is `AUTH_REMOTE_VALIDITY`, which is advisory and never blocks.
+
+Between the two sits `CHATGPT_SESSION`, which is neither a guess nor a round
+trip: the CLI is asked, in this home, behind the outer profile, with the
+credential store pinned to `file` so the answer is about this copy rather than
+about a keychain entry.
 """
 
 import os
@@ -27,7 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # The only file copied. `auth.json` is where 0.153.4 keeps the ChatGPT session
-# when `cli_auth_credentials_store` is the default file backend.
+# under the `file` credential store, which every invocation pins explicitly
+# rather than leaving to the default.
 AUTH_FILE = "auth.json"
 
 HOME_MODE = 0o700

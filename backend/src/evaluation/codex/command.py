@@ -72,9 +72,20 @@ DISABLED_FEATURES = (
     "web_search_request",
 )
 
+# Where credentials are read from and written to. `AuthCredentialsStoreMode` is
+# one of file / keyring / auto / ephemeral, and the default reaches the login
+# keychain -- shared with the real session and outliving any temporary home.
+# `file` keeps every credential read and write inside the isolated `auth.json`:
+# the login probe then judges the copy the attempt would use rather than a
+# keychain entry the isolated home does not contain, and a token refresh either
+# lands in that throwaway copy -- the one path the outer profile grants write
+# access to -- or fails. Neither outcome can reach the real login.
+AUTH_STORE_OVERRIDE = 'cli_auth_credentials_store="file"'
+
 # Config overrides that close instruction sources and pin the login method.
 BASE_CONFIG_OVERRIDES = (
     'forced_login_method="chatgpt"',
+    AUTH_STORE_OVERRIDE,
     # The top-level mode is the real control. `tools.web_search` is a
     # `WebSearchToolConfig` (domains, context size, location), and its legacy
     # boolean form is parsed and then discarded -- `Some(Enabled(enabled)) =>
@@ -260,7 +271,10 @@ def build_preflight_arguments(*, launcher: CodexLauncher) -> list[str]:
     with the same scrubbed environment. It starts no turn and calls no model.
     """
     validate_launcher(launcher)
-    return [str(launcher.executable), "login", "status"]
+    # The store is pinned here too. Without it the probe could answer from the
+    # login keychain while the attempt reads the isolated `auth.json`, and a
+    # session would be reported that the turn never gets to use.
+    return [str(launcher.executable), "login", "status", "-c", AUTH_STORE_OVERRIDE]
 
 
 def build_version_arguments(*, launcher: CodexLauncher) -> list[str]:

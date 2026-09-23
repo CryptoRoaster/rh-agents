@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from src.evaluation.codex import release as release_module
 from src.evaluation.codex import sandbox
 from src.evaluation.codex.auth_home import IsolatedHome
 from src.evaluation.codex.catalogs import GPT_5_5_CATALOG, GPT_5_5_CATALOG_SHA256
@@ -26,7 +27,14 @@ def sandbox_roots(tmp_path: Path) -> tuple[sandbox.SandboxRoots, Path]:
 
 def status_for(tmp_path: Path, **overrides: object):  # type: ignore[no-untyped-def]
     roots, outside = sandbox_roots(tmp_path)
-    home = IsolatedHome(path=tmp_path / "codex-home", auth_present=True)
+    home_path = tmp_path / "codex-home"
+    home_path.chmod(0o700)
+    auth = home_path / "auth.json"
+    if not auth.exists():
+        # A placeholder. No real credential appears in any test here.
+        auth.write_text('{"placeholder": "not a credential"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    home = IsolatedHome(path=home_path, auth_present=True)
     settings: dict[str, object] = {
         "catalog_path": GPT_5_5_CATALOG,
         "expected_digest": GPT_5_5_CATALOG_SHA256,
@@ -62,16 +70,57 @@ def test_the_catalog_version_session_and_sandbox_gates_pass(tmp_path: Path) -> N
 
 
 @pytest.mark.skipif(not sandbox.available(), reason="macOS sandbox-exec is not available")
-def test_auth_isolation_stays_unverified_until_a_real_turn(tmp_path: Path) -> None:
-    """The mechanism exists; whether the copied state authenticates does not follow.
+def test_auth_isolation_judges_the_isolation_not_the_token(tmp_path: Path) -> None:
+    """These were conflated, and the result was a gate nothing could clear.
 
-    Calling this PASS because the file is in place would be the same mistake as
-    calling a quiet run proof that no tool was offered.
+    `may_run` needs every blocking gate to pass, while the old version of this
+    one could only pass after the turn it was blocking. The isolation itself is
+    checkable now; server acceptance is a separate, advisory gate.
     """
     status = status_for(tmp_path)
-    assert gate(status, "AUTH_HOME_ISOLATION").state is GateState.UNVERIFIED  # type: ignore[attr-defined]
+    assert gate(status, "AUTH_HOME_ISOLATION").state is GateState.PASS  # type: ignore[attr-defined]
+    assert gate(status, "AUTH_REMOTE_VALIDITY").state is GateState.UNVERIFIED  # type: ignore[attr-defined]
+    # Advisory: unknowable before a request, so it never blocks the check that
+    # has to happen before one.
+    assert status.may_run is True
+    assert "REAL RUN ALLOWED" in status.render()
+
+
+def test_a_home_with_extra_files_fails_isolation(tmp_path: Path) -> None:
+    status = status_for(tmp_path)
+    assert gate(status, "AUTH_HOME_ISOLATION").state is GateState.PASS  # type: ignore[attr-defined]
+    (tmp_path / "codex-home" / "config.toml").write_text("x", encoding="utf-8")
+    later = status_for(tmp_path)
+    assert gate(later, "AUTH_HOME_ISOLATION").state is GateState.FAIL  # type: ignore[attr-defined]
+    assert later.may_run is False
+
+
+def test_a_loose_mode_fails_isolation(tmp_path: Path) -> None:
+    """A world-readable copy of the login state is not isolation."""
+    status_for(tmp_path)  # builds the home the way the harness would
+    home = tmp_path / "codex-home"
+    (home / "auth.json").chmod(0o644)
+    problem = release_module._isolation_problem(home)
+    assert problem == "auth file is not 0600"
+
+    home.chmod(0o755)
+    assert release_module._isolation_problem(home) == "home is not 0700"
+
+
+def test_egress_is_its_own_gate(tmp_path: Path) -> None:
+    status = status_for(tmp_path)
+    assert gate(status, "NETWORK_EGRESS").state is GateState.PASS  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "reported",
+    ["codex-cli 0.153.40", "codex-cli 0.153.4-dev", "x0.153.4x", "codex-cli"],
+)
+def test_a_near_miss_version_is_not_the_supported_build(tmp_path: Path, reported: str) -> None:
+    """`supported in cli_version` would have accepted 0.153.40 for 0.153.4."""
+    status = status_for(tmp_path, cli_version=reported)
+    assert gate(status, "CODEX_VERSION").state is GateState.FAIL  # type: ignore[attr-defined]
     assert status.may_run is False
-    assert "REAL RUN REFUSED" in status.render()
 
 
 def test_a_missing_outer_sandbox_is_a_failure_not_a_warning(tmp_path: Path) -> None:

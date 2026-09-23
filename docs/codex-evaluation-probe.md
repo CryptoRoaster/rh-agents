@@ -78,8 +78,18 @@ substitutes a value it did not observe.
 
 ## Authentication
 
-Only the official ChatGPT login path. No auth file is opened, copied or parsed,
-and no token is read into the Python process.
+Only the official ChatGPT login path.
+
+`auth.json` is copied — by the filesystem, byte for byte, into a temporary
+isolated `CODEX_HOME` — and it is never *read into this process*: no value from
+it is parsed, logged, asserted on, reported or committed. The user's own file is
+opened only by `shutil.copyfile`, and it is not modified: the probe run was
+checked against its digest, size, mode and mtime before and after.
+
+Every invocation pins `cli_auth_credentials_store="file"`. The default store
+reaches the login keychain, which is shared with the real session and is not
+inside the isolated home; pinned to `file`, both the read and any refresh write
+stay in the copy, which is the one path the outer profile makes writable.
 
 The login probe reads **stderr as well as stdout**. In 0.153.4,
 `run_login_status` (`codex-rs/cli/src/login.rs`) reports every outcome with
@@ -515,20 +525,74 @@ gate's pid, its process group and every inherited descriptor — including the
 pinned catalog — carry through unchanged. Nothing about the ownership
 architecture moves.
 
-The profile denies by default. Its platform section is Codex's own vetted
-minimum for a sandboxed process on macOS, copied verbatim so the harness does
-not re-derive it; the harness section allows exactly three roots:
+The profile denies by default and has two sections, which grant different
+things and are documented separately so neither is mistaken for the other.
+
+**`HARNESS_READ_ROOTS`** — the user-data decision, made here:
 
 | root | why |
 |---|---|
 | `CODEX_VENDOR` | the binary and the resources it ships with |
-| `WORKSPACE` | the empty evaluation workspace, read-only |
+| `WORKSPACE` | the empty evaluation workspace |
 | `CODEX_HOME` | the isolated home, holding the login state and nothing else |
+| `/dev/fd` | the two inherited descriptors, below |
 
-plus `/dev/fd` for the pinned catalog. Not `HOME`, not `/Volumes`, not the
-repository. Paths are **resolved** before they reach the profile, because
-Seatbelt matches the real filesystem and `/tmp` would never match
-`/private/tmp`.
+Not `HOME`, not `/Volumes`, not the repository, and not the scratch directory.
+
+**`PLATFORM_RUNTIME_READS`** — Codex's own vetted platform section for a
+sandboxed process on macOS, copied verbatim rather than re-derived: `/usr/lib`,
+`/System`, the dyld cache, `/dev/null` and similar. These are loader and runtime
+paths, not user data, and none of them reaches a document, a repository or a
+credential. Four of the vendor's rules are **removed**:
+
+| removed rule | why |
+|---|---|
+| `(allow file-read* (extension "com.apple.app-sandbox.read"))` | an inherited App Sandbox extension grants paths outside the roots above — the one thing this profile exists to prevent |
+| `(allow file-read* file-write* (extension "com.apple.app-sandbox.read-write"))` | same, and it would grant writes as well |
+| `(allow file-read* (subpath "/opt/homebrew/lib"))` | not needed: the platform binary carries its own resources |
+| `(allow file-read* (subpath "/usr/local/lib"))` | same |
+
+`codex --version` and `codex login status` were both confirmed to start under
+the profile without them, offline and without any model request.
+
+Paths are **resolved** before they reach the profile, because Seatbelt matches
+the real filesystem and `/tmp` would never match `/private/tmp`.
+
+### What is writable, and what is reachable
+
+**`WRITEABLE_PATHS`** is not "none". It is exactly one file:
+
+```
+(allow file-write-data file-write-flags file-write-times
+  (literal (param "AUTH_FILE")))
+```
+
+Codex 0.153.4 persists a refreshed ChatGPT token through
+`FileAuthStorage::save`, which truncates and rewrites `CODEX_HOME/auth.json`;
+without this a refresh inside the sandbox would fail. The grant is contents
+only — the **directory stays unwritable**, so no second file can appear beside
+it, and that is measured rather than assumed. The user's own `CODEX_HOME` is not
+named in the profile at all.
+
+**`RUNTIME_DEVICE_WRITES`** are the platform section's device nodes
+(`/dev/null`, `/dev/dtracehelper`, the process's own tty) plus the `TMPDIR`
+handling Codex needs to start. They are not a path into user data and are listed
+separately so the single-file claim above stays exact.
+
+**Network egress is open, deliberately.** `(allow network-outbound (remote tcp))`
+plus `(allow system-socket)` and DNS mach lookups. Without it the profile has no
+path to the provider and a real turn could not happen at all. Seatbelt matches
+sockets, not hostnames, so there is no dependable way to narrow this to one
+endpoint, and claiming otherwise would be worse than stating the limit: **what
+this profile enforces is the file-read boundary, not the network.** It is
+measured with a loopback listener, before and after, so the gate reports what
+the profile permits rather than what the network happens to allow.
+
+**The two descriptors.** The pinned catalog and the output schema reach the
+child as private, unlinked, read-only snapshots referenced as `/dev/fd/<n>`.
+Neither is passed by a path under the scratch directory — that would mean
+opening the scratch directory to the sandboxed process, and everything beside
+the file with it. There is no `(subpath SCRATCH)` in the profile.
 
 The boundary is tested with sentinel files standing in for the repository,
 `HOME` and credential classes — reading an actual `.env` would prove one path
@@ -548,20 +612,63 @@ session, `auth.json`, and discards it afterwards. No token value is read into
 the harness, logged, asserted on or reported; a refresh during an attempt lands
 in the copy, so the user's own session is untouched.
 
-Whether that copied state is *sufficient* to authenticate cannot be settled
-offline. `AUTH_HOME_ISOLATION` is therefore `UNVERIFIED`, not `PASS`, and a real
-run stays refused until one is separately authorised.
+Three questions were once one gate, and that gate could never clear: `may_run`
+demanded every gate pass, while the only thing that could have cleared it was
+the turn it was blocking. They are now separate.
+
+| gate | question | how it is answered |
+|---|---|---|
+| `AUTH_HOME_ISOLATION` | is the home isolated? | checked here and now: `0700` directory, exactly one entry, `0600` mode, source home unchanged, and the outer profile confines reads to this home |
+| `CHATGPT_SESSION` | does *this* copy carry a ChatGPT session? | `codex login status` really runs — in this home, behind the same profile, with the credential store pinned to `file`. Not a guess, and not a model request |
+| `AUTH_REMOTE_VALIDITY` | will the provider accept the token? | unknowable without a request. **Advisory**: it is `UNVERIFIED` and never blocks, because blocking on it would be circular |
 
 ## Release gates
 
 `release.evaluate_release` answers, without contacting a model, whether a real
-turn could proceed: `MODEL_CATALOG`, `CATALOG_DIGEST`, `CODEX_VERSION`,
-`CHATGPT_SESSION`, `TOOL_SURFACE`, `OUTER_READ_SANDBOX`, `AUTH_HOME_ISOLATION`.
+turn could proceed: `MODEL_CATALOG`, `CATALOG_DIGEST`, `TOOL_SURFACE`,
+`CODEX_VERSION`, `CHATGPT_SESSION`, `OUTER_READ_SANDBOX`, `NETWORK_EGRESS`,
+`AUTH_HOME_ISOLATION`, `AUTH_REMOTE_VALIDITY`.
 
 Each is `PASS`, `FAIL` or `UNVERIFIED`, and `may_run` is true only when every
 gate is `PASS`. There is no "warning but continue" — `OUTER_READ_SANDBOX` and
 `CATALOG_DIGEST` in particular have no degraded mode, and `UNVERIFIED` is its
-own answer rather than a soft pass.
+own answer rather than a soft pass. The single exemption is `ADVISORY_GATES`,
+which holds exactly `AUTH_REMOTE_VALIDITY` and nothing else.
+
+### The gate is structural, not a flag
+
+`RunMode` was removed because a boolean the caller sets is a promise, not a
+check — and replacing it with a second boolean would have been the same mistake
+under a new name. What a real run needs instead is a **value that cannot be
+fabricated**:
+
+* `ReleaseAuthorization` refuses construction without a private permit object,
+  so `ReleaseAuthorization(status=..., _permit=object())` raises;
+* `authorize()` is the only holder of that permit, and it produces one only from
+  a `PreflightStatus` where nothing is blocking;
+* `RealCodexRunner` — the only entry point that may reach a real turn — takes
+  one as a constructor argument, and additionally re-checks that the
+  configuration in front of it is the shape the preflight described: an outer
+  sandbox is configured and the login probe is on. A refusal happens before a
+  client exists, so `exec_starts` stays 0.
+
+`CodexEvaluationClient` on its own remains the offline engine. It enforces
+everything about *one attempt*; it does not know whether a real run was cleared,
+and it no longer has to.
+
+### Running it
+
+```
+cd backend && uv run python -m src.evaluation.codex.final_preflight
+```
+
+It builds the isolated home, runs both CLI probes behind the profile, measures
+the boundary against a **separate placeholder home** — the write probe rewrites
+the auth file it is pointed at, and pointing it at the copied login state would
+push a real token through a shell round trip — evaluates the gates, prints the
+table and removes everything it made. It starts no turn. Exit code 0 means every
+blocking gate passed; it does not mean a run happened, and running one is a
+separate, separately reviewed decision.
 
 ## Open blockers
 
@@ -571,18 +678,23 @@ Three claims remain **unproven**, and no test in this suite can prove them:
    not measured. `observed_tool_activity` records tool *use*; an offered but
    unused tool emits no event, so an empty result is not evidence of a
    tool-free run.
-2. **The read boundary is now examined, and there is none.**
+2. **Codex's own `read-only` is not a read boundary.**
    `SandboxPolicy::has_full_disk_read_access` returns `true` for every variant
    and `seatbelt.rs` turns that into a blanket `(allow file-read*)`, so
-   `read-only` restricts writes and nothing else. The seatbelt also wraps
-   commands the agent runs rather than the agent itself. What remains is not an
-   open question but a stated limit: read safety rests on no reading tool being
-   offered, which is a configuration property rather than an enforced one.
+   `read-only` restricts writes and nothing else, and it wraps the commands the
+   agent runs rather than the agent itself. This is no longer load-bearing: the
+   harness's own outer profile supplies the read boundary, and it is measured
+   rather than argued. What the outer profile does **not** constrain is the
+   network — see above; that limit is deliberate and stated, not overlooked.
 3. **`apply_patch` stays on offer.** Its effect is blocked by the read-only
    sandbox; the offer is not.
 
 Subscription metering, quotas and the admissibility of automated subscription
 use are likewise unverified. They are contract questions, not code questions.
+
+**No real turn has been run.** Every gate above was established offline, and
+`REAL_CODEX_RUN_STATUS` is `BLOCKED_PENDING_FINAL_INDEPENDENT_REVIEW`: a clear
+preflight is a precondition for a real run, not a decision to perform one.
 
 **A real run would not settle any of this either.** A successful invocation
 shows that one attempt produced one validated answer. It does not establish the

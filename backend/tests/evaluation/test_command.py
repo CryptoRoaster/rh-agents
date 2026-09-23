@@ -12,6 +12,7 @@ import pytest
 
 from src.evaluation.codex.command import (
     ALLOWED_ENVIRONMENT_KEYS,
+    AUTH_STORE_OVERRIDE,
     BASE_CONFIG_OVERRIDES,
     DISABLED_FEATURES,
     FORBIDDEN_ARGUMENTS,
@@ -115,7 +116,12 @@ def test_node_shim_with_node_on_child_path_is_accepted(tmp_path: Path) -> None:
         executable=tmp_path / "codex.js",
         path_entries=(node_dir,),
     )
-    assert build_preflight_arguments(launcher=shim)[1:] == ["login", "status"]
+    assert build_preflight_arguments(launcher=shim)[1:] == [
+        "login",
+        "status",
+        "-c",
+        AUTH_STORE_OVERRIDE,
+    ]
 
 
 def test_child_environment_holds_only_the_allowed_keys(tmp_path: Path) -> None:

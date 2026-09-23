@@ -163,6 +163,16 @@ def snapshot_catalog(path: Path, snapshot_dir: Path) -> CatalogSnapshot | None:
     raw = _read_operator_file(path)
     if raw is None:
         return None
+    return snapshot_payload(raw, snapshot_dir)
+
+
+def snapshot_payload(raw: bytes, snapshot_dir: Path) -> CatalogSnapshot | None:
+    """Freeze bytes the harness already holds, with the same guarantees.
+
+    Used for the output schema as well as the catalog: passing the schema by
+    path would mean opening the scratch directory to the sandboxed process,
+    and a descriptor to an unlinked private copy costs nothing extra.
+    """
     try:
         # Strict: `load_catalog_json` uses `read_to_string`, which rejects
         # invalid UTF-8. Repairing it here would mean judging a different text

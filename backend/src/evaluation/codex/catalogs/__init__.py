@@ -23,6 +23,9 @@ CATALOG_DIR = Path(__file__).parent
 GPT_5_5_CATALOG = CATALOG_DIR / "gpt-5.5-codex-0.153.4.json"
 # sha256 of that file's bytes exactly as committed.
 GPT_5_5_CATALOG_SHA256 = "5997e42da1de33fff1746eca8a98c9ac26f7ed1f4a82f15a1876027682d22e77"
+# The `slug` of its one entry, which is what `--model` has to be given. The file
+# name carries the Codex product name; the slug is what the catalog says.
+GPT_5_5_CATALOG_SLUG = "gpt-5.5"
 
 
 class CatalogBuildError(Exception):

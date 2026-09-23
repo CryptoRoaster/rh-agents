@@ -33,6 +33,7 @@ from src.evaluation.codex.catalog import (
     CatalogSnapshot,
     judge_snapshot,
     snapshot_catalog,
+    snapshot_payload,
 )
 from src.evaluation.codex.command import (
     CommandBuildError,
@@ -111,12 +112,17 @@ class CodexClientConfig:
             raise ValueError("expected_catalog_sha256 must be a sha256 hex digest")
 
 
+class OuterSandboxMissing(Exception):
+    """Raised when the outer profile is configured but not on disk."""
+
+
 @dataclass
 class CodexEvaluationClient:
     """Runs at most one attempt. A second call is refused, not retried."""
 
     config: CodexClientConfig
     exec_starts: int = field(default=0, init=False)
+    _profile: Path | None = field(default=None, init=False)
     version_starts: int = field(default=0, init=False)
     preflight_starts: int = field(default=0, init=False)
 
@@ -185,6 +191,35 @@ class CodexEvaluationClient:
         if rejection is not None:
             return rejection
 
+        # One profile for the whole attempt. Every Codex invocation goes behind
+        # it -- the version probe and the login probe as much as the turn --
+        # so no phase of the path that may be released ever starts Codex
+        # unsandboxed.
+        if self.config.outer_sandbox is not None:
+            try:
+                self._profile = sandbox.write_profile(self.config.scratch)
+            except OSError as error:
+                return self._reject(
+                    EvaluationFailure.PROCESS_START_FAILED,
+                    type(error).__name__.upper(),
+                    deadline,
+                )
+        try:
+            return await self._attempt_sandboxed(request, deadline, catalog, environment, schema)
+        finally:
+            if self._profile is not None:
+                self._profile.unlink(missing_ok=True)
+                self._profile = None
+
+    async def _attempt_sandboxed[Output: BaseModel](
+        self,
+        request: EvaluationRequest[Output],
+        deadline: Deadline,
+        catalog: CatalogSnapshot,
+        environment: dict[str, str],
+        schema: dict[str, object],
+    ) -> EvaluationOutcome[Output]:
+
         rejection = await self._verify_version(environment, request.limits, deadline)
         if rejection is not None:
             return rejection
@@ -194,31 +229,36 @@ class CodexEvaluationClient:
             if rejection is not None:
                 return rejection
 
-        schema_path = self.config.scratch / "orbit-output-schema.json"
-        profile_path: Path | None = None
+        # The schema travels as a descriptor too. Passing it by path would mean
+        # opening the scratch directory to the sandboxed process, and the
+        # profile deliberately has no scratch root.
+        schema_snapshot = snapshot_payload(
+            json.dumps(schema, sort_keys=True).encode("utf-8"), self.config.scratch
+        )
+        if schema_snapshot is None:
+            return self._reject(
+                EvaluationFailure.SCHEMA_UNSUPPORTED, "SCHEMA_SNAPSHOT_FAILED", deadline
+            )
         try:
-            schema_path.write_text(json.dumps(schema, sort_keys=True), encoding="utf-8")
             arguments = build_arguments(
                 launcher=self.config.launcher,
                 working_directory=self.config.workspace,
-                schema_path=schema_path,
+                schema_path=Path(schema_snapshot.reference),
                 model=self.config.model,
                 effort=self.config.effort,
                 instructions=request.instructions,
                 model_catalog_reference=catalog.reference,
                 forbidden_roots=self.config.forbidden_roots,
             )
-            if self.config.outer_sandbox is not None:
-                # Applied in front of Codex itself, not in front of the commands
-                # it might run. `sandbox-exec` execs in place, so the gate's pid,
-                # process group and inherited descriptors all carry through.
-                profile_path = sandbox.write_profile(self.config.scratch)
-                arguments = sandbox.wrap(arguments, profile_path, self.config.outer_sandbox)
+            # The same profile the probes ran behind, written once for the
+            # whole attempt and removed in the caller's `finally`. Applied in
+            # front of Codex itself, not in front of the commands it might run.
+            arguments = self._sandboxed(arguments)
         except CommandBuildError as error:
             return self._reject(error.failure, error.reason_code, deadline)
-        except OSError as error:
+        except OuterSandboxMissing:
             return self._reject(
-                EvaluationFailure.PROCESS_START_FAILED, type(error).__name__.upper(), deadline
+                EvaluationFailure.PROCESS_START_FAILED, "OUTER_SANDBOX_MISSING", deadline
             )
 
         accumulator = EventAccumulator(
@@ -231,13 +271,16 @@ class CodexEvaluationClient:
         self.exec_starts += 1
         try:
             return await self._run_attempt(
-                request, deadline, arguments, environment, payload, accumulator, catalog
+                request,
+                deadline,
+                arguments,
+                environment,
+                payload,
+                accumulator,
+                (catalog.fd, schema_snapshot.fd),
             )
         finally:
-            # The profile is only needed while `sandbox-exec` starts; leaving it
-            # in the scratch directory would be an artefact nobody collects.
-            if profile_path is not None:
-                profile_path.unlink(missing_ok=True)
+            schema_snapshot.close()
 
     async def _run_attempt[Output: BaseModel](
         self,
@@ -247,7 +290,7 @@ class CodexEvaluationClient:
         environment: dict[str, str],
         payload: bytes,
         accumulator: EventAccumulator,
-        catalog: CatalogSnapshot,
+        extra_fds: tuple[int, ...],
     ) -> EvaluationOutcome[Output]:
         try:
             result = await run_bounded(
@@ -258,7 +301,7 @@ class CodexEvaluationClient:
                 limits=request.limits,
                 deadline=deadline,
                 on_stdout_line=accumulator.feed,
-                extra_fds=(catalog.fd,),
+                extra_fds=extra_fds,
             )
         except ProcessError as error:
             return self._reject(error.failure, error.reason_code, deadline, error.cleanup)
@@ -300,10 +343,17 @@ class CodexEvaluationClient:
                 EvaluationFailure.DEADLINE_EXCEEDED, "NO_TIME_FOR_VERSION_CHECK", deadline
             )
 
+        try:
+            wrapped = self._sandboxed(arguments)
+        except OuterSandboxMissing:
+            return self._reject(
+                EvaluationFailure.PROCESS_START_FAILED, "OUTER_SANDBOX_MISSING", deadline
+            )
+
         self.version_starts += 1
         try:
             outcome = await check_cli_version(
-                arguments=arguments,
+                arguments=wrapped,
                 environment=environment,
                 working_directory=self.config.workspace,
                 limits=limits,
@@ -345,6 +395,23 @@ class CodexEvaluationClient:
             )
         return None
 
+    def _sandboxed(self, arguments: list[str]) -> list[str]:
+        """Put the outer profile in front of any Codex invocation.
+
+        `sandbox-exec` execs in place, so the gate's pid, its process group and
+        every inherited descriptor carry through unchanged.
+
+        A configured outer sandbox with no profile on disk raises instead of
+        returning the bare command. Falling back to an unwrapped Codex would be
+        the exact outcome the configuration exists to prevent, and it would be
+        invisible in the result.
+        """
+        if self.config.outer_sandbox is None:
+            return arguments
+        if self._profile is None:
+            raise OuterSandboxMissing
+        return sandbox.wrap(arguments, self._profile, self.config.outer_sandbox)
+
     def _probe_deadline(self, budget_seconds: float, deadline: Deadline) -> Deadline | None:
         budget = min(budget_seconds, deadline.remaining_for_work)
         if budget <= 0:
@@ -369,10 +436,17 @@ class CodexEvaluationClient:
                 EvaluationFailure.DEADLINE_EXCEEDED, "NO_TIME_FOR_PREFLIGHT", deadline
             )
 
+        try:
+            wrapped = self._sandboxed(arguments)
+        except OuterSandboxMissing:
+            return self._reject(
+                EvaluationFailure.PREFLIGHT_FAILED, "OUTER_SANDBOX_MISSING", deadline
+            )
+
         self.preflight_starts += 1
         try:
             outcome = await check_chatgpt_login(
-                arguments=arguments,
+                arguments=wrapped,
                 environment=environment,
                 working_directory=self.config.workspace,
                 limits=limits,

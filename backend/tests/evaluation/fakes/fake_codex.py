@@ -113,10 +113,32 @@ def observed_catalog_digest() -> str | None:
     return None
 
 
+def record_schema() -> None:
+    """Record the reference and the bytes `--output-schema` actually delivers.
+
+    Same reasoning as the catalog: the reference alone would only show that
+    something was passed. The digest shows the child read the bytes the parent
+    wrote, through a descriptor that has no name in any directory.
+    """
+    for index, item in enumerate(sys.argv):
+        if item == "--output-schema" and index + 1 < len(sys.argv):
+            reference = sys.argv[index + 1]
+            try:
+                with open(reference, "rb") as handle:
+                    digest = hashlib.sha256(handle.read()).hexdigest()
+            except OSError:
+                digest = "<unreadable>"
+            Path.cwd().joinpath("observed-schema.json").write_text(
+                json.dumps({"reference": reference, "digest": digest}), encoding="utf-8"
+            )
+            return
+
+
 def main() -> int:
     # Only the attempt carries a pinned catalog; the version and login probes
     # do not, and have nothing to compare.
     observed = observed_catalog_digest()
+    record_schema()
     expected = Path.cwd() / "expected-catalog-digest.txt"
     if observed is not None and expected.exists():
         if observed != expected.read_text(encoding="utf-8").strip():
