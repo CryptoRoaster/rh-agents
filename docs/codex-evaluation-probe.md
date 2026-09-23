@@ -385,10 +385,27 @@ operator's own descriptor only stops one of them. A descriptor binds to an
 changes what an already-open read handle sees. Replacing the path is the other
 way. An earlier version of this harness handled only the second.
 
-So the judged bytes are frozen rather than referenced. The operator file is read
-once; those exact bytes are hashed and judged; they are written to a fresh file,
-`fsync`ed, and the writer is closed; the copy is reopened **read-only** and then
-**unlinked**. What the child inherits through `pass_fds` has no name left to
+So the judged bytes are frozen rather than referenced, and every step that could
+leave the copy different from what was judged is checked rather than assumed:
+
+1. the operator file is read once, bounded by `MAX_CATALOG_BYTES`, and decoded
+   as **strict** UTF-8 — `load_catalog_json` uses `read_to_string`, so repairing
+   invalid bytes here would mean judging a text the runtime loader never sees;
+2. those exact bytes are hashed and judged;
+3. they are written to a fresh file in a **write-all loop** — one `os.write` is
+   not a promise to write everything, and a write that makes no progress is an
+   error;
+4. `fsync`, then the writer is closed;
+5. the copy is reopened **read-only**;
+6. it is **unlinked, and the unlink must succeed** — a snapshot still reachable
+   by name is not immutable, so a failure here refuses the attempt rather than
+   being swallowed;
+7. the finished file is **read back and hashed** through that descriptor and
+   compared with the judged digest, which catches a truncation, extra bytes or
+   any transformation in between;
+8. the descriptor is rewound.
+
+Only then does a snapshot exist. What the child inherits through `pass_fds` has no name left to
 write through and carries no write capability of its own.
 `model_catalog_json` points at `/dev/fd/<n>`, which resolves through that open
 file description, and the descriptor survives the gate's `os.execv` because
@@ -407,11 +424,18 @@ makes the whole `ModelInfo` snapshot part of the contract instead of the few
 fields this guard samples, so changing the catalog becomes a reviewable change
 rather than an edit to an operational file.
 
-For a real turn the digest is **mandatory**. `RunMode.REAL` without
-`expected_catalog_sha256` is refused before the version probe, the login probe
-or `exec` — without the pin the guard would be sampling a file that can be
-anything. `RunMode.FIXTURE` may omit it, because a stand-in process has no
-approved snapshot to be held to.
+The digest is **always** mandatory. It used to be optional with a run mode
+deciding when it mattered, which meant a caller setting the wrong mode could
+have reached a real turn without a pin — a security property behind a flag is
+not a security property. `CodexClientConfig` now rejects a missing or malformed
+digest at construction, so no combination of it carries one as far as `exec`,
+and fixtures are pinned exactly like anything else.
+
+The child verifies this too, by digest rather than by looking for a bad string.
+It hashes whatever `model_catalog_json` delivers and compares that with the
+snapshot digest, so the end-to-end regression covers a short write, a
+truncation, extra bytes and any transformation — not merely the absence of a
+marker.
 
 The guard refuses anything outside an explicit allowlist: a declared
 `tool_mode`, a non-empty `experimental_supported_tools`, an unknown

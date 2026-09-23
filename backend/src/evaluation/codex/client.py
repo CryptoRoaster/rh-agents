@@ -55,7 +55,6 @@ from src.evaluation.codex.models import (
     EvaluationRequest,
     OutputLimits,
     ProcessLimits,
-    RunMode,
     SchemaUnsupportedError,
 )
 from src.evaluation.codex.preflight import check_chatgpt_login, check_cli_version
@@ -76,14 +75,13 @@ class CodexClientConfig:
     """
 
     launcher: CodexLauncher
-    run_mode: RunMode
     codex_home: Path
     home: Path
     tmpdir: Path
     workspace: Path
     scratch: Path
     model_catalog_path: Path
-    expected_catalog_sha256: str | None
+    expected_catalog_sha256: str
     model: str
     effort: str | None = None
     forbidden_roots: tuple[Path, ...] = ()
@@ -91,6 +89,20 @@ class CodexClientConfig:
     run_preflight: bool = True
     preflight_budget_seconds: float = PREFLIGHT_BUDGET_SECONDS
     version_budget_seconds: float = VERSION_BUDGET_SECONDS
+
+    def __post_init__(self) -> None:
+        """Refuse a configuration that could reach `exec` without a pinned catalog.
+
+        The digest is not a mode, a flag or a caller's promise. There is no
+        combination of this dataclass that carries a missing or malformed digest
+        any further than construction, so nothing downstream has to remember to
+        check for one.
+        """
+        digest = self.expected_catalog_sha256
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError("expected_catalog_sha256 must be a sha256 hex digest")
+        if any(character not in "0123456789abcdef" for character in digest.lower()):
+            raise ValueError("expected_catalog_sha256 must be a sha256 hex digest")
 
 
 @dataclass
@@ -119,12 +131,6 @@ class CodexEvaluationClient:
     async def _attempt[Output: BaseModel](
         self, request: EvaluationRequest[Output], deadline: Deadline
     ) -> EvaluationOutcome[Output]:
-        if self.config.run_mode is RunMode.REAL and self.config.expected_catalog_sha256 is None:
-            # A real turn without a pinned digest would trust whatever the file
-            # happens to contain. Refused before the first process starts.
-            return self._reject(
-                EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, "CATALOG_DIGEST_REQUIRED", deadline
-            )
         if self.config.effort is not None and self.config.effort not in SUPPORTED_EFFORTS:
             # Never remapped onto a neighbouring value: a silently downgraded
             # effort would make the recorded configuration a lie.

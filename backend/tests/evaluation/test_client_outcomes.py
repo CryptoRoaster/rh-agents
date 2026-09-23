@@ -25,7 +25,6 @@ from src.evaluation.codex.models import (
     EvaluationFailure,
     EvaluationRejected,
     OutputLimits,
-    RunMode,
 )
 from tests.evaluation.conftest import (
     LAUNCHER_INJECTED_ENVIRONMENT_KEYS,
@@ -484,37 +483,82 @@ async def test_mutating_the_operator_catalog_after_the_check_changes_nothing(
     assert isinstance(outcome, EvaluationCompleted)
 
 
-async def test_a_real_run_without_a_pinned_digest_starts_nothing(probe: Probe) -> None:
-    """The reviewed snapshot is the contract, so a real turn needs the pin.
+def test_no_configuration_can_omit_the_catalog_digest(probe: Probe) -> None:
+    """There is no mode, flag or caller promise that skips the pin.
 
-    Without it the guard would be sampling three fields of a file that can be
-    anything. Refused before the version probe, the login probe or exec.
+    The digest used to be optional and a run mode decided whether it mattered,
+    which meant a caller setting the wrong mode could have reached a real turn
+    without one. It is now a property of the configuration: nothing carries a
+    missing or malformed digest past construction.
     """
+    for bad in (None, "", "not-a-digest", "0" * 63, "g" * 64):
+        with pytest.raises(ValueError):
+            probe.config(expected_catalog_sha256=bad)
+
+
+async def test_a_stale_digest_starts_nothing(probe: Probe) -> None:
     probe.scenario("success")
-    client = probe.client(run_mode=RunMode.REAL, expected_catalog_sha256=None)
+    client = probe.client(expected_catalog_sha256="0" * 64)
     outcome = await client.evaluate(probe.request())
     assert isinstance(outcome, EvaluationRejected)
     assert outcome.reason is EvaluationFailure.TOOL_SURFACE_UNSUPPORTED
-    assert outcome.detail_code == "CATALOG_DIGEST_REQUIRED"
+    assert outcome.detail_code == "CATALOG_DIGEST_MISMATCH"
     assert client.exec_starts == 0
     assert client.version_starts == 0
     assert client.preflight_starts == 0
 
 
-async def test_a_real_run_with_the_right_digest_proceeds(probe: Probe) -> None:
+async def test_the_matching_digest_proceeds(probe: Probe) -> None:
     probe.scenario("success")
-    digest = hashlib.sha256(probe.model_catalog_path.read_bytes()).hexdigest()
-    client = probe.client(run_mode=RunMode.REAL, expected_catalog_sha256=digest)
+    client = probe.client(expected_catalog_sha256=probe.catalog_digest)
     assert isinstance(await client.evaluate(probe.request()), EvaluationCompleted)
 
 
-async def test_a_real_run_with_a_stale_digest_starts_nothing(probe: Probe) -> None:
+async def test_a_catalog_that_is_not_valid_utf8_starts_nothing(probe: Probe) -> None:
+    """`read_to_string` rejects it, so the guard must not repair it.
+
+    Decoding with replacement would have the guard judging one text while the
+    runtime loader sees another -- or refuses outright.
+    """
     probe.scenario("success")
-    client = probe.client(run_mode=RunMode.REAL, expected_catalog_sha256="0" * 64)
+    probe.model_catalog_path.write_bytes(b'{"models": [\xff\xfe]}')
+    client = probe.client(
+        expected_catalog_sha256=hashlib.sha256(probe.model_catalog_path.read_bytes()).hexdigest()
+    )
     outcome = await client.evaluate(probe.request())
     assert isinstance(outcome, EvaluationRejected)
-    assert outcome.detail_code == "CATALOG_DIGEST_MISMATCH"
+    assert outcome.detail_code == "CATALOG_UNREADABLE"
     assert client.exec_starts == 0
+
+
+async def test_an_oversized_catalog_starts_nothing(probe: Probe) -> None:
+    """One reviewed entry is kilobytes; nothing needs to be read past the bound."""
+    padding = "x" * (catalog_module.MAX_CATALOG_BYTES + 1)
+    probe.model_catalog_path.write_text(
+        json.dumps({"models": [], "padding": padding}), encoding="utf-8"
+    )
+    probe.scenario("success")
+    client = probe.client(
+        expected_catalog_sha256=hashlib.sha256(probe.model_catalog_path.read_bytes()).hexdigest()
+    )
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "CATALOG_UNREADABLE"
+    assert client.exec_starts == 0
+
+
+async def test_a_snapshot_that_cannot_be_unlinked_starts_nothing(
+    probe: Probe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A snapshot still reachable by name is not the immutable thing promised."""
+    probe.scenario("success")
+    monkeypatch.setattr(catalog_module.os, "unlink", _raise_oserror, raising=True)
+    client = probe.client()
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "CATALOG_UNREADABLE"
+    assert client.exec_starts == 0
+    assert client.version_starts == 0
 
 
 @pytest.mark.parametrize(
@@ -556,3 +600,7 @@ async def test_an_unreadable_pinned_catalog_never_runs_an_attempt(probe: Probe) 
     assert isinstance(outcome, EvaluationRejected)
     assert outcome.detail_code == "CATALOG_UNREADABLE"
     assert client.exec_starts == 0
+
+
+def _raise_oserror(*_args: object, **_kwargs: object) -> None:
+    raise OSError("unlink refused")

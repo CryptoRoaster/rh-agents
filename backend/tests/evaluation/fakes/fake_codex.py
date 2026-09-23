@@ -15,6 +15,7 @@ The scenario is read from `scenario.json` in the working directory, because the
 child environment is scrubbed down to five keys and carries no test channel.
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -92,12 +93,12 @@ def answer(scenario: dict[str, object]) -> str:
     return json.dumps(payload)
 
 
-def inspect_pinned_catalog() -> str | None:
-    """Read what `model_catalog_json` actually points at, from inside the child.
+def observed_catalog_digest() -> str | None:
+    """Hash the bytes `model_catalog_json` actually delivers, inside the child.
 
-    This is what makes the snapshot tests end-to-end. The harness judges bytes
-    in the parent; only a child that opens the reference can show that the same
-    bytes arrived here, through `pass_fds` and across `os.execv`.
+    A marker string would only say "nothing obviously bad arrived". A digest
+    says the bytes are the ones the parent judged -- which also covers a short
+    write, a truncation, extra bytes and any transformation in between.
     """
     for index, item in enumerate(sys.argv):
         if item == "-c" and index + 1 < len(sys.argv):
@@ -105,19 +106,23 @@ def inspect_pinned_catalog() -> str | None:
             if override.startswith("model_catalog_json="):
                 reference = override[len("model_catalog_json=") :].strip('"')
                 try:
-                    with open(reference, encoding="utf-8") as handle:
-                        return handle.read()
-                except OSError as error:
-                    return f"<unreadable: {error}>"
+                    with open(reference, "rb") as handle:
+                        return hashlib.sha256(handle.read()).hexdigest()
+                except OSError:
+                    return "<unreadable>"
     return None
 
 
 def main() -> int:
-    seen_catalog = inspect_pinned_catalog()
-    if seen_catalog is not None and "code_mode_only" in seen_catalog:
-        # The child was handed a catalog the harness never approved.
-        sys.stderr.write("child received an unapproved catalog\n")
-        return 9
+    # Only the attempt carries a pinned catalog; the version and login probes
+    # do not, and have nothing to compare.
+    observed = observed_catalog_digest()
+    expected = Path.cwd() / "expected-catalog-digest.txt"
+    if observed is not None and expected.exists():
+        if observed != expected.read_text(encoding="utf-8").strip():
+            # The bytes that arrived are not the bytes that were judged.
+            sys.stderr.write(f"catalog digest mismatch: {observed}\n")
+            return 9
 
     scenario_path = Path.cwd() / "scenario.json"
     scenario: dict[str, object] = json.loads(scenario_path.read_text(encoding="utf-8"))

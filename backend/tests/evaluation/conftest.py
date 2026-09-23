@@ -6,6 +6,7 @@ they say nothing about the real CLI's tool surface, its filesystem isolation or
 how subscription usage is metered.
 """
 
+import hashlib
 import json
 import stat
 import sys
@@ -24,7 +25,6 @@ from src.evaluation.codex.models import (
     EvaluationRequest,
     LauncherKind,
     OutputLimits,
-    RunMode,
 )
 from tests.evaluation.fixtures.orbit_candidate import task_input
 
@@ -110,7 +110,16 @@ class Probe:
             "use_responses_lite": False,
         }
         entry.update(overrides)
-        self.model_catalog_path.write_text(json.dumps({"models": [entry]}), encoding="utf-8")
+        payload = json.dumps({"models": [entry]}).encode("utf-8")
+        self.model_catalog_path.write_bytes(payload)
+        # Fixtures are pinned exactly like a real run: there is no configuration
+        # that reaches `exec` without a digest, so the helper supplies one.
+        self.catalog_digest = hashlib.sha256(payload).hexdigest()
+        # The child compares what it reads against this, so the end-to-end test
+        # is about bytes rather than about the absence of a marker string.
+        (self.workspace / "expected-catalog-digest.txt").write_text(
+            self.catalog_digest, encoding="utf-8"
+        )
 
     def scenario(self, name: str = "success", **extra: Any) -> None:
         payload: dict[str, Any] = {
@@ -135,7 +144,6 @@ class Probe:
     def config(self, **overrides: Any) -> CodexClientConfig:
         settings: dict[str, Any] = {
             "launcher": self.launcher(),
-            "run_mode": RunMode.FIXTURE,
             "codex_home": self.codex_home,
             "home": self.home,
             "tmpdir": self.tmpdir,
@@ -143,7 +151,7 @@ class Probe:
             "scratch": self.scratch,
             "model": "gpt-5.4",
             "model_catalog_path": self.model_catalog_path,
-            "expected_catalog_sha256": None,
+            "expected_catalog_sha256": self.catalog_digest,
             "effort": "low",
             "run_preflight": False,
         }

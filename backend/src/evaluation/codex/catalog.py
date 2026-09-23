@@ -109,6 +109,12 @@ KNOWN_APPLY_PATCH_TYPES = frozenset({"freeform", "function"})
 
 MISSING = object()
 
+# The approved catalog is one reviewed `ModelInfo` entry, which is a few
+# kilobytes. The whole bundled catalog of the supported build is about half a
+# megabyte, so this leaves ample room while keeping an arbitrarily large file
+# from being read and copied.
+MAX_CATALOG_BYTES = 1_048_576
+
 
 @dataclass(frozen=True)
 class CatalogSnapshot:
@@ -144,45 +150,116 @@ class CatalogSnapshot:
 def snapshot_catalog(path: Path, snapshot_dir: Path) -> CatalogSnapshot | None:
     """Read the operator's catalog once and freeze those exact bytes.
 
-    Returns None when the file cannot be read or the snapshot cannot be made;
-    the caller refuses either way.
+    Every step that could leave the snapshot different from what was judged is
+    checked rather than assumed: the write is completed in a loop, the unlink
+    has to succeed, and the finished file is read back and hashed before the
+    descriptor is handed on. A single `os.write` is not a guarantee, and an
+    unlink that quietly failed would leave a name through which the snapshot
+    could still be rewritten.
+
+    Returns None on any failure; the caller refuses. Being unable to establish
+    the snapshot is the same answer as not liking it.
     """
+    raw = _read_operator_file(path)
+    if raw is None:
+        return None
     try:
-        raw = path.read_bytes()
-    except OSError:
+        # Strict: `load_catalog_json` uses `read_to_string`, which rejects
+        # invalid UTF-8. Repairing it here would mean judging a different text
+        # than the runtime loader ever sees.
+        payload = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    digest = hashlib.sha256(raw).hexdigest()
+
+    temporary = _write_snapshot(raw, snapshot_dir)
+    if temporary is None:
         return None
 
+    try:
+        # Read-only on purpose: the descriptor the child inherits must not
+        # carry a write capability of its own.
+        fd = os.open(temporary, os.O_RDONLY)
+    except OSError:
+        _cleanup_unlink(temporary)
+        return None
+    os.set_inheritable(fd, True)
+
+    try:
+        # Required, not best effort. A snapshot still reachable by name is not
+        # the immutable thing this function promises.
+        os.unlink(temporary)
+    except OSError:
+        _close(fd)
+        return None
+
+    if not _matches_after_readback(fd, digest):
+        _close(fd)
+        return None
+
+    return CatalogSnapshot(fd=fd, payload=payload, digest=digest)
+
+
+def _read_operator_file(path: Path) -> bytes | None:
+    """Read the operator's catalog, refusing anything past the size bound."""
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_CATALOG_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > MAX_CATALOG_BYTES:
+        return None
+    return raw
+
+
+def _write_snapshot(raw: bytes, snapshot_dir: Path) -> str | None:
+    """Write the bytes out in full, or leave nothing behind."""
     writer = -1
     temporary = ""
     try:
         writer, temporary = tempfile.mkstemp(dir=snapshot_dir, prefix="catalog-", suffix=".json")
-        os.write(writer, raw)
+        _write_all(writer, raw)
         os.fsync(writer)
     except OSError:
         if writer != -1:
             _close(writer)
         if temporary:
-            _unlink(temporary)
+            _cleanup_unlink(temporary)
         return None
     _close(writer)
+    return temporary
 
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte. A short write is normal; losing bytes is not."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("snapshot write made no progress")
+        view = view[written:]
+
+
+def _matches_after_readback(fd: int, digest: str) -> bool:
+    """Hash what the finished file actually contains, then rewind.
+
+    Verifying the object rather than the call: a short write, a truncation or
+    anything else that made the snapshot differ shows up here, before the
+    descriptor is handed to anyone.
+    """
+    chunks: list[bytes] = []
     try:
-        # Read-only on purpose: the descriptor the child inherits must not carry
-        # a write capability of its own.
-        fd = os.open(temporary, os.O_RDONLY)
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        if hashlib.sha256(b"".join(chunks)).hexdigest() != digest:
+            return False
+        os.lseek(fd, 0, os.SEEK_SET)
     except OSError:
-        _unlink(temporary)
-        return None
-    os.set_inheritable(fd, True)
-    # Once unlinked there is no path left through which the snapshot could be
-    # rewritten, in place or otherwise.
-    _unlink(temporary)
-
-    return CatalogSnapshot(
-        fd=fd,
-        payload=raw.decode("utf-8", errors="replace"),
-        digest=hashlib.sha256(raw).hexdigest(),
-    )
+        return False
+    return True
 
 
 def _close(descriptor: int) -> None:
@@ -192,7 +269,8 @@ def _close(descriptor: int) -> None:
         pass
 
 
-def _unlink(path: str) -> None:
+def _cleanup_unlink(path: str) -> None:
+    """Best effort, for paths that only matter while cleaning up after a failure."""
     try:
         os.unlink(path)
     except OSError:
@@ -218,17 +296,15 @@ class CatalogVerdict:
     reason: str | None
 
 
-def judge_snapshot(
-    catalog: CatalogSnapshot, model: str, expected_digest: str | None
-) -> CatalogVerdict:
+def judge_snapshot(catalog: CatalogSnapshot, model: str, expected_digest: str) -> CatalogVerdict:
     """Judge the bytes that were actually read, digest first.
 
-    The digest pin turns the approved catalog into reviewable content rather
-    than an operational file three fields get sampled from. The whole
-    `ModelInfo` snapshot is part of what was approved, not just the parts this
-    module happens to look at.
+    The digest is required, not optional. It turns the approved catalog into
+    reviewable content rather than an operational file a few fields get sampled
+    from: the whole `ModelInfo` snapshot is what was approved, not just the
+    parts this module looks at.
     """
-    if expected_digest is not None and catalog.digest != expected_digest:
+    if catalog.digest != expected_digest:
         return CatalogVerdict(surface=None, reason="CATALOG_DIGEST_MISMATCH")
     return judge_catalog(catalog.payload, model)
 
@@ -328,6 +404,7 @@ __all__ = [
     "ALLOWED_EXPERIMENTAL_TOOLS",
     "ALLOWED_TOOL_MODE",
     "KNOWN_APPLY_PATCH_TYPES",
+    "MAX_CATALOG_BYTES",
     "CatalogSnapshot",
     "CatalogVerdict",
     "ToolSurface",

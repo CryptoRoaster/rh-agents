@@ -1,8 +1,13 @@
 """The catalog guard, including what the real 0.153.4 catalog actually says."""
 
+import hashlib
 import json
+import os
 from pathlib import Path
 
+import pytest
+
+from src.evaluation.codex import catalog as catalog_module
 from src.evaluation.codex.catalog import (
     judge_catalog,
     judge_snapshot,
@@ -130,7 +135,7 @@ def test_the_judged_bytes_survive_the_path_being_replaced(tmp_path: Path) -> Non
 
         assert "code_mode_only" in path.read_text(encoding="utf-8")
         assert "code_mode_only" not in opened.payload
-        assert judge_snapshot(opened, "gpt-5.4", None).reason is None
+        assert judge_snapshot(opened, "gpt-5.4", opened.digest).reason is None
         assert Path(opened.reference).read_text(encoding="utf-8") == opened.payload
     finally:
         opened.close()
@@ -179,3 +184,91 @@ def test_the_frontier_entry_is_refused_for_its_tool_mode_alone() -> None:
     assert verdict.reason == "TOOL_MODE_CODE_MODE_ONLY"
     assert verdict.surface is not None
     assert verdict.surface.use_responses_lite is True
+
+
+def test_short_writes_still_produce_the_exact_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single `os.write` is not a promise to write everything.
+
+    The kernel may take fewer bytes than offered. Without a write-all loop the
+    snapshot would be a truncated copy of what the guard judged, and the digest
+    would still match the original because it was taken before the copy.
+    """
+    path = tmp_path / "catalog.json"
+    path.write_text(catalog(REAL_LEGACY_ENTRY), encoding="utf-8")
+    real_write = os.write
+
+    def dribble(fd: int, data: object) -> int:
+        view = memoryview(bytes(data))  # type: ignore[arg-type]
+        return real_write(fd, view[:7])
+
+    monkeypatch.setattr(catalog_module.os, "write", dribble)
+    opened = snapshot_catalog(path, tmp_path)
+    monkeypatch.undo()
+
+    assert opened is not None
+    try:
+        raw = path.read_bytes()
+        assert opened.digest == hashlib.sha256(raw).hexdigest()
+        with open(opened.reference, "rb") as handle:
+            assert handle.read() == raw
+    finally:
+        opened.close()
+
+
+def test_a_write_that_makes_no_progress_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "catalog.json"
+    path.write_text(catalog(REAL_LEGACY_ENTRY), encoding="utf-8")
+    monkeypatch.setattr(catalog_module.os, "write", lambda *_a, **_k: 0)
+    assert snapshot_catalog(path, tmp_path) is None
+
+
+def test_a_snapshot_that_cannot_be_unlinked_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Required, not best effort: a name left behind is a way back in."""
+    path = tmp_path / "catalog.json"
+    path.write_text(catalog(REAL_LEGACY_ENTRY), encoding="utf-8")
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise OSError("unlink refused")
+
+    monkeypatch.setattr(catalog_module.os, "unlink", refuse)
+    assert snapshot_catalog(path, tmp_path) is None
+
+
+def test_a_snapshot_that_reads_back_differently_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The finished object is verified, not just the call that produced it."""
+    path = tmp_path / "catalog.json"
+    path.write_text(catalog(REAL_LEGACY_ENTRY), encoding="utf-8")
+    real_write = os.write
+
+    def drop_the_tail(fd: int, data: object) -> int:
+        payload = bytes(data)  # type: ignore[arg-type]
+        real_write(fd, payload[:-1])
+        return len(payload)  # claim success, deliver less
+
+    monkeypatch.setattr(catalog_module.os, "write", drop_the_tail)
+    assert snapshot_catalog(path, tmp_path) is None
+
+
+def test_invalid_utf8_is_refused_rather_than_repaired(tmp_path: Path) -> None:
+    """`read_to_string` rejects it, so judging a repaired text would be wrong."""
+    path = tmp_path / "catalog.json"
+    path.write_bytes(b'{"models": [\xff\xfe]}')
+    assert snapshot_catalog(path, tmp_path) is None
+
+
+def test_a_catalog_past_the_size_bound_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "catalog.json"
+    path.write_bytes(b"x" * (catalog_module.MAX_CATALOG_BYTES + 1))
+    assert snapshot_catalog(path, tmp_path) is None
+    path.write_bytes(catalog(REAL_LEGACY_ENTRY).encode("utf-8"))
+    opened = snapshot_catalog(path, tmp_path)
+    assert opened is not None
+    opened.close()
