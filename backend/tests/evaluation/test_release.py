@@ -9,7 +9,7 @@ from src.evaluation.codex import sandbox
 from src.evaluation.codex.auth_home import IsolatedHome
 from src.evaluation.codex.catalogs import GPT_5_5_CATALOG, GPT_5_5_CATALOG_SHA256
 from src.evaluation.codex.models import SUPPORTED_CLI_VERSION
-from src.evaluation.codex.release import GateState, evaluate_release
+from src.evaluation.codex.release import REQUIRED_GATES, GateState, evaluate_release
 
 
 def sandbox_roots(tmp_path: Path) -> tuple[sandbox.SandboxRoots, Path]:
@@ -107,9 +107,34 @@ def test_a_loose_mode_fails_isolation(tmp_path: Path) -> None:
     assert release_module._isolation_problem(home) == "home is not 0700"
 
 
+@pytest.mark.skipif(not sandbox.available(), reason="macOS sandbox-exec is not available")
 def test_egress_is_its_own_gate(tmp_path: Path) -> None:
     status = status_for(tmp_path)
     assert gate(status, "NETWORK_EGRESS").state is GateState.PASS  # type: ignore[attr-defined]
+
+
+def test_the_gate_set_is_the_same_on_every_platform(tmp_path: Path) -> None:
+    """A gate that cannot be measured is FAIL, never absent.
+
+    This is not a cosmetic symmetry. `authorize` requires the full required
+    set, so a status that silently drops `NETWORK_EGRESS` where no sandbox can
+    be measured would be refused for the wrong reason -- and before the shape
+    check existed, an incomplete set was simply not noticed. It is also how the
+    Linux CI run came to disagree with the macOS one: the gate was missing, not
+    failing, and looking it up raised `StopIteration`.
+    """
+    assert sorted(item.name for item in status_for(tmp_path).gates) == sorted(REQUIRED_GATES)
+
+
+def test_an_unmeasurable_platform_fails_both_sandbox_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sandbox, "macos", lambda: False)
+    status = status_for(tmp_path)
+    assert sorted(item.name for item in status.gates) == sorted(REQUIRED_GATES)
+    assert gate(status, "OUTER_READ_SANDBOX").state is GateState.FAIL  # type: ignore[attr-defined]
+    assert gate(status, "NETWORK_EGRESS").state is GateState.FAIL  # type: ignore[attr-defined]
+    assert status.may_run is False
 
 
 @pytest.mark.parametrize(

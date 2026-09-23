@@ -588,6 +588,12 @@ this profile enforces is the file-read boundary, not the network.** It is
 measured with a loopback listener, before and after, so the gate reports what
 the profile permits rather than what the network happens to allow.
 
+What the loopback measurement shows is exactly one thing: Seatbelt permits an
+outbound TCP connection. It does not show DNS resolution of the provider, TLS,
+that the endpoint is reachable, or that the token is accepted. Those are
+operability uncertainties that will first be observed on a real turn, and they
+are not a reason to build a provider request into the preflight.
+
 **The two descriptors.** The pinned catalog and the output schema reach the
 child as private, unlinked, read-only snapshots referenced as `/dev/fd/<n>`.
 Neither is passed by a path under the scratch directory — that would mean
@@ -625,9 +631,10 @@ the turn it was blocking. They are now separate.
 ## Release gates
 
 `release.evaluate_release` answers, without contacting a model, whether a real
-turn could proceed: `MODEL_CATALOG`, `CATALOG_DIGEST`, `TOOL_SURFACE`,
-`CODEX_VERSION`, `CHATGPT_SESSION`, `OUTER_READ_SANDBOX`, `NETWORK_EGRESS`,
-`AUTH_HOME_ISOLATION`, `AUTH_REMOTE_VALIDITY`.
+turn could proceed. `REQUIRED_GATES` is the whole set and never varies:
+`MODEL_CATALOG`, `CATALOG_DIGEST`, `CODEX_VERSION`, `CHATGPT_SESSION`,
+`TOOL_SURFACE`, `OUTER_READ_SANDBOX`, `NETWORK_EGRESS`, `AUTH_HOME_ISOLATION`,
+`AUTH_REMOTE_VALIDITY`.
 
 Each is `PASS`, `FAIL` or `UNVERIFIED`, and `may_run` is true only when every
 gate is `PASS`. There is no "warning but continue" — `OUTER_READ_SANDBOX` and
@@ -635,26 +642,122 @@ gate is `PASS`. There is no "warning but continue" — `OUTER_READ_SANDBOX` and
 own answer rather than a soft pass. The single exemption is `ADVISORY_GATES`,
 which holds exactly `AUTH_REMOTE_VALIDITY` and nothing else.
 
-### The gate is structural, not a flag
+### The gate set is fixed before its contents are read
 
-`RunMode` was removed because a boolean the caller sets is a promise, not a
-check — and replacing it with a second boolean would have been the same mistake
-under a new name. What a real run needs instead is a **value that cannot be
-fabricated**:
+`all(...)` over an empty tuple is `True`. So `PreflightStatus(gates=())` used to
+have `may_run == True`, and so did a single invented `Gate("EVERYTHING", PASS,
+…)`. A status that is merely *not failing* is not a preflight.
 
-* `ReleaseAuthorization` refuses construction without a private permit object,
-  so `ReleaseAuthorization(status=..., _permit=object())` raises;
-* `authorize()` is the only holder of that permit, and it produces one only from
-  a `PreflightStatus` where nothing is blocking;
-* `RealCodexRunner` — the only entry point that may reach a real turn — takes
-  one as a constructor argument, and additionally re-checks that the
-  configuration in front of it is the shape the preflight described: an outer
-  sandbox is configured and the login probe is on. A refusal happens before a
-  client exists, so `exec_starts` stays 0.
+`authorize` therefore checks the **shape** first: exactly `REQUIRED_GATES`, each
+name exactly once, nothing else present. Only then does it look at states, where
+every required gate must be `PASS` except those in `ADVISORY_GATES` — which
+holds exactly `AUTH_REMOTE_VALIDITY`. Refusals name what was wrong: `missing
+gate X`, `duplicate gate X`, `unexpected gate X`.
 
-`CodexEvaluationClient` on its own remains the offline engine. It enforces
-everything about *one attempt*; it does not know whether a real run was cleared,
-and it no longer has to.
+The same requirement is why `evaluate_release` emits every gate on **every**
+platform. On Linux the sandbox gates are `FAIL`, not absent. They used to be
+absent, and that is precisely how the Linux CI run came to disagree with the
+macOS one — looking `NETWORK_EGRESS` up raised `StopIteration` rather than
+reporting a failure.
+
+### The authorization carries what it authorised
+
+A cleared preflight is about one concrete configuration. An authorization that
+did not say which one could be paired afterwards with a wider workspace root, a
+different isolated home, another launcher or another pinned catalog, and the
+green preflight would be about something other than what runs.
+
+`ReleaseAuthorization` therefore carries a `RunBinding` — every path already
+**resolved**, so equality means the same real location rather than the same
+spelling:
+
+| bound | bound |
+|---|---|
+| `model` | `catalog_digest` |
+| `catalog_path` | `launcher_kind` |
+| `launcher_path` | `supported_cli_version` |
+| `workspace` | `codex_home` |
+| `home` | `tmpdir` |
+| `scratch` | `forbidden_roots` |
+| `sandbox_vendor` | `sandbox_workspace` |
+| `sandbox_codex_home` | `sandbox_auth_file` |
+| `run_preflight` | `max_exec_starts` |
+| `profile_sha256` | |
+
+`max_exec_starts` is there because "at most one attempt" is a property of the
+release, not of the caller's intentions. Reasoning effort is *not*, because it
+changes what the model does rather than what the run can reach.
+
+`RealCodexRunner` compares the configuration in front of it against that binding
+field by field and refuses by name — `configuration drifted: sandbox_workspace,
+sandbox_auth_file`. The comparison happens a second time inside the client, via
+the permit the authorization issues, so it cannot be lost by constructing the
+client another way.
+
+**This is not unforgeable, and the code no longer claims it is.** `_PERMIT` is
+module-private by convention, and convention is not a security boundary in
+Python; an in-process caller that sets out to build a `ReleaseAuthorization`
+can. What is bought is fail-closed behaviour against **miswiring and accidental
+bypass**: a configuration that was never checked, or that drifted after it was,
+does not run.
+
+### The direct bypass is closed
+
+`CodexEvaluationClient` could be constructed directly with
+`LauncherKind.PLATFORM_BINARY` and would happily start the real thing, which
+made "the only entry point that may reach a real turn" a convention.
+
+`LauncherKind` now has a third member. `FAKE_EXECUTABLE` is what the test
+fixtures declare and needs no permit, because starting it is not starting Codex.
+`PLATFORM_BINARY` and `NODE_SHIM` are real, and the client refuses them without
+a `ReleasePermit` whose binding matches the configuration — before the version
+probe, before the login probe, before anything: `version_starts`,
+`preflight_starts` and `exec_starts` all stay 0.
+
+A caller could of course declare the real binary as a fake. `validate_launcher`
+refuses a Mach-O file under that kind, which closes the accident; a wrapper
+script around the real binary would still pass, and that is lying to the harness
+rather than bypassing it — the same class of thing as the paragraph above.
+
+### One profile, bound by its bytes
+
+The preflight used to write a profile, measure it, and delete it; the client
+then composed a *new* one from the same two source files at exec time. Same file
+names is not the same policy, and between the two measurements anything could
+have changed.
+
+`sandbox.write_bound_profile` returns the path **and** the SHA-256 of what was
+written. That digest is a field of the `RunBinding`, the client loads the bound
+profile instead of composing a fresh one, and both the runner and the client
+re-read the file and compare before starting anything. A rewritten or removed
+profile is `profile digest mismatch`, refused before any process.
+
+### Prepared real run
+
+```
+async with prepare_real_run(launcher=…, source_codex_home=…) as prepared:
+    prepared.status         # what was measured
+    prepared.authorization  # None if anything blocking failed
+    prepared.runner         # None likewise; otherwise bound to this tree
+```
+
+On entry: a `0700` temporary root, a workspace, an isolated `CODEX_HOME` with
+the copied `auth.json`, **one** profile written once and bound by digest, the
+version and login probes run behind that profile in that home, the boundary
+measured, the gates evaluated, and — only if nothing blocking failed — a
+`RunBinding` taken from the configuration that would actually run. `runner` and
+`authorization` are `None` together; there is no state where a caller holds a
+runner whose preflight failed.
+
+On exit: the profile, the isolated home and the whole tree are removed.
+
+**The placeholder boundary probe.** The write check rewrites the auth file it is
+pointed at, so it gets a home of its own; pointing it at the copied login state
+would push a real token through a shell round trip. That is only sound because
+the two runs load the *same profile bytes* and differ solely in their `-D`
+parameters — which is asserted — and because the real `-D` values are part of
+the binding. The probe establishes the policy semantics; the binding pins which
+paths the real instance substitutes into that policy.
 
 ### Running it
 
@@ -662,13 +765,11 @@ and it no longer has to.
 cd backend && uv run python -m src.evaluation.codex.final_preflight
 ```
 
-It builds the isolated home, runs both CLI probes behind the profile, measures
-the boundary against a **separate placeholder home** — the write probe rewrites
-the auth file it is pointed at, and pointing it at the copied login state would
-push a real token through a shell round trip — evaluates the gates, prints the
-table and removes everything it made. It starts no turn. Exit code 0 means every
-blocking gate passed; it does not mean a run happened, and running one is a
-separate, separately reviewed decision.
+Enters the prepared run, prints the gate table and whether a runner could be
+bound to that environment, and tears everything down. It starts no turn. Exit
+code 0 means every blocking gate passed and a runner existed *inside the
+context*; it does not mean anything ran, and running something is a separate,
+separately reviewed decision.
 
 ## Open blockers
 

@@ -1,14 +1,34 @@
-"""The gates a real turn would have to pass, evaluated offline.
+"""The gates a real turn would have to pass, and the binding it runs under.
 
-Every gate here is either PASS, FAIL or UNVERIFIED, and `may_run` is true only
-when none of them is anything but PASS. There is no "warning but continue":
-a gate that cannot be established is a gate that did not pass, and
-`OUTER_READ_SANDBOX` and `CATALOG_DIGEST` in particular have no degraded mode.
+Every gate is PASS, FAIL or UNVERIFIED, and there is no "warning but continue":
+a gate that cannot be established is a gate that did not pass. UNVERIFIED is its
+own answer on purpose -- whether the copied login state will be accepted by the
+provider cannot be settled offline, and calling it PASS because the mechanism
+exists would be the same mistake as calling a quiet run proof that no tool was
+offered.
 
-UNVERIFIED is its own answer on purpose. Some things cannot be settled without
-a real turn -- whether the copied login state actually authenticates, above all
--- and calling that PASS because the mechanism exists would be the same mistake
-as calling a quiet run proof that no tool was offered.
+Two things this module is careful about, both of which it previously got wrong.
+
+**The gate set is fixed.** `all(...)` over an empty tuple is `True`, so
+`PreflightStatus(gates=())` used to authorise a real run, and so did a single
+invented `Gate("EVERYTHING", PASS, ...)`. `authorize` now checks the shape of
+the status before its contents: exactly the required names, each exactly once,
+nothing else. A gate set that is merely *not failing* is not a preflight. The
+same requirement is why `evaluate_release` emits every gate on every platform --
+on Linux the sandbox gates are FAIL rather than absent.
+
+**The authorization carries what was checked.** A cleared preflight says
+something about one concrete configuration: this launcher, this catalog, this
+workspace, this isolated home, these sandbox roots, this profile. An
+authorization that did not carry those could be paired with a different
+configuration afterwards, and the green preflight would be about something other
+than what runs.
+
+What this is not: `ReleaseAuthorization` is not unforgeable. Module privacy in
+Python is a convention, not a security boundary, and an in-process caller that
+sets out to build one can. The property being bought is fail-closed behaviour
+against miswiring and accidental bypass -- a configuration that was never
+checked, or that drifted after it was, does not run.
 """
 
 from dataclasses import dataclass
@@ -43,6 +63,83 @@ class Gate:
 # turn it would be blocking.
 ADVISORY_GATES = frozenset({"AUTH_REMOTE_VALIDITY"})
 
+# The shape a preflight must have before its contents are worth reading. Every
+# name appears exactly once, nothing else appears at all, and this is checked
+# first -- an empty tuple and a single invented gate both used to satisfy the
+# contents check, because `all(...)` over nothing is true.
+REQUIRED_GATES = (
+    "MODEL_CATALOG",
+    "CATALOG_DIGEST",
+    "CODEX_VERSION",
+    "CHATGPT_SESSION",
+    "TOOL_SURFACE",
+    "OUTER_READ_SANDBOX",
+    "NETWORK_EGRESS",
+    "AUTH_HOME_ISOLATION",
+    "AUTH_REMOTE_VALIDITY",
+)
+
+# Every advisory gate must also be a required gate, or the exemption would name
+# something the status is not obliged to contain.
+assert ADVISORY_GATES <= frozenset(REQUIRED_GATES)
+
+
+@dataclass(frozen=True)
+class RunBinding:
+    """The security-relevant identity of the configuration a preflight cleared.
+
+    Plain strings rather than `Path` objects, and every path already resolved:
+    equality then means "the same real location", not "a path that happens to
+    spell the same way". `/tmp` and `/private/tmp` are the standing example of
+    why that distinction is not academic.
+
+    What belongs here is anything that changes what the run may reach. Not the
+    reasoning effort, which changes what the model does rather than what it can
+    touch; but the exec budget does belong, because "at most one attempt" is a
+    property of the release and not of the caller's intentions.
+    """
+
+    model: str
+    catalog_digest: str
+    catalog_path: str
+    launcher_kind: str
+    launcher_path: str
+    supported_cli_version: str
+    workspace: str
+    codex_home: str
+    home: str
+    tmpdir: str
+    scratch: str
+    sandbox_vendor: str
+    sandbox_workspace: str
+    sandbox_codex_home: str
+    sandbox_auth_file: str
+    forbidden_roots: tuple[str, ...]
+    run_preflight: bool
+    max_exec_starts: int
+    profile_sha256: str
+
+    def differences(self, other: "RunBinding") -> tuple[str, ...]:
+        """Which fields disagree, so a refusal can say what drifted."""
+        return tuple(
+            name
+            for name in self.__dataclass_fields__
+            if getattr(self, name) != getattr(other, name)
+        )
+
+
+@dataclass(frozen=True)
+class ReleasePermit:
+    """What a process invocation against a real Codex build has to be handed.
+
+    The client is the offline engine and stays usable with a fake launcher and
+    no permit at all. What it will not do is start a *real* build without one,
+    so a configuration that never went through a preflight cannot reach `exec`
+    by being constructed directly.
+    """
+
+    binding: RunBinding
+
 
 @dataclass(frozen=True)
 class PreflightStatus:
@@ -70,12 +167,19 @@ class PreflightStatus:
 
 
 class ReleaseRefused(Exception):
-    """A real run was requested without a clear preflight."""
+    """A real run was requested without a clear preflight.
 
-    def __init__(self, blocking: tuple[Gate, ...]) -> None:
+    Carries both halves of the answer: which required gates did not pass, and
+    what was wrong with the shape of the status itself. A status that is the
+    wrong shape is refused before its contents are read, so the two are
+    reported separately rather than folded into one list.
+    """
+
+    def __init__(self, blocking: tuple[Gate, ...], problems: tuple[str, ...] = ()) -> None:
         self.blocking = blocking
-        names = ", ".join(gate.name for gate in blocking) or "unknown"
-        super().__init__(f"release refused: {names}")
+        self.problems = problems
+        detail = ", ".join([*problems, *(gate.name for gate in blocking)]) or "unknown"
+        super().__init__(f"release refused: {detail}")
 
 
 _PERMIT = object()
@@ -83,41 +187,66 @@ _PERMIT = object()
 
 @dataclass(frozen=True)
 class ReleaseAuthorization:
-    """Evidence that every blocking gate passed, and the only way to hold it.
+    """A cleared preflight together with the configuration it cleared.
 
-    Deliberately not a boolean and not a mode. `RunMode` was removed for
-    exactly that reason: a flag the caller sets is a promise, not a check. This
-    can only come from `authorize`, which produces one solely from a status
-    where nothing is blocking, and the real runner requires an instance rather
-    than a claim.
+    Not a boolean and not a mode. `RunMode` was removed because a flag the
+    caller sets is a promise rather than a check, and a second boolean would
+    have been the same mistake under a new name. This comes from `authorize`,
+    which makes one only from a status of the required shape where nothing
+    blocking failed, and it carries a `RunBinding` so the configuration that
+    runs can be compared against the configuration that was checked.
+
+    It is *not* unforgeable. `_PERMIT` is module-private by convention, and
+    convention is not a security boundary in Python. What this buys is
+    fail-closed behaviour against miswiring: a run that was never cleared, or
+    whose configuration drifted after it was, does not start.
     """
 
     status: PreflightStatus
+    binding: RunBinding
     _permit: object
 
     def __post_init__(self) -> None:
         if self._permit is not _PERMIT:
             raise ValueError("a ReleaseAuthorization may only come from authorize()")
 
-
-def authorize(status: PreflightStatus) -> ReleaseAuthorization:
-    """Turn a clear preflight into an authorization, or refuse."""
-    if not status.may_run:
-        raise ReleaseRefused(status.blocking)
-    return ReleaseAuthorization(status=status, _permit=_PERMIT)
+    def permit(self) -> ReleasePermit:
+        """The token a client needs before it may start a real build."""
+        return ReleasePermit(binding=self.binding)
 
 
-GATE_NAMES = (
-    "MODEL_CATALOG",
-    "CATALOG_DIGEST",
-    "CODEX_VERSION",
-    "CHATGPT_SESSION",
-    "TOOL_SURFACE",
-    "OUTER_READ_SANDBOX",
-    "NETWORK_EGRESS",
-    "AUTH_HOME_ISOLATION",
-    "AUTH_REMOTE_VALIDITY",
-)
+def shape_problems(status: PreflightStatus) -> tuple[str, ...]:
+    """What is wrong with the *set* of gates, before any state is considered.
+
+    Three separate ways a status can fail to be a preflight at all: a required
+    gate is missing, a required gate appears more than once, or a gate nobody
+    asked for is present. Each is reported by name, because "release refused"
+    with no reason is how a caller ends up removing the check.
+    """
+    seen = [gate.name for gate in status.gates]
+    problems: list[str] = []
+    for name in REQUIRED_GATES:
+        count = seen.count(name)
+        if count == 0:
+            problems.append(f"missing gate {name}")
+        elif count > 1:
+            problems.append(f"duplicate gate {name}")
+    for name in sorted(set(seen) - set(REQUIRED_GATES)):
+        problems.append(f"unexpected gate {name}")
+    return tuple(problems)
+
+
+def authorize(status: PreflightStatus, binding: RunBinding) -> ReleaseAuthorization:
+    """Turn a clear preflight over the required gate set into an authorization."""
+    problems = shape_problems(status)
+    if problems or not status.may_run:
+        raise ReleaseRefused(status.blocking, problems)
+    return ReleaseAuthorization(status=status, binding=binding, _permit=_PERMIT)
+
+
+# Kept as the published name for the gate set; `REQUIRED_GATES` is what
+# `authorize` enforces, and they are deliberately the same tuple.
+GATE_NAMES = REQUIRED_GATES
 
 
 def evaluate_release(
@@ -220,21 +349,30 @@ def _session_gate(chatgpt_session: bool | None) -> list[Gate]:
     ]
 
 
+def _unmeasurable(reason: str) -> list[Gate]:
+    """Both sandbox gates, failed for the same reason.
+
+    Always *both*. An absent gate is not a safe absence: `authorize` requires
+    the full gate set, and a status that silently drops one on a platform where
+    it cannot be measured would be refused for the wrong reason -- or, before
+    the shape check existed, accepted for no reason at all. This is also what
+    made the Linux CI run disagree with the macOS one.
+    """
+    return [
+        Gate("OUTER_READ_SANDBOX", GateState.FAIL, reason),
+        Gate("NETWORK_EGRESS", GateState.FAIL, reason),
+    ]
+
+
 def _sandbox_gate(roots: sandbox.SandboxRoots | None, probe_outside: Path | None) -> list[Gate]:
     if not sandbox.macos():
         # Linux would need bwrap or landlock, which is not implemented. Refusing
         # is the only honest answer; there is no degraded mode here.
-        return [Gate("OUTER_READ_SANDBOX", GateState.FAIL, "only implemented for macOS")]
+        return _unmeasurable("only implemented for macOS")
     if not sandbox.available():
-        return [
-            Gate("OUTER_READ_SANDBOX", GateState.FAIL, "sandbox-exec or profile missing"),
-            Gate("NETWORK_EGRESS", GateState.FAIL, "no outer sandbox to measure"),
-        ]
+        return _unmeasurable("sandbox-exec or profile missing")
     if roots is None or probe_outside is None:
-        return [
-            Gate("OUTER_READ_SANDBOX", GateState.FAIL, "no outer sandbox configured"),
-            Gate("NETWORK_EGRESS", GateState.FAIL, "no outer sandbox to measure"),
-        ]
+        return _unmeasurable("no outer sandbox configured")
 
     profile = sandbox.write_profile(probe_outside)
     try:
@@ -336,11 +474,15 @@ def _remote_validity_gate() -> list[Gate]:
 __all__ = [
     "ADVISORY_GATES",
     "GATE_NAMES",
+    "REQUIRED_GATES",
     "Gate",
     "GateState",
     "PreflightStatus",
     "ReleaseAuthorization",
+    "ReleasePermit",
     "ReleaseRefused",
+    "RunBinding",
     "authorize",
     "evaluate_release",
+    "shape_problems",
 ]

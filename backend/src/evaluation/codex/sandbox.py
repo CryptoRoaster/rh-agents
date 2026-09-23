@@ -26,6 +26,7 @@ run without it.
 """
 
 import contextlib
+import hashlib
 import os
 import platform
 import socket
@@ -109,15 +110,46 @@ def compose_profile() -> str:
     )
 
 
+@dataclass(frozen=True)
+class WrittenProfile:
+    """A profile on disk together with the digest of what was written.
+
+    The digest is the point. Between a preflight that measures a profile and an
+    exec that loads one, the bytes could differ -- a different temporary file, a
+    re-composition from source files that changed in between, an edit in place.
+    Carrying the digest lets the exec path establish that it is loading the
+    policy that was measured, rather than a policy assembled from the same two
+    file names.
+    """
+
+    path: Path
+    digest: str
+
+    def still_matches(self) -> bool:
+        """Re-read the file and compare. False means it changed or vanished."""
+        try:
+            return hashlib.sha256(self.path.read_bytes()).hexdigest() == self.digest
+        except OSError:
+            return False
+
+
 def write_profile(directory: Path) -> Path:
     """Materialise the composed profile so sandbox-exec can load it."""
+    return write_bound_profile(directory).path
+
+
+def write_bound_profile(directory: Path) -> WrittenProfile:
+    """Materialise the composed profile and keep the digest of its bytes."""
+    payload = compose_profile().encode("utf-8")
     handle, name = tempfile.mkstemp(dir=directory, prefix="read-isolation-", suffix=".sb")
     try:
-        os.write(handle, compose_profile().encode("utf-8"))
+        written = 0
+        while written < len(payload):
+            written += os.write(handle, payload[written:])
         os.fsync(handle)
     finally:
         os.close(handle)
-    return Path(name)
+    return WrittenProfile(path=Path(name), digest=hashlib.sha256(payload).hexdigest())
 
 
 def wrap(command: list[str], profile: Path, roots: SandboxRoots) -> list[str]:
@@ -288,6 +320,7 @@ __all__ = [
     "PROFILE_DIR",
     "SANDBOX_EXEC",
     "ProbeResult",
+    "WrittenProfile",
     "SandboxRoots",
     "available",
     "codex_vendor_root",
@@ -297,5 +330,6 @@ __all__ = [
     "LoopbackTarget",
     "probe_boundaries",
     "wrap",
+    "write_bound_profile",
     "write_profile",
 ]

@@ -99,17 +99,31 @@ class DomainValidationError(Exception):
 
 
 class LauncherKind(StrEnum):
-    """How the CLI is started, because the two forms need different environments.
+    """How the CLI is started, because the forms need different environments.
 
     `PLATFORM_BINARY` is the self-contained executable and needs no interpreter
     on PATH. `NODE_SHIM` is the `codex.js` entry point with a `#!/usr/bin/env
     node` line, so it cannot start unless the directory holding `node` is on the
     PATH handed to the child. The command builder checks that rather than
     quietly inheriting the parent environment.
+
+    `FAKE_EXECUTABLE` is the third form and the reason the distinction is in the
+    type rather than in a comment: the two real forms may not be started without
+    a release permit, and the fake form needs no permit because it is not Codex.
+    A caller could of course declare the real binary as a fake -- that is
+    lying to the harness rather than bypassing it, and `validate_launcher`
+    still refuses a Mach-O file under this kind, so the accident is closed even
+    though the deliberate misuse is not something a Python type can prevent.
     """
 
     PLATFORM_BINARY = "PLATFORM_BINARY"
     NODE_SHIM = "NODE_SHIM"
+    FAKE_EXECUTABLE = "FAKE_EXECUTABLE"
+
+    @property
+    def is_real_codex(self) -> bool:
+        """Whether starting this needs a release permit."""
+        return self is not LauncherKind.FAKE_EXECUTABLE
 
 
 class OutputLimits(Immutable):

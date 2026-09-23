@@ -61,6 +61,7 @@ from src.evaluation.codex.models import (
 )
 from src.evaluation.codex.preflight import check_chatgpt_login, check_cli_version
 from src.evaluation.codex.process import AbortedByConsumer, ProcessError, run_bounded
+from src.evaluation.codex.release import ReleasePermit, RunBinding
 from src.evaluation.codex.schema import strict_schema
 from src.evaluation.codex.stream import EventAccumulator, StreamError
 
@@ -94,6 +95,12 @@ class CodexClientConfig:
     # `OUTER_READ_SANDBOX` when it is absent, and that gate has no degraded
     # mode.
     outer_sandbox: sandbox.SandboxRoots | None = None
+    # A profile that already exists, with the digest of the bytes it was created
+    # from. When set, the client loads *this* policy and re-checks the bytes
+    # rather than composing a fresh one from the two source files: between a
+    # preflight that measured a profile and an exec that loads one, "the same
+    # two file names" is not "the same policy".
+    outer_profile: sandbox.WrittenProfile | None = None
     preflight_budget_seconds: float = PREFLIGHT_BUDGET_SECONDS
     version_budget_seconds: float = VERSION_BUDGET_SECONDS
 
@@ -116,13 +123,56 @@ class OuterSandboxMissing(Exception):
     """Raised when the outer profile is configured but not on disk."""
 
 
+def binding_for(config: CodexClientConfig, profile_sha256: str) -> RunBinding:
+    """Reduce a configuration to the identity a release is granted for.
+
+    Every path is resolved, because the question is which real location the run
+    may reach, not how the caller spelled it. Widening a root, swapping the
+    isolated home, pointing at a different launcher or a different pinned
+    catalog all change one of these fields, and the comparison in
+    `_permit_problem` then refuses before any process starts.
+    """
+    sandbox_roots = config.outer_sandbox
+    parameters = sandbox_roots.parameters() if sandbox_roots is not None else {}
+    return RunBinding(
+        model=config.model,
+        catalog_digest=config.expected_catalog_sha256,
+        catalog_path=str(config.model_catalog_path.resolve()),
+        launcher_kind=str(config.launcher.kind),
+        launcher_path=str(config.launcher.executable.resolve()),
+        supported_cli_version=SUPPORTED_CLI_VERSION,
+        workspace=str(config.workspace.resolve()),
+        codex_home=str(config.codex_home.resolve()),
+        home=str(config.home.resolve()),
+        tmpdir=str(config.tmpdir.resolve()),
+        scratch=str(config.scratch.resolve()),
+        sandbox_vendor=parameters.get("CODEX_VENDOR", ""),
+        sandbox_workspace=parameters.get("WORKSPACE", ""),
+        sandbox_codex_home=parameters.get("CODEX_HOME", ""),
+        sandbox_auth_file=parameters.get("AUTH_FILE", ""),
+        forbidden_roots=tuple(sorted(str(root.resolve()) for root in config.forbidden_roots)),
+        run_preflight=config.run_preflight,
+        max_exec_starts=config.process_limits.max_exec_starts,
+        profile_sha256=profile_sha256,
+    )
+
+
 @dataclass
 class CodexEvaluationClient:
-    """Runs at most one attempt. A second call is refused, not retried."""
+    """Runs at most one attempt. A second call is refused, not retried.
+
+    Usable without a permit, with a `FAKE_EXECUTABLE` launcher: that is the
+    offline engine every test in this suite drives. What it will not do without
+    one is start a real Codex build -- see `_permit_problem`.
+    """
 
     config: CodexClientConfig
+    # Held by a `ReleaseAuthorization`, which only a cleared preflight produces.
+    # Absent is the normal case; it is required only for a real build.
+    permit: ReleasePermit | None = None
     exec_starts: int = field(default=0, init=False)
     _profile: Path | None = field(default=None, init=False)
+    _owns_profile: bool = field(default=False, init=False)
     version_starts: int = field(default=0, init=False)
     preflight_starts: int = field(default=0, init=False)
 
@@ -143,6 +193,12 @@ class CodexEvaluationClient:
     async def _attempt[Output: BaseModel](
         self, request: EvaluationRequest[Output], deadline: Deadline
     ) -> EvaluationOutcome[Output]:
+        problem = self._permit_problem()
+        if problem is not None:
+            # Before the effort check, before the budget check, before any
+            # process: nothing about a real build may start on the strength of
+            # a configuration that was never cleared.
+            return self._reject(EvaluationFailure.LAUNCHER_UNSUPPORTED, problem, deadline)
         if self.config.effort is not None and self.config.effort not in SUPPORTED_EFFORTS:
             # Never remapped onto a neighbouring value: a silently downgraded
             # effort would make the recorded configuration a lie.
@@ -196,20 +252,35 @@ class CodexEvaluationClient:
         # so no phase of the path that may be released ever starts Codex
         # unsandboxed.
         if self.config.outer_sandbox is not None:
-            try:
-                self._profile = sandbox.write_profile(self.config.scratch)
-            except OSError as error:
-                return self._reject(
-                    EvaluationFailure.PROCESS_START_FAILED,
-                    type(error).__name__.upper(),
-                    deadline,
-                )
+            bound = self.config.outer_profile
+            if bound is not None:
+                # Prepared elsewhere and already measured. Loading it is only
+                # sound if it is still the policy that was measured.
+                if not bound.still_matches():
+                    return self._reject(
+                        EvaluationFailure.PROCESS_START_FAILED, "PROFILE_DIGEST_MISMATCH", deadline
+                    )
+                self._profile = bound.path
+                self._owns_profile = False
+            else:
+                try:
+                    self._profile = sandbox.write_profile(self.config.scratch)
+                    self._owns_profile = True
+                except OSError as error:
+                    return self._reject(
+                        EvaluationFailure.PROCESS_START_FAILED,
+                        type(error).__name__.upper(),
+                        deadline,
+                    )
         try:
             return await self._attempt_sandboxed(request, deadline, catalog, environment, schema)
         finally:
-            if self._profile is not None:
+            # A profile handed in belongs to whoever prepared it and outlives
+            # this attempt; one written here does not.
+            if self._profile is not None and self._owns_profile:
                 self._profile.unlink(missing_ok=True)
-                self._profile = None
+            self._profile = None
+            self._owns_profile = False
 
     async def _attempt_sandboxed[Output: BaseModel](
         self,
@@ -393,6 +464,29 @@ class CodexEvaluationClient:
             return self._reject(
                 EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, verdict.reason, deadline
             )
+        return None
+
+    def _permit_problem(self) -> str | None:
+        """Why this client may not start the launcher it was given, if it may not.
+
+        A real Codex build is reachable only with a permit, and the permit has
+        to describe *this* configuration -- otherwise a cleared preflight for
+        one run would authorise a different one. A fake launcher needs neither,
+        because starting it is not starting Codex.
+        """
+        if not self.config.launcher.kind.is_real_codex:
+            return None
+        if self.permit is None:
+            return "RELEASE_PERMIT_REQUIRED"
+        if self.config.outer_profile is None:
+            # The binding names a profile digest, so there has to be a bound
+            # profile to compare it against.
+            return "PERMIT_WITHOUT_BOUND_PROFILE"
+        expected = self.permit.binding
+        actual = binding_for(self.config, self.config.outer_profile.digest)
+        drifted = expected.differences(actual)
+        if drifted:
+            return f"PERMIT_MISMATCH_{drifted[0].upper()}"
         return None
 
     def _sandboxed(self, arguments: list[str]) -> list[str]:

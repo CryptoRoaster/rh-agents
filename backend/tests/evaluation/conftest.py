@@ -135,8 +135,14 @@ class Probe:
         (self.workspace / "scenario.json").write_text(json.dumps(payload), encoding="utf-8")
 
     def launcher(self) -> CodexLauncher:
+        """A fake, and declared as one.
+
+        The kind is what decides whether a release permit is required, so the
+        fixture says what it is rather than borrowing the real form's name.
+        Every test here drives this shim; nothing in this suite starts Codex.
+        """
         return CodexLauncher(
-            kind=LauncherKind.PLATFORM_BINARY,
+            kind=LauncherKind.FAKE_EXECUTABLE,
             executable=self.launcher_path,
             path_entries=CHILD_PATH_ENTRIES,
         )

@@ -172,18 +172,49 @@ def child_environment(
     }
 
 
+# The first bytes of a Mach-O executable, in the four forms macOS produces.
+# A fake launcher is a script; a real Codex build is one of these.
+MACH_O_MAGIC = (
+    b"\xcf\xfa\xed\xfe",  # 64-bit, little endian
+    b"\xce\xfa\xed\xfe",  # 32-bit, little endian
+    b"\xca\xfe\xba\xbe",  # universal (fat)
+    b"\xbe\xba\xfe\xca",  # universal, byte-swapped
+)
+
+
+def looks_like_a_native_binary(path: Path) -> bool:
+    """Whether the file on disk is a compiled executable rather than a script."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(4) in MACH_O_MAGIC
+    except OSError:
+        return False
+
+
 def validate_launcher(launcher: CodexLauncher) -> None:
     """Refuse a launcher the minimal environment could not actually start.
 
     The npm entry point is a `#!/usr/bin/env node` script that re-spawns the
     platform binary, so it cannot run unless `node` is reachable on the PATH the
     child is given. The self-contained platform binary needs no interpreter.
+
+    `FAKE_EXECUTABLE` additionally has to *be* a fake. The kind decides whether
+    a release permit is required, so a compiled binary declared as a fake would
+    turn the permit requirement into an opt-out. This does not stop a caller who
+    sets out to defeat it -- a wrapper script around the real binary would pass
+    -- and it is not meant to. It stops the accident.
     """
     if launcher.kind is LauncherKind.NODE_SHIM:
         if not any((entry / "node").exists() for entry in launcher.path_entries):
             raise CommandBuildError(
                 EvaluationFailure.LAUNCHER_UNSUPPORTED, "NODE_NOT_ON_CHILD_PATH"
             )
+    if launcher.kind is LauncherKind.FAKE_EXECUTABLE and looks_like_a_native_binary(
+        launcher.executable
+    ):
+        raise CommandBuildError(
+            EvaluationFailure.LAUNCHER_UNSUPPORTED, "NATIVE_BINARY_DECLARED_AS_FAKE"
+        )
 
 
 def build_arguments(
@@ -214,10 +245,11 @@ def build_arguments(
     if model_catalog_reference.startswith(FD_REFERENCE_PREFIX):
         # A descriptor reference only survives if the launcher hands the
         # descriptor on unchanged. The platform binary is exec'd by our own gate
-        # and does; the npm entry point re-spawns through Node, and that Node
-        # process passing a foreign descriptor through its own spawn has not
-        # been demonstrated. Refusing is the fail-closed answer.
-        if launcher.kind is not LauncherKind.PLATFORM_BINARY:
+        # and does, and so does a fake that execs an interpreter; the npm entry
+        # point re-spawns through Node, and that Node process passing a foreign
+        # descriptor through its own spawn has not been demonstrated. Refusing
+        # the shim is the fail-closed answer.
+        if launcher.kind is LauncherKind.NODE_SHIM:
             raise CommandBuildError(
                 EvaluationFailure.LAUNCHER_UNSUPPORTED, "FD_CATALOG_NEEDS_PLATFORM_BINARY"
             )
