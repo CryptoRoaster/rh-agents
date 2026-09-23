@@ -348,6 +348,47 @@ the binary — shows what that means for the shipped entries:
 Code mode is a local code-execution surface. A model that can run code can read
 files, and no flag in `command.py` removes it from a `code_mode_only` model.
 
+### Is `code_mode_only` a choice or a requirement?
+
+`gpt-5.6-sol` is refused because its catalog entry declares
+`tool_mode = "code_mode_only"`. Whether a reviewed static snapshot could
+legitimately say `null` instead turns on what that field *is*. Five things in
+0.153.4 answer that, and none of them was established by removing the field and
+seeing what happened.
+
+1. **The code calls it a selector, and `Direct` is one of its values.** The type
+   is `Option<ToolMode>`, and `code_mode_warning_tests.rs` has a case named
+   `does_not_warn_when_model_has_tool_mode_selector` that iterates
+   `[Direct, CodeMode, CodeModeOnly]` as metadata a model may carry. The field
+   expresses which surface to build, and "direct" is among the answers.
+2. **It never reaches the server.** `tool_mode` appears nowhere in
+   `ResponsesApiRequest`. There is no capability negotiation and no server-side
+   validation that could reject a turn for running the model without code mode.
+3. **This model's instructions do not assume code mode.** Its
+   `base_instructions` are 17 730 characters and mention code mode, JavaScript,
+   Node and REPL exactly zero times, while mentioning `apply_patch` three times
+   and `shell` four — the direct surface.
+4. **There is no code-mode variant of the instructions.** `model_messages`
+   carries one `instructions_template`, used either way.
+5. **Nothing errors or warns in this direction.**
+   `unsupported_code_mode_warning` fires only when code mode is enabled *by
+   feature* while `model_info.tool_mode.is_none()`. With a catalog saying `null`
+   and every code-mode feature disabled, the condition is false.
+
+So the answer is **(A), a catalog-chosen tool configuration** — not a capability
+the model or the request requires.
+
+Two caveats belong with that answer. Codex's only statement about a mismatch
+between features and model metadata is "**This may degrade model performance**",
+and that is for the mirror case; the symmetric claim is plausible but not
+demonstrated. And "code_mode_only model, direct surface" is an *unexercised*
+path in 0.153.4 rather than a proven-good one. Overriding vendor metadata is a
+quality and support question even where it is not a correctness one — though for
+a single structured classification with no tools at all, agentic coding
+performance is not what this harness is asking the model for.
+
+This settles what the field is. It does not select a model.
+
 ### Judging the catalog the turn actually uses
 
 Reading the *bundled* dump would not have been enough, and that was a real hole.

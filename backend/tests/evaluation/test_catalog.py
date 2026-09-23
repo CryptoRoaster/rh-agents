@@ -272,3 +272,22 @@ def test_a_catalog_past_the_size_bound_is_refused(tmp_path: Path) -> None:
     opened = snapshot_catalog(path, tmp_path)
     assert opened is not None
     opened.close()
+
+
+def test_a_descriptor_that_cannot_be_made_inheritable_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rare, but it gets the same treatment as every other failure here.
+
+    Without the flag the child would never receive the descriptor, and letting
+    the error escape would leave the descriptor and the temporary name behind.
+    """
+    path = tmp_path / "catalog.json"
+    path.write_text(catalog(REAL_LEGACY_ENTRY), encoding="utf-8")
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise OSError("set_inheritable refused")
+
+    monkeypatch.setattr(catalog_module.os, "set_inheritable", refuse)
+    assert snapshot_catalog(path, tmp_path) is None
+    assert not list(tmp_path.glob("catalog-*.json"))

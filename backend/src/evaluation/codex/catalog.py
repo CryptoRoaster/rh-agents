@@ -183,7 +183,16 @@ def snapshot_catalog(path: Path, snapshot_dir: Path) -> CatalogSnapshot | None:
     except OSError:
         _cleanup_unlink(temporary)
         return None
-    os.set_inheritable(fd, True)
+
+    try:
+        # Rare, but it has its own failure mode: without the flag the child
+        # would never receive the descriptor, and letting the error escape
+        # would leave both the descriptor and the temporary name behind.
+        os.set_inheritable(fd, True)
+    except OSError:
+        _close(fd)
+        _cleanup_unlink(temporary)
+        return None
 
     try:
         # Required, not best effort. A snapshot still reachable by name is not
