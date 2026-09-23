@@ -560,19 +560,23 @@ the real filesystem and `/tmp` would never match `/private/tmp`.
 
 ### What is writable, and what is reachable
 
-**`WRITEABLE_PATHS`** is not "none". It is exactly one file:
+**`WRITEABLE_PATHS`** is not "none". It is exactly two files, both named
+`literal`:
 
 ```
 (allow file-write-data file-write-flags file-write-times
   (literal (param "AUTH_FILE")))
+(allow file-write-data file-write-flags file-write-times file-write-mode
+  (literal (param "INSTALLATION_ID_FILE")))
 ```
 
 Codex 0.153.4 persists a refreshed ChatGPT token through
 `FileAuthStorage::save`, which truncates and rewrites `CODEX_HOME/auth.json`;
-without this a refresh inside the sandbox would fail. The grant is contents
-only — the **directory stays unwritable**, so no second file can appear beside
-it, and that is measured rather than assumed. The user's own `CODEX_HOME` is not
-named in the profile at all.
+and its app-server startup opens `CODEX_HOME/installation_id` read-write — see
+the section on the second writable file for how that rule was measured. The
+grants are contents only: the **directory stays unwritable**, so no third file
+can appear beside them, and that is measured rather than assumed. The user's own
+`CODEX_HOME` is not named in the profile at all.
 
 **`RUNTIME_DEVICE_WRITES`** are the platform section's device nodes
 (`/dev/null`, `/dev/dtracehelper`, the process's own tty) plus the `TMPDIR`
@@ -624,7 +628,7 @@ the turn it was blocking. They are now separate.
 
 | gate | question | how it is answered |
 |---|---|---|
-| `AUTH_HOME_ISOLATION` | is the home isolated? | checked here and now: `0700` directory, exactly one entry, `0600` mode, source home unchanged, and the outer profile confines reads to this home |
+| `AUTH_HOME_ISOLATION` | is the home isolated? | checked here and now: `0700` directory holding exactly `auth.json` (`0600`) and `installation_id` (`0644`), source home unchanged, and the outer profile confines reads to this home |
 | `CHATGPT_SESSION` | does *this* copy carry a ChatGPT session? | `codex login status` really runs — in this home, behind the same profile, with the credential store pinned to `file`. Not a guess, and not a model request |
 | `AUTH_REMOTE_VALIDITY` | will the provider accept the token? | unknowable without a request. **Advisory**: it is `UNVERIFIED` and never blocks, because blocking on it would be circular |
 
@@ -829,6 +833,97 @@ When `exit_code != 0` **and** no `turn.started` was seen, the result is now
 `PROCESS_FAILED` with `EXIT_<n>_BEFORE_TURN` and a diagnostic. The branch is
 narrow on purpose: once a turn has started, the existing event semantics decide
 exactly as before, and a clean exit with no turn is still `TURN_NEVER_STARTED`.
+
+## The second writable file, and why it exists
+
+The second authorised real probe failed with:
+
+```
+Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)
+```
+
+`codex exec` starts an in-process app-server client, whose `start_uninitialized`
+calls `resolve_installation_id` (`core/src/installation_id.rs` — the path is in
+the shipped 0.153.4 binary). That opens `CODEX_HOME/installation_id`
+read+write+create, locks it, repairs its mode to `0644`, reads it, and rewrites
+it when the content is not a usable UUID. A home holding only `auth.json`
+cannot satisfy that, and the harness built exactly such a home.
+
+**The file is pre-seeded, not left for Codex to create.** Letting the CLI create
+it would mean granting write on the *directory*, and a writable directory means
+arbitrary sidecar files, an unknown file set, and an `AUTH_HOME_ISOLATION` gate
+with nothing left to check. Seeding keeps the directory unwritable and the
+contents known in advance. An existing `installation_id` in the user's own
+`CODEX_HOME` is copied so a probe run does not look like a fresh installation;
+when there is none, a UUID is generated **in the copy only** — the user's home is
+never written to. The value is not a credential, but it is a persistent
+identifier, and it is never read into the process as a value, logged or
+reported.
+
+### The rule was measured, not copied
+
+The obvious move — reuse the auth file's `file-write-data file-write-flags
+file-write-times` — is wrong, and a `/bin/sh` probe under the real profile shows
+why:
+
+| grant on the literal | open R/W | chmod 644 | truncate+write | unlink | file beside |
+|---|---|---|---|---|---|
+| *(none)* | DENIED | DENIED | DENIED | DENIED | DENIED |
+| `file-write-mode` | DENIED | OK | DENIED | DENIED | DENIED |
+| `data/flags/times` | OK | **DENIED** | OK | DENIED | DENIED |
+| **`data/flags/times/mode`** | **OK** | **OK** | **OK** | **DENIED** | **DENIED** |
+| `file-write*` | OK | OK | OK | **OK** | DENIED |
+
+`file-write-mode` is needed because the CLI repairs the mode; seeding at `0644`
+makes that a no-op rather than a dependency. And `file-write*` — which the review
+was willing to accept — is measurably *worse*: it also permits **unlinking** the
+file. So the granted set is `file-write-data file-write-flags file-write-times
+file-write-mode` on `(literal (param "INSTALLATION_ID_FILE"))`. Never
+`(subpath (param "CODEX_HOME"))`, and a test asserts that every harness write
+grant is a literal.
+
+The isolated home's expected shape is now `0700` holding exactly `auth.json`
+(`0600`) and `installation_id` (`0644`). A third entry, a missing entry or a
+wrong mode is an `AUTH_HOME_ISOLATION` failure. The path is bound in
+`SandboxRoots.parameters()` as `INSTALLATION_ID_FILE` and in the `RunBinding` as
+`sandbox_installation_id_file`, so swapping it after the preflight is refused
+before any process starts.
+
+### What this does and does not establish
+
+Establishing that Codex now gets *past* this point would take another real turn,
+which this work deliberately did not do. What is established offline is that the
+policy denied every operation `resolve_installation_id` performs, and now permits
+exactly those and no more.
+
+### Other CODEX_HOME writes on this path
+
+Nothing else was granted, because nothing else is demonstrated. The process died
+at the app-server client init, so everything downstream of it is unobserved:
+
+| target | status |
+|---|---|
+| `installation_id` | **REQUIRED_ON_OUR_PATH** — reached, denied, now permitted |
+| `sessions/`, `history.jsonl`, `archived_sessions/` | DISABLED by `--ephemeral` ("run without persisting session files to disk") |
+| `config.toml` | NOT REACHED for writing; `--ignore-user-config` and read-only anyway |
+| plugins, skills, memories | DISABLED via the feature and `orchestrator.*` overrides |
+| `codex.sqlite` / `codex.db` (state and log stores) | **UNKNOWN** — the names are in the binary, and whether the startup opens them after `installation_id` was never observed. Config keys `sqlite_home` and `log_dir` exist should it turn out they are needed |
+| PATH alias state | NON-FATAL — see below |
+
+This is the honest answer rather than a comfortable one: the sqlite store is the
+most likely next blocker, and no amount of offline work rules it out. Granting
+it pre-emptively would be the "for all cases" opening this policy exists to
+avoid.
+
+### The PATH-aliases warning
+
+```
+WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted
+```
+
+Appears on both the failed exec run and on `codex debug models --bundled`, which
+exits 0. Its own wording says it proceeds, so it is best-effort and is **not**
+treated as a second blocker. No write grant has been added to silence a warning.
 
 ## Descriptor transport, measured against the real sandbox
 

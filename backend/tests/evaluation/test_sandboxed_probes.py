@@ -156,5 +156,6 @@ def test_the_recorded_shape_matches_what_wrap_produces(probe: Probe) -> None:
         "AUTH_FILE",
         "CODEX_HOME",
         "CODEX_VENDOR",
+        "INSTALLATION_ID_FILE",
         "WORKSPACE",
     ]

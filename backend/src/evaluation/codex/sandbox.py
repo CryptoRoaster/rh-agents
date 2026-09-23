@@ -36,6 +36,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.evaluation.codex.auth_home import AUTH_FILE, INSTALLATION_ID_FILE
+
 SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 PROFILE_DIR = Path(__file__).parent / "profiles"
 PLATFORM_DEFAULTS = PROFILE_DIR / "platform-defaults.sbpl"
@@ -48,10 +50,15 @@ PROBE_TIMEOUT_SECONDS = 20.0
 class SandboxRoots:
     """The paths the harness section of the profile names.
 
-    Three readable roots and one writable file. Not `HOME`, not `/Volumes`, not
-    the repository: each of those is a class of file the attempt has no business
-    seeing. The platform section adds system and loader paths on top -- those
-    are runtime, not user data, and they are listed in the profile itself.
+    Three readable roots and two writable files. Not `HOME`, not `/Volumes`,
+    not the repository: each of those is a class of file the attempt has no
+    business seeing. The platform section adds system and loader paths on top
+    -- those are runtime, not user data, and they are listed in the profile
+    itself.
+
+    The two writable paths are `literal`, never `subpath`. The directory that
+    holds them stays unwritable, which is what keeps the file set closed and
+    `AUTH_HOME_ISOLATION` meaningful.
     """
 
     codex_vendor: Path
@@ -60,16 +67,22 @@ class SandboxRoots:
 
     @property
     def auth_file(self) -> Path:
-        return self.codex_home / "auth.json"
+        return self.codex_home / AUTH_FILE
+
+    @property
+    def installation_id_file(self) -> Path:
+        return self.codex_home / INSTALLATION_ID_FILE
 
     def parameters(self) -> dict[str, str]:
+        # Resolved from the home rather than from the files, which need not
+        # exist yet when the profile is written.
+        home = self.codex_home.resolve()
         return {
             "CODEX_VENDOR": str(self.codex_vendor.resolve()),
             "WORKSPACE": str(self.workspace.resolve()),
-            "CODEX_HOME": str(self.codex_home.resolve()),
-            # Resolved from the home rather than the file, which may not exist
-            # yet when the profile is written.
-            "AUTH_FILE": str(self.codex_home.resolve() / "auth.json"),
+            "CODEX_HOME": str(home),
+            "AUTH_FILE": str(home / AUTH_FILE),
+            "INSTALLATION_ID_FILE": str(home / INSTALLATION_ID_FILE),
         }
 
 
@@ -170,6 +183,8 @@ class ProbeResult:
     sentinel_readable: bool
     auth_readable: bool
     auth_rewritable: bool
+    installation_id_readable: bool
+    installation_id_rewritable: bool
     other_file_creatable: bool
     egress_reachable: bool
 
@@ -179,8 +194,20 @@ class ProbeResult:
 
     @property
     def write_scope_holds(self) -> bool:
-        """One file writable, and no way to put anything beside it."""
-        return self.auth_readable and self.auth_rewritable and not self.other_file_creatable
+        """Exactly the two expected files writable, and nothing beside them.
+
+        `installation_id` is checked the way Codex opens it -- read-write on an
+        existing file -- rather than as a plain overwrite, because that is the
+        operation the app-server startup performs and the one the policy had to
+        be measured against.
+        """
+        return (
+            self.auth_readable
+            and self.auth_rewritable
+            and self.installation_id_readable
+            and self.installation_id_rewritable
+            and not self.other_file_creatable
+        )
 
 
 DENIED_EVERYTHING = ProbeResult(
@@ -189,6 +216,8 @@ DENIED_EVERYTHING = ProbeResult(
     sentinel_readable=True,
     auth_readable=False,
     auth_rewritable=False,
+    installation_id_readable=False,
+    installation_id_rewritable=False,
     other_file_creatable=True,
     egress_reachable=False,
 )
@@ -234,8 +263,13 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
     Sentinels stand in for the repository, HOME and credential classes. Reading
     an actual `.env` to see whether it is blocked would be the wrong experiment
     twice over: it proves one path rather than a class, and it puts a real
-    secret in the way of a test. The auth file used here is a placeholder, never
-    a real credential.
+    secret in the way of a test. Both files used here are placeholders, never a
+    real credential and never the machine's own installation identifier.
+
+    `installation_id` is exercised the way Codex opens it: `exec 3<> file`, a
+    read-write open on an existing file, then a mode repair. A plain overwrite
+    would pass under a policy that the app-server startup still fails on, which
+    is exactly the mistake that produced the second probe's failure.
     """
     workspace = roots.workspace.resolve()
     outside = outside.resolve()
@@ -246,12 +280,16 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
     forbidden.write_text("forbidden\n", encoding="utf-8")
     sentinel.write_text("sentinel\n", encoding="utf-8")
 
-    auth = Path(roots.parameters()["AUTH_FILE"])
+    parameters = roots.parameters()
+    auth = Path(parameters["AUTH_FILE"])
+    marker = Path(parameters["INSTALLATION_ID_FILE"])
     beside = auth.parent / "sandbox-probe-should-not-exist.txt"
-    existed = auth.exists()
-    if not existed:
+    if not auth.exists():
         auth.write_text('{"placeholder": "not a credential"}\n', encoding="utf-8")
         os.chmod(auth, 0o600)
+    if not marker.exists():
+        marker.write_text("00000000-0000-4000-8000-000000000000", encoding="utf-8")
+        os.chmod(marker, 0o644)
 
     target = LoopbackTarget()
     try:
@@ -265,6 +303,7 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
                         ("FORBIDDEN", forbidden),
                         ("SENTINEL", sentinel),
                         ("AUTHREAD", auth),
+                        ("INSTALLREAD", marker),
                     )
                 ),
                 f'if cp "{auth}" "{auth}" 2>/dev/null && : > /dev/null; then :; fi',
@@ -272,8 +311,18 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
                 f' else echo "SIDECAR DENIED"; fi',
                 f"if printf '%s' \"$(cat '{auth}')\" > \"{auth}\" 2>/dev/null;"
                 f' then echo "AUTHWRITE OK"; else echo "AUTHWRITE DENIED"; fi',
+                # Opened read-write and then mode-repaired, which is what
+                # `resolve_installation_id` does. Each check runs in a subshell:
+                # a failed `exec` redirection ends a non-interactive shell
+                # outright, and a denial must read as a denial rather than as
+                # silence.
+                f'if ( exec 3<> "{marker}"; exec 3>&- ) 2>/dev/null &&'
+                f' /bin/chmod 644 "{marker}" 2>/dev/null;'
+                f' then echo "INSTALLRDWR OK"; else echo "INSTALLRDWR DENIED"; fi',
                 f'if : > "{beside}" 2>/dev/null; then echo "BESIDE OK";'
                 f' else echo "BESIDE DENIED"; fi',
+                f'if : > "{marker}.probe" 2>/dev/null; then echo "MARKERSIDECAR OK";'
+                f' else echo "MARKERSIDECAR DENIED"; fi',
                 f"if /usr/bin/nc -w 3 127.0.0.1 {target.port} < /dev/null > /dev/null 2>&1;"
                 f' then echo "EGRESS OK"; else echo "EGRESS DENIED"; fi',
             ]
@@ -294,6 +343,7 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
         target.close()
         beside.unlink(missing_ok=True)
         Path(f"{auth}.probe").unlink(missing_ok=True)
+        Path(f"{marker}.probe").unlink(missing_ok=True)
 
     output = completed.stdout
     return ProbeResult(
@@ -302,7 +352,11 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
         sentinel_readable="SENTINEL OK" in output,
         auth_readable="AUTHREAD OK" in output,
         auth_rewritable="AUTHWRITE OK" in output,
-        other_file_creatable="BESIDE OK" in output or "SIDECAR OK" in output,
+        installation_id_readable="INSTALLREAD OK" in output,
+        installation_id_rewritable="INSTALLRDWR OK" in output,
+        other_file_creatable=any(
+            marker in output for marker in ("BESIDE OK", "SIDECAR OK", "MARKERSIDECAR OK")
+        ),
         egress_reachable="EGRESS OK" in output,
     )
 

@@ -42,7 +42,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.evaluation.codex import sandbox
-from src.evaluation.codex.auth_home import AUTH_MODE, HOME_MODE, IsolatedHome, build_isolated_home
+from src.evaluation.codex.auth_home import (
+    AUTH_FILE,
+    AUTH_MODE,
+    HOME_MODE,
+    INSTALLATION_ID_FILE,
+    INSTALLATION_ID_MODE,
+    IsolatedHome,
+    build_isolated_home,
+)
 from src.evaluation.codex.catalogs import (
     GPT_5_5_CATALOG,
     GPT_5_5_CATALOG_SHA256,
@@ -74,6 +82,9 @@ from src.evaluation.codex.release import (
 
 PROBE_BUDGET_SECONDS = 30.0
 PLACEHOLDER_AUTH = '{"placeholder": "not a credential"}\n'
+# A fixed nil-ish UUID. The machine's own installation identifier is never
+# used for a destructive probe.
+PLACEHOLDER_INSTALLATION_ID = "00000000-0000-4000-8000-000000000000"
 
 
 @dataclass(frozen=True)
@@ -123,9 +134,14 @@ def _build_tree(root: Path) -> _Tree:
 
     probe_home = root / "probe-home"
     probe_home.mkdir(mode=HOME_MODE, parents=False, exist_ok=False)
-    placeholder = probe_home / "auth.json"
+    placeholder = probe_home / AUTH_FILE
     placeholder.write_text(PLACEHOLDER_AUTH, encoding="utf-8")
     os.chmod(placeholder, AUTH_MODE)
+    # The probe home models both writable files, so the measurement is about
+    # the policy the real home runs under rather than about half of it.
+    marker = probe_home / INSTALLATION_ID_FILE
+    marker.write_text(PLACEHOLDER_INSTALLATION_ID, encoding="utf-8")
+    os.chmod(marker, INSTALLATION_ID_MODE)
 
     return _Tree(
         root=root,

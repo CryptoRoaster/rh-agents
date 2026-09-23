@@ -151,6 +151,7 @@ def binding_for(config: CodexClientConfig, profile_sha256: str) -> RunBinding:
         sandbox_workspace=parameters.get("WORKSPACE", ""),
         sandbox_codex_home=parameters.get("CODEX_HOME", ""),
         sandbox_auth_file=parameters.get("AUTH_FILE", ""),
+        sandbox_installation_id_file=parameters.get("INSTALLATION_ID_FILE", ""),
         forbidden_roots=tuple(sorted(str(root.resolve()) for root in config.forbidden_roots)),
         run_preflight=config.run_preflight,
         max_exec_starts=config.process_limits.max_exec_starts,

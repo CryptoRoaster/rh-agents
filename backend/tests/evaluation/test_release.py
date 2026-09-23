@@ -6,7 +6,7 @@ import pytest
 
 from src.evaluation.codex import release as release_module
 from src.evaluation.codex import sandbox
-from src.evaluation.codex.auth_home import IsolatedHome
+from src.evaluation.codex.auth_home import AUTH_FILE, INSTALLATION_ID_FILE, IsolatedHome
 from src.evaluation.codex.catalogs import GPT_5_5_CATALOG, GPT_5_5_CATALOG_SHA256
 from src.evaluation.codex.models import SUPPORTED_CLI_VERSION
 from src.evaluation.codex.release import REQUIRED_GATES, GateState, evaluate_release
@@ -29,11 +29,15 @@ def status_for(tmp_path: Path, **overrides: object):  # type: ignore[no-untyped-
     roots, outside = sandbox_roots(tmp_path)
     home_path = tmp_path / "codex-home"
     home_path.chmod(0o700)
-    auth = home_path / "auth.json"
+    auth = home_path / AUTH_FILE
     if not auth.exists():
         # A placeholder. No real credential appears in any test here.
         auth.write_text('{"placeholder": "not a credential"}\n', encoding="utf-8")
     auth.chmod(0o600)
+    marker = home_path / INSTALLATION_ID_FILE
+    if not marker.exists():
+        marker.write_text("00000000-0000-4000-8000-000000000000", encoding="utf-8")
+    marker.chmod(0o644)
     home = IsolatedHome(path=home_path, auth_present=True)
     settings: dict[str, object] = {
         "catalog_path": GPT_5_5_CATALOG,
@@ -87,6 +91,7 @@ def test_auth_isolation_judges_the_isolation_not_the_token(tmp_path: Path) -> No
 
 
 def test_a_home_with_extra_files_fails_isolation(tmp_path: Path) -> None:
+    """The set is closed at two. A third entry is still an isolation failure."""
     status = status_for(tmp_path)
     assert gate(status, "AUTH_HOME_ISOLATION").state is GateState.PASS  # type: ignore[attr-defined]
     (tmp_path / "codex-home" / "config.toml").write_text("x", encoding="utf-8")
@@ -95,13 +100,35 @@ def test_a_home_with_extra_files_fails_isolation(tmp_path: Path) -> None:
     assert later.may_run is False
 
 
+def test_a_home_without_the_installation_id_fails_isolation(tmp_path: Path) -> None:
+    """The shape the harness built before this was found is now refused.
+
+    `codex exec` requires the file, so a home without it is not a home the
+    attempt could run in -- which is exactly what the second real probe
+    demonstrated at the cost of one authorised turn.
+    """
+    status_for(tmp_path)
+    home = tmp_path / "codex-home"
+    (home / INSTALLATION_ID_FILE).unlink()
+    problem = release_module._isolation_problem(home)
+    assert problem is not None
+    assert "expected exactly" in problem
+
+
 def test_a_loose_mode_fails_isolation(tmp_path: Path) -> None:
     """A world-readable copy of the login state is not isolation."""
     status_for(tmp_path)  # builds the home the way the harness would
     home = tmp_path / "codex-home"
-    (home / "auth.json").chmod(0o644)
-    problem = release_module._isolation_problem(home)
-    assert problem == "auth file is not 0600"
+    (home / AUTH_FILE).chmod(0o644)
+    assert release_module._isolation_problem(home) == "auth.json is not 0600"
+    (home / AUTH_FILE).chmod(0o600)
+
+    # The second file has its own required mode, and it is checked too: 0644 is
+    # what `resolve_installation_id` repairs to, so a different mode means the
+    # CLI would attempt a chmod the policy need not have allowed.
+    (home / INSTALLATION_ID_FILE).chmod(0o600)
+    assert release_module._isolation_problem(home) == "installation_id is not 0644"
+    (home / INSTALLATION_ID_FILE).chmod(0o644)
 
     home.chmod(0o755)
     assert release_module._isolation_problem(home) == "home is not 0700"

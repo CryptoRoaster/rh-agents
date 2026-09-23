@@ -232,6 +232,38 @@ def test_a_wider_sandbox_workspace_root_is_refused(probe: Probe) -> None:
     assert "sandbox_workspace" in refused.value.reason
 
 
+def test_a_drifted_installation_id_path_is_refused(probe: Probe) -> None:
+    """The second writable path is bound exactly like the first.
+
+    It is a path the sandboxed process may write to, so swapping it after the
+    preflight would mean the run writes somewhere the preflight never measured.
+    """
+    _, authorization, profile, _ = bound(probe)
+    other_home = probe.workspace.parent / "swapped-home"
+    other_home.mkdir(exist_ok=True)
+    swapped = sandbox.SandboxRoots(
+        codex_vendor=probe.workspace.parent,
+        workspace=probe.workspace,
+        codex_home=other_home,
+    )
+    with pytest.raises(RealRunRefused) as refused:
+        RealCodexRunner(
+            authorization=authorization,
+            config=probe.config(outer_sandbox=swapped, outer_profile=profile, run_preflight=True),
+        )
+    assert "sandbox_installation_id_file" in refused.value.reason
+
+
+def test_the_binding_names_both_writable_paths(probe: Probe) -> None:
+    config, _, profile, roots = bound(probe)
+    binding = binding_for(config, profile.digest)
+    assert binding.sandbox_auth_file == str(probe.codex_home.resolve() / "auth.json")
+    assert binding.sandbox_installation_id_file == str(
+        probe.codex_home.resolve() / "installation_id"
+    )
+    assert binding.sandbox_auth_file != binding.sandbox_installation_id_file
+
+
 def test_a_different_sandbox_codex_home_and_auth_file_are_refused(probe: Probe) -> None:
     config, authorization, profile, _ = bound(probe)
     other_home = probe.workspace.parent / "other-home"
@@ -248,6 +280,7 @@ def test_a_different_sandbox_codex_home_and_auth_file_are_refused(probe: Probe) 
         )
     assert "sandbox_codex_home" in refused.value.reason
     assert "sandbox_auth_file" in refused.value.reason
+    assert "sandbox_installation_id_file" in refused.value.reason
 
 
 def test_a_different_launcher_is_refused(probe: Probe) -> None:

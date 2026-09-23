@@ -119,6 +119,48 @@ async def test_the_prepared_run_measures_the_environment_it_holds_open() -> None
     assert not root.exists()
 
 
+def source_state(home: Path) -> dict[str, object]:
+    """Existence, size, mode and mtime. Never content.
+
+    `auth.json` is a credential and `installation_id` is a persistent
+    identifier; neither belongs in an assertion message, so the fingerprint is
+    metadata only.
+    """
+    state: dict[str, object] = {}
+    for name in ("auth.json", "installation_id"):
+        path = home / name
+        if not path.exists():
+            state[name] = "ABSENT"
+            continue
+        info = path.stat()
+        state[name] = (info.st_size, info.st_mode & 0o777, info.st_mtime_ns)
+    return state
+
+
+@requires_codex
+@pytest.mark.asyncio
+async def test_the_user_codex_home_is_untouched_by_a_preparation() -> None:
+    """The source files are read and never written, including the new one.
+
+    A missing `installation_id` is generated in the isolated copy, never
+    created in the user's own home -- otherwise a probe run would leave a
+    permanent mark on the machine it was only supposed to observe.
+    """
+    launcher = default_launcher()
+    assert launcher is not None
+    source = Path.home() / ".codex"
+    before = source_state(source)
+
+    async with prepare_real_run(launcher=launcher, source_codex_home=source) as prepared:
+        assert prepared.config.codex_home != source
+        assert sorted(item.name for item in prepared.config.codex_home.iterdir()) == [
+            "auth.json",
+            "installation_id",
+        ]
+
+    assert source_state(source) == before
+
+
 @requires_codex
 @pytest.mark.asyncio
 async def test_the_probe_home_never_holds_the_copied_login_state() -> None:

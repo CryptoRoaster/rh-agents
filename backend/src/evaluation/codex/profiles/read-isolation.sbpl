@@ -31,16 +31,33 @@
 
 ; ---- harness write allowlist -----------------------------------------------
 
-; Exactly one file, and only its contents. Codex 0.153.4 persists a refreshed
-; ChatGPT token through FileAuthStorage::save, which truncates and rewrites
-; CODEX_HOME/auth.json; without this the refresh would fail inside the sandbox.
-;
-; The directory itself stays unwritable, so no second file can appear beside it,
+; Exactly two files, both named literally, and only their contents. The
+; directory itself stays unwritable, so no third file can appear beside them,
 ; and the user's own CODEX_HOME is not in the profile at all. Verified offline:
-; the isolated copy can be read and rewritten, while creating any other file in
-; the same directory is refused.
+; both isolated copies can be read and rewritten, while creating any other file
+; in the same directory is refused.
+
+; Codex 0.153.4 persists a refreshed ChatGPT token through
+; FileAuthStorage::save, which truncates and rewrites CODEX_HOME/auth.json;
+; without this the refresh would fail inside the sandbox.
 (allow file-write-data file-write-flags file-write-times
   (literal (param "AUTH_FILE")))
+
+; `codex exec` starts an in-process app-server client, and its
+; start_uninitialized calls resolve_installation_id
+; (core/src/installation_id.rs), which opens CODEX_HOME/installation_id
+; read+write+create, locks it, repairs its mode to 0644 and may rewrite it.
+; Without this the second authorised real probe died before any event with
+; "failed to initialize in-process app-server client: Operation not permitted".
+;
+; file-write-mode is here because the CLI repairs the mode, and the harness
+; seeds the file at 0644 only so that repair is a no-op rather than a
+; dependency. The operations were measured rather than copied from the rule
+; above: with data/flags/times alone the chmod is refused, and `file-write*`
+; would additionally permit *unlinking* this file. What is granted is the
+; smallest set that works.
+(allow file-write-data file-write-flags file-write-times file-write-mode
+  (literal (param "INSTALLATION_ID_FILE")))
 
 ; ---- network ---------------------------------------------------------------
 

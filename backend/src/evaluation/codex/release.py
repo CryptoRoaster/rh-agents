@@ -36,7 +36,14 @@ from enum import StrEnum
 from pathlib import Path
 
 from src.evaluation.codex import sandbox
-from src.evaluation.codex.auth_home import AUTH_FILE, IsolatedHome
+from src.evaluation.codex.auth_home import (
+    AUTH_FILE,
+    AUTH_MODE,
+    EXPECTED_ENTRIES,
+    INSTALLATION_ID_FILE,
+    INSTALLATION_ID_MODE,
+    IsolatedHome,
+)
 from src.evaluation.codex.catalog import judge_snapshot, snapshot_catalog
 from src.evaluation.codex.preflight import VERSION_PATTERN
 
@@ -114,6 +121,7 @@ class RunBinding:
     sandbox_workspace: str
     sandbox_codex_home: str
     sandbox_auth_file: str
+    sandbox_installation_id_file: str
     forbidden_roots: tuple[str, ...]
     run_preflight: bool
     max_exec_starts: int
@@ -462,21 +470,34 @@ def _home_gate(isolated_home: IsolatedHome | None) -> list[Gate]:
         Gate(
             "AUTH_HOME_ISOLATION",
             GateState.PASS,
-            "0700 home holding only a 0600 auth file",
+            "0700 home holding only 0600 auth.json and 0644 installation_id",
         )
     ]
 
 
 def _isolation_problem(home: Path) -> str | None:
-    """Check the shape of the isolated home without reading what is in it."""
+    """Check the shape of the isolated home without reading what is in it.
+
+    Two files, not one. `codex exec` starts an in-process app-server client
+    whose `resolve_installation_id` requires `CODEX_HOME/installation_id`, so
+    "exactly one entry" was the wrong shape for 0.153.4 -- the second real
+    probe died on it. The set stays closed: a third entry is still a failure,
+    and both modes are still checked, because the point of the gate is that
+    the file set is known in advance rather than whatever the CLI left behind.
+    """
     try:
         if home.stat().st_mode & 0o777 != 0o700:
             return "home is not 0700"
         names = sorted(item.name for item in home.iterdir())
-        if names != [AUTH_FILE]:
-            return f"home holds {len(names)} entries, expected only the auth file"
-        if (home / AUTH_FILE).stat().st_mode & 0o777 != 0o600:
-            return "auth file is not 0600"
+        if names != sorted(EXPECTED_ENTRIES):
+            expected = ", ".join(sorted(EXPECTED_ENTRIES))
+            return f"home holds {len(names)} entries, expected exactly {expected}"
+        for name, mode in (
+            (AUTH_FILE, AUTH_MODE),
+            (INSTALLATION_ID_FILE, INSTALLATION_ID_MODE),
+        ):
+            if (home / name).stat().st_mode & 0o777 != mode:
+                return f"{name} is not {mode:04o}"
     except OSError as error:
         return type(error).__name__
     return None
