@@ -500,6 +500,69 @@ are a separate configuration layer that neither `--ignore-user-config` nor
 `--ignore-rules` reaches, and the harness does not attempt to bypass them. No
 `--dangerously-bypass-*` flag is ever emitted.
 
+## The outer read boundary (macOS)
+
+Codex's `--sandbox read-only` restricts writes and nothing else, and the profile
+it builds wraps the commands the agent runs rather than the agent. So the
+harness puts **its own** Seatbelt profile in front of Codex:
+
+```
+harness -> launch_gate -> /usr/bin/sandbox-exec -f <profile> -- codex ...
+```
+
+`sandbox-exec` applies the profile and `exec`s in the same process, so the
+gate's pid, its process group and every inherited descriptor — including the
+pinned catalog — carry through unchanged. Nothing about the ownership
+architecture moves.
+
+The profile denies by default. Its platform section is Codex's own vetted
+minimum for a sandboxed process on macOS, copied verbatim so the harness does
+not re-derive it; the harness section allows exactly three roots:
+
+| root | why |
+|---|---|
+| `CODEX_VENDOR` | the binary and the resources it ships with |
+| `WORKSPACE` | the empty evaluation workspace, read-only |
+| `CODEX_HOME` | the isolated home, holding the login state and nothing else |
+
+plus `/dev/fd` for the pinned catalog. Not `HOME`, not `/Volumes`, not the
+repository. Paths are **resolved** before they reach the profile, because
+Seatbelt matches the real filesystem and `/tmp` would never match
+`/private/tmp`.
+
+The boundary is tested with sentinel files standing in for the repository,
+`HOME` and credential classes — reading an actual `.env` would prove one path
+instead of a class, and would put a real secret in a test. `codex --version`
+was confirmed to start under the profile, offline and without any request.
+
+There is no fallback. On macOS the outer sandbox is required; where it cannot be
+established the release gate fails. Linux would need bwrap or landlock and is
+not implemented.
+
+### The isolated CODEX_HOME
+
+Pointing the attempt at `~/.codex` would put config, history, sessions, skills,
+plugins and caches inside the boundary. Instead the harness builds a `0700`
+directory holding a `0600` copy of the one file 0.153.4 reads for a ChatGPT
+session, `auth.json`, and discards it afterwards. No token value is read into
+the harness, logged, asserted on or reported; a refresh during an attempt lands
+in the copy, so the user's own session is untouched.
+
+Whether that copied state is *sufficient* to authenticate cannot be settled
+offline. `AUTH_HOME_ISOLATION` is therefore `UNVERIFIED`, not `PASS`, and a real
+run stays refused until one is separately authorised.
+
+## Release gates
+
+`release.evaluate_release` answers, without contacting a model, whether a real
+turn could proceed: `MODEL_CATALOG`, `CATALOG_DIGEST`, `CODEX_VERSION`,
+`CHATGPT_SESSION`, `TOOL_SURFACE`, `OUTER_READ_SANDBOX`, `AUTH_HOME_ISOLATION`.
+
+Each is `PASS`, `FAIL` or `UNVERIFIED`, and `may_run` is true only when every
+gate is `PASS`. There is no "warning but continue" — `OUTER_READ_SANDBOX` and
+`CATALOG_DIGEST` in particular have no degraded mode, and `UNVERIFIED` is its
+own answer rather than a soft pass.
+
 ## Open blockers
 
 Three claims remain **unproven**, and no test in this suite can prove them:

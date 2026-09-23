@@ -28,6 +28,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 
+from src.evaluation.codex import sandbox
 from src.evaluation.codex.catalog import (
     CatalogSnapshot,
     judge_snapshot,
@@ -87,6 +88,11 @@ class CodexClientConfig:
     forbidden_roots: tuple[Path, ...] = ()
     process_limits: ProcessLimits = ProcessLimits()
     run_preflight: bool = True
+    # When set, every attempt runs behind the outer Seatbelt profile. A real
+    # turn additionally requires it -- `release.evaluate_release` fails
+    # `OUTER_READ_SANDBOX` when it is absent, and that gate has no degraded
+    # mode.
+    outer_sandbox: sandbox.SandboxRoots | None = None
     preflight_budget_seconds: float = PREFLIGHT_BUDGET_SECONDS
     version_budget_seconds: float = VERSION_BUDGET_SECONDS
 
@@ -189,6 +195,7 @@ class CodexEvaluationClient:
                 return rejection
 
         schema_path = self.config.scratch / "orbit-output-schema.json"
+        profile_path: Path | None = None
         try:
             schema_path.write_text(json.dumps(schema, sort_keys=True), encoding="utf-8")
             arguments = build_arguments(
@@ -201,6 +208,12 @@ class CodexEvaluationClient:
                 model_catalog_reference=catalog.reference,
                 forbidden_roots=self.config.forbidden_roots,
             )
+            if self.config.outer_sandbox is not None:
+                # Applied in front of Codex itself, not in front of the commands
+                # it might run. `sandbox-exec` execs in place, so the gate's pid,
+                # process group and inherited descriptors all carry through.
+                profile_path = sandbox.write_profile(self.config.scratch)
+                arguments = sandbox.wrap(arguments, profile_path, self.config.outer_sandbox)
         except CommandBuildError as error:
             return self._reject(error.failure, error.reason_code, deadline)
         except OSError as error:
@@ -216,6 +229,26 @@ class CodexEvaluationClient:
         ).encode("utf-8")
 
         self.exec_starts += 1
+        try:
+            return await self._run_attempt(
+                request, deadline, arguments, environment, payload, accumulator, catalog
+            )
+        finally:
+            # The profile is only needed while `sandbox-exec` starts; leaving it
+            # in the scratch directory would be an artefact nobody collects.
+            if profile_path is not None:
+                profile_path.unlink(missing_ok=True)
+
+    async def _run_attempt[Output: BaseModel](
+        self,
+        request: EvaluationRequest[Output],
+        deadline: Deadline,
+        arguments: list[str],
+        environment: dict[str, str],
+        payload: bytes,
+        accumulator: EventAccumulator,
+        catalog: CatalogSnapshot,
+    ) -> EvaluationOutcome[Output]:
         try:
             result = await run_bounded(
                 arguments=arguments,

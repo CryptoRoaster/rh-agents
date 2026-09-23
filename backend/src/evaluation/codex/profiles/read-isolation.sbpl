@@ -1,0 +1,35 @@
+; Outer read isolation for the Codex process itself.
+;
+; Codex's own `--sandbox read-only` is a *write* boundary: SandboxPolicy::
+; has_full_disk_read_access returns true for every variant, seatbelt.rs turns
+; that into a blanket `(allow file-read*)`, and the profile it builds wraps the
+; commands the agent runs rather than the agent. Nothing there stops the Codex
+; process from reading the repository, a .env file or an SSH key.
+;
+; This profile is applied to the Codex process itself, before it starts. It
+; denies by default and then allows only what has been shown to be necessary.
+; The platform section below is Codex's own vetted minimum for a sandboxed
+; process on macOS, copied verbatim so this file does not re-derive it; the
+; harness section at the end is ours.
+;
+; Paths arrive as `-D` parameters and must be *resolved* real paths: seatbelt
+; matches the real filesystem, so /tmp would never match /private/tmp.
+
+; The harness composes this file after the platform section rather than using
+; `(import ...)`: sandbox-exec resolves an import against its own search path,
+; not against the directory the profile was loaded from.
+
+; ---- harness allowlist -----------------------------------------------------
+
+; The Codex binary and the resources it ships with.
+(allow file-read* file-map-executable (subpath (param "CODEX_VENDOR")))
+
+; The empty evaluation workspace. Read-only: the attempt needs no scratch space
+; of its own, and anything it could write would be state nobody reads back.
+(allow file-read* (subpath (param "WORKSPACE")))
+
+; The isolated CODEX_HOME. Holds the auth state and nothing else.
+(allow file-read* (subpath (param "CODEX_HOME")))
+
+; The pinned catalog, inherited as a descriptor.
+(allow file-read* (subpath "/dev/fd"))

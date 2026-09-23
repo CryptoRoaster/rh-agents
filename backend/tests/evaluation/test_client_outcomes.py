@@ -19,7 +19,8 @@ from pydantic import BaseModel, ConfigDict
 from src.agents.orbit.models import OrbitAssessment, OrbitClassification
 from src.evaluation.codex import catalog as catalog_module
 from src.evaluation.codex import client as client_module
-from src.evaluation.codex.command import ALLOWED_ENVIRONMENT_KEYS
+from src.evaluation.codex import sandbox
+from src.evaluation.codex.command import ALLOWED_ENVIRONMENT_KEYS, build_arguments
 from src.evaluation.codex.models import (
     EvaluationCompleted,
     EvaluationFailure,
@@ -604,3 +605,47 @@ async def test_an_unreadable_pinned_catalog_never_runs_an_attempt(probe: Probe) 
 
 def _raise_oserror(*_args: object, **_kwargs: object) -> None:
     raise OSError("unlink refused")
+
+
+def test_the_attempt_runs_behind_the_outer_sandbox_when_configured(
+    probe: Probe, tmp_path: Path
+) -> None:
+    """The profile goes in front of Codex, not in front of what Codex runs.
+
+    Codex's own `--sandbox read-only` never restricts the agent process itself,
+    so the outer profile has to wrap the launcher. `sandbox-exec` execs in
+    place, which is why the gate's pid, its process group and the inherited
+    catalog descriptor all survive the wrap.
+    """
+    workspace = tmp_path / "sb-ws"
+    home = tmp_path / "sb-home"
+    vendor = tmp_path / "sb-vendor"
+    for directory in (workspace, home, vendor):
+        directory.mkdir()
+    roots = sandbox.SandboxRoots(codex_vendor=vendor, workspace=workspace, codex_home=home)
+    codex_argv = build_arguments(
+        launcher=probe.launcher(),
+        working_directory=probe.workspace,
+        schema_path=probe.scratch / "schema.json",
+        model="gpt-5.5",
+        effort="low",
+        instructions="x",
+        model_catalog_reference="/dev/fd/9",
+    )
+    profile = sandbox.write_profile(tmp_path)
+    try:
+        wrapped = sandbox.wrap(codex_argv, profile, roots)
+    finally:
+        profile.unlink(missing_ok=True)
+
+    assert wrapped[0] == str(sandbox.SANDBOX_EXEC)
+    # The Codex invocation survives the wrap unchanged, including the pin.
+    assert wrapped[-len(codex_argv) :] == codex_argv
+    assert any(item.startswith("model_catalog_json=") for item in wrapped)
+
+
+def test_the_client_accepts_an_outer_sandbox(probe: Probe, tmp_path: Path) -> None:
+    workspace = tmp_path / "sb-ws2"
+    workspace.mkdir()
+    roots = sandbox.SandboxRoots(codex_vendor=tmp_path, workspace=workspace, codex_home=tmp_path)
+    assert probe.config(outer_sandbox=roots).outer_sandbox is roots
