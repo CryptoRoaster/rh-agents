@@ -779,6 +779,82 @@ code 0 means every blocking gate passed and a runner existed *inside the
 context*; it does not mean anything ran, and running something is a separate,
 separately reviewed decision.
 
+## Diagnosing a failure without leaking one
+
+The first authorised real run exited 1 after 375 ms having emitted no events.
+The harness reported `INCONSISTENT_COMPLETION / TURN_NEVER_STARTED` and could
+say nothing more: `run_bounded` had captured the child's `stderr_tail`,
+`_run_attempt` used only the exit code and the cleanup report, and the bytes
+were dropped. A failure nobody can diagnose is a failure that gets retried
+blindly.
+
+Handing the raw tail out would have been the wrong repair, because a provider,
+auth or CLI error can carry an `Authorization` header, a refresh token, a cookie
+or the user's absolute paths. So the bytes stop inside `diagnostics.py`, and
+what leaves is a `ProcessDiagnostic`:
+
+| field | |
+|---|---|
+| `exit_code` | |
+| `stderr_present` | whether the child wrote anything at all |
+| `stderr_captured_bytes` | how much was read off the pipe |
+| `stderr_was_truncated` | whether the cap was reached |
+| `safe_lines` | at most 8 redacted lines, ≤240 chars each, ≤2 KiB total |
+
+There is deliberately **no raw field**, and a test asserts the dataclass has
+none.
+
+**Redaction is line-dropping, not editing.** A line naming any of
+`authorization`, `bearer`, `access_token`, `refresh_token`, `id_token`,
+`session_token`, `api_key`, `apikey`, `secret`, `password`, `cookie` or
+`set-cookie` (case-insensitively) becomes `[REDACTED_SENSITIVE_LINE]` whole.
+Editing would assume the shape of the value, and a shape assumption is exactly
+what fails on the error message nobody anticipated. A consecutive run of them
+collapses into one marker, so placeholders cannot push the one useful line out
+of the budget. Whatever survives then goes through a second, blunt pass that
+masks JWTs and any long opaque run, and through the path aliases, so a
+diagnostic says `<CODEX_HOME>` and `<HOME>` rather than where this machine
+keeps them.
+
+**It fails closed.** Everything is inside one try block; if the redactor itself
+raises, the result is the single line `[DIAGNOSTIC_REDACTION_FAILED]`. There is
+no path on which unredacted bytes reach a caller, and that path is tested by
+breaking the redactor on purpose.
+
+### A failed start is reported as one
+
+`_finish` used to ask `require_consistent_completion()` first, so a non-zero
+exit with no events became "the turn did not complete" — true, and useless.
+When `exit_code != 0` **and** no `turn.started` was seen, the result is now
+`PROCESS_FAILED` with `EXIT_<n>_BEFORE_TURN` and a diagnostic. The branch is
+narrow on purpose: once a turn has started, the existing event semantics decide
+exactly as before, and a clean exit with no turn is still `TURN_NEVER_STARTED`.
+
+## Descriptor transport, measured against the real sandbox
+
+The catalog travels as `model_catalog_json=/dev/fd/N` and the schema as
+`--output-schema /dev/fd/M`. Both rest on the descriptors surviving
+
+```
+run_bounded (pass_fds) -> launch_gate -> /usr/bin/sandbox-exec -> exec child
+```
+
+and that had never been exercised against the real thing: earlier tests either
+substituted a recording shim for `sandbox-exec`, or read `/dev/fd/N` in the
+parent, where it works trivially and proves nothing about a sandboxed child.
+
+`test_fd_transport.py` uses the real `/usr/bin/sandbox-exec` and the real
+composed profile, with a `/bin/sh` child that only reads what it is handed. The
+snapshots are unlinked before the child starts and the profile grants no
+readable root that could contain them, so `/dev/fd` is the only way in. The two
+descriptors carry different sentinels and are checked **separately** — "some fd
+was readable" would not tell the catalog path from the schema path. The child
+also tries to append to each, which must fail, with a positive control
+appending to the one writable path so that a refusal cannot be mistaken for a
+profile that refuses every write.
+
+Result on macOS: both survive byte-exact, both stay read-only.
+
 ## Open blockers
 
 Three claims remain **unproven**, and no test in this suite can prove them:

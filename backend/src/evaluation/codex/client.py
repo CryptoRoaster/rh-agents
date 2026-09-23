@@ -43,6 +43,7 @@ from src.evaluation.codex.command import (
     child_environment,
 )
 from src.evaluation.codex.deadline import Deadline
+from src.evaluation.codex.diagnostics import PathAliases, ProcessDiagnostic, diagnose
 from src.evaluation.codex.models import (
     SUPPORTED_CLI_VERSION,
     SUPPORTED_EFFORTS,
@@ -387,7 +388,17 @@ class CodexEvaluationClient:
                 error.cleanup,
             )
 
-        return self._finish(request, accumulator, result.exit_code, result.cleanup, deadline)
+        # The tail is not dropped any more and is not logged either: it goes
+        # straight into the redactor and the raw bytes end there.
+        return self._finish(
+            request,
+            accumulator,
+            result.exit_code,
+            result.cleanup,
+            deadline,
+            result.stderr_tail,
+            request.limits.max_stderr_bytes,
+        )
 
     async def _verify_version(
         self, environment: dict[str, str], limits: OutputLimits, deadline: Deadline
@@ -561,48 +572,91 @@ class CodexEvaluationClient:
         exit_code: int,
         cleanup: CleanupReport,
         deadline: Deadline,
+        stderr_tail: bytes = b"",
+        stderr_limit: int = 0,
     ) -> EvaluationOutcome[Output]:
+        diagnostic = diagnose(
+            exit_code=exit_code,
+            stderr_tail=stderr_tail,
+            captured_limit=stderr_limit,
+            aliases=self._aliases(),
+        )
         if deadline.expired:
             # The budget was already gone when the child finished. Parsing an
             # answer now could only produce a result that arrived too late.
             return self._reject(
-                EvaluationFailure.DEADLINE_EXCEEDED, "RESULT_AFTER_DEADLINE", deadline, cleanup
+                EvaluationFailure.DEADLINE_EXCEEDED,
+                "RESULT_AFTER_DEADLINE",
+                deadline,
+                cleanup,
+                diagnostic,
+            )
+        if exit_code != 0 and not accumulator.turn_started:
+            # A CLI that failed before emitting a single event never got as far
+            # as a turn, so the interesting fact is the failed start, not the
+            # missing completion. Reported first for that reason: the previous
+            # ordering answered "the turn did not complete", which is true and
+            # useless, and it is what made the first real failure undiagnosable.
+            return self._reject(
+                EvaluationFailure.PROCESS_FAILED,
+                f"EXIT_{exit_code}_BEFORE_TURN",
+                deadline,
+                cleanup,
+                diagnostic,
             )
         try:
             answer = accumulator.require_consistent_completion()
         except StreamError as error:
-            return self._reject(error.failure, error.reason_code, deadline, cleanup)
+            # A turn did start here, so the event semantics decide and are left
+            # exactly as they were.
+            return self._reject(error.failure, error.reason_code, deadline, cleanup, diagnostic)
         if exit_code != 0:
             # A completed turn and a failing exit contradict each other; the
             # attempt is not treated as successful on the strength of one of them.
             return self._reject(
-                EvaluationFailure.INCONSISTENT_COMPLETION, f"EXIT_{exit_code}", deadline, cleanup
+                EvaluationFailure.INCONSISTENT_COMPLETION,
+                f"EXIT_{exit_code}",
+                deadline,
+                cleanup,
+                diagnostic,
             )
 
         try:
             payload = json.loads(answer)
         except json.JSONDecodeError:
             return self._reject(
-                EvaluationFailure.OUTPUT_NOT_JSON, "ANSWER_NOT_JSON", deadline, cleanup
+                EvaluationFailure.OUTPUT_NOT_JSON, "ANSWER_NOT_JSON", deadline, cleanup, diagnostic
             )
         try:
             output = request.output_model.model_validate(payload)
         except ValidationError:
             return self._reject(
-                EvaluationFailure.OUTPUT_SCHEMA_MISMATCH, "LOCAL_SCHEMA_MISMATCH", deadline, cleanup
+                EvaluationFailure.OUTPUT_SCHEMA_MISMATCH,
+                "LOCAL_SCHEMA_MISMATCH",
+                deadline,
+                cleanup,
+                diagnostic,
             )
         if deadline.expired:
             # First point where control is back. Starting the domain validator
             # now would add work that could not change the outcome, so the
             # overrun stops here rather than after a second blocking call.
             return self._reject(
-                EvaluationFailure.DEADLINE_EXCEEDED, "SCHEMA_VALIDATION_OVERRAN", deadline, cleanup
+                EvaluationFailure.DEADLINE_EXCEEDED,
+                "SCHEMA_VALIDATION_OVERRAN",
+                deadline,
+                cleanup,
+                diagnostic,
             )
         try:
             request.domain_validator(output)
         except DomainValidationError as error:
             return self._reject(
-                EvaluationFailure.OUTPUT_DOMAIN_INVALID, error.reason_code, deadline, cleanup
+                EvaluationFailure.OUTPUT_DOMAIN_INVALID,
+                error.reason_code,
+                deadline,
+                cleanup,
+                diagnostic,
             )
 
         if deadline.expired:
@@ -610,7 +664,11 @@ class CodexEvaluationClient:
             # event loop cannot preempt, so an overrun can only be noticed once
             # they return. It is noticed here, and it is never completed anyway.
             return self._reject(
-                EvaluationFailure.DEADLINE_EXCEEDED, "VALIDATION_OVERRAN", deadline, cleanup
+                EvaluationFailure.DEADLINE_EXCEEDED,
+                "VALIDATION_OVERRAN",
+                deadline,
+                cleanup,
+                diagnostic,
             )
 
         return EvaluationCompleted(
@@ -634,10 +692,33 @@ class CodexEvaluationClient:
         detail_code: str,
         deadline: Deadline,
         cleanup: CleanupReport | None = None,
+        diagnostic: ProcessDiagnostic | None = None,
     ) -> EvaluationRejected:
         return EvaluationRejected(
             reason=failure,
             detail_code=detail_code,
             wall_clock_ms=deadline.elapsed_ms,
             cleanup=cleanup if cleanup is not None else CleanupReport(),
+            diagnostic=diagnostic,
+        )
+
+    def _aliases(self) -> PathAliases:
+        """The bound paths, so a diagnostic names roles rather than locations.
+
+        A failure message is about this harness's behaviour. Publishing where
+        the machine keeps the user's home, or which temporary directory held
+        the login copy, adds nothing to that and is not ours to publish.
+        """
+        roots = self.config.outer_sandbox
+        parameters = roots.parameters() if roots is not None else {}
+        return PathAliases.build(
+            codex_home=self.config.codex_home,
+            home=self.config.home,
+            workspace=self.config.workspace,
+            scratch=self.config.scratch,
+            tmpdir=self.config.tmpdir,
+            catalog=self.config.model_catalog_path,
+            launcher=self.config.launcher.executable,
+            profile=self.config.outer_profile.path if self.config.outer_profile else None,
+            codex_vendor=parameters.get("CODEX_VENDOR"),
         )

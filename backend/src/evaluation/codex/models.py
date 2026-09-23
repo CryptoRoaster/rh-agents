@@ -32,6 +32,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.evaluation.codex.diagnostics import ProcessDiagnostic
+
 # The only CLI build whose event contract and argument surface this harness was
 # written against. A different build may add a default tool or rename an event,
 # so the client refuses to run rather than assume compatibility.
@@ -297,12 +299,20 @@ class EvaluationCompleted[Output: BaseModel]:
 
 @dataclass(frozen=True)
 class EvaluationRejected:
-    """No validated output. Never carries a partial result."""
+    """No validated output. Never carries a partial result.
+
+    `diagnostic` is present when a child actually ran and said something on
+    stderr. It holds redacted lines and counts, never raw bytes -- see
+    `diagnostics.ProcessDiagnostic`. Rejections decided before any process
+    starts, such as a refused permit, have nothing to diagnose and leave it
+    `None`.
+    """
 
     reason: EvaluationFailure
     detail_code: str
     wall_clock_ms: int
     cleanup: CleanupReport
+    diagnostic: ProcessDiagnostic | None = None
 
 
 type EvaluationOutcome[Output: BaseModel] = EvaluationCompleted[Output] | EvaluationRejected

@@ -196,6 +196,16 @@ def main() -> int:
     else:
         name = str(scenario.get("name", "success"))
 
+    if name == "fails_before_turn":
+        # A CLI that dies during startup: no events at all, a non-zero exit,
+        # and a stderr message shaped like the ones that actually carry
+        # credentials. The harness has to classify the failed start *and*
+        # report nothing from these lines.
+        for line in scenario.get("stderr_lines", ["startup failed"]):
+            sys.stderr.write(f"{line}\n")
+        sys.stderr.flush()
+        return int(scenario.get("exit_code", 1))
+
     if name == "record_environment":
         Path(str(scenario["environment_out"])).write_text(
             json.dumps(dict(os.environ), sort_keys=True), encoding="utf-8"
