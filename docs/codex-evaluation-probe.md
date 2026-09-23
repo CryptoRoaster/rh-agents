@@ -694,6 +694,14 @@ sandbox_auth_file`. The comparison happens a second time inside the client, via
 the permit the authorization issues, so it cannot be lost by constructing the
 client another way.
 
+A matching binding alone was not enough, and that was the last hole. A caller
+holding a configuration can compute `binding_for(config, …)` from that same
+configuration, so a hand-built `ReleasePermit` would always agree with itself
+while no preflight had run. `ReleasePermit` therefore also carries a mint token
+that only `ReleaseAuthorization.permit()` supplies: `ReleasePermit(binding=…)`
+and `ReleasePermit(binding=…, _token=object())` both raise, so the binding has
+to have come *through* an authorization rather than beside one.
+
 **This is not unforgeable, and the code no longer claims it is.** `_PERMIT` is
 module-private by convention, and convention is not a security boundary in
 Python; an in-process caller that sets out to build a `ReleaseAuthorization`

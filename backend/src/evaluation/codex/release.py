@@ -128,6 +128,13 @@ class RunBinding:
         )
 
 
+# Minted only by `ReleaseAuthorization.permit`. Same convention as `_PERMIT`
+# below, and the same caveat: this is not a security boundary against an
+# in-process caller who sets out to defeat it. It is what makes the accident --
+# building a permit beside the preflight rather than out of one -- fail.
+_RELEASE_PERMIT_TOKEN = object()
+
+
 @dataclass(frozen=True)
 class ReleasePermit:
     """What a process invocation against a real Codex build has to be handed.
@@ -136,9 +143,25 @@ class ReleasePermit:
     no permit at all. What it will not do is start a *real* build without one,
     so a configuration that never went through a preflight cannot reach `exec`
     by being constructed directly.
+
+    Carrying a matching `RunBinding` is necessary but was not sufficient on its
+    own: a caller holding a configuration can compute `binding_for(config, ...)`
+    from it and hand the client a permit that agrees with itself, which says
+    nothing about a preflight ever having run. So the binding has to have come
+    *through* an authorization, and the token is how that is expressed.
+
+    Not unforgeable -- module privacy in Python is a convention. Fail-closed
+    against miswiring, which is the property being bought.
     """
 
     binding: RunBinding
+    # Defaulted so that `ReleasePermit(binding=...)` is refused here with a
+    # reason rather than by an argument-count error further out.
+    _token: object | None = None
+
+    def __post_init__(self) -> None:
+        if self._token is not _RELEASE_PERMIT_TOKEN:
+            raise ValueError("a ReleasePermit may only come from ReleaseAuthorization.permit()")
 
 
 @dataclass(frozen=True)
@@ -211,8 +234,13 @@ class ReleaseAuthorization:
             raise ValueError("a ReleaseAuthorization may only come from authorize()")
 
     def permit(self) -> ReleasePermit:
-        """The token a client needs before it may start a real build."""
-        return ReleasePermit(binding=self.binding)
+        """The token a client needs before it may start a real build.
+
+        The only place `_RELEASE_PERMIT_TOKEN` is used, so a permit exists only
+        where an authorization does, and an authorization exists only where a
+        preflight of the required shape cleared.
+        """
+        return ReleasePermit(binding=self.binding, _token=_RELEASE_PERMIT_TOKEN)
 
 
 def shape_problems(status: PreflightStatus) -> tuple[str, ...]:

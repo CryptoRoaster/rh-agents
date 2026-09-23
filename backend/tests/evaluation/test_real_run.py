@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from src.evaluation.codex import release as release_module
 from src.evaluation.codex import sandbox
 from src.evaluation.codex.client import CodexEvaluationClient, binding_for
 from src.evaluation.codex.command import (
@@ -40,6 +41,7 @@ from src.evaluation.codex.release import (
     GateState,
     PreflightStatus,
     ReleaseAuthorization,
+    ReleasePermit,
     ReleaseRefused,
     authorize,
     shape_problems,
@@ -316,6 +318,90 @@ def test_a_configuration_with_the_login_probe_off_is_refused(probe: Probe) -> No
 # --------------------------------------------------------------------------
 # Blocker 3: the client will not start a real build on its own
 # --------------------------------------------------------------------------
+
+
+def test_a_permit_cannot_be_built_beside_the_preflight(probe: Probe) -> None:
+    """A binding that agrees with itself is not evidence of a preflight.
+
+    This was the remaining hole. A caller holding a configuration can compute
+    `binding_for(config, ...)` from that same configuration, so a hand-made
+    permit would always match and `_permit_problem` would find nothing to
+    object to -- while no preflight had run at all.
+    """
+    binding = some_binding(probe)
+    with pytest.raises(ValueError):
+        ReleasePermit(binding=binding)
+    with pytest.raises(ValueError):
+        ReleasePermit(binding=binding, _token=object())
+    # Not even the module's other token, which guards a different type.
+    with pytest.raises(ValueError):
+        ReleasePermit(binding=binding, _token=release_module._PERMIT)
+
+
+def test_only_an_authorization_mints_a_permit(probe: Probe) -> None:
+    binding = some_binding(probe)
+    permit = authorize(cleared(), binding).permit()
+    assert isinstance(permit, ReleasePermit)
+    assert permit.binding == binding
+    # Minting twice gives equal permits rather than a stateful one-shot: the
+    # property is where it came from, not how often it was asked for.
+    assert authorize(cleared(), binding).permit() == permit
+
+
+@pytest.mark.asyncio
+async def test_a_hand_made_permit_cannot_release_a_real_launcher(probe: Probe) -> None:
+    """The whole point, end to end: no preflight, so no process of any kind."""
+    config, _, profile, roots = bound(probe)
+    real = probe.config(
+        launcher=CodexLauncher(
+            kind=LauncherKind.PLATFORM_BINARY,
+            executable=probe.launcher_path,
+            path_entries=(Path("/usr/bin"), Path("/bin")),
+        ),
+        outer_sandbox=roots,
+        outer_profile=profile,
+        run_preflight=True,
+    )
+    # Exactly what a caller could compute from the configuration in hand.
+    with pytest.raises(ValueError):
+        ReleasePermit(binding=binding_for(real, profile.digest), _token=object())
+
+    # And with the construction refused there is nothing to hand over, so the
+    # client is left in the state it refuses from.
+    probe.scenario("success")
+    client = CodexEvaluationClient(config=real)
+    outcome = await client.evaluate(probe.request())
+    assert outcome.detail_code == "RELEASE_PERMIT_REQUIRED"  # type: ignore[union-attr]
+    assert (client.version_starts, client.preflight_starts, client.exec_starts) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_minted_permit_for_the_bound_configuration_is_accepted(probe: Probe) -> None:
+    """The positive case, so the refusals above are not passing vacuously.
+
+    The launcher is the fake shim declared as a real form, which is the closest
+    this suite comes to a real build: the permit path is exercised in full and
+    no Codex is started.
+    """
+    config, _, profile, roots = bound(probe)
+    real = probe.config(
+        launcher=CodexLauncher(
+            kind=LauncherKind.PLATFORM_BINARY,
+            executable=probe.launcher_path,
+            path_entries=(Path("/usr/bin"), Path("/bin")),
+        ),
+        outer_sandbox=roots,
+        outer_profile=profile,
+        run_preflight=True,
+    )
+    permit = authorize(cleared(), binding_for(real, profile.digest)).permit()
+    probe.scenario("success")
+    client = CodexEvaluationClient(config=real, permit=permit)
+    outcome = await client.evaluate(probe.request())
+    # It got past the permit gate and into the ordinary offline path: the
+    # version probe ran, which it never does when the permit is refused.
+    assert client.version_starts == 1
+    assert outcome.detail_code != "RELEASE_PERMIT_REQUIRED"  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
