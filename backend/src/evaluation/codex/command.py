@@ -172,13 +172,16 @@ def child_environment(
     }
 
 
-# The first bytes of a Mach-O executable, in the four forms macOS produces.
-# A fake launcher is a script; a real Codex build is one of these.
-MACH_O_MAGIC = (
-    b"\xcf\xfa\xed\xfe",  # 64-bit, little endian
-    b"\xce\xfa\xed\xfe",  # 32-bit, little endian
-    b"\xca\xfe\xba\xbe",  # universal (fat)
-    b"\xbe\xba\xfe\xca",  # universal, byte-swapped
+# The first bytes of a compiled executable. Both families are listed because
+# the check is about the launcher kind, which is platform-independent, while
+# Codex ships a Mach-O build for macOS and an ELF build for Linux. A fake
+# launcher is a script; a real Codex build is one of these.
+NATIVE_BINARY_MAGIC = (
+    b"\xcf\xfa\xed\xfe",  # Mach-O, 64-bit, little endian
+    b"\xce\xfa\xed\xfe",  # Mach-O, 32-bit, little endian
+    b"\xca\xfe\xba\xbe",  # Mach-O universal (fat)
+    b"\xbe\xba\xfe\xca",  # Mach-O universal, byte-swapped
+    b"\x7fELF",  # ELF
 )
 
 
@@ -186,7 +189,7 @@ def looks_like_a_native_binary(path: Path) -> bool:
     """Whether the file on disk is a compiled executable rather than a script."""
     try:
         with open(path, "rb") as handle:
-            return handle.read(4) in MACH_O_MAGIC
+            return handle.read(4) in NATIVE_BINARY_MAGIC
     except OSError:
         return False
 

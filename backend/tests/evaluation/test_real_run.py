@@ -26,7 +26,11 @@ import pytest
 
 from src.evaluation.codex import sandbox
 from src.evaluation.codex.client import CodexEvaluationClient, binding_for
-from src.evaluation.codex.command import CommandBuildError, build_version_arguments
+from src.evaluation.codex.command import (
+    CommandBuildError,
+    build_version_arguments,
+    looks_like_a_native_binary,
+)
 from src.evaluation.codex.models import CodexLauncher, LauncherKind
 from src.evaluation.codex.real_run import RealCodexRunner, RealRunRefused
 from src.evaluation.codex.release import (
@@ -359,11 +363,22 @@ async def test_a_permit_for_a_different_configuration_starts_nothing(probe: Prob
     assert (client.version_starts, client.preflight_starts, client.exec_starts) == (0, 0, 0)
 
 
-def test_a_native_binary_may_not_be_declared_a_fake() -> None:
-    """The kind decides whether a permit is needed, so it may not be a free choice."""
+def test_a_native_binary_may_not_be_declared_a_fake(probe: Probe) -> None:
+    """The kind decides whether a permit is needed, so it may not be a free choice.
+
+    `/bin/sh` is compiled on both platforms this runs on -- Mach-O on macOS,
+    ELF on Linux -- which is why the magic table lists both families. The check
+    is about the launcher kind, and the kind is platform-independent even
+    though the sandbox is not.
+    """
+    assert looks_like_a_native_binary(Path("/bin/sh"))
     disguised = CodexLauncher(
         kind=LauncherKind.FAKE_EXECUTABLE, executable=Path("/bin/sh"), path_entries=()
     )
     with pytest.raises(CommandBuildError) as caught:
         build_version_arguments(launcher=disguised)
     assert caught.value.reason_code == "NATIVE_BINARY_DECLARED_AS_FAKE"
+
+    # And the fixture's own shim, which is a script, stays usable as a fake.
+    assert not looks_like_a_native_binary(probe.launcher_path)
+    assert build_version_arguments(launcher=probe.launcher())[1:] == ["--version"]
