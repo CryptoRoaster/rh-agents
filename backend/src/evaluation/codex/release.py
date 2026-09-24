@@ -445,21 +445,31 @@ def _sandbox_gate(roots: sandbox.SandboxRoots | None, probe_outside: Path | None
                 f" catalog_locked={not result.catalog_writable}",
             )
         )
-    # Both halves, because one of them alone was green while the turn could
-    # not reach anything. The sixth real probe got past `turn.started` and then
-    # failed on `failed to lookup address information`, while this gate
-    # reported PASS -- it measured a TCP connection to `127.0.0.1`, which needs
-    # no name resolved. Reaching an address and being able to find one are two
-    # permissions, and the profile granted only the first.
-    reachable = result.egress_reachable and result.name_resolution_available
+    # Three permissions, because each of the first two alone was green while
+    # the turn could reach nothing. The sixth real probe failed on `failed to
+    # lookup address information` while the gate measured only a TCP connection
+    # to `127.0.0.1`, which needs no name resolved. The eighth then resolved the
+    # name, opened the connection and failed on `invalid peer certificate:
+    # UnknownIssuer` while the gate measured only tcp and the resolver.
+    #
+    # Reaching an address, finding one, and being able to verify who answered
+    # are three separate permissions, and the profile has to grant all three.
+    #
+    # `tls_trust_available` says exactly one thing: a process under this profile
+    # can reach the native macOS trust store through Security.framework. It does
+    # not say that any particular server presents a valid certificate, that the
+    # network is up, that the provider is reachable, or that the login is good.
+    reachable = (
+        result.egress_reachable and result.name_resolution_available and result.tls_trust_available
+    )
     gates.append(
         Gate(
             "NETWORK_EGRESS",
             GateState.PASS if reachable else GateState.FAIL,
-            "outbound tcp reaches a loopback listener and the resolver is reachable"
+            "outbound tcp, resolver and native TLS trust store are reachable"
             if reachable
-            else f"tcp={result.egress_reachable} resolver={result.name_resolution_available};"
-            " the provider would be unreachable",
+            else f"tcp={result.egress_reachable} resolver={result.name_resolution_available}"
+            f" tls_trust={result.tls_trust_available}; the provider would be unreachable",
         )
     )
     return gates

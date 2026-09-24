@@ -189,6 +189,60 @@ def test_the_resolver_grant_is_one_socket_and_no_wider_network() -> None:
     assert "(remote udp)" not in text
 
 
+def test_the_native_trust_store_is_reachable_through_the_profile(tmp_path: Path) -> None:
+    """Reaching a server and being able to verify it are two permissions.
+
+    The eighth real probe resolved the name, opened the connection, started a
+    turn and then spent its whole budget on `invalid peer certificate:
+    UnknownIssuer`. `rustls-native-certs` reads the macOS store through
+    Security.framework's `TrustSettings`, and under the profile every domain
+    came back empty.
+
+    Asked the way that library asks. A readable keychain file proves nothing
+    here: the file was already readable when the probe failed.
+    """
+    assert measure(tmp_path).tls_trust_available is True
+
+
+def test_the_trust_grant_is_two_literals_and_no_user_keychain() -> None:
+    """The public anchors this machine already trusts, and nothing of the user's.
+
+    Measured one dimension at a time: with file reads held open only
+    `com.apple.SecurityServer` worked, and with mach held open only
+    `/System/Library/Keychains` did. Neither is sufficient alone, so both are
+    granted -- narrowed to the two files that were measured to be needed.
+    `X509Anchors` sits beside them and is not one of them.
+    """
+    rules = [
+        line for line in sandbox.compose_profile().splitlines() if not line.lstrip().startswith(";")
+    ]
+    text = " ".join("\n".join(rules).split())
+
+    assert '(literal "/System/Library/Keychains/SystemRootCertificates.keychain")' in text
+    assert '(literal "/System/Library/Keychains/SystemTrustSettings.plist")' in text
+    assert '(allow mach-lookup (global-name "com.apple.SecurityServer"))' in text
+
+    # The negatives are asserted against the harness section alone. The
+    # platform section is Codex's own vendored minimum for a sandboxed process
+    # -- it already grants `/private/var/db`, among others -- and is not this
+    # profile's to police. What this test owns is what the harness adds on top.
+    harness = " ".join(
+        line
+        for line in sandbox.READ_ISOLATION.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith(";")
+    )
+    # No keychain reaches the harness section as a directory, and no user
+    # keychain reaches it at all. A subpath here would hand over every file
+    # that is or ever will be placed in it.
+    assert '(subpath "/System/Library/Keychains")' not in harness
+    assert "/Library/Keychains" not in harness.replace("/System/Library/Keychains/", "")
+    assert "X509Anchors" not in harness
+    assert "Users/" not in harness
+    assert "/private/var/db" not in harness
+    # The only home the harness names is the isolated one it created itself.
+    assert "HOME" not in harness.replace('(param "CODEX_HOME")', "")
+
+
 def test_the_app_sandbox_extensions_are_not_inherited() -> None:
     """An inherited extension would grant paths outside the three roots."""
     rules = [

@@ -113,3 +113,41 @@
 ; and the unresolved spelling was measured and does not match -- the same rule
 ; the rest of this profile follows.
 (allow network-outbound (literal "/private/var/run/mDNSResponder"))
+
+; ---- TLS trust anchors -----------------------------------------------------
+
+; Reaching the provider is not the same as being able to verify it. The eighth
+; real probe resolved the name, opened the connection, started a turn, and then
+; spent its whole budget on:
+;
+;   Reconnecting... 4/5 (stream disconnected before completion:
+;                        invalid peer certificate: UnknownIssuer)
+;
+; Codex 0.153.4 uses `rustls-native-certs` 0.8.3, which on macOS reads the
+; native store through `security_framework::trust_settings::TrustSettings` for
+; the User, Admin and System domains -- not a bundled PEM file. Under this
+; profile every domain came back empty, so every certificate chain was
+; unknown.
+;
+; Measured, one dimension at a time. Codex's own network policy names
+; `SecurityServer`, `networkd`, `ocspd` and `trustd.agent` for TLS certificate
+; information; with file reads held open, only `SecurityServer` made the system
+; domain readable, and `networkd`, `ocspd`, `securityd`, `coreservicesd` and
+; the distributed notification service each made no difference. With mach held
+; open, only `/System/Library/Keychains` did, and `/Library/Keychains`,
+; `/private/var/db`, `/private/var/db/mds` and `/private/etc` each made none.
+; Neither dimension works alone: both of these are required together.
+;
+; Narrowed to two literals rather than the directory. `X509Anchors` sits beside
+; them and was measured to be unnecessary, so it is not granted.
+(allow mach-lookup (global-name "com.apple.SecurityServer"))
+(allow file-read*
+  (literal "/System/Library/Keychains/SystemRootCertificates.keychain")
+  (literal "/System/Library/Keychains/SystemTrustSettings.plist"))
+
+; What is deliberately *not* here: `~/Library/Keychains`, `/Library/Keychains`,
+; any user keychain, `HOME`, and any subpath of a trust or security directory.
+; The attempt reads the public root anchors this machine already trusts and
+; nothing that belongs to the user. The User domain stays empty inside the
+; sandbox -- the isolated `HOME` holds no keychain -- and that is the intended
+; outcome rather than a gap.

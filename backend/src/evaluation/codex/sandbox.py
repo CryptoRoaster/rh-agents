@@ -200,6 +200,7 @@ class ProbeResult:
     other_file_creatable: bool
     egress_reachable: bool
     name_resolution_available: bool
+    tls_trust_available: bool
     catalog_readable: bool
     catalog_replayable: bool
     catalog_writable: bool
@@ -263,6 +264,7 @@ DENIED_EVERYTHING = ProbeResult(
     other_file_creatable=True,
     egress_reachable=False,
     name_resolution_available=False,
+    tls_trust_available=False,
     catalog_readable=False,
     catalog_replayable=False,
     catalog_writable=True,
@@ -413,6 +415,14 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
                 # permission that was missing.
                 f'if /usr/bin/nc -U -w 3 "{RESOLVER_SOCKET}" < /dev/null > /dev/null 2>&1;'
                 f' then echo "RESOLVER OK"; else echo "RESOLVER DENIED"; fi',
+                # The native trust store, asked the way `rustls-native-certs`
+                # asks: through Security.framework's TrustSettings for the
+                # System domain, not by `cat`-ing a keychain file. A readable
+                # file says nothing about whether the framework can answer,
+                # and the eighth real probe failed with the file already
+                # readable.
+                "if /usr/bin/security dump-trust-settings -s > /dev/null 2>&1;"
+                ' then echo "TLSTRUST OK"; else echo "TLSTRUST DENIED"; fi',
             ]
         )
         command = wrap(["/bin/sh", "-c", script], profile, roots)
@@ -449,6 +459,7 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
         ),
         egress_reachable="EGRESS OK" in output,
         name_resolution_available="RESOLVER OK" in output,
+        tls_trust_available="TLSTRUST OK" in output,
         catalog_readable=bool(reads) and reads[0] != "UNREADABLE",
         # Three reads, all present and all identical. Two agreeing reads out of
         # three would not do: the failure being guarded against is precisely a

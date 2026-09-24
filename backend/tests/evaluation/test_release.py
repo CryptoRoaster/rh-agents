@@ -244,6 +244,7 @@ def probe_result(**overrides: object) -> sandbox.ProbeResult:
         "other_file_creatable": False,
         "egress_reachable": True,
         "name_resolution_available": True,
+        "tls_trust_available": True,
         "catalog_readable": True,
         "catalog_replayable": True,
         "catalog_writable": False,
@@ -261,11 +262,12 @@ def egress_gate(tmp_path: Path, result: sandbox.ProbeResult, monkeypatch: pytest
 
 
 @pytest.mark.skipif(not sandbox.macos(), reason="the sandbox gates are macOS only")
-def test_tcp_and_resolution_together_are_a_pass(
+def test_tcp_resolution_and_trust_together_are_a_pass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     found = egress_gate(tmp_path, probe_result(), monkeypatch)
     assert found.state is GateState.PASS  # type: ignore[attr-defined]
+    assert "trust store are reachable" in found.detail  # type: ignore[attr-defined]
 
 
 @pytest.mark.skipif(not sandbox.macos(), reason="the sandbox gates are macOS only")
@@ -281,6 +283,22 @@ def test_tcp_without_resolution_is_a_failure(
     found = egress_gate(tmp_path, probe_result(name_resolution_available=False), monkeypatch)
     assert found.state is GateState.FAIL  # type: ignore[attr-defined]
     assert "resolver=False" in found.detail  # type: ignore[attr-defined]
+
+
+@pytest.mark.skipif(not sandbox.macos(), reason="the sandbox gates are macOS only")
+def test_tcp_and_resolution_without_trust_is_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exactly the state the eighth real probe ran under, reported green.
+
+    It resolved the name, opened the connection and started a turn, then spent
+    175s on `invalid peer certificate: UnknownIssuer` -- while this gate passed,
+    because it measured only the first two permissions. Being able to reach a
+    server says nothing about being able to verify it.
+    """
+    found = egress_gate(tmp_path, probe_result(tls_trust_available=False), monkeypatch)
+    assert found.state is GateState.FAIL  # type: ignore[attr-defined]
+    assert "tls_trust=False" in found.detail  # type: ignore[attr-defined]
 
 
 @pytest.mark.skipif(not sandbox.macos(), reason="the sandbox gates are macOS only")
