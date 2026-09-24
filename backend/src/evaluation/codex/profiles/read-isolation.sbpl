@@ -90,3 +90,26 @@
 (allow mach-lookup
   (global-name "com.apple.dnssd.service")
   (global-name "com.apple.SystemConfiguration.configd"))
+
+; The resolver socket, and nothing else in that directory.
+;
+; `getaddrinfo` does not send the DNS query itself. It hands the name to
+; mDNSResponder over a Unix domain socket, and `(remote tcp)` does not cover a
+; Unix socket -- neither does `(remote udp)`. So every outbound TCP connection
+; by address worked while every connection by name failed, which is how the
+; sixth real probe died after `turn.started`:
+;
+;   Reconnecting... 2/5 (stream disconnected before completion: failed to
+;   lookup address information: nodename nor servname provided, or not known)
+;
+; Measured rather than guessed. Codex's own `seatbelt_network_policy.sbpl`
+; lists `SystemConfiguration.DNSConfiguration`, `networkd`, `ocspd`,
+; `SecurityServer` and the `net.routetable` sysctls; each was granted on its
+; own against a resolver probe under this profile and not one of them made a
+; remote name resolvable. `(allow network-outbound)` did, and narrowing that
+; down left exactly this socket.
+;
+; The path is the resolved one. `/var/run` is a symlink to `/private/var/run`,
+; and the unresolved spelling was measured and does not match -- the same rule
+; the rest of this profile follows.
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))

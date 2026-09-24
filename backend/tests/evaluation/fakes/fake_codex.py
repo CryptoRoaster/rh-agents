@@ -323,20 +323,30 @@ def main() -> int:
         return 1
 
     if name == "stream_error":
-        # Codex reporting a failure of its own, which is what ended the fifth
-        # real probe. The scenario controls how far the stream got first, so a
-        # test can pin what the diagnostic is expected to have established.
+        # Codex reporting trouble of its own, which is what the fifth and sixth
+        # real probes ran into. The event is not terminal -- the CLI retries --
+        # so the scenario says what happens after it, and a test can pin both
+        # what the diagnostic established and whether the run survived.
         thread_started()
         if scenario.get("stream_error_after_turn"):
             emit({"type": "turn.started"})
         if scenario.get("stream_error_tool_item"):
             emit({"type": "item.started", "item": {"id": "c1", "type": "command_execution"}})
-        emit(
-            {
-                "type": "error",
-                "message": scenario.get("stream_error_message", "provider rejected request"),
-            }
-        )
+        for _ in range(int(scenario.get("stream_error_repeat", 1))):
+            emit(
+                {
+                    "type": "error",
+                    "message": scenario.get("stream_error_message", "Reconnecting... 2/5"),
+                }
+            )
+        ending = str(scenario.get("stream_error_ending", "exit"))
+        if ending == "completed":
+            agent_message(answer(scenario))
+            turn_completed()
+            return 0
+        if ending == "turn_failed":
+            emit({"type": "turn.failed", "error": {"message": "giving up after retries"}})
+            return 1
         return 1
 
     if name == "no_final_message":

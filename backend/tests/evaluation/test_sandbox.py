@@ -140,6 +140,55 @@ def test_outbound_tcp_is_reachable_through_the_profile(tmp_path: Path) -> None:
     assert measure(tmp_path).egress_reachable is True
 
 
+def test_the_resolver_is_reachable_through_the_profile(tmp_path: Path) -> None:
+    """Reaching an address and being able to find one are two permissions.
+
+    `getaddrinfo` does not send the query itself -- it hands the name to
+    mDNSResponder over a Unix domain socket, which `(remote tcp)` does not
+    cover and `(remote udp)` does not either. Every connection by address
+    worked while every connection by name failed, which is how the sixth real
+    probe died after `turn.started`.
+
+    Measured by connecting to the socket, not by resolving a name: a live
+    lookup would send a DNS query off the machine for a test, and `localhost`
+    -- the only name resolvable without doing so -- resolves even under the
+    profile that broke that probe.
+    """
+    result = measure(tmp_path)
+    assert result.name_resolution_available is True
+    assert result.egress_reachable is True
+
+
+def test_the_resolver_grant_is_one_socket_and_no_wider_network() -> None:
+    """The narrowest rule that was measured to work, and nothing beside it.
+
+    `(allow network-outbound)` unrestricted also fixes it, and that would open
+    every outbound connection of every kind. Codex's own network policy lists
+    `SystemConfiguration.DNSConfiguration`, `networkd`, `ocspd`,
+    `SecurityServer` and the `net.routetable` sysctls; each was granted alone
+    against a resolver probe and not one made a remote name resolvable.
+    """
+    rules = [
+        line for line in sandbox.compose_profile().splitlines() if not line.lstrip().startswith(";")
+    ]
+    text = " ".join("\n".join(rules).split())
+    assert '(allow network-outbound (literal "/private/var/run/mDNSResponder"))' in text
+
+    forms = [f"(allow {form}".strip() for form in text.split("(allow ")[1:]]
+    outbound = sorted(form for form in forms if "network-outbound" in form)
+    # The complete set, listed rather than counted: tcp to anywhere, the
+    # platform section's syslog socket, and this one resolver socket. A bare
+    # `(allow network-outbound)` or a `(remote unix-socket)` wildcard would
+    # also make the probe pass, and neither is here.
+    assert outbound == [
+        '(allow network-outbound (literal "/private/var/run/mDNSResponder"))',
+        '(allow network-outbound (literal "/private/var/run/syslog"))',
+        "(allow network-outbound (remote tcp))",
+    ], outbound
+    assert "(remote unix-socket)" not in text
+    assert "(remote udp)" not in text
+
+
 def test_the_app_sandbox_extensions_are_not_inherited() -> None:
     """An inherited extension would grant paths outside the three roots."""
     rules = [

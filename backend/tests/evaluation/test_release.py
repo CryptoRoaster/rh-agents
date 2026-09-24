@@ -224,3 +224,69 @@ def test_a_catalog_for_another_model_fails_the_surface_gate(tmp_path: Path) -> N
 def test_a_home_without_login_state_fails(tmp_path: Path) -> None:
     status = status_for(tmp_path, isolated_home=IsolatedHome(path=tmp_path, auth_present=False))
     assert gate(status, "AUTH_HOME_ISOLATION").state is GateState.FAIL  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------
+# NETWORK_EGRESS: reaching an address and finding one are two permissions
+# --------------------------------------------------------------------------
+
+
+def probe_result(**overrides: object) -> sandbox.ProbeResult:
+    """A boundary result that holds everywhere except where a test says."""
+    settings: dict[str, object] = {
+        "allowed_readable": True,
+        "forbidden_readable": False,
+        "sentinel_readable": False,
+        "auth_readable": True,
+        "auth_rewritable": True,
+        "installation_id_readable": True,
+        "installation_id_rewritable": True,
+        "other_file_creatable": False,
+        "egress_reachable": True,
+        "name_resolution_available": True,
+        "catalog_readable": True,
+        "catalog_replayable": True,
+        "catalog_writable": False,
+        "catalog_truncatable": False,
+        "catalog_deletable": False,
+        "catalog_sidecar_creatable": False,
+    }
+    settings.update(overrides)
+    return sandbox.ProbeResult(**settings)  # type: ignore[arg-type]
+
+
+def egress_gate(tmp_path: Path, result: sandbox.ProbeResult, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(sandbox, "probe_boundaries", lambda *_args, **_kwargs: result)
+    return gate(status_for(tmp_path), "NETWORK_EGRESS")
+
+
+@pytest.mark.skipif(not sandbox.macos(), reason="the sandbox gates are macOS only")
+def test_tcp_and_resolution_together_are_a_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    found = egress_gate(tmp_path, probe_result(), monkeypatch)
+    assert found.state is GateState.PASS  # type: ignore[attr-defined]
+
+
+@pytest.mark.skipif(not sandbox.macos(), reason="the sandbox gates are macOS only")
+def test_tcp_without_resolution_is_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exactly the state the sixth real probe ran under, reported green.
+
+    The gate measured a TCP connection to `127.0.0.1`, which needs no name
+    resolved, and passed while `getaddrinfo` was blocked. A preflight that is
+    green for a boundary the turn cannot survive is worse than no preflight.
+    """
+    found = egress_gate(tmp_path, probe_result(name_resolution_available=False), monkeypatch)
+    assert found.state is GateState.FAIL  # type: ignore[attr-defined]
+    assert "resolver=False" in found.detail  # type: ignore[attr-defined]
+
+
+@pytest.mark.skipif(not sandbox.macos(), reason="the sandbox gates are macOS only")
+def test_resolution_without_tcp_is_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    found = egress_gate(tmp_path, probe_result(egress_reachable=False), monkeypatch)
+    assert found.state is GateState.FAIL  # type: ignore[attr-defined]
+    assert "tcp=False" in found.detail  # type: ignore[attr-defined]

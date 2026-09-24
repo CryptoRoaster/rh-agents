@@ -26,7 +26,11 @@ from src.evaluation.codex.diagnostics import (
     diagnose,
     redact,
 )
-from src.evaluation.codex.models import EvaluationFailure, EvaluationRejected
+from src.evaluation.codex.models import (
+    EvaluationCompleted,
+    EvaluationFailure,
+    EvaluationRejected,
+)
 from tests.evaluation.conftest import Probe
 
 # Values that must never appear in any reported outcome. Deliberately
@@ -235,35 +239,70 @@ async def test_a_failing_exit_after_a_completed_turn_keeps_its_meaning(probe: Pr
 
 
 # --------------------------------------------------------------------------
-# A stream abort: the other half of the channel, and its own kind of answer
+# Codex reporting trouble: retained, redacted, and not by itself terminal
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_a_codex_stream_error_says_what_codex_said(probe: Probe) -> None:
-    """End to end: the message survives redaction instead of being dropped.
+async def test_a_retry_notice_does_not_stop_a_run_that_still_succeeds(probe: Probe) -> None:
+    """The sixth real probe's failure, end to end.
 
-    The fifth authorised real probe ended on `{"type": "error", ...}` and could
-    report nothing but `STREAM_ERROR`. The message was read, used to pick
-    between two reason codes, and discarded -- so the report said a failure had
-    happened and nothing about which one.
+    Codex said "Reconnecting... 2/5" and kept going; the harness stopped
+    reading and killed it. `responses_retry.rs` returns `Ok(())` after that
+    notice and the JSONL processor reports `CodexStatus::Running`, so the run
+    was never over.
     """
-    probe.scenario("stream_error", stream_error_message="provider rejected request")
+    probe.scenario(
+        "stream_error",
+        stream_error_after_turn=True,
+        stream_error_ending="completed",
+    )
     outcome = await probe.client().evaluate(probe.request())
-    assert isinstance(outcome, EvaluationRejected)
-    assert outcome.reason is EvaluationFailure.PROCESS_FAILED
-    assert outcome.detail_code == "STREAM_ERROR"
-    assert outcome.stream_diagnostic is not None
-    assert outcome.stream_diagnostic.safe_lines == ("provider rejected request",)
+    assert isinstance(outcome, EvaluationCompleted)
+    assert outcome.thread_id == "11111111-2222-3333-4444-555555555555"
 
 
 @pytest.mark.asyncio
-async def test_no_secret_from_a_stream_error_reaches_the_outcome(probe: Probe) -> None:
-    """The same guarantee the stderr channel gives, on the same shapes.
+async def test_a_terminal_failure_after_retries_explains_itself(probe: Probe) -> None:
+    """`turn.failed` is the signal that ends it, carrying what led there.
 
-    Checked over the whole repr, because a caller logging the outcome is the
-    realistic way a secret would escape.
+    A turn that gave up after several reconnections is explained by those
+    reconnections, not by the word "failed".
     """
+    probe.scenario(
+        "stream_error",
+        stream_error_after_turn=True,
+        stream_error_ending="turn_failed",
+    )
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.TURN_FAILED
+    assert outcome.stream_diagnostic is not None
+    assert "Reconnecting... 2/5" in outcome.stream_diagnostic.safe_lines
+    assert "giving up after retries" in outcome.stream_diagnostic.safe_lines
+    assert outcome.stream_diagnostic.turn_started is True
+
+
+@pytest.mark.asyncio
+async def test_a_cli_that_exits_after_retries_still_reports_them(probe: Probe) -> None:
+    """The other terminal path: no turn, no failure event, just an exit.
+
+    The retry messages are the only explanation such a run has, and they would
+    be lost if only the exit code were reported.
+    """
+    probe.scenario("stream_error", stream_error_ending="exit")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "EXIT_1_BEFORE_TURN"
+    assert outcome.diagnostic is not None
+    assert outcome.stream_diagnostic is not None
+    assert outcome.stream_diagnostic.safe_lines == ("Reconnecting... 2/5",)
+    assert outcome.stream_diagnostic.turn_started is False
+
+
+@pytest.mark.asyncio
+async def test_no_secret_from_a_codex_error_reaches_the_outcome(probe: Probe) -> None:
+    """The same guarantee the stderr channel gives, on the same shapes."""
     probe.scenario(
         "stream_error",
         stream_error_message=f"Authorization: Bearer {SECRETS[0]} for {JWT_LIKE}",
@@ -278,7 +317,7 @@ async def test_no_secret_from_a_stream_error_reaches_the_outcome(probe: Probe) -
 
 
 @pytest.mark.asyncio
-async def test_a_stream_error_names_paths_by_role(probe: Probe) -> None:
+async def test_a_codex_error_names_paths_by_role(probe: Probe) -> None:
     """The client's own aliases are used, not an empty set of them."""
     probe.scenario(
         "stream_error",
@@ -293,12 +332,21 @@ async def test_a_stream_error_names_paths_by_role(probe: Probe) -> None:
 
 
 @pytest.mark.asyncio
+async def test_many_retries_stay_inside_the_diagnostic_budget(probe: Probe) -> None:
+    """A reconnection storm must not grow the report without limit."""
+    probe.scenario("stream_error", stream_error_repeat=40)
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.stream_diagnostic is not None
+    assert len(outcome.stream_diagnostic.safe_lines) <= MAX_LINES
+
+
+@pytest.mark.asyncio
 async def test_a_stream_error_reports_what_the_stream_had_established(probe: Probe) -> None:
     """Whether a turn began, which thread, and what tools had been seen.
 
     All three were UNKNOWN in the fifth probe's report, and all three are facts
-    the parser already held. None of them can carry a prompt, a payload, a
-    model answer or a credential.
+    the parser already held.
     """
     probe.scenario(
         "stream_error",
@@ -317,30 +365,13 @@ async def test_a_stream_error_reports_what_the_stream_had_established(probe: Pro
 
 
 @pytest.mark.asyncio
-async def test_a_stream_error_before_any_turn_says_so(probe: Probe) -> None:
-    """The negative case, stated rather than inferred.
-
-    An empty `observed_tool_activity` means nothing was observed up to the
-    abort. It is not a claim that no tool was offered, and the field name is
-    the only thing that has ever claimed anything here.
-    """
-    probe.scenario("stream_error")
-    outcome = await probe.client().evaluate(probe.request())
-    assert isinstance(outcome, EvaluationRejected)
-    diagnostic = outcome.stream_diagnostic
-    assert diagnostic is not None
-    assert diagnostic.turn_started is False
-    assert diagnostic.thread_id == "11111111-2222-3333-4444-555555555555"
-    assert diagnostic.observed_tool_activity == ()
-
-
-@pytest.mark.asyncio
-async def test_a_malformed_stream_error_keeps_its_own_code(probe: Probe) -> None:
-    """A non-string message has nothing to redact and says so."""
+async def test_a_malformed_error_event_still_aborts_the_stream(probe: Probe) -> None:
+    """The loosening is about meaning, not about accepting a broken shape."""
     probe.scenario("stream_error", stream_error_message={"not": "a string"})
     outcome = await probe.client().evaluate(probe.request())
     assert isinstance(outcome, EvaluationRejected)
     assert outcome.detail_code == "STREAM_ERROR_MALFORMED"
+    assert outcome.diagnostic is None
     assert outcome.stream_diagnostic is not None
     assert outcome.stream_diagnostic.safe_lines == ()
 
@@ -355,20 +386,21 @@ async def test_a_stream_abort_gets_no_invented_process_diagnostic(probe: Probe) 
     would have to invent an `exit_code` -- and that number would read as the
     CLI's answer when it is our own signal.
     """
-    probe.scenario("stream_error")
+    probe.scenario("corrupt_line")
     outcome = await probe.client().evaluate(probe.request())
     assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "LINE_NOT_JSON"
     assert outcome.diagnostic is None
     assert outcome.stream_diagnostic is not None
 
 
 @pytest.mark.asyncio
-async def test_a_process_failure_still_gets_no_stream_diagnostic(probe: Probe) -> None:
-    """And the other way round: the existing channel is untouched."""
+async def test_a_process_failure_still_carries_its_process_diagnostic(probe: Probe) -> None:
+    """The existing channel is untouched: a real exit keeps its real code."""
     probe.scenario("fails_before_turn", exit_code=1, stderr_lines=["error: could not start"])
     outcome = await probe.client().evaluate(probe.request())
     assert isinstance(outcome, EvaluationRejected)
     assert outcome.detail_code == "EXIT_1_BEFORE_TURN"
     assert outcome.diagnostic is not None
     assert outcome.diagnostic.exit_code == 1
-    assert outcome.stream_diagnostic is None
+    assert outcome.diagnostic.safe_lines == ("error: could not start",)

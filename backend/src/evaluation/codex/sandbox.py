@@ -45,6 +45,10 @@ READ_ISOLATION = PROFILE_DIR / "read-isolation.sbpl"
 
 PROBE_TIMEOUT_SECONDS = 20.0
 
+# Where `getaddrinfo` hands the name over. Resolved on purpose: `/var/run` is a
+# symlink to `/private/var/run`, and Seatbelt matches the real filesystem.
+RESOLVER_SOCKET = Path("/private/var/run/mDNSResponder")
+
 
 @dataclass(frozen=True)
 class SandboxRoots:
@@ -195,6 +199,7 @@ class ProbeResult:
     installation_id_rewritable: bool
     other_file_creatable: bool
     egress_reachable: bool
+    name_resolution_available: bool
     catalog_readable: bool
     catalog_replayable: bool
     catalog_writable: bool
@@ -257,6 +262,7 @@ DENIED_EVERYTHING = ProbeResult(
     installation_id_rewritable=False,
     other_file_creatable=True,
     egress_reachable=False,
+    name_resolution_available=False,
     catalog_readable=False,
     catalog_replayable=False,
     catalog_writable=True,
@@ -397,6 +403,16 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
                 f' else echo "CATALOGSIDECAR DENIED"; fi',
                 f"if /usr/bin/nc -w 3 127.0.0.1 {target.port} < /dev/null > /dev/null 2>&1;"
                 f' then echo "EGRESS OK"; else echo "EGRESS DENIED"; fi',
+                # Reaching the resolver, measured without resolving anything.
+                # A live lookup would be the wrong experiment twice over: it
+                # would send a DNS query off the machine for a test, and
+                # `localhost` -- the only name that could be looked up without
+                # doing so -- resolves even under the profile that broke the
+                # sixth real probe, so it would report a boundary that is not
+                # there. Connecting to the socket is local, and it is the exact
+                # permission that was missing.
+                f'if /usr/bin/nc -U -w 3 "{RESOLVER_SOCKET}" < /dev/null > /dev/null 2>&1;'
+                f' then echo "RESOLVER OK"; else echo "RESOLVER DENIED"; fi',
             ]
         )
         command = wrap(["/bin/sh", "-c", script], profile, roots)
@@ -432,6 +448,7 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
             marker in output for marker in ("BESIDE OK", "SIDECAR OK", "MARKERSIDECAR OK")
         ),
         egress_reachable="EGRESS OK" in output,
+        name_resolution_available="RESOLVER OK" in output,
         catalog_readable=bool(reads) and reads[0] != "UNREADABLE",
         # Three reads, all present and all identical. Two agreeing reads out of
         # three would not do: the failure being guarded against is precisely a
@@ -507,6 +524,7 @@ __all__ = [
     "macos",
     "DENIED_EVERYTHING",
     "PROBE_CATALOG_PAYLOAD",
+    "RESOLVER_SOCKET",
     "LoopbackTarget",
     "probe_boundaries",
     "wrap",

@@ -18,6 +18,14 @@ Item types that indicate tool use are `command_execution`, `file_change`,
 item that starts and completes is one observation rather than two, and an item
 that starts and never completes is still observed.
 
+An `error` event is not a terminal state. `responses_retry.rs` reports a
+retryable stream failure through `notify_stream_error(..., "Reconnecting...
+X/Y", ...)` and then carries on; the app-server marks it `will_retry: true`,
+and the JSONL processor drops that flag, emits a bare `ThreadEvent::Error` and
+returns `CodexStatus::Running`. So an `error` event is recorded -- redacted --
+and the run continues. What ends an attempt is `turn.failed`, `turn.completed`,
+the process ending, the deadline, or local validation.
+
 The order of these is looser than it looks. `item.started`, `item.updated` and
 `item.completed` can arrive **before** `turn.started`: the JSONL processor maps
 `ServerNotification::TurnPlanUpdated` directly onto an `ItemStarted` carrying a
@@ -46,7 +54,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.evaluation.codex.diagnostics import EMPTY_ALIASES, PathAliases, redact
+from src.evaluation.codex.diagnostics import EMPTY_ALIASES, MAX_LINES, PathAliases, redact
 from src.evaluation.codex.models import (
     EvaluationFailure,
     EvaluationUsage,
@@ -99,6 +107,10 @@ class EventAccumulator:
     final_message: str | None = None
     usage: EvaluationUsage = field(default_factory=EvaluationUsage)
     tool_items: dict[str, set[str]] = field(default_factory=dict)
+    # Redacted only. Codex reports retryable stream trouble through `error`
+    # events, so these accumulate while the run continues and are what makes a
+    # later terminal failure explainable.
+    error_lines: tuple[str, ...] = ()
 
     def feed(self, line: bytes) -> None:
         text = line.strip()
@@ -130,18 +142,30 @@ class EventAccumulator:
         # Any other type is additive and ignored on purpose.
 
     def _stream_error(self, event: dict[str, Any]) -> None:
-        """Codex reported a failure of its own. Say what it was, safely.
+        """Codex reported a problem. Record it, safely, and keep reading.
 
-        The fifth real probe ended here and could report nothing but the code:
-        the message was recognised, used to pick between two reason codes, and
-        then dropped. A failure that cannot be described is a failure that gets
-        retried blindly.
+        An `error` event is **not** terminal, and treating it as terminal ended
+        the sixth real probe on a message that says so in its own text:
+        "Reconnecting... 2/5". In 0.153.4 `responses_retry.rs` calls
+        `notify_stream_error(..., "Reconnecting... X/Y", ...)` for a retryable
+        stream failure and then returns `Ok(())` to try again; the app-server
+        turns that into `ServerNotification::Error` with `will_retry: true`,
+        commented in the source as an intermediate state for retries. The JSONL
+        processor drops `will_retry`, emits a bare `ThreadEvent::Error` and
+        returns `CodexStatus::Running` -- so the event we receive cannot be
+        distinguished from a fatal one by its own contents, and the CLI's own
+        answer is that it is still running.
 
-        So the message goes through exactly the redaction stderr goes through
-        -- the same sensitive-term rules, the same JWT and long-opaque masking,
-        the same path aliases, the same line and size budgets, and the same
-        fail-closed guarantee. The raw string is never stored, never logged and
-        never reaches the exception's own message.
+        So fatality is decided by the signals that actually mean it:
+        `turn.failed`, `turn.completed`, the process ending, the deadline, and
+        local validation. Nothing here touches `turn_started`,
+        `turn_completed` or the tool observation.
+
+        The message still goes through exactly the redaction stderr goes
+        through -- the same sensitive-term rules, the same JWT and long-opaque
+        masking, the same path aliases, the same fail-closed guarantee -- and
+        the raw string is never stored, never logged and never reaches an
+        exception message.
 
         `errors="replace"` on the encode is not decoration: a JSON string may
         contain a lone surrogate, which plain UTF-8 encoding refuses, and a
@@ -149,12 +173,26 @@ class EventAccumulator:
         """
         message = event.get("message")
         if not isinstance(message, str):
+            # An event we cannot read is a different matter from an event that
+            # reports trouble. This one violates the contract rather than
+            # describing a retry, and it stays a refusal for the same reason
+            # `ITEM_MISSING` does.
             raise StreamError(EvaluationFailure.PROCESS_FAILED, "STREAM_ERROR_MALFORMED")
-        raise StreamError(
-            EvaluationFailure.PROCESS_FAILED,
-            "STREAM_ERROR",
-            redact(message.encode("utf-8", errors="replace"), self.aliases),
-        )
+        self._remember(redact(message.encode("utf-8", errors="replace"), self.aliases))
+
+    def _remember(self, lines: tuple[str, ...]) -> None:
+        """Keep the most recent safe error lines, within the diagnostic budget.
+
+        The most recent, because a run that retries five times and then fails
+        is best explained by what it said last. Bounded by the same `MAX_LINES`
+        the stderr channel uses, so a storm of retries cannot grow this without
+        limit.
+        """
+        self.error_lines = (*self.error_lines, *lines)[-MAX_LINES:]
+
+    def safe_error_lines(self) -> tuple[str, ...]:
+        """Redacted error text seen so far. Never raw, never a whole event."""
+        return self.error_lines
 
     def _thread_started(self, event: dict[str, Any]) -> None:
         if self.thread_id is not None:
@@ -226,13 +264,22 @@ class EventAccumulator:
         self.usage = _usage(event.get("usage"))
 
     def _turn_failed(self, event: dict[str, Any]) -> None:
+        """The terminal signal, carrying whatever the retries said on the way.
+
+        A turn that failed after five reconnection attempts is explained by
+        those attempts, not by the word "failed". The earlier `error` events
+        were redacted when they arrived, so what travels here is already safe.
+        """
         if self.turn_completed:
             raise StreamError(EvaluationFailure.EVENT_STREAM_INVALID, "TURN_FAILED_AFTER_END")
         error = event.get("error")
         message = error.get("message") if isinstance(error, dict) else None
+        if isinstance(message, str):
+            self._remember(redact(message.encode("utf-8", errors="replace"), self.aliases))
         raise StreamError(
             EvaluationFailure.TURN_FAILED,
             "TURN_FAILED" if isinstance(message, str) else "TURN_FAILED_MALFORMED",
+            self.error_lines,
         )
 
     def observed_tool_activity(self) -> tuple[ObservedToolActivity, ...]:

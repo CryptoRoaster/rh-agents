@@ -693,13 +693,27 @@ class CodexEvaluationClient:
                 deadline,
                 cleanup,
                 diagnostic,
+                # Retryable stream trouble is reported through `error` events
+                # and no longer ends the run, so a CLI that gave up after
+                # several attempts exits with those messages behind it. They
+                # are what explains the exit, and they would otherwise be lost.
+                self._stream_diagnostic(accumulator, accumulator.safe_error_lines()),
             )
         try:
             answer = accumulator.require_consistent_completion()
         except StreamError as error:
             # A turn did start here, so the event semantics decide and are left
             # exactly as they were.
-            return self._reject(error.failure, error.reason_code, deadline, cleanup, diagnostic)
+            return self._reject(
+                error.failure,
+                error.reason_code,
+                deadline,
+                cleanup,
+                diagnostic,
+                self._stream_diagnostic(
+                    accumulator, error.safe_lines or accumulator.safe_error_lines()
+                ),
+            )
         if exit_code != 0:
             # A completed turn and a failing exit contradict each other; the
             # attempt is not treated as successful on the strength of one of them.
