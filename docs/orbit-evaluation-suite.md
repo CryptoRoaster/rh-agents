@@ -213,10 +213,12 @@ no winner field with a value.
 ### Safety of the CLI
 
 ```
-python -m tests.evaluation.orbit_compare_runner [--provider codex|anthropic|both]
-    [--repetitions N] [--case SLUG|all ...] [--execute] [--output /abs/path.json]
+python -m tests.evaluation.orbit_compare_runner [--suite v1|v2|all]
+    [--provider codex|anthropic|both] [--repetitions N] [--case SLUG|all ...]
+    [--execute] [--output /abs/path.json]
 ```
 
+- `--suite` defaults to `v1`; v2 is described in `orbit-evaluation-suite-v2.md`.
 - Default is a dry run: the fixed plan on stdout,
   `provider_invocations_started = 0`, `real_provider_requests_occurred = NO`, no
   environment read, no file written. No executor exists in a dry run.
