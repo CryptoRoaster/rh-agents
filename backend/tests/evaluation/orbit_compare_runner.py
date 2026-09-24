@@ -63,6 +63,7 @@ from src.reasoning.models import (
     ReasoningResult,
 )
 from tests.evaluation.fixtures.orbit_suite import SUITE, OrbitSuiteCase
+from tests.evaluation.fixtures.orbit_suite_v2 import SUITE_V2
 from tests.evaluation.orbit_benchmark import evaluate
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -187,10 +188,12 @@ class ComparisonPlan:
     cases: tuple[OrbitSuiteCase, ...]
     repetitions: int
     samples: tuple[PlannedSample, ...]
+    suite: str = "v1"
 
     def describe(self, *, mode: str) -> dict[str, object]:
         return {
             "mode": mode,
+            "suite": self.suite,
             "providers": [p.value for p in self.providers],
             "cases": [c.slug for c in self.cases],
             "repetitions": self.repetitions,
@@ -203,7 +206,10 @@ class ComparisonPlan:
 
 
 def build_plan(
-    providers: Sequence[ProviderId], cases: Sequence[OrbitSuiteCase], repetitions: int
+    providers: Sequence[ProviderId],
+    cases: Sequence[OrbitSuiteCase],
+    repetitions: int,
+    suite: str = "v1",
 ) -> ComparisonPlan:
     if repetitions < 1:
         raise ValueError("repetitions must be at least 1")
@@ -214,7 +220,11 @@ def build_plan(
         for provider in providers
     )
     return ComparisonPlan(
-        providers=tuple(providers), cases=tuple(cases), repetitions=repetitions, samples=samples
+        providers=tuple(providers),
+        cases=tuple(cases),
+        repetitions=repetitions,
+        samples=samples,
+        suite=suite,
     )
 
 
@@ -752,18 +762,29 @@ def _repetitions(text: str) -> int:
     return value
 
 
-def select_cases(requested: Sequence[str] | None) -> tuple[OrbitSuiteCase, ...]:
+# v1 stays the default so an unchanged command line plans exactly what the v1
+# campaign ran. v2 and the union are explicit choices only.
+SUITES: dict[str, tuple[OrbitSuiteCase, ...]] = {
+    "v1": SUITE,
+    "v2": SUITE_V2,
+    "all": (*SUITE, *SUITE_V2),
+}
+
+
+def select_cases(
+    requested: Sequence[str] | None, suite: Sequence[OrbitSuiteCase] = SUITE
+) -> tuple[OrbitSuiteCase, ...]:
     if not requested or "all" in requested:
         if requested and len(set(requested)) > 1:
             raise UsageError("'all' cannot be combined with individual cases")
-        return SUITE
-    known = {c.slug: c for c in SUITE}
+        return tuple(suite)
+    known = {c.slug: c for c in suite}
     unknown = [slug for slug in requested if slug not in known]
     if unknown:
         raise UsageError(f"unknown case: {', '.join(unknown)}")
     wanted = set(requested)
     # Suite order, whatever order they were given in.
-    return tuple(c for c in SUITE if c.slug in wanted)
+    return tuple(c for c in suite if c.slug in wanted)
 
 
 def check_output_path(raw: str) -> Path:
@@ -786,6 +807,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         prog="python -m tests.evaluation.orbit_compare_runner",
         description="Plan (default) or explicitly execute the ORBIT provider comparison.",
     )
+    parser.add_argument("--suite", choices=sorted(SUITES), default="v1")
     parser.add_argument("--provider", choices=sorted(PROVIDER_CHOICES), default="both")
     parser.add_argument("--repetitions", type=_repetitions, default=1)
     parser.add_argument("--case", action="append", dest="cases", metavar="SLUG|all")
@@ -817,14 +839,14 @@ def main(
     except SystemExit as exit_:
         return int(exit_.code or 0)
     try:
-        cases = select_cases(args.cases)
+        cases = select_cases(args.cases, SUITES[args.suite])
         output = check_output_path(args.output) if args.output is not None else None
         if output is not None and not args.execute:
             raise UsageError("--output is only written with --execute")
     except UsageError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
-    plan = build_plan(PROVIDER_CHOICES[args.provider], cases, args.repetitions)
+    plan = build_plan(PROVIDER_CHOICES[args.provider], cases, args.repetitions, args.suite)
 
     if not args.execute:
         # No executor exists in a dry run, so no provider path can be entered.

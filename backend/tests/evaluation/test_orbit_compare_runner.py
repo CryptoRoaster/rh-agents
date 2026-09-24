@@ -1092,3 +1092,49 @@ def test_codex_domain_rejection_stays_output_contract_after_invocation() -> None
     assert result.failure_kind is FailureKind.OUTPUT_CONTRACT
     assert result.domain_reason == "CONTRADICTED_VALUE"
     assert result.provider_invocation_started is True
+
+
+# --- Suite selection ---------------------------------------------------------------
+
+
+def test_default_suite_is_v1_and_unchanged() -> None:
+    _, out = run_cli(["--repetitions", "3"])
+    plan = json.loads(out)
+    assert plan["suite"] == "v1"
+    assert plan["cases"] == [c.slug for c in SUITE]
+    assert plan["planned_samples"] == 42
+    assert run_cli(["--suite", "v1", "--repetitions", "3"])[1] == out
+
+
+def test_suite_v2_plans_only_v2_cases() -> None:
+    from tests.evaluation.fixtures.orbit_suite_v2 import SUITE_V2
+
+    _, out = run_cli(["--suite", "v2", "--repetitions", "3"])
+    plan = json.loads(out)
+    assert plan["suite"] == "v2"
+    assert plan["cases"] == [c.slug for c in SUITE_V2]
+    assert plan["planned_samples"] == 8 * 3 * 2
+    assert plan["provider_invocations_started"] == 0
+
+
+def test_suite_all_is_v1_then_v2() -> None:
+    from tests.evaluation.fixtures.orbit_suite_v2 import SUITE_V2
+
+    _, out = run_cli(["--suite", "all"])
+    plan = json.loads(out)
+    assert plan["cases"] == [c.slug for c in (*SUITE, *SUITE_V2)]
+    assert plan["planned_samples"] == 15 * 2
+    assert len({s["sample_id"] for s in plan["samples"]}) == 30
+
+
+def test_case_must_belong_to_the_selected_suite(monkeypatch: pytest.MonkeyPatch) -> None:
+    codex, anthropic = FakeCodex(), FakeAnthropic()
+    anthropic.install(monkeypatch)
+    code, out = run_cli(
+        ["--suite", "v1", "--case", "liquidity_exactly_at_floor", "--execute"], deps(codex)
+    )
+    assert code == 2 and out == ""
+    code, out = run_cli(["--suite", "v2", "--case", "liquidity_exactly_at_floor"])
+    assert code == 0
+    assert json.loads(out)["cases"] == ["liquidity_exactly_at_floor"]
+    assert codex.contexts == codex.evaluate_calls == anthropic.calls == 0
