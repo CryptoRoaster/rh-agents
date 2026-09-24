@@ -1,0 +1,729 @@
+"""End-to-end outcomes of one attempt, driven by a fake process.
+
+Scope, stated plainly: these tests exercise our argument building, our process
+handling and our validation. They do not demonstrate the real CLI's tool
+surface, its filesystem isolation, or how subscription usage is metered. A fake
+process cannot show any of that, and a green run here is not evidence for it.
+"""
+
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+from unittest import mock
+
+import pytest
+from pydantic import BaseModel, ConfigDict
+
+from src.agents.orbit.models import OrbitAssessment, OrbitClassification
+from src.evaluation.codex import catalog as catalog_module
+from src.evaluation.codex import client as client_module
+from src.evaluation.codex import sandbox
+from src.evaluation.codex.command import ALLOWED_ENVIRONMENT_KEYS, build_arguments
+from src.evaluation.codex.models import (
+    EvaluationCompleted,
+    EvaluationFailure,
+    EvaluationRejected,
+    OutputLimits,
+)
+from tests.evaluation.conftest import (
+    LAUNCHER_INJECTED_ENVIRONMENT_KEYS,
+    Probe,
+    orbit_domain_validator,
+)
+
+
+class FreeForm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    bag: dict[str, object]
+
+
+async def test_a_valid_answer_is_accepted_and_locally_validated(probe: Probe) -> None:
+    probe.scenario("success")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+    assert isinstance(outcome.output, OrbitAssessment)
+    assert outcome.output.classification is OrbitClassification.INTERESTING
+    assert outcome.output.pair_id == probe.task_input.candidate.pair_id
+    assert outcome.usage.input_tokens == 1200
+    assert outcome.thread_id == "11111111-2222-3333-4444-555555555555"
+    assert outcome.cleanup.complete is True
+    assert outcome.wall_clock_ms >= 0
+
+
+async def test_configured_values_are_never_passed_off_as_reported_ones(probe: Probe) -> None:
+    probe.scenario("success")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+    assert outcome.configuration.configured_model == "gpt-5.4"
+    assert outcome.configuration.configured_effort == "low"
+    # The documented event contract carries neither, so both stay absent.
+    assert outcome.configuration.reported_model is None
+    assert outcome.configuration.reported_effort is None
+
+
+async def test_only_the_last_message_before_the_turn_ends_counts(probe: Probe) -> None:
+    probe.scenario("two_messages")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+
+
+async def test_missing_usage_stays_none_without_failing_the_attempt(probe: Probe) -> None:
+    probe.scenario("no_usage")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+    assert outcome.usage.input_tokens is None
+    assert outcome.usage.output_tokens is None
+
+
+async def test_domain_contradiction_never_yields_a_completed_result(probe: Probe) -> None:
+    probe.scenario("success", pair_id="a-different-pair")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.OUTPUT_DOMAIN_INVALID
+    assert outcome.detail_code == "MARKET_MISMATCH"
+
+
+async def test_citing_an_observation_that_was_never_shown_is_refused(probe: Probe) -> None:
+    probe.scenario("success", observation_ids=["ffffffff-0000-4000-8000-000000000009"])
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "UNKNOWN_OBSERVATION_REFERENCE"
+
+
+async def test_schema_conformant_nonsense_is_refused_locally(probe: Probe) -> None:
+    probe.scenario("success", assessment_overrides={"classification": "MAYBE"})
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.OUTPUT_SCHEMA_MISMATCH
+
+
+async def test_a_non_json_answer_is_refused(probe: Probe) -> None:
+    probe.scenario("not_json")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.OUTPUT_NOT_JSON
+
+
+@pytest.mark.parametrize(
+    ("scenario", "failure"),
+    [
+        ("turn_failed", EvaluationFailure.TURN_FAILED),
+        ("no_final_message", EvaluationFailure.NO_FINAL_MESSAGE),
+        ("message_without_turn_end", EvaluationFailure.INCONSISTENT_COMPLETION),
+        ("item_before_turn", EvaluationFailure.EVENT_STREAM_INVALID),
+        ("corrupt_line", EvaluationFailure.EVENT_STREAM_INVALID),
+    ],
+)
+async def test_broken_event_sequences_are_refused(
+    probe: Probe, scenario: str, failure: EvaluationFailure
+) -> None:
+    probe.scenario(scenario)
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is failure
+
+
+async def test_a_failing_exit_contradicts_a_completed_turn(probe: Probe) -> None:
+    probe.scenario("exit_nonzero")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.INCONSISTENT_COMPLETION
+    assert outcome.detail_code == "EXIT_3"
+
+
+async def test_an_oversized_answer_hits_the_parser_budget(probe: Probe) -> None:
+    probe.scenario("huge_message")
+    outcome = await probe.client().evaluate(
+        probe.request(limits=OutputLimits(max_line_bytes=400_000, max_final_message_bytes=1024))
+    )
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.PARSER_BUDGET_EXCEEDED
+
+
+async def test_observed_tool_activity_is_recorded_when_it_happens(probe: Probe) -> None:
+    probe.scenario("tool_activity")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+    activity = {item.item_type: item.count for item in outcome.observed_tool_activity}
+    assert activity == {"command_execution": 1, "web_search": 1}
+
+
+async def test_a_quiet_stream_is_not_evidence_that_no_tool_was_offered(probe: Probe) -> None:
+    probe.scenario("success")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+    # Nothing was used. Which tools were *offered* remains unknown here.
+    assert outcome.observed_tool_activity == ()
+
+
+async def test_a_second_attempt_is_refused_rather_than_retried(probe: Probe) -> None:
+    probe.scenario("success")
+    client = probe.client()
+    assert isinstance(await client.evaluate(probe.request()), EvaluationCompleted)
+    second = await client.evaluate(probe.request())
+    assert isinstance(second, EvaluationRejected)
+    assert second.detail_code == "EXEC_BUDGET_EXHAUSTED"
+    assert client.exec_starts == 1
+
+
+async def test_an_unsupported_effort_is_refused_not_remapped(probe: Probe) -> None:
+    probe.scenario("success")
+    outcome = await probe.client(effort="max").evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.EFFORT_NOT_SUPPORTED
+    assert outcome.detail_code == "max"
+
+
+async def test_the_launcher_is_asked_which_build_it_is(probe: Probe) -> None:
+    probe.scenario("success")
+    client = probe.client()
+    assert isinstance(await client.evaluate(probe.request()), EvaluationCompleted)
+    # The version probe is its own process with its own counter.
+    assert client.version_starts == 1
+    assert client.exec_starts == 1
+
+
+async def test_a_launcher_reporting_another_build_never_runs_an_attempt(
+    probe: Probe,
+) -> None:
+    probe.scenario("success", version="codex-cli 0.155.1")
+    client = probe.client()
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.CLI_VERSION_UNSUPPORTED
+    # The measured version is reported, not the one we hoped for.
+    assert outcome.detail_code == "0.155.1"
+    assert client.version_starts == 1
+    assert client.exec_starts == 0
+
+
+async def test_a_launcher_that_reports_no_version_never_runs_an_attempt(
+    probe: Probe,
+) -> None:
+    probe.scenario("success", version=None)
+    client = probe.client()
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.VERSION_CHECK_FAILED
+    assert outcome.detail_code == "VERSION_NOT_REPORTED"
+    assert client.exec_starts == 0
+
+
+async def test_a_failing_version_probe_never_runs_an_attempt(probe: Probe) -> None:
+    probe.scenario("success", version="__fail__")
+    client = probe.client()
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.VERSION_CHECK_FAILED
+    assert outcome.detail_code == "EXIT_2"
+    assert client.exec_starts == 0
+
+
+async def test_an_inexpressible_output_model_never_starts_a_process(probe: Probe) -> None:
+    probe.scenario("success")
+    client = probe.client()
+    outcome = await client.evaluate(
+        probe.request(output_model=FreeForm, domain_validator=lambda _output: None)
+    )
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.SCHEMA_UNSUPPORTED
+    assert client.exec_starts == 0
+
+
+async def test_the_login_probe_is_counted_apart_from_the_attempt(probe: Probe) -> None:
+    probe.scenario("success", login="login_status_chatgpt")
+    client = probe.client(run_preflight=True)
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+    assert client.preflight_starts == 1
+    assert client.exec_starts == 1
+
+
+@pytest.mark.parametrize("login", ["login_status_api_key", "login_status_failure"])
+async def test_without_a_chatgpt_session_no_attempt_is_started(probe: Probe, login: str) -> None:
+    probe.scenario("success", login=login)
+    client = probe.client(run_preflight=True)
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.PREFLIGHT_FAILED
+    assert client.exec_starts == 0
+
+
+async def test_the_child_inherits_no_credential_from_the_parent(probe: Probe) -> None:
+    recorded = probe.workspace.parent / "child-env.json"
+    probe.scenario("record_environment", environment_out=str(recorded))
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+
+    seen = json.loads(Path(recorded).read_text(encoding="utf-8"))  # noqa: ASYNC240
+    # Everything present is either a key the harness passed or a variable the
+    # operating system and the test's own shell shim add. Nothing else gets in.
+    assert set(seen) - LAUNCHER_INJECTED_ENVIRONMENT_KEYS == set(ALLOWED_ENVIRONMENT_KEYS)
+    for banned in (
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+        "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+        "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+        "DATABASE_URL",
+        "OPENAI_BASE_URL",
+    ):
+        assert banned not in seen
+    assert seen["CODEX_HOME"] == str(probe.codex_home)
+
+
+async def test_a_validator_that_overruns_the_deadline_is_never_a_late_success(
+    probe: Probe,
+) -> None:
+    """The regression: synchronous validation cannot be cancelled, only caught.
+
+    `time.sleep` in a validator blocks the event loop outright. Nothing can
+    interrupt it, so the only honest handling is to notice the overrun once it
+    returns and refuse the result that arrived too late.
+    """
+    probe.scenario("success")
+    bound = orbit_domain_validator(probe.task_input)
+
+    def slow(output: OrbitAssessment) -> None:
+        bound(output)
+        time.sleep(2.0)
+
+    outcome = await probe.client().evaluate(
+        probe.request(deadline_seconds=2.0, cleanup_reserve_seconds=0.5, domain_validator=slow)
+    )
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.DEADLINE_EXCEEDED
+    assert outcome.detail_code == "VALIDATION_OVERRAN"
+
+
+async def test_the_same_budget_accepts_a_validator_that_returns_in_time(
+    probe: Probe,
+) -> None:
+    probe.scenario("success")
+    outcome = await probe.client().evaluate(
+        probe.request(deadline_seconds=2.0, cleanup_reserve_seconds=0.5)
+    )
+    assert isinstance(outcome, EvaluationCompleted)
+
+
+async def test_the_version_probe_runs_with_the_same_scrubbed_environment(
+    probe: Probe,
+) -> None:
+    recorded = probe.workspace.parent / "version-env.json"
+    probe.scenario("success", version_environment_out=str(recorded))
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+
+    seen = json.loads(Path(recorded).read_text(encoding="utf-8"))  # noqa: ASYNC240
+    assert set(seen) - LAUNCHER_INJECTED_ENVIRONMENT_KEYS == set(ALLOWED_ENVIRONMENT_KEYS)
+    for banned in ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"):
+        assert banned not in seen
+
+
+async def test_the_login_probe_reads_the_channel_the_cli_actually_uses(
+    probe: Probe,
+) -> None:
+    """The regression: 0.153.4 answers on stderr, with stdout left empty.
+
+    `run_login_status` reports every outcome with `eprintln!`, so a probe that
+    watched stdout alone would see nothing and reject a perfectly valid ChatGPT
+    session. The exit code cannot stand in for the marker either -- an API-key
+    session also exits 0.
+    """
+    probe.scenario("success", login="login_status_chatgpt")
+    client = probe.client(run_preflight=True)
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+    assert client.preflight_starts == 1
+    assert client.exec_starts == 1
+
+
+@pytest.mark.parametrize(
+    "login",
+    [
+        "login_status_api_key",
+        "login_status_access_token",
+        "login_status_failure",
+        # A longer status beginning with the marker: accepted by a substring
+        # test, rejected by an exact line match.
+        "login_status_chatgpt_prefixed",
+        # The marker exists only if the two channels are glued together, which
+        # is why they are matched separately.
+        "login_status_split_channels",
+    ],
+)
+async def test_no_other_login_mode_counts_as_a_chatgpt_session(probe: Probe, login: str) -> None:
+    probe.scenario("success", login=login)
+    client = probe.client(run_preflight=True)
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.PREFLIGHT_FAILED
+    assert client.exec_starts == 0
+
+
+async def test_a_slow_schema_validation_does_not_fund_a_domain_validator(
+    probe: Probe,
+) -> None:
+    """The deadline stops at the first boundary where control comes back."""
+    probe.scenario("success")
+    started = False
+
+    class SlowAssessment(OrbitAssessment):
+        @classmethod
+        def model_validate(cls, obj: object, **kwargs: object) -> "SlowAssessment":
+            time.sleep(2.0)
+            return super().model_validate(obj, **kwargs)  # type: ignore[no-any-return,arg-type]
+
+    def sentinel(_output: OrbitAssessment) -> None:
+        nonlocal started
+        started = True
+
+    outcome = await probe.client().evaluate(
+        probe.request(
+            output_model=SlowAssessment,
+            domain_validator=sentinel,
+            deadline_seconds=2.0,
+            cleanup_reserve_seconds=0.5,
+        )
+    )
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.DEADLINE_EXCEEDED
+    assert outcome.detail_code == "SCHEMA_VALIDATION_OVERRAN"
+    assert started is False
+
+
+async def test_the_pinned_catalog_decides_not_the_bundled_dump(probe: Probe) -> None:
+    """The regression for the gap between inspected and effective catalog.
+
+    The fake's `debug models --bundled` output says `tool_mode:
+    "code_mode_only"`; the pinned catalog says null. A root session resolves
+    ModelInfo through the ModelsManager, so judging the bundled dump would have
+    judged a catalog the turn never uses. This run must follow the pinned file.
+    """
+    probe.scenario("success")
+    probe.catalog(tool_mode=None)
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationCompleted)
+
+
+async def test_a_pinned_catalog_with_code_mode_never_reaches_exec(probe: Probe) -> None:
+    """And the other direction, which is the one that matters.
+
+    Bundled could say anything; what decides is the file `codex exec` is pinned
+    to. When that file declares a tool mode, no attempt starts.
+    """
+    probe.scenario("success")
+    probe.catalog(tool_mode="code_mode_only")
+    client = probe.client()
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.TOOL_SURFACE_UNSUPPORTED
+    assert outcome.detail_code == "TOOL_MODE_CODE_MODE_ONLY"
+    assert client.exec_starts == 0
+    assert client.version_starts == 0
+
+
+async def test_mutating_the_operator_catalog_after_the_check_changes_nothing(
+    probe: Probe,
+) -> None:
+    """The regression for "a judged file is not the file that runs".
+
+    Two ways to change a file after it has been judged: replace the path, or
+    rewrite the same inode. Neither can reach the attempt, because the judged
+    bytes are copied once into the private runtime catalog and it is that copy
+    `model_catalog_json` points at. The operator's file is read once and is
+    never consulted again.
+    """
+    probe.scenario("success")
+    probe.catalog(tool_mode=None)
+    client = probe.client()
+
+    original = catalog_module.materialise_runtime_catalog
+    mutated: dict[str, bool] = {}
+    hostile = json.dumps(
+        {
+            "models": [
+                {
+                    "slug": "gpt-5.4",
+                    "tool_mode": "code_mode_only",
+                    "apply_patch_tool_type": "freeform",
+                    "experimental_supported_tools": [],
+                    "use_responses_lite": False,
+                }
+            ]
+        }
+    )
+
+    def materialise_then_mutate(path: Path, directory: Path) -> object:
+        taken = original(path, directory)
+        # In place: same inode, no rename. An operator fd would follow this.
+        with path.open("r+", encoding="utf-8") as handle:
+            handle.truncate(0)
+            handle.write(hostile)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # And the other way too, to keep both paths covered.
+        swap = path.with_suffix(".swap")
+        swap.write_text(hostile, encoding="utf-8")
+        swap.replace(path)
+        mutated["done"] = True
+        return taken
+
+    with (
+        mock.patch.object(catalog_module, "materialise_runtime_catalog", materialise_then_mutate),
+        mock.patch.object(client_module, "materialise_runtime_catalog", materialise_then_mutate),
+    ):
+        outcome = await client.evaluate(probe.request())
+
+    assert mutated.get("done") is True
+    assert "code_mode_only" in probe.model_catalog_path.read_text(encoding="utf-8")
+    assert isinstance(outcome, EvaluationCompleted)
+
+
+def test_no_configuration_can_omit_the_catalog_digest(probe: Probe) -> None:
+    """There is no mode, flag or caller promise that skips the pin.
+
+    The digest used to be optional and a run mode decided whether it mattered,
+    which meant a caller setting the wrong mode could have reached a real turn
+    without one. It is now a property of the configuration: nothing carries a
+    missing or malformed digest past construction.
+    """
+    for bad in (None, "", "not-a-digest", "0" * 63, "g" * 64):
+        with pytest.raises(ValueError):
+            probe.config(expected_catalog_sha256=bad)
+
+
+async def test_a_stale_digest_starts_nothing(probe: Probe) -> None:
+    probe.scenario("success")
+    client = probe.client(expected_catalog_sha256="0" * 64)
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.TOOL_SURFACE_UNSUPPORTED
+    assert outcome.detail_code == "CATALOG_DIGEST_MISMATCH"
+    assert client.exec_starts == 0
+    assert client.version_starts == 0
+    assert client.preflight_starts == 0
+
+
+async def test_the_matching_digest_proceeds(probe: Probe) -> None:
+    probe.scenario("success")
+    client = probe.client(expected_catalog_sha256=probe.catalog_digest)
+    assert isinstance(await client.evaluate(probe.request()), EvaluationCompleted)
+
+
+async def test_a_catalog_that_is_not_valid_utf8_starts_nothing(probe: Probe) -> None:
+    """`read_to_string` rejects it, so the guard must not repair it.
+
+    Decoding with replacement would have the guard judging one text while the
+    runtime loader sees another -- or refuses outright.
+    """
+    probe.scenario("success")
+    probe.model_catalog_path.write_bytes(b'{"models": [\xff\xfe]}')
+    client = probe.client(
+        expected_catalog_sha256=hashlib.sha256(probe.model_catalog_path.read_bytes()).hexdigest()
+    )
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "CATALOG_UNREADABLE"
+    assert client.exec_starts == 0
+
+
+async def test_an_oversized_catalog_starts_nothing(probe: Probe) -> None:
+    """One reviewed entry is kilobytes; nothing needs to be read past the bound."""
+    padding = "x" * (catalog_module.MAX_CATALOG_BYTES + 1)
+    probe.model_catalog_path.write_text(
+        json.dumps({"models": [], "padding": padding}), encoding="utf-8"
+    )
+    probe.scenario("success")
+    client = probe.client(
+        expected_catalog_sha256=hashlib.sha256(probe.model_catalog_path.read_bytes()).hexdigest()
+    )
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "CATALOG_UNREADABLE"
+    assert client.exec_starts == 0
+
+
+async def test_a_runtime_catalog_that_cannot_be_written_starts_nothing(
+    probe: Probe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A catalog that could not be laid down in full is not one to run against.
+
+    The write is completed in a loop and the finished file is hashed before
+    anything is pointed at it. Being unable to establish the runtime copy is
+    the same answer as not liking its contents: refuse, with no process
+    started.
+    """
+    probe.scenario("success")
+    monkeypatch.setattr(catalog_module, "_write_all", _raise_oserror, raising=True)
+    client = probe.client()
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "CATALOG_UNREADABLE"
+    assert client.exec_starts == 0
+    assert client.version_starts == 0
+
+
+async def test_the_runtime_catalog_is_removed_once_the_attempt_is_over(probe: Probe) -> None:
+    """A named file has to be cleaned up; an unlinked descriptor did not.
+
+    The catalog the client materialises for itself lives in a private
+    directory under the scratch root, and both are gone afterwards. A prepared
+    run keeps its own for the length of the context and removes it in teardown,
+    which `test_prepared_run` covers separately.
+    """
+    probe.scenario("success")
+    client = probe.client()
+    assert isinstance(await client.evaluate(probe.request()), EvaluationCompleted)
+    assert list(probe.scratch.glob("catalog-runtime-*")) == []
+
+
+async def test_bytes_that_change_after_the_judgement_refuse_before_the_exec(
+    probe: Probe,
+) -> None:
+    """The TOCTOU check, on the one transport that has a name to attack.
+
+    The descriptor transport was immutable by construction: unlinked, read-only,
+    no name to write through. A named file is not, so the digest is re-hashed
+    immediately before the exec. A catalog rewritten between the judgement and
+    the run refuses with `exec_starts` still at zero, rather than reaching the
+    model as bytes nobody judged.
+    """
+    probe.scenario("success")
+    held = probe.runtime_catalog()
+    client = probe.client(runtime_catalog=held)
+
+    held.directory.chmod(0o700)
+    held.path.chmod(0o600)
+    held.path.write_text(json.dumps({"models": []}), encoding="utf-8")
+
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.PROCESS_START_FAILED
+    assert outcome.detail_code == "RUNTIME_CATALOG_DIGEST_MISMATCH"
+    assert client.exec_starts == 0
+
+
+async def test_a_runtime_catalog_that_vanished_refuses_before_the_exec(probe: Probe) -> None:
+    """Missing and rewritten are the same answer, and neither starts anything."""
+    probe.scenario("success")
+    held = probe.runtime_catalog()
+    client = probe.client(runtime_catalog=held)
+
+    held.directory.chmod(0o700)
+    held.path.chmod(0o600)
+    held.path.unlink()
+
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "RUNTIME_CATALOG_DIGEST_MISMATCH"
+    assert client.exec_starts == 0
+
+
+@pytest.mark.parametrize(
+    ("overrides", "detail"),
+    [
+        ({"tool_mode": "code_mode_only"}, "TOOL_MODE_CODE_MODE_ONLY"),
+        ({"tool_mode": "direct"}, "TOOL_MODE_DIRECT"),
+        ({"experimental_supported_tools": ["clock"]}, "EXPERIMENTAL_TOOL_CLOCK"),
+        ({"apply_patch_tool_type": "something_new"}, "APPLY_PATCH_SOMETHING_NEW"),
+        ({"slug": "another-model"}, "MODEL_NOT_IN_CATALOG"),
+        ({"tool_mode": {"unexpected": "shape"}}, "TOOL_MODE_MALFORMED"),
+        ({"apply_patch_tool_type": 7}, "APPLY_PATCH_MALFORMED"),
+        ({"experimental_supported_tools": "clock"}, "EXPERIMENTAL_TOOLS_MALFORMED"),
+    ],
+)
+async def test_a_wider_or_malformed_surface_never_runs_an_attempt(
+    probe: Probe, overrides: dict[str, object], detail: str
+) -> None:
+    """Fail-closed: an unwanted surface, an unknown value and a wrong type all refuse.
+
+    A wrong type is not the same fact as `null`. Reading `{"unexpected":
+    "shape"}` as "absent" would turn a parsing accident into a permission.
+    """
+    probe.scenario("success")
+    probe.catalog(**overrides)
+    client = probe.client()
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.TOOL_SURFACE_UNSUPPORTED
+    assert outcome.detail_code == detail
+    assert client.exec_starts == 0
+
+
+async def test_an_unreadable_pinned_catalog_never_runs_an_attempt(probe: Probe) -> None:
+    probe.scenario("success")
+    probe.model_catalog_path.unlink()
+    client = probe.client()
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "CATALOG_UNREADABLE"
+    assert client.exec_starts == 0
+
+
+def _raise_oserror(*_args: object, **_kwargs: object) -> None:
+    raise OSError("unlink refused")
+
+
+def test_the_attempt_runs_behind_the_outer_sandbox_when_configured(
+    probe: Probe, tmp_path: Path
+) -> None:
+    """The profile goes in front of Codex, not in front of what Codex runs.
+
+    Codex's own `--sandbox read-only` never restricts the agent process itself,
+    so the outer profile has to wrap the launcher. `sandbox-exec` execs in
+    place, which is why the gate's pid, its process group and the inherited
+    catalog descriptor all survive the wrap.
+    """
+    workspace = tmp_path / "sb-ws"
+    home = tmp_path / "sb-home"
+    vendor = tmp_path / "sb-vendor"
+    catalog_runtime = tmp_path / "sb-catalog-runtime"
+    for directory in (workspace, home, vendor, catalog_runtime):
+        directory.mkdir()
+    catalog_file = catalog_runtime / "models.json"
+    roots = sandbox.SandboxRoots(
+        codex_vendor=vendor,
+        workspace=workspace,
+        codex_home=home,
+        catalog_file=catalog_file,
+    )
+    codex_argv = build_arguments(
+        launcher=probe.launcher(),
+        working_directory=probe.workspace,
+        schema_path=Path("/dev/fd/9"),
+        model="gpt-5.5",
+        effort="low",
+        instructions="x",
+        model_catalog_reference=str(catalog_file),
+    )
+    profile = sandbox.write_profile(tmp_path)
+    try:
+        wrapped = sandbox.wrap(codex_argv, profile, roots)
+    finally:
+        profile.unlink(missing_ok=True)
+
+    assert wrapped[0] == str(sandbox.SANDBOX_EXEC)
+    # The Codex invocation survives the wrap unchanged, including the pin.
+    assert wrapped[-len(codex_argv) :] == codex_argv
+    assert any(item.startswith("model_catalog_json=") for item in wrapped)
+    # The catalog travels by name and the schema by descriptor, and the wrap
+    # keeps both. A `/dev/fd` catalog is what the third real probe died on.
+    assert f'model_catalog_json="{catalog_file}"' in wrapped
+    assert any(item.startswith("CATALOG_FILE=") for item in wrapped)
+
+
+def test_the_client_accepts_an_outer_sandbox(probe: Probe, tmp_path: Path) -> None:
+    workspace = tmp_path / "sb-ws2"
+    workspace.mkdir()
+    roots = sandbox.SandboxRoots(
+        codex_vendor=tmp_path,
+        workspace=workspace,
+        codex_home=tmp_path,
+        catalog_file=tmp_path / "catalog-runtime" / "models.json",
+    )
+    assert probe.config(outer_sandbox=roots).outer_sandbox is roots
