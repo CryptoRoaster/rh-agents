@@ -404,3 +404,116 @@ async def test_a_process_failure_still_carries_its_process_diagnostic(probe: Pro
     assert outcome.diagnostic is not None
     assert outcome.diagnostic.exit_code == 1
     assert outcome.diagnostic.safe_lines == ("error: could not start",)
+
+
+# --------------------------------------------------------------------------
+# A deadline: how far the run got, which the exit code cannot say
+# --------------------------------------------------------------------------
+
+
+async def timed_out(probe: Probe, **scenario: object) -> EvaluationRejected:
+    """Run until the budget is gone and return the rejection."""
+    probe.scenario("hang_with_stream", **scenario)
+    outcome = await probe.client().evaluate(
+        probe.request(deadline_seconds=2.0, cleanup_reserve_seconds=0.5)
+    )
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.DEADLINE_EXCEEDED
+    assert outcome.detail_code == "WORK_BUDGET_EXHAUSTED"
+    return outcome
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_before_the_turn_says_the_turn_never_began(probe: Probe) -> None:
+    """Case 1: the negative answer, stated rather than left blank."""
+    outcome = await timed_out(probe)
+    assert outcome.stream_diagnostic is not None
+    assert outcome.stream_diagnostic.turn_started is False
+    assert outcome.stream_diagnostic.thread_id == "11111111-2222-3333-4444-555555555555"
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_after_the_turn_says_the_turn_had_begun(probe: Probe) -> None:
+    """Case 2: exactly the fact the seventh real probe could not report.
+
+    It burned the whole work budget and the rejection carried neither
+    diagnostic, so "did it reach the model at all" had no answer. The
+    accumulator held it the entire time.
+    """
+    outcome = await timed_out(probe, hang_turn_started=True)
+    assert outcome.stream_diagnostic is not None
+    assert outcome.stream_diagnostic.turn_started is True
+    assert outcome.stream_diagnostic.thread_id == "11111111-2222-3333-4444-555555555555"
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_after_a_retry_carries_the_redacted_lines(probe: Probe) -> None:
+    """Case 3: a run that reconnected and then ran out of time explains itself."""
+    outcome = await timed_out(
+        probe, hang_turn_started=True, hang_error_message="Reconnecting... 2/5"
+    )
+    assert outcome.stream_diagnostic is not None
+    assert outcome.stream_diagnostic.safe_lines == ("Reconnecting... 2/5",)
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_keeps_secrets_out_of_the_retry_lines(probe: Probe) -> None:
+    """Case 7: the same redaction, on the same path, over the whole outcome."""
+    outcome = await timed_out(
+        probe,
+        hang_turn_started=True,
+        hang_error_message=f"Authorization: Bearer {SECRETS[0]} for {JWT_LIKE}",
+    )
+    rendered = repr(outcome)
+    assert SECRETS[0] not in rendered
+    assert JWT_LIKE not in rendered
+    assert outcome.stream_diagnostic is not None
+    assert outcome.stream_diagnostic.safe_lines == (REDACTED_LINE,)
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_after_a_tool_item_still_reports_it(probe: Probe) -> None:
+    """Case 4: observation up to the deadline, which is not the same as none."""
+    outcome = await timed_out(probe, hang_tool_item=True, hang_turn_started=True)
+    assert outcome.stream_diagnostic is not None
+    assert [
+        (item.item_type, item.count) for item in outcome.stream_diagnostic.observed_tool_activity
+    ] == [("command_execution", 1)]
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_with_no_stream_activity_invents_nothing(probe: Probe) -> None:
+    """Case 5: empty is an answer; it is not a placeholder for a guess."""
+    outcome = await timed_out(probe, hang_thread_started=False)
+    assert outcome.stream_diagnostic is not None
+    assert outcome.stream_diagnostic.turn_started is False
+    assert outcome.stream_diagnostic.thread_id is None
+    assert outcome.stream_diagnostic.safe_lines == ()
+    assert outcome.stream_diagnostic.observed_tool_activity == ()
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_gets_no_invented_process_diagnostic(probe: Probe) -> None:
+    """Case 6: `ProcessError` carries no stderr tail, so that half stays absent.
+
+    A deadline stops the child from the outside. There is no exit status it
+    chose and no tail that was collected, and making one up would read as the
+    CLI's answer.
+    """
+    outcome = await timed_out(probe, hang_turn_started=True)
+    assert outcome.diagnostic is None
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_stays_a_rejection_however_far_it_got(probe: Probe) -> None:
+    """The diagnostic explains the run; it does not rehabilitate it.
+
+    A turn that began, a thread id and a clean stream are all reported, and the
+    attempt is still refused. Nothing here is a partial success.
+    """
+    outcome = await timed_out(probe, hang_turn_started=True, hang_tool_item=True)
+    assert outcome.reason is EvaluationFailure.DEADLINE_EXCEEDED
+    assert outcome.detail_code == "WORK_BUDGET_EXHAUSTED"
+    assert outcome.stream_diagnostic is not None
+    assert outcome.stream_diagnostic.turn_started is True
+    assert not isinstance(outcome, EvaluationCompleted)

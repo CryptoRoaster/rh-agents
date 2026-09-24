@@ -447,7 +447,25 @@ class CodexEvaluationClient:
                 extra_fds=extra_fds,
             )
         except ProcessError as error:
-            return self._reject(error.failure, error.reason_code, deadline, error.cleanup)
+            # The child could not be run to a usable end -- most often because
+            # the budget ran out. The accumulator still holds everything the
+            # stream had established by then, and dropping it is what made the
+            # seventh real probe unreadable: it burned the whole 55s work
+            # budget and the report could not say whether a turn had begun,
+            # which thread it was, or what the CLI had said on the way.
+            #
+            # `ProcessError` carries no stderr tail, so there is nothing for a
+            # `ProcessDiagnostic` here and it stays absent rather than being
+            # invented. The stream half is what exists, and it is reported.
+            return self._reject(
+                error.failure,
+                error.reason_code,
+                deadline,
+                error.cleanup,
+                stream_diagnostic=self._stream_diagnostic(
+                    accumulator, accumulator.safe_error_lines()
+                ),
+            )
         except AbortedByConsumer as error:
             # The consumer stopped reading and the process layer then signalled
             # the group, so there is no child exit status and no stderr tail --

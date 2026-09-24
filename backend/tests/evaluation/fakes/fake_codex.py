@@ -237,6 +237,22 @@ def main() -> int:
         time.sleep(600)
         return 0
 
+    if name == "hang_with_stream":
+        # Gets some way into the stream and then stops, so the deadline is what
+        # ends the attempt. The knobs say how far it got, which is exactly what
+        # the report could not state after the seventh real probe.
+        if scenario.get("hang_thread_started", True):
+            thread_started()
+        if scenario.get("hang_tool_item"):
+            emit({"type": "item.started", "item": {"id": "c1", "type": "command_execution"}})
+        if scenario.get("hang_turn_started"):
+            emit({"type": "turn.started"})
+        message = scenario.get("hang_error_message")
+        if message is not None:
+            emit({"type": "error", "message": message})
+        time.sleep(600)
+        return 0
+
     if name == "hang_with_grandchild":
         spawn_descendant("import time; time.sleep(600)")
         Path(str(scenario["pgid_out"])).write_text(str(os.getpgid(0)), encoding="utf-8")
