@@ -25,9 +25,27 @@
 ; The isolated CODEX_HOME. Holds the login state and nothing else.
 (allow file-read* (subpath (param "CODEX_HOME")))
 
-; The pinned catalog and the output schema, both inherited as descriptors.
+; The output schema, inherited as a descriptor. `load_output_schema` reads it
+; once, so a single-read stream is the right transport for it.
 ; Nothing under the scratch directory is readable by path.
 (allow file-read* (subpath "/dev/fd"))
+
+; The pinned model catalog, as a named file rather than a descriptor.
+;
+; Codex 0.153.4 reads `model_catalog_json` twice: once in the initial
+; `ConfigBuilder::build()` and again at `thread/start`, through
+; `ConfigManager::load_with_overrides`. Reopening `/dev/fd/N` lands on the same
+; open file description, so the second read of the descriptor the first read
+; consumed returns nothing -- which is exactly how the third real probe died
+; ("EOF while parsing a value at line 1 column 0"). A named file can be opened
+; from scratch as often as the CLI asks.
+;
+; `literal`, never `subpath`: the directory holding it must stay closed, so
+; nothing else becomes readable by being placed beside the catalog. Read only,
+; and deliberately no `file-write-*` of any kind -- the runtime catalog is the
+; judged, digest-bound copy, and Codex may not rewrite, truncate, chmod,
+; rename or unlink it.
+(allow file-read* (literal (param "CATALOG_FILE")))
 
 ; ---- harness write allowlist -----------------------------------------------
 

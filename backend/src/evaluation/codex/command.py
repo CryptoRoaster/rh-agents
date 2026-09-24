@@ -124,7 +124,9 @@ FORBIDDEN_ARGUMENTS = (
 ALLOWED_ENVIRONMENT_KEYS = ("CODEX_HOME", "HOME", "PATH", "TMPDIR", "LANG")
 
 # `/dev/fd/<n>` resolves through the open file description rather than a
-# directory entry, which is what makes the catalog pin about bytes.
+# directory entry. That is the right transport for a payload the CLI reads
+# once -- the output schema -- and the wrong one for the model catalog, which
+# Codex 0.153.4 reads again at `thread/start` and would then find consumed.
 FD_REFERENCE_PREFIX = "/dev/fd/"
 
 
@@ -246,15 +248,28 @@ def build_arguments(
             EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, "CATALOG_PATH_NOT_ABSOLUTE"
         )
     if model_catalog_reference.startswith(FD_REFERENCE_PREFIX):
-        # A descriptor reference only survives if the launcher hands the
-        # descriptor on unchanged. The platform binary is exec'd by our own gate
-        # and does, and so does a fake that execs an interpreter; the npm entry
-        # point re-spawns through Node, and that Node process passing a foreign
-        # descriptor through its own spawn has not been demonstrated. Refusing
-        # the shim is the fail-closed answer.
+        # Refused outright, not merely discouraged. `model_catalog_json` is
+        # loaded twice -- `ConfigBuilder::build()` at startup and again through
+        # `ConfigManager::load_with_overrides` at `thread/start` -- and both
+        # loads are a fresh `std::fs::read_to_string`. Reopening `/dev/fd/N`
+        # returns to the same open file description, so the second load of a
+        # descriptor the first load consumed parses an empty string. That is
+        # not a tuning choice to be made per caller; it is a property of the
+        # supported build, so the shape that cannot work is rejected here.
+        raise CommandBuildError(
+            EvaluationFailure.TOOL_SURFACE_UNSUPPORTED, "CATALOG_MUST_BE_A_NAMED_PATH"
+        )
+    if str(schema_path).startswith(FD_REFERENCE_PREFIX):
+        # The schema keeps the descriptor transport, and with it the constraint
+        # the catalog used to carry: a descriptor reference only survives if the
+        # launcher hands the descriptor on unchanged. The platform binary is
+        # exec'd by our own gate and does, and so does a fake that execs an
+        # interpreter; the npm entry point re-spawns through Node, and that Node
+        # process passing a foreign descriptor through its own spawn has not
+        # been demonstrated. Refusing the shim is the fail-closed answer.
         if launcher.kind is LauncherKind.NODE_SHIM:
             raise CommandBuildError(
-                EvaluationFailure.LAUNCHER_UNSUPPORTED, "FD_CATALOG_NEEDS_PLATFORM_BINARY"
+                EvaluationFailure.LAUNCHER_UNSUPPORTED, "FD_SCHEMA_NEEDS_PLATFORM_BINARY"
             )
     resolved = working_directory.resolve()
     for root in forbidden_roots:
@@ -291,6 +306,10 @@ def build_arguments(
     # provider build a `StaticModelsManager`, which ignores the refresh strategy,
     # never consults the on-disk cache and treats `refresh_if_new_etag` as a
     # no-op -- so the entry this harness judged is the entry the turn uses.
+    #
+    # The reference is a named runtime file whose bytes were judged and whose
+    # digest is re-checked immediately before this command runs. It is not the
+    # operator's own catalog path, and it is not a descriptor.
     arguments += ["-c", f"model_catalog_json={toml_string(model_catalog_reference)}"]
     arguments += ["-c", f"developer_instructions={toml_string(instructions)}"]
     # A bare "-" makes the CLI read the prompt from stdin, so untrusted market

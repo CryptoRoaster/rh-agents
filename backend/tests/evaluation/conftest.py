@@ -10,6 +10,7 @@ import hashlib
 import json
 import stat
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,8 @@ import pytest
 
 from src.agents.orbit.models import OrbitAssessment, OrbitTaskInput
 from src.agents.orbit.validation import OrbitValidationError, validate_assessment
+from src.evaluation.codex import sandbox
+from src.evaluation.codex.catalog import RuntimeCatalog, materialise_runtime_catalog
 from src.evaluation.codex.client import CodexClientConfig, CodexEvaluationClient
 from src.evaluation.codex.models import (
     CodexLauncher,
@@ -120,6 +123,29 @@ class Probe:
         (self.workspace / "expected-catalog-digest.txt").write_text(
             self.catalog_digest, encoding="utf-8"
         )
+
+    def runtime_catalog(self) -> RuntimeCatalog:
+        """The named runtime copy of whatever `catalog()` last wrote.
+
+        A configuration that holds one of these is the shape a prepared run
+        hands to the client: the catalog exists under a name for as long as the
+        run is valid, which is what lets the CLI reopen it at `thread/start`.
+        """
+        directory = Path(tempfile.mkdtemp(dir=self.scratch, prefix="catalog-runtime-"))
+        catalog = materialise_runtime_catalog(self.model_catalog_path, directory)
+        assert catalog is not None
+        return catalog
+
+    def sandbox_roots(self, **overrides: Any) -> sandbox.SandboxRoots:
+        """Roots pointing at this probe's own directories, catalog included."""
+        settings: dict[str, Any] = {
+            "codex_vendor": self.workspace.parent,
+            "workspace": self.workspace,
+            "codex_home": self.codex_home,
+            "catalog_file": self.scratch / "catalog-runtime" / "models.json",
+        }
+        settings.update(overrides)
+        return sandbox.SandboxRoots(**settings)
 
     def scenario(self, name: str = "success", **extra: Any) -> None:
         payload: dict[str, Any] = {

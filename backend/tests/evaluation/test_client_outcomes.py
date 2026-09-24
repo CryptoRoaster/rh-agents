@@ -430,19 +430,19 @@ async def test_a_pinned_catalog_with_code_mode_never_reaches_exec(probe: Probe) 
 async def test_mutating_the_operator_catalog_after_the_check_changes_nothing(
     probe: Probe,
 ) -> None:
-    """The regression for "an open fd is not an immutable snapshot".
+    """The regression for "a judged file is not the file that runs".
 
     Two ways to change a file after it has been judged: replace the path, or
-    rewrite the same inode. A descriptor held on the operator's own file stops
-    the first and not the second, because it binds to the inode. The judged
-    bytes are therefore copied into a private file, reopened read-only and
-    unlinked; both mutations then miss.
+    rewrite the same inode. Neither can reach the attempt, because the judged
+    bytes are copied once into the private runtime catalog and it is that copy
+    `model_catalog_json` points at. The operator's file is read once and is
+    never consulted again.
     """
     probe.scenario("success")
     probe.catalog(tool_mode=None)
     client = probe.client()
 
-    original = catalog_module.snapshot_catalog
+    original = catalog_module.materialise_runtime_catalog
     mutated: dict[str, bool] = {}
     hostile = json.dumps(
         {
@@ -458,8 +458,8 @@ async def test_mutating_the_operator_catalog_after_the_check_changes_nothing(
         }
     )
 
-    def snapshot_then_mutate(path: Path, snapshot_dir: Path) -> object:
-        taken = original(path, snapshot_dir)
+    def materialise_then_mutate(path: Path, directory: Path) -> object:
+        taken = original(path, directory)
         # In place: same inode, no rename. An operator fd would follow this.
         with path.open("r+", encoding="utf-8") as handle:
             handle.truncate(0)
@@ -474,8 +474,8 @@ async def test_mutating_the_operator_catalog_after_the_check_changes_nothing(
         return taken
 
     with (
-        mock.patch.object(catalog_module, "snapshot_catalog", snapshot_then_mutate),
-        mock.patch.object(client_module, "snapshot_catalog", snapshot_then_mutate),
+        mock.patch.object(catalog_module, "materialise_runtime_catalog", materialise_then_mutate),
+        mock.patch.object(client_module, "materialise_runtime_catalog", materialise_then_mutate),
     ):
         outcome = await client.evaluate(probe.request())
 
@@ -548,18 +548,80 @@ async def test_an_oversized_catalog_starts_nothing(probe: Probe) -> None:
     assert client.exec_starts == 0
 
 
-async def test_a_snapshot_that_cannot_be_unlinked_starts_nothing(
+async def test_a_runtime_catalog_that_cannot_be_written_starts_nothing(
     probe: Probe, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A snapshot still reachable by name is not the immutable thing promised."""
+    """A catalog that could not be laid down in full is not one to run against.
+
+    The write is completed in a loop and the finished file is hashed before
+    anything is pointed at it. Being unable to establish the runtime copy is
+    the same answer as not liking its contents: refuse, with no process
+    started.
+    """
     probe.scenario("success")
-    monkeypatch.setattr(catalog_module.os, "unlink", _raise_oserror, raising=True)
+    monkeypatch.setattr(catalog_module, "_write_all", _raise_oserror, raising=True)
     client = probe.client()
     outcome = await client.evaluate(probe.request())
     assert isinstance(outcome, EvaluationRejected)
     assert outcome.detail_code == "CATALOG_UNREADABLE"
     assert client.exec_starts == 0
     assert client.version_starts == 0
+
+
+async def test_the_runtime_catalog_is_removed_once_the_attempt_is_over(probe: Probe) -> None:
+    """A named file has to be cleaned up; an unlinked descriptor did not.
+
+    The catalog the client materialises for itself lives in a private
+    directory under the scratch root, and both are gone afterwards. A prepared
+    run keeps its own for the length of the context and removes it in teardown,
+    which `test_prepared_run` covers separately.
+    """
+    probe.scenario("success")
+    client = probe.client()
+    assert isinstance(await client.evaluate(probe.request()), EvaluationCompleted)
+    assert list(probe.scratch.glob("catalog-runtime-*")) == []
+
+
+async def test_bytes_that_change_after_the_judgement_refuse_before_the_exec(
+    probe: Probe,
+) -> None:
+    """The TOCTOU check, on the one transport that has a name to attack.
+
+    The descriptor transport was immutable by construction: unlinked, read-only,
+    no name to write through. A named file is not, so the digest is re-hashed
+    immediately before the exec. A catalog rewritten between the judgement and
+    the run refuses with `exec_starts` still at zero, rather than reaching the
+    model as bytes nobody judged.
+    """
+    probe.scenario("success")
+    held = probe.runtime_catalog()
+    client = probe.client(runtime_catalog=held)
+
+    held.directory.chmod(0o700)
+    held.path.chmod(0o600)
+    held.path.write_text(json.dumps({"models": []}), encoding="utf-8")
+
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.PROCESS_START_FAILED
+    assert outcome.detail_code == "RUNTIME_CATALOG_DIGEST_MISMATCH"
+    assert client.exec_starts == 0
+
+
+async def test_a_runtime_catalog_that_vanished_refuses_before_the_exec(probe: Probe) -> None:
+    """Missing and rewritten are the same answer, and neither starts anything."""
+    probe.scenario("success")
+    held = probe.runtime_catalog()
+    client = probe.client(runtime_catalog=held)
+
+    held.directory.chmod(0o700)
+    held.path.chmod(0o600)
+    held.path.unlink()
+
+    outcome = await client.evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "RUNTIME_CATALOG_DIGEST_MISMATCH"
+    assert client.exec_starts == 0
 
 
 @pytest.mark.parametrize(
@@ -620,17 +682,24 @@ def test_the_attempt_runs_behind_the_outer_sandbox_when_configured(
     workspace = tmp_path / "sb-ws"
     home = tmp_path / "sb-home"
     vendor = tmp_path / "sb-vendor"
-    for directory in (workspace, home, vendor):
+    catalog_runtime = tmp_path / "sb-catalog-runtime"
+    for directory in (workspace, home, vendor, catalog_runtime):
         directory.mkdir()
-    roots = sandbox.SandboxRoots(codex_vendor=vendor, workspace=workspace, codex_home=home)
+    catalog_file = catalog_runtime / "models.json"
+    roots = sandbox.SandboxRoots(
+        codex_vendor=vendor,
+        workspace=workspace,
+        codex_home=home,
+        catalog_file=catalog_file,
+    )
     codex_argv = build_arguments(
         launcher=probe.launcher(),
         working_directory=probe.workspace,
-        schema_path=probe.scratch / "schema.json",
+        schema_path=Path("/dev/fd/9"),
         model="gpt-5.5",
         effort="low",
         instructions="x",
-        model_catalog_reference="/dev/fd/9",
+        model_catalog_reference=str(catalog_file),
     )
     profile = sandbox.write_profile(tmp_path)
     try:
@@ -642,10 +711,19 @@ def test_the_attempt_runs_behind_the_outer_sandbox_when_configured(
     # The Codex invocation survives the wrap unchanged, including the pin.
     assert wrapped[-len(codex_argv) :] == codex_argv
     assert any(item.startswith("model_catalog_json=") for item in wrapped)
+    # The catalog travels by name and the schema by descriptor, and the wrap
+    # keeps both. A `/dev/fd` catalog is what the third real probe died on.
+    assert f'model_catalog_json="{catalog_file}"' in wrapped
+    assert any(item.startswith("CATALOG_FILE=") for item in wrapped)
 
 
 def test_the_client_accepts_an_outer_sandbox(probe: Probe, tmp_path: Path) -> None:
     workspace = tmp_path / "sb-ws2"
     workspace.mkdir()
-    roots = sandbox.SandboxRoots(codex_vendor=tmp_path, workspace=workspace, codex_home=tmp_path)
+    roots = sandbox.SandboxRoots(
+        codex_vendor=tmp_path,
+        workspace=workspace,
+        codex_home=tmp_path,
+        catalog_file=tmp_path / "catalog-runtime" / "models.json",
+    )
     assert probe.config(outer_sandbox=roots).outer_sandbox is roots

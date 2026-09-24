@@ -23,6 +23,7 @@ claim, and nothing here may reach a risk decision or an execution.
 
 import asyncio
 import json
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,9 +31,9 @@ from pydantic import BaseModel, ValidationError
 
 from src.evaluation.codex import sandbox
 from src.evaluation.codex.catalog import (
-    CatalogSnapshot,
+    RuntimeCatalog,
     judge_snapshot,
-    snapshot_catalog,
+    materialise_runtime_catalog,
     snapshot_payload,
 )
 from src.evaluation.codex.command import (
@@ -87,6 +88,12 @@ class CodexClientConfig:
     model_catalog_path: Path
     expected_catalog_sha256: str
     model: str
+    # The named, digest-bound copy of the judged catalog bytes, held open for
+    # the whole prepared run. Absent means "materialise one for this attempt
+    # and discard it afterwards", which is what the offline tests do; a real
+    # build additionally requires one, because the binding names its path and
+    # its digest and neither can be checked against nothing.
+    runtime_catalog: RuntimeCatalog | None = None
     effort: str | None = None
     forbidden_roots: tuple[Path, ...] = ()
     process_limits: ProcessLimits = ProcessLimits()
@@ -124,6 +131,14 @@ class OuterSandboxMissing(Exception):
     """Raised when the outer profile is configured but not on disk."""
 
 
+def _remove_empty_directory(directory: Path) -> None:
+    """Clear a runtime-catalog directory whose catalog was never written."""
+    try:
+        directory.rmdir()
+    except OSError:
+        pass
+
+
 def binding_for(config: CodexClientConfig, profile_sha256: str) -> RunBinding:
     """Reduce a configuration to the identity a release is granted for.
 
@@ -132,13 +147,24 @@ def binding_for(config: CodexClientConfig, profile_sha256: str) -> RunBinding:
     isolated home, pointing at a different launcher or a different pinned
     catalog all change one of these fields, and the comparison in
     `_permit_problem` then refuses before any process starts.
+
+    The runtime catalog contributes three fields rather than one: the path the
+    sandbox grants read access to, the path `model_catalog_json` is pointed at,
+    and the digest of the bytes in it. A path alone would authorise whatever
+    that path happens to hold at exec time, and a digest alone would authorise
+    the same bytes reached through some other file.
     """
     sandbox_roots = config.outer_sandbox
     parameters = sandbox_roots.parameters() if sandbox_roots is not None else {}
+    runtime_catalog = config.runtime_catalog
     return RunBinding(
         model=config.model,
         catalog_digest=config.expected_catalog_sha256,
         catalog_path=str(config.model_catalog_path.resolve()),
+        runtime_catalog_path=(
+            str(runtime_catalog.path.resolve()) if runtime_catalog is not None else ""
+        ),
+        runtime_catalog_digest=runtime_catalog.digest if runtime_catalog is not None else "",
         launcher_kind=str(config.launcher.kind),
         launcher_path=str(config.launcher.executable.resolve()),
         supported_cli_version=SUPPORTED_CLI_VERSION,
@@ -152,6 +178,7 @@ def binding_for(config: CodexClientConfig, profile_sha256: str) -> RunBinding:
         sandbox_codex_home=parameters.get("CODEX_HOME", ""),
         sandbox_auth_file=parameters.get("AUTH_FILE", ""),
         sandbox_installation_id_file=parameters.get("INSTALLATION_ID_FILE", ""),
+        sandbox_catalog_file=parameters.get("CATALOG_FILE", ""),
         forbidden_roots=tuple(sorted(str(root.resolve()) for root in config.forbidden_roots)),
         run_preflight=config.run_preflight,
         max_exec_starts=config.process_limits.max_exec_starts,
@@ -224,20 +251,40 @@ class CodexEvaluationClient:
             path_entries=self.config.launcher.path_entries,
         )
 
-        # Cheapest gate first: one open, one read, no process at all. The
-        # descriptor stays open so the attempt inherits it.
-        catalog = snapshot_catalog(self.config.model_catalog_path, self.config.scratch)
+        # Cheapest gate first: one bounded read, no process at all.
+        #
+        # A prepared run hands its own runtime catalog in and keeps it for the
+        # whole context, which is what lets the binding name a path that still
+        # exists at exec time. Without one -- the offline engine -- the attempt
+        # materialises its own into a private directory under the scratch root
+        # and removes it again afterwards. There is deliberately no third mode:
+        # the descriptor transport cannot serve a catalog the CLI reloads.
+        held = self.config.runtime_catalog
+        if held is not None:
+            return await self._attempt_with_catalog(request, deadline, held, environment, schema)
+
+        try:
+            directory = Path(tempfile.mkdtemp(dir=self.config.scratch, prefix="catalog-runtime-"))
+        except OSError as error:
+            return self._reject(
+                EvaluationFailure.TOOL_SURFACE_UNSUPPORTED,
+                type(error).__name__.upper(),
+                deadline,
+            )
+        catalog = materialise_runtime_catalog(self.config.model_catalog_path, directory)
         try:
             return await self._attempt_with_catalog(request, deadline, catalog, environment, schema)
         finally:
             if catalog is not None:
-                catalog.close()
+                catalog.discard()
+            else:
+                _remove_empty_directory(directory)
 
     async def _attempt_with_catalog[Output: BaseModel](
         self,
         request: EvaluationRequest[Output],
         deadline: Deadline,
-        catalog: CatalogSnapshot | None,
+        catalog: RuntimeCatalog | None,
         environment: dict[str, str],
         schema: dict[str, object],
     ) -> EvaluationOutcome[Output]:
@@ -288,7 +335,7 @@ class CodexEvaluationClient:
         self,
         request: EvaluationRequest[Output],
         deadline: Deadline,
-        catalog: CatalogSnapshot,
+        catalog: RuntimeCatalog,
         environment: dict[str, str],
         schema: dict[str, object],
     ) -> EvaluationOutcome[Output]:
@@ -341,6 +388,18 @@ class CodexEvaluationClient:
             request.data, sort_keys=True, separators=(",", ":"), ensure_ascii=True
         ).encode("utf-8")
 
+        # Last thing before the exec, and after everything that could have
+        # taken time: the version probe, the login probe and the schema
+        # snapshot all ran since the bytes were judged. Re-hashing the file
+        # here is what makes the judgement about the bytes the child will read
+        # rather than about the bytes that were there a few seconds ago. A
+        # mismatch refuses with `exec_starts` still at zero.
+        if not catalog.still_matches():
+            schema_snapshot.close()
+            return self._reject(
+                EvaluationFailure.PROCESS_START_FAILED, "RUNTIME_CATALOG_DIGEST_MISMATCH", deadline
+            )
+
         self.exec_starts += 1
         try:
             return await self._run_attempt(
@@ -350,7 +409,9 @@ class CodexEvaluationClient:
                 environment,
                 payload,
                 accumulator,
-                (catalog.fd, schema_snapshot.fd),
+                # Only the schema travels as a descriptor now. The catalog is a
+                # named file the child opens for itself, once per config build.
+                (schema_snapshot.fd,),
             )
         finally:
             schema_snapshot.close()
@@ -462,14 +523,15 @@ class CodexEvaluationClient:
         return None
 
     def _verify_tool_surface(
-        self, catalog: CatalogSnapshot, deadline: Deadline
+        self, catalog: RuntimeCatalog, deadline: Deadline
     ) -> EvaluationRejected | None:
         """Refuse a catalog whose entry would widen the tool surface.
 
-        Judged from the bytes already read through the open descriptor, not by
-        re-reading a path. The descriptor is what the child inherits, so the
-        bytes checked here and the bytes `StaticModelsManager` is built from are
-        the same bytes -- replacing the path afterwards changes nothing.
+        Judged from the bytes that were written into the runtime file, not by
+        re-reading the operator's path. Those bytes are what the child is
+        pointed at, and `_runtime_catalog_drifted` re-hashes the file
+        immediately before the exec, so the window between this judgement and
+        the run is closed by a check rather than by an assumption.
         """
         verdict = judge_snapshot(catalog, self.config.model, self.config.expected_catalog_sha256)
         if verdict.reason is not None:
@@ -494,6 +556,13 @@ class CodexEvaluationClient:
             # The binding names a profile digest, so there has to be a bound
             # profile to compare it against.
             return "PERMIT_WITHOUT_BOUND_PROFILE"
+        if self.config.runtime_catalog is None:
+            # Same reasoning for the catalog: the binding names a runtime path
+            # and a runtime digest, and an attempt that would materialise its
+            # own copy has nothing for those fields to be about. A real build
+            # runs against the catalog the prepared run holds open, or not at
+            # all.
+            return "PERMIT_WITHOUT_RUNTIME_CATALOG"
         expected = self.permit.binding
         actual = binding_for(self.config, self.config.outer_profile.digest)
         drifted = expected.differences(actual)

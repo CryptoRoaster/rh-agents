@@ -109,6 +109,11 @@ class RunBinding:
     model: str
     catalog_digest: str
     catalog_path: str
+    # The named runtime copy: where it is, and what is in it. Both, because a
+    # path alone authorises whatever that path holds at exec time and a digest
+    # alone authorises those bytes wherever they are reached from.
+    runtime_catalog_path: str
+    runtime_catalog_digest: str
     launcher_kind: str
     launcher_path: str
     supported_cli_version: str
@@ -122,6 +127,7 @@ class RunBinding:
     sandbox_codex_home: str
     sandbox_auth_file: str
     sandbox_installation_id_file: str
+    sandbox_catalog_file: str
     forbidden_roots: tuple[str, ...]
     run_preflight: bool
     max_exec_starts: int
@@ -422,7 +428,8 @@ def _sandbox_gate(roots: sandbox.SandboxRoots | None, probe_outside: Path | None
             Gate(
                 "OUTER_READ_SANDBOX",
                 GateState.PASS,
-                "workspace readable, outside denied, one writable auth file",
+                "workspace readable, outside denied, two writable files,"
+                " catalog re-readable and unmodifiable",
             )
         )
     else:
@@ -433,7 +440,9 @@ def _sandbox_gate(roots: sandbox.SandboxRoots | None, probe_outside: Path | None
                 f"allowed={result.allowed_readable} forbidden={result.forbidden_readable}"
                 f" sentinel={result.sentinel_readable} auth_rw="
                 f"{result.auth_readable and result.auth_rewritable}"
-                f" beside={result.other_file_creatable}",
+                f" beside={result.other_file_creatable}"
+                f" catalog_replayable={result.catalog_replayable}"
+                f" catalog_locked={not result.catalog_writable}",
             )
         )
     gates.append(

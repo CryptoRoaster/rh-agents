@@ -17,10 +17,18 @@ def sandbox_roots(tmp_path: Path) -> tuple[sandbox.SandboxRoots, Path]:
     home = tmp_path / "codex-home"
     outside = tmp_path / "outside"
     vendor = tmp_path / "vendor"
-    for directory in (workspace, home, outside, vendor):
+    catalog_runtime = tmp_path / "catalog-runtime"
+    for directory in (workspace, home, outside, vendor, catalog_runtime):
         directory.mkdir(exist_ok=True)
     return (
-        sandbox.SandboxRoots(codex_vendor=vendor, workspace=workspace, codex_home=home),
+        sandbox.SandboxRoots(
+            codex_vendor=vendor,
+            workspace=workspace,
+            codex_home=home,
+            # Seeded by the probe, and deliberately a placeholder: the catalog
+            # checks try to write, truncate and unlink whatever they are given.
+            catalog_file=catalog_runtime / "models.json",
+        ),
         outside,
     )
 

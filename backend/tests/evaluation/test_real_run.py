@@ -169,22 +169,37 @@ def test_an_authorization_still_refuses_a_hand_made_permit(probe: Probe) -> None
 
 
 def bound(probe: Probe, **overrides: object):  # type: ignore[no-untyped-def]
-    """A configuration with a real bound profile, and its authorization."""
+    """A configuration with a real bound profile and catalog, and its authorization."""
     profile = sandbox.write_bound_profile(probe.scratch)
-    roots = sandbox.SandboxRoots(
-        codex_vendor=probe.workspace.parent,
-        workspace=probe.workspace,
-        codex_home=probe.codex_home,
-    )
+    catalog = probe.runtime_catalog()
+    roots = probe.sandbox_roots(catalog_file=catalog.path)
     settings: dict[str, object] = {
         "outer_sandbox": roots,
         "outer_profile": profile,
+        "runtime_catalog": catalog,
         "run_preflight": True,
     }
     settings.update(overrides)
     config = probe.config(**settings)
     authorization = authorize(cleared(), binding_for(config, profile.digest))
     return config, authorization, profile, roots
+
+
+def rebound(probe: Probe, base: object, **overrides: object):  # type: ignore[no-untyped-def]
+    """A configuration differing from `base` only where the test says it does.
+
+    The profile, the sandbox roots and the runtime catalog are carried over
+    deliberately: a test about one drifted field should fail on that field, not
+    on a second difference the helper introduced by leaving something out.
+    """
+    settings: dict[str, object] = {
+        "outer_sandbox": base.outer_sandbox,  # type: ignore[attr-defined]
+        "outer_profile": base.outer_profile,  # type: ignore[attr-defined]
+        "runtime_catalog": base.runtime_catalog,  # type: ignore[attr-defined]
+        "run_preflight": True,
+    }
+    settings.update(overrides)
+    return probe.config(**settings)
 
 
 def test_a_bound_configuration_is_accepted(probe: Probe) -> None:
@@ -208,9 +223,7 @@ def test_a_drifted_field_is_refused_by_name(probe: Probe, field: str, expected: 
     elsewhere = probe.workspace.parent / "elsewhere"
     elsewhere.mkdir(exist_ok=True)
     replacement: object = "gpt-5.5" if field == "model" else elsewhere
-    drifted = probe.config(
-        outer_sandbox=roots, outer_profile=profile, run_preflight=True, **{field: replacement}
-    )
+    drifted = rebound(probe, config, **{field: replacement})
     with pytest.raises(RealRunRefused) as refused:
         RealCodexRunner(authorization=authorization, config=drifted)
     assert expected in refused.value.reason
@@ -218,16 +231,11 @@ def test_a_drifted_field_is_refused_by_name(probe: Probe, field: str, expected: 
 
 def test_a_wider_sandbox_workspace_root_is_refused(probe: Probe) -> None:
     """The exact case the binding exists for: same authorization, wider roots."""
-    config, authorization, profile, _ = bound(probe)
-    wider = sandbox.SandboxRoots(
-        codex_vendor=probe.workspace.parent,
-        workspace=Path("/"),
-        codex_home=probe.codex_home,
-    )
+    config, authorization, _, _ = bound(probe)
+    wider = probe.sandbox_roots(workspace=Path("/"), catalog_file=config.runtime_catalog.path)
     with pytest.raises(RealRunRefused) as refused:
         RealCodexRunner(
-            authorization=authorization,
-            config=probe.config(outer_sandbox=wider, outer_profile=profile, run_preflight=True),
+            authorization=authorization, config=rebound(probe, config, outer_sandbox=wider)
         )
     assert "sandbox_workspace" in refused.value.reason
 
@@ -238,18 +246,13 @@ def test_a_drifted_installation_id_path_is_refused(probe: Probe) -> None:
     It is a path the sandboxed process may write to, so swapping it after the
     preflight would mean the run writes somewhere the preflight never measured.
     """
-    _, authorization, profile, _ = bound(probe)
+    config, authorization, _, _ = bound(probe)
     other_home = probe.workspace.parent / "swapped-home"
     other_home.mkdir(exist_ok=True)
-    swapped = sandbox.SandboxRoots(
-        codex_vendor=probe.workspace.parent,
-        workspace=probe.workspace,
-        codex_home=other_home,
-    )
+    swapped = probe.sandbox_roots(codex_home=other_home, catalog_file=config.runtime_catalog.path)
     with pytest.raises(RealRunRefused) as refused:
         RealCodexRunner(
-            authorization=authorization,
-            config=probe.config(outer_sandbox=swapped, outer_profile=profile, run_preflight=True),
+            authorization=authorization, config=rebound(probe, config, outer_sandbox=swapped)
         )
     assert "sandbox_installation_id_file" in refused.value.reason
 
@@ -265,36 +268,131 @@ def test_the_binding_names_both_writable_paths(probe: Probe) -> None:
 
 
 def test_a_different_sandbox_codex_home_and_auth_file_are_refused(probe: Probe) -> None:
-    config, authorization, profile, _ = bound(probe)
+    config, authorization, _, _ = bound(probe)
     other_home = probe.workspace.parent / "other-home"
     other_home.mkdir(exist_ok=True)
-    swapped = sandbox.SandboxRoots(
-        codex_vendor=probe.workspace.parent,
-        workspace=probe.workspace,
-        codex_home=other_home,
-    )
+    swapped = probe.sandbox_roots(codex_home=other_home, catalog_file=config.runtime_catalog.path)
     with pytest.raises(RealRunRefused) as refused:
         RealCodexRunner(
-            authorization=authorization,
-            config=probe.config(outer_sandbox=swapped, outer_profile=profile, run_preflight=True),
+            authorization=authorization, config=rebound(probe, config, outer_sandbox=swapped)
         )
     assert "sandbox_codex_home" in refused.value.reason
     assert "sandbox_auth_file" in refused.value.reason
     assert "sandbox_installation_id_file" in refused.value.reason
 
 
+def test_the_binding_names_the_runtime_catalog_by_path_and_by_content(probe: Probe) -> None:
+    """Both, because either alone authorises something the preflight did not.
+
+    A path alone authorises whatever that path holds when the exec happens. A
+    digest alone authorises those bytes wherever they are reached from. The
+    catalog stopped being an unlinked descriptor when Codex 0.153.4 turned out
+    to reload it at `thread/start`, so this is what replaces the immutability
+    the descriptor had by construction.
+    """
+    config, _, profile, roots = bound(probe)
+    binding = binding_for(config, profile.digest)
+    catalog = config.runtime_catalog
+    assert binding.runtime_catalog_path == str(catalog.path.resolve())
+    assert binding.runtime_catalog_digest == catalog.digest
+    assert binding.sandbox_catalog_file == str(catalog.path.resolve())
+    # The operator's own file is still bound, and is a different path.
+    assert binding.catalog_path != binding.runtime_catalog_path
+
+
+def test_a_different_runtime_catalog_path_is_refused(probe: Probe) -> None:
+    """Same bytes, different file. The preflight cleared one named location."""
+    config, authorization, _, _ = bound(probe)
+    elsewhere = probe.runtime_catalog()
+    assert elsewhere.digest == config.runtime_catalog.digest
+    assert elsewhere.path != config.runtime_catalog.path
+    with pytest.raises(RealRunRefused) as refused:
+        RealCodexRunner(
+            authorization=authorization,
+            config=rebound(
+                probe,
+                config,
+                runtime_catalog=elsewhere,
+                outer_sandbox=probe.sandbox_roots(catalog_file=elsewhere.path),
+            ),
+        )
+    assert "runtime_catalog_path" in refused.value.reason
+    assert "sandbox_catalog_file" in refused.value.reason
+
+
+def test_runtime_catalog_bytes_that_changed_are_refused(probe: Probe) -> None:
+    """The TOCTOU case for the catalog, checked before anything exists."""
+    config, authorization, _, _ = bound(probe)
+    catalog = config.runtime_catalog
+    catalog.directory.chmod(0o700)
+    catalog.path.chmod(0o600)
+    catalog.path.write_text('{"models": []}', encoding="utf-8")
+    with pytest.raises(RealRunRefused) as refused:
+        RealCodexRunner(authorization=authorization, config=config)
+    assert refused.value.reason == "runtime catalog digest mismatch"
+
+
+def test_a_missing_runtime_catalog_is_refused(probe: Probe) -> None:
+    """Gone is the same answer as rewritten: the named file has to be there."""
+    config, authorization, _, _ = bound(probe)
+    catalog = config.runtime_catalog
+    catalog.directory.chmod(0o700)
+    catalog.path.chmod(0o600)
+    catalog.path.unlink()
+    with pytest.raises(RealRunRefused) as refused:
+        RealCodexRunner(authorization=authorization, config=config)
+    assert refused.value.reason == "runtime catalog digest mismatch"
+
+
+def test_a_configuration_without_a_runtime_catalog_is_refused(probe: Probe) -> None:
+    """`model_catalog_json` must point at a file the CLI can open twice.
+
+    An attempt that would materialise its own copy is not the thing the
+    authorization describes, and the binding's two catalog fields would have
+    nothing to be about.
+    """
+    config, authorization, _, _ = bound(probe)
+    with pytest.raises(RealRunRefused) as refused:
+        RealCodexRunner(
+            authorization=authorization, config=rebound(probe, config, runtime_catalog=None)
+        )
+    assert refused.value.reason == "no runtime catalog"
+
+
+@pytest.mark.asyncio
+async def test_a_permitted_client_without_a_runtime_catalog_starts_nothing(probe: Probe) -> None:
+    """The same rule inside the client, so it cannot be lost by another wiring."""
+    config, _, profile, _ = bound(probe)
+    real = rebound(
+        probe,
+        config,
+        launcher=CodexLauncher(
+            kind=LauncherKind.PLATFORM_BINARY,
+            executable=probe.launcher_path,
+            path_entries=(Path("/usr/bin"), Path("/bin")),
+        ),
+        runtime_catalog=None,
+    )
+    probe.scenario("success")
+    client = CodexEvaluationClient(
+        config=real, permit=authorize(cleared(), binding_for(real, profile.digest)).permit()
+    )
+    outcome = await client.evaluate(probe.request())
+    assert outcome.detail_code == "PERMIT_WITHOUT_RUNTIME_CATALOG"  # type: ignore[union-attr]
+    assert (client.version_starts, client.preflight_starts, client.exec_starts) == (0, 0, 0)
+
+
 def test_a_different_launcher_is_refused(probe: Probe) -> None:
-    config, authorization, profile, roots = bound(probe)
+    config, authorization, _, _ = bound(probe)
     other = probe.workspace.parent / "other-codex"
     other.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     other.chmod(other.stat().st_mode | stat.S_IXUSR)
     with pytest.raises(RealRunRefused) as refused:
         RealCodexRunner(
             authorization=authorization,
-            config=probe.config(
-                outer_sandbox=roots,
-                outer_profile=profile,
-                run_preflight=True,
+            config=rebound(
+                probe,
+                config,
                 launcher=CodexLauncher(
                     kind=LauncherKind.FAKE_EXECUTABLE, executable=other, path_entries=()
                 ),
@@ -304,13 +402,10 @@ def test_a_different_launcher_is_refused(probe: Probe) -> None:
 
 
 def test_a_different_catalog_digest_is_refused(probe: Probe) -> None:
-    config, authorization, profile, roots = bound(probe)
+    config, authorization, _, _ = bound(probe)
     probe.catalog(slug="gpt-5.4", use_responses_lite=True)
     with pytest.raises(RealRunRefused) as refused:
-        RealCodexRunner(
-            authorization=authorization,
-            config=probe.config(outer_sandbox=roots, outer_profile=profile, run_preflight=True),
-        )
+        RealCodexRunner(authorization=authorization, config=rebound(probe, config))
     assert "catalog_digest" in refused.value.reason
 
 
@@ -339,11 +434,10 @@ def test_a_configuration_without_an_outer_sandbox_is_refused(probe: Probe) -> No
 
 
 def test_a_configuration_with_the_login_probe_off_is_refused(probe: Probe) -> None:
-    _, authorization, profile, roots = bound(probe)
+    config, authorization, _, _ = bound(probe)
     with pytest.raises(RealRunRefused) as refused:
         RealCodexRunner(
-            authorization=authorization,
-            config=probe.config(outer_sandbox=roots, outer_profile=profile, run_preflight=False),
+            authorization=authorization, config=rebound(probe, config, run_preflight=False)
         )
     assert refused.value.reason == "login preflight disabled"
 
@@ -384,16 +478,15 @@ def test_only_an_authorization_mints_a_permit(probe: Probe) -> None:
 @pytest.mark.asyncio
 async def test_a_hand_made_permit_cannot_release_a_real_launcher(probe: Probe) -> None:
     """The whole point, end to end: no preflight, so no process of any kind."""
-    config, _, profile, roots = bound(probe)
-    real = probe.config(
+    config, _, profile, _ = bound(probe)
+    real = rebound(
+        probe,
+        config,
         launcher=CodexLauncher(
             kind=LauncherKind.PLATFORM_BINARY,
             executable=probe.launcher_path,
             path_entries=(Path("/usr/bin"), Path("/bin")),
         ),
-        outer_sandbox=roots,
-        outer_profile=profile,
-        run_preflight=True,
     )
     # Exactly what a caller could compute from the configuration in hand.
     with pytest.raises(ValueError):
@@ -416,16 +509,15 @@ async def test_a_minted_permit_for_the_bound_configuration_is_accepted(probe: Pr
     this suite comes to a real build: the permit path is exercised in full and
     no Codex is started.
     """
-    config, _, profile, roots = bound(probe)
-    real = probe.config(
+    config, _, profile, _ = bound(probe)
+    real = rebound(
+        probe,
+        config,
         launcher=CodexLauncher(
             kind=LauncherKind.PLATFORM_BINARY,
             executable=probe.launcher_path,
             path_entries=(Path("/usr/bin"), Path("/bin")),
         ),
-        outer_sandbox=roots,
-        outer_profile=profile,
-        run_preflight=True,
     )
     permit = authorize(cleared(), binding_for(real, profile.digest)).permit()
     probe.scenario("success")
@@ -459,20 +551,19 @@ async def test_a_real_launcher_without_a_permit_starts_nothing(probe: Probe) -> 
 
 @pytest.mark.asyncio
 async def test_a_permit_for_a_different_configuration_starts_nothing(probe: Probe) -> None:
-    config, authorization, profile, roots = bound(probe)
+    config, authorization, _, _ = bound(probe)
     elsewhere = probe.workspace.parent / "elsewhere"
     elsewhere.mkdir(exist_ok=True)
     probe.scenario("success")
     client = CodexEvaluationClient(
-        config=probe.config(
+        config=rebound(
+            probe,
+            config,
             launcher=CodexLauncher(
                 kind=LauncherKind.PLATFORM_BINARY,
                 executable=probe.launcher_path,
                 path_entries=(Path("/usr/bin"), Path("/bin")),
             ),
-            outer_sandbox=roots,
-            outer_profile=profile,
-            run_preflight=True,
             home=elsewhere,
         ),
         permit=authorization.permit(),

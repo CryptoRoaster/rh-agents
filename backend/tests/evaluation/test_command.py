@@ -165,26 +165,57 @@ def test_a_relative_catalog_path_is_refused(tmp_path: Path) -> None:
     assert caught.value.reason_code == "CATALOG_PATH_NOT_ABSOLUTE"
 
 
-def test_a_descriptor_catalog_needs_the_platform_binary(tmp_path: Path) -> None:
-    """A Node respawn passing a foreign descriptor through is not demonstrated.
-
-    The platform binary is exec'd by our own gate, which keeps the descriptor.
-    The npm entry point spawns a separate Node process, and nothing here shows
-    it forwards descriptors it was never told about -- so this refuses instead
-    of assuming.
-    """
+def node_shim(tmp_path: Path) -> CodexLauncher:
     node_dir = tmp_path / "bin"
-    node_dir.mkdir()
+    node_dir.mkdir(exist_ok=True)
     (node_dir / "node").write_text("#!/bin/sh\n", encoding="utf-8")
-    shim = CodexLauncher(
+    return CodexLauncher(
         kind=LauncherKind.NODE_SHIM,
         executable=tmp_path / "codex.js",
         path_entries=(node_dir,),
     )
+
+
+def test_a_descriptor_catalog_is_refused_for_every_launcher(tmp_path: Path) -> None:
+    """The shape that cannot work, rejected rather than left to the caller.
+
+    Codex 0.153.4 loads `model_catalog_json` twice: once in the initial
+    `ConfigBuilder::build()` and again at `thread/start`, through
+    `ConfigManager::load_with_overrides`. Both are a fresh
+    `std::fs::read_to_string`, and reopening `/dev/fd/N` lands on the same open
+    file description -- so the second load parses the empty string the first
+    load left behind. That is not a launcher question and not a preference: it
+    is a property of the build, and the third real probe is what it cost.
+    """
+    for launcher in (BINARY, node_shim(tmp_path)):
+        with pytest.raises(CommandBuildError) as caught:
+            arguments(tmp_path, launcher=launcher, model_catalog_reference="/dev/fd/7")
+        assert caught.value.failure is EvaluationFailure.TOOL_SURFACE_UNSUPPORTED
+        assert caught.value.reason_code == "CATALOG_MUST_BE_A_NAMED_PATH"
+
+
+def test_a_descriptor_schema_still_needs_the_platform_binary(tmp_path: Path) -> None:
+    """The constraint the catalog used to carry, kept where it still applies.
+
+    The output schema is read once, by `load_output_schema`, so it keeps the
+    descriptor transport -- and with it the requirement that the launcher hand
+    the descriptor on unchanged. The platform binary is exec'd by our own gate,
+    which keeps it. The npm entry point spawns a separate Node process, and
+    nothing here shows it forwards descriptors it was never told about, so this
+    refuses instead of assuming.
+    """
     with pytest.raises(CommandBuildError) as caught:
-        arguments(tmp_path, launcher=shim, model_catalog_reference="/dev/fd/7")
+        arguments(tmp_path, launcher=node_shim(tmp_path), schema_path=Path("/dev/fd/8"))
     assert caught.value.failure is EvaluationFailure.LAUNCHER_UNSUPPORTED
-    assert caught.value.reason_code == "FD_CATALOG_NEEDS_PLATFORM_BINARY"
+    assert caught.value.reason_code == "FD_SCHEMA_NEEDS_PLATFORM_BINARY"
+
+
+def test_a_descriptor_schema_is_accepted_for_the_platform_binary(tmp_path: Path) -> None:
+    built = arguments(tmp_path, schema_path=Path("/dev/fd/8"))
+    assert built[built.index("--output-schema") + 1] == "/dev/fd/8"
+    # And the catalog beside it is a name, never a descriptor.
+    catalog = next(item for item in built if item.startswith("model_catalog_json="))
+    assert "/dev/fd/" not in catalog
 
 
 def test_web_search_is_turned_off_by_the_mode_not_the_tool_table(tmp_path: Path) -> None:

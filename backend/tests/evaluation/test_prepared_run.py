@@ -65,10 +65,16 @@ def test_the_placeholder_probe_and_the_real_run_share_the_profile_bytes(
     assert first.path.read_bytes() == second.path.read_bytes()
 
     placeholder_roots = sandbox.SandboxRoots(
-        codex_vendor=tmp_path, workspace=tmp_path / "probe-workspace", codex_home=tmp_path / "ph"
+        codex_vendor=tmp_path,
+        workspace=tmp_path / "probe-workspace",
+        codex_home=tmp_path / "ph",
+        catalog_file=tmp_path / "probe-catalog-runtime" / "models.json",
     )
     real_roots = sandbox.SandboxRoots(
-        codex_vendor=tmp_path, workspace=tmp_path / "workspace", codex_home=tmp_path / "real"
+        codex_vendor=tmp_path,
+        workspace=tmp_path / "workspace",
+        codex_home=tmp_path / "real",
+        catalog_file=tmp_path / "catalog-runtime" / "models.json",
     )
     placeholder = sandbox.wrap(["codex"], first.path, placeholder_roots)
     real = sandbox.wrap(["codex"], first.path, real_roots)

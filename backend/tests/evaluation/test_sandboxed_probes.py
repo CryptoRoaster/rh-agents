@@ -64,11 +64,7 @@ async def test_all_three_invocations_are_wrapped(
     log = probe.tmpdir / RECORD
     monkeypatch.setattr(sandbox, "SANDBOX_EXEC", write_recording_shim(probe.tmpdir, log))
 
-    roots = sandbox.SandboxRoots(
-        codex_vendor=probe.workspace.parent,
-        workspace=probe.workspace,
-        codex_home=probe.codex_home,
-    )
+    roots = probe.sandbox_roots()
     probe.scenario("success")
     client = probe.client(outer_sandbox=roots, run_preflight=True)
     outcome = await client.evaluate(probe.request())
@@ -104,11 +100,7 @@ async def test_a_configured_sandbox_that_cannot_be_written_refuses_the_attempt(
         raise OSError("no room for a profile")
 
     monkeypatch.setattr(sandbox, "write_profile", refuse)
-    roots = sandbox.SandboxRoots(
-        codex_vendor=probe.workspace.parent,
-        workspace=probe.workspace,
-        codex_home=probe.codex_home,
-    )
+    roots = probe.sandbox_roots()
     probe.scenario("success")
     client = probe.client(outer_sandbox=roots, run_preflight=True)
     outcome = await client.evaluate(probe.request())
@@ -124,11 +116,7 @@ async def test_the_probes_and_the_attempt_share_one_profile(
     """One profile file for the whole attempt, and none left behind."""
     log = probe.tmpdir / RECORD
     monkeypatch.setattr(sandbox, "SANDBOX_EXEC", write_recording_shim(probe.tmpdir, log))
-    roots = sandbox.SandboxRoots(
-        codex_vendor=probe.workspace.parent,
-        workspace=probe.workspace,
-        codex_home=probe.codex_home,
-    )
+    roots = probe.sandbox_roots()
     probe.scenario("success")
     await probe.client(outer_sandbox=roots, run_preflight=True).evaluate(probe.request())
 
@@ -143,17 +131,14 @@ async def test_the_probes_and_the_attempt_share_one_profile(
 
 def test_the_recorded_shape_matches_what_wrap_produces(probe: Probe) -> None:
     """The shim's parsing assumption is the real wrapper's output shape."""
-    roots = sandbox.SandboxRoots(
-        codex_vendor=probe.workspace.parent,
-        workspace=probe.workspace,
-        codex_home=probe.codex_home,
-    )
+    roots = probe.sandbox_roots()
     wrapped = sandbox.wrap(["codex", "--version"], probe.tmpdir / "profile.sb", roots)
     assert wrapped[0] == str(sandbox.SANDBOX_EXEC)
     assert wrapped[1] == "-f"
     assert wrapped[wrapped.index("--") + 1 :] == ["codex", "--version"]
     assert json.loads(json.dumps(sorted(roots.parameters()))) == [
         "AUTH_FILE",
+        "CATALOG_FILE",
         "CODEX_HOME",
         "CODEX_VENDOR",
         "INSTALLATION_ID_FILE",

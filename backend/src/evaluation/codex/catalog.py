@@ -39,12 +39,28 @@ entirely, returns the catalog it was constructed with, and implements
 `thread_manager::build_models_manager`.
 
 So the harness pins `codex exec` to one catalog and judges **the same bytes**.
-Not the same path -- a path can be replaced between the read and the run, and
-"same pathname" would be a check with a window in it. The file is opened once,
-those bytes are judged, and the still-open descriptor is handed to the child;
-`model_catalog_json` then points at `/dev/fd/<n>`, which resolves through the
-open file description rather than the directory entry. Replacing the path
-afterwards changes nothing the child can see.
+Not the operator's path -- that can be replaced between the read and the run,
+and "same pathname" would be a check with a window in it. The operator's file
+is read once, those bytes are judged, and they are then written into a private
+runtime file that `model_catalog_json` points at for the rest of the prepared
+run.
+
+That runtime file is named rather than a descriptor, and the reason is a
+property of the CLI rather than a preference. Codex 0.153.4 loads
+`model_catalog_json` **twice** -- once in the initial `ConfigBuilder::build()`
+and again at `thread/start`, through
+`ConfigManager::load_with_overrides` -> `ConfigBuilder::build()` -- and each
+load is a fresh `std::fs::read_to_string`. Reopening `/dev/fd/<n>` resolves to
+the same open file description, so the second read of a descriptor that the
+first read already consumed returns the empty string. The third real probe died
+exactly there.
+
+What the unlinked descriptor used to provide is provided by other means: the
+runtime file is 0400 inside a 0500 directory, the outer profile grants
+`file-read*` on that one literal path and no write operation whatsoever, the
+path and the digest are both carried in the `RunBinding`, and the digest is
+re-checked immediately before the exec. The output schema is read once, by
+`load_output_schema`, and keeps the descriptor transport.
 
 Every `model_info` field `spec_plan.rs` consults is either judged here or made
 irrelevant by a gate this harness sets explicitly:
@@ -145,6 +161,161 @@ class CatalogSnapshot:
             os.close(self.fd)
         except OSError:
             pass
+
+
+# The named runtime catalog.
+#
+# `model_catalog_json` is not read once. Codex 0.153.4 loads it during the
+# initial `ConfigBuilder::build()` in `exec/src/lib.rs`, hands the same CLI
+# overrides to `InProcessClientStartArgs`, and `thread/start` then runs
+# `ConfigManager::load_with_overrides` -> `load_with_cli_overrides` ->
+# `ConfigBuilder::build()` a second time. Each build calls
+# `load_model_catalog` -> `load_catalog_json` -> `std::fs::read_to_string`.
+#
+# Reopening `/dev/fd/N` resolves to the same open file description, so the
+# first full read leaves the offset at the end and the second read returns the
+# empty string. That is what killed the third real probe:
+#
+#   failed to parse model_catalog_json path `/dev/fd/6` as JSON:
+#   EOF while parsing a value at line 1 column 0
+#
+# So the catalog travels as a named file that can be opened again from scratch,
+# while the output schema -- read once, by `load_output_schema` -- keeps the
+# descriptor transport.
+RUNTIME_CATALOG_FILE = "models.json"
+# Read-only once the bytes are in place. The sandbox denies writes anyway; this
+# is the second lock rather than the only one.
+RUNTIME_CATALOG_MODE = 0o400
+# No write bit on the directory either, so no sidecar can appear beside the
+# catalog even outside the sandbox. Restored for the duration of cleanup.
+RUNTIME_CATALOG_DIR_MODE = 0o500
+RUNTIME_CATALOG_BUILD_MODE = 0o700
+
+
+@dataclass(frozen=True)
+class RuntimeCatalog:
+    """The judged bytes, kept under a name the CLI may reopen at will.
+
+    Everything `CatalogSnapshot` establishes about the bytes is established
+    here too -- one bounded read of the operator's file, strict UTF-8, a
+    completed write, an fsync, a readback and a digest. What differs is only
+    what happens afterwards: the file keeps its name for as long as the
+    prepared run is valid, instead of being unlinked behind an open descriptor.
+
+    Keeping the name is what the descriptor could not offer, and it costs the
+    unlink-based immutability. Three things take its place: the file is 0400
+    and its directory is 0500, the sandbox profile grants `file-read*` on this
+    one literal path and no write operation at all, and `still_matches` is
+    re-checked immediately before the exec, so bytes that changed after the
+    judgement refuse the run rather than reaching the model.
+    """
+
+    directory: Path
+    path: Path
+    payload: str
+    digest: str
+
+    @property
+    def reference(self) -> str:
+        """What `model_catalog_json` is pointed at. An absolute, named path."""
+        return str(self.path)
+
+    def still_matches(self) -> bool:
+        """Re-read the file and compare. False means it changed or vanished."""
+        try:
+            with self.path.open("rb") as handle:
+                raw = handle.read(MAX_CATALOG_BYTES + 1)
+        except OSError:
+            return False
+        if len(raw) > MAX_CATALOG_BYTES:
+            return False
+        return hashlib.sha256(raw).hexdigest() == self.digest
+
+    def discard(self) -> None:
+        """Remove the file and its directory, restoring the modes to do so."""
+        _chmod(self.directory, RUNTIME_CATALOG_BUILD_MODE)
+        _chmod(self.path, 0o600)
+        _cleanup_unlink(str(self.path))
+        try:
+            os.rmdir(self.directory)
+        except OSError:
+            pass
+
+
+def materialise_runtime_catalog(path: Path, directory: Path) -> RuntimeCatalog | None:
+    """Read the operator's catalog once and freeze those bytes under a name.
+
+    `directory` must already exist and must be private to this run. The catalog
+    is harness configuration, not model working material, so it deliberately
+    does not go into the evaluation workspace.
+    """
+    raw = _read_operator_file(path)
+    if raw is None:
+        return None
+    return runtime_catalog_from_payload(raw, directory)
+
+
+def runtime_catalog_from_payload(raw: bytes, directory: Path) -> RuntimeCatalog | None:
+    """Freeze bytes the harness already holds into the named runtime file."""
+    try:
+        # Strict for the same reason the descriptor path is strict:
+        # `load_catalog_json` uses `read_to_string`, which rejects invalid
+        # UTF-8, so repairing it here would judge a text the loader never sees.
+        payload = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    digest = hashlib.sha256(raw).hexdigest()
+    target = directory / RUNTIME_CATALOG_FILE
+
+    writer = -1
+    try:
+        os.chmod(directory, RUNTIME_CATALOG_BUILD_MODE)
+        # O_EXCL: this function never writes over an existing runtime catalog.
+        writer = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        _write_all(writer, raw)
+        os.fsync(writer)
+    except OSError:
+        if writer != -1:
+            _close(writer)
+        _cleanup_unlink(str(target))
+        return None
+    _close(writer)
+
+    # Hash the finished object rather than trusting the calls that produced it.
+    if not _file_matches(target, digest):
+        _cleanup_unlink(str(target))
+        return None
+
+    try:
+        os.chmod(target, RUNTIME_CATALOG_MODE)
+        os.chmod(directory, RUNTIME_CATALOG_DIR_MODE)
+    except OSError:
+        _chmod(directory, RUNTIME_CATALOG_BUILD_MODE)
+        _cleanup_unlink(str(target))
+        return None
+
+    return RuntimeCatalog(
+        directory=directory, path=target.resolve(), payload=payload, digest=digest
+    )
+
+
+def _file_matches(path: Path, digest: str) -> bool:
+    """Whether the file on disk hashes to the digest that was judged."""
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_CATALOG_BYTES + 1)
+    except OSError:
+        return False
+    if len(raw) > MAX_CATALOG_BYTES:
+        return False
+    return hashlib.sha256(raw).hexdigest() == digest
+
+
+def _chmod(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
 
 
 def snapshot_catalog(path: Path, snapshot_dir: Path) -> CatalogSnapshot | None:
@@ -315,7 +486,9 @@ class CatalogVerdict:
     reason: str | None
 
 
-def judge_snapshot(catalog: CatalogSnapshot, model: str, expected_digest: str) -> CatalogVerdict:
+def judge_snapshot(
+    catalog: CatalogSnapshot | RuntimeCatalog, model: str, expected_digest: str
+) -> CatalogVerdict:
     """Judge the bytes that were actually read, digest first.
 
     The digest is required, not optional. It turns the approved catalog into
@@ -424,11 +597,17 @@ __all__ = [
     "ALLOWED_TOOL_MODE",
     "KNOWN_APPLY_PATCH_TYPES",
     "MAX_CATALOG_BYTES",
+    "RUNTIME_CATALOG_DIR_MODE",
+    "RUNTIME_CATALOG_FILE",
+    "RUNTIME_CATALOG_MODE",
     "CatalogSnapshot",
     "CatalogVerdict",
+    "RuntimeCatalog",
     "ToolSurface",
     "judge_catalog",
     "judge_snapshot",
+    "materialise_runtime_catalog",
+    "runtime_catalog_from_payload",
     "snapshot_catalog",
     "unsupported_reason",
 ]

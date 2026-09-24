@@ -15,11 +15,18 @@ def roots_for(tmp_path: Path) -> tuple[sandbox.SandboxRoots, Path]:
     workspace = tmp_path / "workspace"
     home = tmp_path / "codex-home"
     outside = tmp_path / "outside"
-    for directory in (workspace, home, outside):
+    catalog_runtime = tmp_path / "catalog-runtime"
+    for directory in (workspace, home, outside, catalog_runtime):
         directory.mkdir()
     return (
         sandbox.SandboxRoots(
-            codex_vendor=tmp_path / "vendor", workspace=workspace, codex_home=home
+            codex_vendor=tmp_path / "vendor",
+            workspace=workspace,
+            codex_home=home,
+            # A placeholder path. `probe_boundaries` seeds it in the shape the
+            # real runtime catalog has, and the checks against it are
+            # destructive by design, so the real one is never pointed at here.
+            catalog_file=catalog_runtime / "models.json",
         ),
         outside,
     )
@@ -33,7 +40,13 @@ def test_the_profile_denies_by_default() -> None:
     rules = [line for line in profile.splitlines() if not line.lstrip().startswith(";")]
     assert not any(line.strip() == "(allow file-read*)" for line in rules)
     assert not any(line.strip().startswith('(allow file-read* (regex #"^/"') for line in rules)
-    for parameter in ("CODEX_VENDOR", "WORKSPACE", "CODEX_HOME", "INSTALLATION_ID_FILE"):
+    for parameter in (
+        "CODEX_VENDOR",
+        "WORKSPACE",
+        "CODEX_HOME",
+        "INSTALLATION_ID_FILE",
+        "CATALOG_FILE",
+    ):
         assert f'(param "{parameter}")' in profile
 
 
@@ -156,8 +169,61 @@ def test_the_wrapper_keeps_the_command_intact(tmp_path: Path) -> None:
     assert wrapped[0] == str(sandbox.SANDBOX_EXEC)
     assert wrapped[-2:] == ["/bin/echo", "hello"]
     assert "--" in wrapped
-    for parameter in ("CODEX_VENDOR", "WORKSPACE", "CODEX_HOME", "INSTALLATION_ID_FILE"):
+    for parameter in (
+        "CODEX_VENDOR",
+        "WORKSPACE",
+        "CODEX_HOME",
+        "INSTALLATION_ID_FILE",
+        "CATALOG_FILE",
+    ):
         assert any(item.startswith(f"{parameter}=") for item in wrapped)
+
+
+def test_the_runtime_catalog_is_readable_over_and_over(tmp_path: Path) -> None:
+    """Three opens of the same path, all returning the same bytes.
+
+    This is the property the descriptor transport could not offer and the
+    reason the catalog moved to a named file at all. Codex 0.153.4 loads
+    `model_catalog_json` in the initial `ConfigBuilder::build()` and again at
+    `thread/start`; a `/dev/fd/N` stream answers the first load and hands the
+    second an empty string, which is how the third real probe died.
+
+    One successful read would therefore prove nothing. The probe reads three
+    times and `catalog_replayable` only holds if every read agreed.
+    """
+    result = measure(tmp_path)
+    assert result.catalog_readable is True
+    assert result.catalog_replayable is True
+
+
+def test_the_runtime_catalog_cannot_be_changed_from_inside(tmp_path: Path) -> None:
+    """Read, and nothing else. Write, truncate, unlink and sidecar all refused.
+
+    The named file gave up the immutability an unlinked descriptor had, and
+    this is where that is paid back. A catalog the sandboxed process could
+    rewrite would be a catalog the judgement no longer describes -- and the
+    second config load at `thread/start` would read whatever replaced it.
+    """
+    result = measure(tmp_path)
+    assert result.catalog_writable is False
+    assert result.catalog_truncatable is False
+    assert result.catalog_deletable is False
+    assert result.catalog_sidecar_creatable is False
+    assert result.catalog_scope_holds is True
+
+
+def test_the_catalog_grant_is_one_literal_read_and_no_write() -> None:
+    """`(subpath catalog-runtime)` would open the directory it is kept in."""
+    rules = [
+        line for line in sandbox.compose_profile().splitlines() if not line.lstrip().startswith(";")
+    ]
+    text = " ".join("\n".join(rules).split())
+    forms = [f"(allow {form}" for form in text.split("(allow ")[1:]]
+    catalog_forms = [form for form in forms if 'param "CATALOG_FILE"' in form]
+    assert len(catalog_forms) == 1, catalog_forms
+    assert '(literal (param "CATALOG_FILE"))' in catalog_forms[0]
+    assert "(subpath" not in catalog_forms[0]
+    assert "file-write" not in catalog_forms[0]
 
 
 def test_the_vendor_root_is_the_tree_the_binary_needs() -> None:

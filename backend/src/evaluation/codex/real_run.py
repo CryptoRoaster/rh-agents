@@ -17,6 +17,13 @@ run with different ones.
 The comparison happens twice on purpose: here, so a mismatch is a loud refusal
 with a named field before anything exists, and again inside the client through
 the permit, so the check cannot be lost by constructing the client another way.
+
+The runtime catalog is checked the same way as the profile, and for the same
+reason. It is a named file rather than an unlinked descriptor -- Codex 0.153.4
+reloads `model_catalog_json` at `thread/start`, so it has to be reopenable --
+and a name is something that can be replaced. So the binding carries both its
+path and the digest of its bytes, and the bytes are re-hashed here and again
+immediately before the exec.
 """
 
 from dataclasses import dataclass, field
@@ -56,6 +63,17 @@ class RealCodexRunner:
         if not self.config.outer_profile.still_matches():
             # The bytes on disk are no longer the bytes that were measured.
             raise RealRunRefused("profile digest mismatch")
+        if self.config.runtime_catalog is None:
+            # `model_catalog_json` has to point at a named file the CLI can
+            # reopen at `thread/start`, and that file has to be the one the
+            # preflight judged. An attempt that would make its own is not the
+            # thing the authorization is about.
+            raise RealRunRefused("no runtime catalog")
+        if not self.config.runtime_catalog.still_matches():
+            # Missing, truncated, rewritten: all the same answer, and all of
+            # them before a process exists. The client checks again immediately
+            # before the exec, for the same reason the profile is checked twice.
+            raise RealRunRefused("runtime catalog digest mismatch")
 
         expected = self.authorization.binding
         actual = binding_for(self.config, self.config.outer_profile.digest)

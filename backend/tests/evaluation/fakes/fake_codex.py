@@ -99,17 +99,31 @@ def observed_catalog_digest() -> str | None:
     A marker string would only say "nothing obviously bad arrived". A digest
     says the bytes are the ones the parent judged -- which also covers a short
     write, a truncation, extra bytes and any transformation in between.
+
+    Read **twice**, with two separate opens, because that is what the real CLI
+    does: `ConfigBuilder::build()` loads the catalog at startup and
+    `ConfigManager::load_with_overrides` loads it again at `thread/start`. The
+    descriptor transport answered the first load and handed the second an empty
+    string, and no offline test noticed because every one of them read once.
+    Disagreeing reads are reported as their own value rather than as the first
+    read's digest, so a transport that cannot be replayed fails here instead of
+    in a real probe.
     """
     for index, item in enumerate(sys.argv):
         if item == "-c" and index + 1 < len(sys.argv):
             override = sys.argv[index + 1]
             if override.startswith("model_catalog_json="):
                 reference = override[len("model_catalog_json=") :].strip('"')
-                try:
-                    with open(reference, "rb") as handle:
-                        return hashlib.sha256(handle.read()).hexdigest()
-                except OSError:
-                    return "<unreadable>"
+                digests = []
+                for _ in range(2):
+                    try:
+                        with open(reference, "rb") as handle:
+                            digests.append(hashlib.sha256(handle.read()).hexdigest())
+                    except OSError:
+                        return "<unreadable>"
+                if digests[0] != digests[1]:
+                    return "<not-replayable>"
+                return digests[0]
     return None
 
 

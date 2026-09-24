@@ -50,11 +50,17 @@ PROBE_TIMEOUT_SECONDS = 20.0
 class SandboxRoots:
     """The paths the harness section of the profile names.
 
-    Three readable roots and two writable files. Not `HOME`, not `/Volumes`,
-    not the repository: each of those is a class of file the attempt has no
-    business seeing. The platform section adds system and loader paths on top
-    -- those are runtime, not user data, and they are listed in the profile
-    itself.
+    Three readable roots, one readable file and two writable files. Not `HOME`,
+    not `/Volumes`, not the repository: each of those is a class of file the
+    attempt has no business seeing. The platform section adds system and loader
+    paths on top -- those are runtime, not user data, and they are listed in the
+    profile itself.
+
+    `catalog_file` is the named runtime catalog, and it is the one path granted
+    read access without being granted anything else. It is a `literal` for the
+    same reason the writable paths are: the directory holding it must stay
+    closed, so no sidecar can appear beside the catalog and nothing else in that
+    directory becomes readable by having been put there.
 
     The two writable paths are `literal`, never `subpath`. The directory that
     holds them stays unwritable, which is what keeps the file set closed and
@@ -64,6 +70,7 @@ class SandboxRoots:
     codex_vendor: Path
     workspace: Path
     codex_home: Path
+    catalog_file: Path
 
     @property
     def auth_file(self) -> Path:
@@ -83,6 +90,7 @@ class SandboxRoots:
             "CODEX_HOME": str(home),
             "AUTH_FILE": str(home / AUTH_FILE),
             "INSTALLATION_ID_FILE": str(home / INSTALLATION_ID_FILE),
+            "CATALOG_FILE": str(self.catalog_file.resolve()),
         }
 
 
@@ -187,10 +195,35 @@ class ProbeResult:
     installation_id_rewritable: bool
     other_file_creatable: bool
     egress_reachable: bool
+    catalog_readable: bool
+    catalog_replayable: bool
+    catalog_writable: bool
+    catalog_truncatable: bool
+    catalog_deletable: bool
+    catalog_sidecar_creatable: bool
 
     @property
     def read_boundary_holds(self) -> bool:
         return self.allowed_readable and not self.forbidden_readable and not self.sentinel_readable
+
+    @property
+    def catalog_scope_holds(self) -> bool:
+        """Readable as often as the CLI asks, and modifiable in no way at all.
+
+        `catalog_replayable` is the property the descriptor transport could not
+        offer: Codex 0.153.4 loads `model_catalog_json` once during the initial
+        `ConfigBuilder::build()` and again at `thread/start`, so one successful
+        read says nothing. The probe reads the same path three times and this
+        only holds if all three returned the same bytes.
+        """
+        return (
+            self.catalog_readable
+            and self.catalog_replayable
+            and not self.catalog_writable
+            and not self.catalog_truncatable
+            and not self.catalog_deletable
+            and not self.catalog_sidecar_creatable
+        )
 
     @property
     def write_scope_holds(self) -> bool:
@@ -200,6 +233,9 @@ class ProbeResult:
         existing file -- rather than as a plain overwrite, because that is the
         operation the app-server startup performs and the one the policy had to
         be measured against.
+
+        The runtime catalog is in this check as a negative: it is the third file
+        the profile names, and the only one that must stay unmodifiable.
         """
         return (
             self.auth_readable
@@ -207,6 +243,7 @@ class ProbeResult:
             and self.installation_id_readable
             and self.installation_id_rewritable
             and not self.other_file_creatable
+            and self.catalog_scope_holds
         )
 
 
@@ -220,6 +257,12 @@ DENIED_EVERYTHING = ProbeResult(
     installation_id_rewritable=False,
     other_file_creatable=True,
     egress_reachable=False,
+    catalog_readable=False,
+    catalog_replayable=False,
+    catalog_writable=True,
+    catalog_truncatable=True,
+    catalog_deletable=True,
+    catalog_sidecar_creatable=True,
 )
 
 
@@ -270,6 +313,13 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
     read-write open on an existing file, then a mode repair. A plain overwrite
     would pass under a policy that the app-server startup still fails on, which
     is exactly the mistake that produced the second probe's failure.
+
+    **`roots.catalog_file` must be a placeholder, never the runtime catalog the
+    attempt will use.** The catalog checks here are destructive by design: they
+    attempt a write, a truncation and an unlink, and every one of them is only
+    a measurement because the policy refuses it. Pointing this at the real
+    runtime catalog would mean that a policy hole -- the very thing being
+    measured -- destroys the file the run depends on.
     """
     workspace = roots.workspace.resolve()
     outside = outside.resolve()
@@ -283,6 +333,8 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
     parameters = roots.parameters()
     auth = Path(parameters["AUTH_FILE"])
     marker = Path(parameters["INSTALLATION_ID_FILE"])
+    catalog = Path(parameters["CATALOG_FILE"])
+    catalog_sidecar = catalog.parent / "sandbox-probe-catalog-sidecar.json"
     beside = auth.parent / "sandbox-probe-should-not-exist.txt"
     if not auth.exists():
         auth.write_text('{"placeholder": "not a credential"}\n', encoding="utf-8")
@@ -290,6 +342,7 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
     if not marker.exists():
         marker.write_text("00000000-0000-4000-8000-000000000000", encoding="utf-8")
         os.chmod(marker, 0o644)
+    _seed_probe_catalog(catalog)
 
     target = LoopbackTarget()
     try:
@@ -323,6 +376,25 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
                 f' else echo "BESIDE DENIED"; fi',
                 f'if : > "{marker}.probe" 2>/dev/null; then echo "MARKERSIDECAR OK";'
                 f' else echo "MARKERSIDECAR DENIED"; fi',
+                # Three separate opens of the same path, because that is what
+                # Codex does: `ConfigBuilder::build()` reads it once at startup
+                # and `thread/start` reads it again. A transport that only
+                # answers the first read is the failure this probe exists for,
+                # so each read is hashed and the digests are compared below.
+                *(
+                    f'if out=$(/sbin/md5 -q "{catalog}" 2>/dev/null);'
+                    f' then echo "CATALOGREAD{index} $out";'
+                    f' else echo "CATALOGREAD{index} UNREADABLE"; fi'
+                    for index in (1, 2, 3)
+                ),
+                f"if printf '%s' x > \"{catalog}\" 2>/dev/null;"
+                f' then echo "CATALOGWRITE OK"; else echo "CATALOGWRITE DENIED"; fi',
+                f'if : > "{catalog}" 2>/dev/null; then echo "CATALOGTRUNC OK";'
+                f' else echo "CATALOGTRUNC DENIED"; fi',
+                f'if /bin/rm -f "{catalog}" 2>/dev/null && [ ! -f "{catalog}" ];'
+                f' then echo "CATALOGDELETE OK"; else echo "CATALOGDELETE DENIED"; fi',
+                f'if : > "{catalog_sidecar}" 2>/dev/null; then echo "CATALOGSIDECAR OK";'
+                f' else echo "CATALOGSIDECAR DENIED"; fi',
                 f"if /usr/bin/nc -w 3 127.0.0.1 {target.port} < /dev/null > /dev/null 2>&1;"
                 f' then echo "EGRESS OK"; else echo "EGRESS DENIED"; fi',
             ]
@@ -344,8 +416,10 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
         beside.unlink(missing_ok=True)
         Path(f"{auth}.probe").unlink(missing_ok=True)
         Path(f"{marker}.probe").unlink(missing_ok=True)
+        _remove_probe_sidecar(catalog_sidecar)
 
     output = completed.stdout
+    reads = _catalog_reads(output)
     return ProbeResult(
         allowed_readable="ALLOWED OK" in output,
         forbidden_readable="FORBIDDEN OK" in output,
@@ -358,7 +432,58 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
             marker in output for marker in ("BESIDE OK", "SIDECAR OK", "MARKERSIDECAR OK")
         ),
         egress_reachable="EGRESS OK" in output,
+        catalog_readable=bool(reads) and reads[0] != "UNREADABLE",
+        # Three reads, all present and all identical. Two agreeing reads out of
+        # three would not do: the failure being guarded against is precisely a
+        # second read that differs from the first.
+        catalog_replayable=(len(reads) == 3 and "UNREADABLE" not in reads and len(set(reads)) == 1),
+        catalog_writable="CATALOGWRITE OK" in output,
+        catalog_truncatable="CATALOGTRUNC OK" in output,
+        # Checked by absence as well as by exit status: `rm -f` reports success
+        # for a path that is already gone, so the script only says OK when the
+        # file actually stopped existing.
+        catalog_deletable="CATALOGDELETE OK" in output or not catalog.is_file(),
+        catalog_sidecar_creatable="CATALOGSIDECAR OK" in output or catalog_sidecar.exists(),
     )
+
+
+PROBE_CATALOG_PAYLOAD = '{"models": []}\n'
+
+
+def _seed_probe_catalog(catalog: Path) -> None:
+    """Put a placeholder catalog in place, in the shape the runtime one has.
+
+    Same modes as `RuntimeCatalog` leaves behind -- a 0400 file in a 0500
+    directory -- so the policy is measured against the arrangement it will
+    actually meet rather than against a more permissive stand-in.
+    """
+    if catalog.exists():
+        return
+    directory = catalog.parent
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(directory, 0o700)
+    catalog.write_text(PROBE_CATALOG_PAYLOAD, encoding="utf-8")
+    os.chmod(catalog, 0o400)
+    os.chmod(directory, 0o500)
+
+
+def _catalog_reads(output: str) -> list[str]:
+    """The three catalog digests the child reported, in order."""
+    found: list[str] = []
+    for index in (1, 2, 3):
+        prefix = f"CATALOGREAD{index} "
+        for line in output.splitlines():
+            if line.startswith(prefix):
+                found.append(line[len(prefix) :].strip())
+                break
+    return found
+
+
+def _remove_probe_sidecar(path: Path) -> None:
+    """Clear a sidecar the probe may have created, whatever the outcome was."""
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
 
 
 def codex_vendor_root(executable: Path) -> Path:
@@ -381,6 +506,7 @@ __all__ = [
     "compose_profile",
     "macos",
     "DENIED_EVERYTHING",
+    "PROBE_CATALOG_PAYLOAD",
     "LoopbackTarget",
     "probe_boundaries",
     "wrap",
