@@ -102,7 +102,7 @@ visible failure rather than a silent break of comparability.
 ## No provider calls in this phase
 
 The tests are offline and fail if any socket connection is attempted. There is
-no runner script for real models in this change. Which cases run for real, on
+a comparison runner (below), but it is call-free by default. Which cases run for real, on
 which providers, with how many repetitions and what budget, is released
 separately after an independent review of this matrix and scorer.
 
@@ -118,3 +118,95 @@ No result of this suite authorises trading, risk, sizing, routing or execution,
 and none is evidence of production readiness. ORBIT's output cannot express any
 of those, and a strong ORBIT opinion never bypasses the deterministic risk
 engine.
+
+## Comparison runner
+
+`backend/tests/evaluation/orbit_compare_runner.py`, test-only, offline tests in
+`test_orbit_compare_runner.py`. Status: built and tested offline. **No live
+campaign is released.**
+
+### Providers
+
+| Id | Path |
+|---|---|
+| `codex-gpt-5.5` | Codex evaluation harness: `default_launcher()` → fresh `prepare_real_run(...)` per sample → `require_runner()` → exactly one `evaluate` |
+| `anthropic-claude-opus-5` | existing `AnthropicReasoningProvider(model="claude-opus-5", effort=None)` |
+
+### Same domain input, different provider controls
+
+Identical for both: `ORBIT_INSTRUCTIONS`, `reasoning_payload(case.task_input)`,
+`OrbitAssessment`, `validate_assessment(output, case.task_input)` and
+`orbit_benchmark.evaluate(case, output)`. No provider sees the slug, the
+description, the notes, any expectation, the sample id or a `BenchmarkResult`.
+
+`IDENTICAL_PROVIDER_CONTROLS = NO`. The asymmetries, also printed in every plan:
+
+| Control | codex-gpt-5.5 | anthropic-claude-opus-5 |
+|---|---|---|
+| runtime | Codex CLI 0.153.4, pinned GPT-5.5 catalog, isolated `CODEX_HOME`, Seatbelt, PreparedRealRun | Anthropic SDK, no Codex, no Seatbelt |
+| time bound | deadline 180 s, cleanup reserve 5 s | timeout 180 s |
+| output tokens | no enforceable cap in the harness | `max_output_tokens = 1024` |
+| internal retries | CLI-internal stream reconnects, not controllable | `transport_retries = 1` (adapter default, unchanged) |
+| effort | none configured | `None` |
+| latency | harness wall clock incl. process start | API call time |
+| cached input tokens | reported | not reported → `null`, never 0 |
+| request identity | `thread_id` (never relabelled as a request id) | `provider_request_id` |
+| domain-invalid output | discarded by the harness as `OUTPUT_DOMAIN_INVALID` | returned, judged locally |
+
+### Result record and failure classes
+
+One `SampleResult` per sample, `sample_id = <provider>:<case>:r<n>`
+(deterministic, evaluation metadata only). Status is `COMPLETED`, `REJECTED`
+(Codex harness), `PROVIDER_FAILURE` (Anthropic) or `NOT_RUN` (campaign halted).
+
+Failures are split so that an outage never reads as a quality miss, and a quality
+miss never hides as an outage:
+
+- `TECHNICAL`: no judgeable answer (deadline, process, transport, rate limit,
+  refusal, preflight). Not in any quality denominator.
+- `OUTPUT_CONTRACT`: the provider answered, but the answer failed the schema or
+  the domain check. Counted as `DOMAIN_INVALID` on both paths: Codex
+  `OUTPUT_NOT_JSON` / `OUTPUT_SCHEMA_MISMATCH` / `OUTPUT_DOMAIN_INVALID` (the
+  harness's detail code is the domain reason), Anthropic `INVALID_MODEL_OUTPUT` /
+  `OUTPUT_SCHEMA_MISMATCH`, and an Anthropic schema-valid, domain-invalid output
+  (`COMPLETED` + `DOMAIN_INVALID`). Without this, the Codex harness discarding
+  domain-invalid answers would silently remove them from the Codex denominator.
+
+Only redacted, typed failure data is stored: Anthropic `category` and
+`reason_code`; Codex `EvaluationFailure`, `detail_code` and the already-redacted
+`ProcessDiagnostic.safe_lines` / `StreamDiagnostic.safe_lines`. An untyped
+exception is recorded by class name only. Summaries are stored, never scored.
+
+### Aggregation
+
+Per provider: planned, completed, technical failures, output-contract failures,
+not run; domain-valid and benchmark-pass counts and rates over *judged* samples
+(completed or output-contract failure); classification, reason-code, data-gap
+and citation match counts and rates over *domain-valid* samples; strength
+distribution. Per case and provider: runs, completed, benchmark passes,
+strengths. Every denominator is named in the output. There is no total score and
+no winner field with a value.
+
+### Safety of the CLI
+
+```
+python -m tests.evaluation.orbit_compare_runner [--provider codex|anthropic|both]
+    [--repetitions N] [--case SLUG|all ...] [--execute] [--output /abs/path.json]
+```
+
+- Default is a dry run: the fixed plan on stdout, `real_model_calls = 0`, no
+  environment read, no file written.
+- Real calls only with `--execute`. No prompt, and credentials are never consent.
+- With `--execute`, every selected provider is checked **before the first
+  sample** (Anthropic key present and non-blank, Codex launcher found, one Codex
+  release preflight without a model turn). If any side is not ready, nothing
+  starts.
+- Fixed order: suite case → repetition → provider (codex before anthropic). The
+  plan is frozen before the first call; no re-planning, no "retry the misses".
+- Runner retries: 0. A Codex sample that ends in `CLEANUP_INCOMPLETE` or a
+  refused preflight halts the campaign; the remaining samples are `NOT_RUN`.
+- `--output` must be an absolute path outside the repository, must not exist,
+  and is written `0600`; without `--execute` it is refused.
+- `ANTHROPIC_API_KEY` is read only under `--execute`, only to build the provider,
+  held as `SecretStr`; it never appears in stdout, results, repr or error text.
+  The runner never touches `Settings`, `.env` or production configuration.
