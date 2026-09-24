@@ -87,6 +87,8 @@ class BenchmarkResult:
 
 
 def evaluate(case: OrbitSuiteCase, assessment: OrbitAssessment) -> BenchmarkResult:
+    domain_valid: bool
+    domain_reason: str | None
     try:
         validate_assessment(assessment, case.task_input)
     except OrbitValidationError as error:

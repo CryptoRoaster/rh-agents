@@ -26,11 +26,12 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, TextIO
@@ -108,6 +109,7 @@ PROVIDER_CONTROLS: dict[ProviderId, dict[str, object]] = {
         # The harness cannot pin an output-token cap on the CLI turn.
         "max_output_tokens": None,
         "internal_retries": "codex-cli internal stream reconnects, not controllable",
+        "underlying_provider_request_count": "UNKNOWN",
         "fresh_prepared_run_per_sample": True,
     },
     ProviderId.ANTHROPIC_CLAUDE_OPUS_5: {
@@ -118,6 +120,7 @@ PROVIDER_CONTROLS: dict[ProviderId, dict[str, object]] = {
         "max_output_tokens": ANTHROPIC_MAX_OUTPUT_TOKENS,
         "transport_retries": DEFAULT_TRANSPORT_RETRIES,
         "internal_retries": f"anthropic SDK max_retries={DEFAULT_TRANSPORT_RETRIES}",
+        "underlying_provider_request_count": "UNKNOWN",
     },
 }
 
@@ -140,6 +143,9 @@ COMPARISON_LIMITS: dict[str, object] = {
         "anthropic exposes a provider request id; codex does not (thread_id kept separately)",
     ],
     "runner_retries": 0,
+    # Neither path exposes how many requests it actually sent: Codex reconnects
+    # inside the CLI, the Anthropic SDK retries the transport. Never estimated.
+    "underlying_provider_request_count": "UNKNOWN",
     "winner_score": None,
 }
 
@@ -182,10 +188,9 @@ class ComparisonPlan:
     repetitions: int
     samples: tuple[PlannedSample, ...]
 
-    def describe(self, *, mode: str, real_model_calls: int = 0) -> dict[str, object]:
+    def describe(self, *, mode: str) -> dict[str, object]:
         return {
             "mode": mode,
-            "real_model_calls": real_model_calls,
             "providers": [p.value for p in self.providers],
             "cases": [c.slug for c in self.cases],
             "repetitions": self.repetitions,
@@ -272,9 +277,12 @@ CODEX_CONTRACT_FAILURES = frozenset(
         EvaluationFailure.OUTPUT_DOMAIN_INVALID,
     }
 )
-ANTHROPIC_CONTRACT_FAILURES = frozenset(
-    {(ReasoningErrorCategory.INVALID_MODEL_OUTPUT, "OUTPUT_SCHEMA_MISMATCH")}
-)
+# Every INVALID_MODEL_OUTPUT means the call returned no valid structured answer
+# (OUTPUT_SCHEMA_MISMATCH, OUTPUT_MISSING, or any future code of that
+# category). Treating one of them as technical would drop it from the quality
+# denominator and flatter the Anthropic path.
+ANTHROPIC_CONTRACT_CATEGORY = ReasoningErrorCategory.INVALID_MODEL_OUTPUT
+SAFE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,79}$")
 SCHEMA_INVALID = "SCHEMA_INVALID"
 
 
@@ -315,6 +323,10 @@ class SampleResult:
     provider_request_id: str | None = None
     thread_id: str | None = None
     reported_model: str | None = None
+
+    # Set on the execution path at the moment evaluate()/generate_structured()
+    # is entered, never inferred from the outcome.
+    provider_invocation_started: bool = False
 
     failure_kind: FailureKind | None = None
     failure: str | None = None
@@ -432,10 +444,18 @@ def normalize_anthropic_result(
     )
 
 
+def anthropic_contract_reason(reason_code: str) -> str:
+    if reason_code == "OUTPUT_SCHEMA_MISMATCH":
+        return SCHEMA_INVALID
+    # The adapter's own typed code, kept as is; anything not code-shaped is
+    # replaced rather than copied, so no vendor text can ride along.
+    return reason_code if SAFE_CODE.match(reason_code) else "UNRECOGNIZED_OUTPUT_FAILURE"
+
+
 def normalize_anthropic_failure(sample: PlannedSample, failure: ReasoningFailure) -> SampleResult:
     contract: dict[str, Any] = {"failure_kind": FailureKind.TECHNICAL}
-    if (failure.category, failure.reason_code) in ANTHROPIC_CONTRACT_FAILURES:
-        contract = _contract_violation(SCHEMA_INVALID)
+    if failure.category is ANTHROPIC_CONTRACT_CATEGORY:
+        contract = _contract_violation(anthropic_contract_reason(failure.reason_code))
     return SampleResult(
         **_base(sample),
         status=SampleStatus.PROVIDER_FAILURE,
@@ -461,16 +481,14 @@ def unclassified_failure(sample: PlannedSample, error: BaseException) -> SampleR
     )
 
 
-NO_CALL_DETAILS = frozenset({"RELEASE_NOT_GRANTED"})
+def invocations_started(results: Sequence[SampleResult]) -> int:
+    """Samples whose executor entered `evaluate` / `generate_structured`.
 
-
-def attempted_calls(results: Sequence[SampleResult]) -> int:
-    """Samples that reached a provider: everything except not-run and gate refusals."""
-    return sum(
-        1
-        for r in results
-        if r.status is not SampleStatus.NOT_RUN and r.failure_detail not in NO_CALL_DETAILS
-    )
+    A runner metric only. It is not a count of provider requests: Codex may
+    reconnect inside the CLI and the Anthropic SDK may retry the transport, and
+    neither is observable here.
+    """
+    return sum(1 for r in results if r.provider_invocation_started)
 
 
 def not_run(sample: PlannedSample, reason: str) -> SampleResult:
@@ -480,8 +498,15 @@ def not_run(sample: PlannedSample, reason: str) -> SampleResult:
 # --- Executors ---------------------------------------------------------------
 
 
+@dataclass
+class InvocationMark:
+    """Flipped by an executor immediately before it enters the provider call."""
+
+    started: bool = False
+
+
 class SampleExecutor(Protocol):
-    async def __call__(self, sample: PlannedSample) -> SampleResult: ...
+    async def __call__(self, sample: PlannedSample, mark: InvocationMark) -> SampleResult: ...
 
 
 PrepareRun = Callable[..., AbstractAsyncContextManager[Any]]
@@ -495,7 +520,8 @@ class CodexExecutor:
     source_codex_home: Path
     prepare: PrepareRun = prepare_real_run
 
-    async def __call__(self, sample: PlannedSample) -> SampleResult:
+    async def __call__(self, sample: PlannedSample, mark: InvocationMark) -> SampleResult:
+        request = codex_request(sample.case)
         async with self.prepare(
             launcher=self.launcher, source_codex_home=self.source_codex_home
         ) as prepared:
@@ -508,7 +534,8 @@ class CodexExecutor:
                     failure_detail="RELEASE_NOT_GRANTED",
                 )
             runner = prepared.require_runner()
-            outcome = await runner.evaluate(codex_request(sample.case))
+            mark.started = True
+            outcome = await runner.evaluate(request)
         return normalize_codex(sample, outcome)
 
 
@@ -516,9 +543,11 @@ class CodexExecutor:
 class AnthropicExecutor:
     provider: AnthropicReasoningProvider
 
-    async def __call__(self, sample: PlannedSample) -> SampleResult:
+    async def __call__(self, sample: PlannedSample, mark: InvocationMark) -> SampleResult:
+        request = anthropic_request(sample.case)
+        mark.started = True
         try:
-            result = await self.provider.generate_structured(anthropic_request(sample.case))
+            result = await self.provider.generate_structured(request)
         except ReasoningFailure as failure:
             return normalize_anthropic_failure(sample, failure)
         return normalize_anthropic_result(sample, result)
@@ -605,12 +634,13 @@ async def run_plan(
         if halted is not None:
             results.append(not_run(sample, halted))
             continue
+        mark = InvocationMark()
         try:
-            result = await executors[sample.provider](sample)
+            result = await executors[sample.provider](sample, mark)
         except Exception as error:
             # Recorded by class name only, never re-raised with its text.
             result = unclassified_failure(sample, error)
-        results.append(result)
+        results.append(replace(result, provider_invocation_started=mark.started))
         if sample.provider is ProviderId.CODEX_GPT_5_5 and result.failure in HALTING_CODEX_FAILURES:
             halted = f"HALTED_AFTER:{sample.sample_id}"
     return tuple(results)
@@ -797,7 +827,15 @@ def main(
     plan = build_plan(PROVIDER_CHOICES[args.provider], cases, args.repetitions)
 
     if not args.execute:
-        _write_json(out, plan.describe(mode="DRY_RUN"))
+        # No executor exists in a dry run, so no provider path can be entered.
+        _write_json(
+            out,
+            {
+                **plan.describe(mode="DRY_RUN"),
+                "provider_invocations_started": 0,
+                "real_provider_requests_occurred": "NO",
+            },
+        )
         return 0
 
     results, blocking = asyncio.run(
@@ -808,7 +846,8 @@ def main(
             out,
             {
                 "mode": "EXECUTE_REFUSED",
-                "real_model_calls": 0,
+                "provider_invocations_started": 0,
+                "real_provider_requests_occurred": "NO",
                 "blocking": list(blocking),
                 "planned_samples": len(plan.samples),
             },
@@ -816,7 +855,9 @@ def main(
         return 3
     report = {
         "mode": "EXECUTED",
-        "plan": plan.describe(mode="EXECUTED", real_model_calls=attempted_calls(results)),
+        "plan": plan.describe(mode="EXECUTED"),
+        "provider_invocations_started": invocations_started(results),
+        "underlying_provider_request_count": "UNKNOWN",
         "results": [r.to_dict() for r in results],
         "aggregate": aggregate(plan, results),
     }
@@ -824,7 +865,16 @@ def main(
         with output.open("x", encoding="utf-8") as handle:
             os.chmod(output, 0o600)
             _write_json(handle, report)
-        _write_json(out, {"mode": "EXECUTED", "output": str(output), "samples": len(results)})
+        _write_json(
+            out,
+            {
+                "mode": "EXECUTED",
+                "output": str(output),
+                "samples": len(results),
+                "provider_invocations_started": invocations_started(results),
+                "underlying_provider_request_count": "UNKNOWN",
+            },
+        )
     else:
         _write_json(out, report)
     return 0

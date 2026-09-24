@@ -164,18 +164,41 @@ miss never hides as an outage:
 
 - `TECHNICAL`: no judgeable answer (deadline, process, transport, rate limit,
   refusal, preflight). Not in any quality denominator.
-- `OUTPUT_CONTRACT`: the provider answered, but the answer failed the schema or
-  the domain check. Counted as `DOMAIN_INVALID` on both paths: Codex
-  `OUTPUT_NOT_JSON` / `OUTPUT_SCHEMA_MISMATCH` / `OUTPUT_DOMAIN_INVALID` (the
-  harness's detail code is the domain reason), Anthropic `INVALID_MODEL_OUTPUT` /
-  `OUTPUT_SCHEMA_MISMATCH`, and an Anthropic schema-valid, domain-invalid output
-  (`COMPLETED` + `DOMAIN_INVALID`). Without this, the Codex harness discarding
-  domain-invalid answers would silently remove them from the Codex denominator.
+- `OUTPUT_CONTRACT`: the call ran but produced no valid structured answer, or
+  one that failed the domain check. Counted as `DOMAIN_INVALID` on both paths:
+  - Codex `OUTPUT_NOT_JSON` / `OUTPUT_SCHEMA_MISMATCH` (→ `SCHEMA_INVALID`) and
+    `OUTPUT_DOMAIN_INVALID` (the harness's detail code is the domain reason). The
+    harness has already discarded the assessment; nothing is reconstructed.
+  - Anthropic: **every** `INVALID_MODEL_OUTPUT`, whatever its reason code.
+    `OUTPUT_SCHEMA_MISMATCH` → `SCHEMA_INVALID`; `OUTPUT_MISSING` (no parsed
+    output) → `OUTPUT_MISSING`; any other code of that category is kept as the
+    domain reason if it is code-shaped, else `UNRECOGNIZED_OUTPUT_FAILURE`.
+  - Anthropic schema-valid, domain-invalid output: `COMPLETED` + `DOMAIN_INVALID`.
+
+  Without this, the Codex harness discarding domain-invalid answers, or an
+  Anthropic `OUTPUT_MISSING`, would drop out of the denominator and flatter that
+  path. All other Anthropic categories (timeout, rate limit, unavailable,
+  refused, rejected request, not configured) stay `TECHNICAL`.
 
 Only redacted, typed failure data is stored: Anthropic `category` and
 `reason_code`; Codex `EvaluationFailure`, `detail_code` and the already-redacted
 `ProcessDiagnostic.safe_lines` / `StreamDiagnostic.safe_lines`. An untyped
 exception is recorded by class name only. Summaries are stored, never scored.
+
+### Invocation accounting
+
+`provider_invocations_started` is a runner metric: the number of samples whose
+executor actually entered Codex `runner.evaluate(...)` or Anthropic
+`provider.generate_structured(...)`. It is set on the execution path at the
+moment of the call, never inferred from a failure code. An exception after the
+call was entered still counts; one before it (environment build, a
+PreparedRealRun without a released runner) does not; `NOT_RUN` samples and a
+refused `--execute` count zero.
+
+It is **not** a request count. `underlying_provider_request_count = UNKNOWN`:
+Codex may reconnect inside the CLI, the Anthropic SDK may retry the transport
+(`max_retries = 1`), and neither is observable here. No such number is
+estimated or reported.
 
 ### Aggregation
 
@@ -194,8 +217,9 @@ python -m tests.evaluation.orbit_compare_runner [--provider codex|anthropic|both
     [--repetitions N] [--case SLUG|all ...] [--execute] [--output /abs/path.json]
 ```
 
-- Default is a dry run: the fixed plan on stdout, `real_model_calls = 0`, no
-  environment read, no file written.
+- Default is a dry run: the fixed plan on stdout,
+  `provider_invocations_started = 0`, `real_provider_requests_occurred = NO`, no
+  environment read, no file written. No executor exists in a dry run.
 - Real calls only with `--execute`. No prompt, and credentials are never consent.
 - With `--execute`, every selected provider is checked **before the first
   sample** (Anthropic key present and non-blank, Codex launcher found, one Codex

@@ -54,6 +54,7 @@ from tests.evaluation.orbit_compare_runner import (
     ComparisonPlan,
     Dependencies,
     FailureKind,
+    InvocationMark,
     PlannedSample,
     ProviderId,
     SampleResult,
@@ -264,7 +265,9 @@ def test_default_cli_plans_and_calls_nothing(monkeypatch: pytest.MonkeyPatch) ->
     plan = json.loads(out)
     assert code == 0
     assert plan["mode"] == "DRY_RUN"
-    assert plan["real_model_calls"] == 0
+    assert plan["provider_invocations_started"] == 0
+    assert plan["real_provider_requests_occurred"] == "NO"
+    assert "real_model_calls" not in plan
     assert plan["planned_samples"] == 7 * 1 * 2
     assert codex.contexts == 0 and codex.evaluate_calls == 0
     assert anthropic.calls == 0
@@ -289,7 +292,7 @@ def test_both_three_repetitions_plans_42_without_calls(monkeypatch: pytest.Monke
     plan = json.loads(out)
     assert code == 0
     assert plan["planned_samples"] == 42 == len(plan["samples"])
-    assert plan["real_model_calls"] == 0
+    assert plan["provider_invocations_started"] == 0
     assert codex.contexts == codex.evaluate_calls == anthropic.calls == 0
 
 
@@ -490,7 +493,9 @@ def test_execute_runs_each_sample_once_with_a_fresh_prepared_run(
     assert codex.evaluate_calls == 14
     assert all(len(r.requests) == 1 for r in codex.runners[1:])
     assert anthropic.calls == 14
-    assert report["plan"]["real_model_calls"] == 28
+    assert report["provider_invocations_started"] == 28
+    assert report["underlying_provider_request_count"] == "UNKNOWN"
+    assert "real_model_calls" not in json.dumps(report)
     assert {r["status"] for r in report["results"]} == {"COMPLETED"}
 
 
@@ -501,6 +506,7 @@ def test_missing_anthropic_key_blocks_both_sides(monkeypatch: pytest.MonkeyPatch
         code, out = run_cli(["--execute"], deps(codex, environ=environ))
         assert code == 3
         assert json.loads(out)["blocking"] == ["ANTHROPIC_API_KEY_MISSING"]
+        assert json.loads(out)["provider_invocations_started"] == 0
     assert codex.contexts == codex.evaluate_calls == anthropic.calls == 0
 
 
@@ -510,6 +516,7 @@ def test_missing_codex_launcher_blocks_both_sides(monkeypatch: pytest.MonkeyPatc
     code, out = run_cli(["--execute"], deps(codex, launcher=None))
     assert code == 3
     assert json.loads(out)["blocking"] == ["CODEX_LAUNCHER_MISSING"]
+    assert json.loads(out)["provider_invocations_started"] == 0
     assert codex.contexts == codex.evaluate_calls == anthropic.calls == 0
 
 
@@ -519,6 +526,7 @@ def test_blocked_codex_preflight_blocks_both_sides(monkeypatch: pytest.MonkeyPat
     code, out = run_cli(["--execute"], deps(codex))
     assert code == 3
     assert json.loads(out)["blocking"] == ["CODEX_PREFLIGHT_BLOCKED"]
+    assert json.loads(out)["provider_invocations_started"] == 0
     assert codex.evaluate_calls == anthropic.calls == 0
 
 
@@ -663,14 +671,71 @@ def test_anthropic_failure_keeps_only_category_and_reason() -> None:
     assert result.process_safe_lines == () and result.stream_safe_lines == ()
 
 
-def test_anthropic_schema_failure_is_an_output_contract_failure() -> None:
-    failure = ReasoningFailure(
-        ReasoningErrorCategory.INVALID_MODEL_OUTPUT, "OUTPUT_SCHEMA_MISMATCH"
-    )
+@pytest.mark.parametrize(
+    ("reason_code", "domain_reason"),
+    [
+        ("OUTPUT_SCHEMA_MISMATCH", "SCHEMA_INVALID"),
+        ("OUTPUT_MISSING", "OUTPUT_MISSING"),
+        ("SOME_INVALID_OUTPUT", "SOME_INVALID_OUTPUT"),
+    ],
+)
+def test_every_invalid_model_output_is_an_output_contract_failure(
+    reason_code: str, domain_reason: str
+) -> None:
+    failure = ReasoningFailure(ReasoningErrorCategory.INVALID_MODEL_OUTPUT, reason_code)
     result = normalize_anthropic_failure(sample(ANTHROPIC), failure)
+    assert result.status is SampleStatus.PROVIDER_FAILURE
     assert result.failure_kind is FailureKind.OUTPUT_CONTRACT
     assert result.domain_valid is False
-    assert result.domain_reason == "SCHEMA_INVALID"
+    assert result.domain_reason == domain_reason
+    assert result.benchmark_pass is False
+    assert result.benchmark_verdict == "DOMAIN_INVALID"
+    assert result.classification is None
+
+
+def test_invalid_model_output_with_non_code_text_is_not_copied() -> None:
+    failure = ReasoningFailure(ReasoningErrorCategory.INVALID_MODEL_OUTPUT, "vendor said: no")
+    result = normalize_anthropic_failure(sample(ANTHROPIC), failure)
+    assert result.failure_kind is FailureKind.OUTPUT_CONTRACT
+    assert result.domain_reason == "UNRECOGNIZED_OUTPUT_FAILURE"
+
+
+@pytest.mark.parametrize(
+    "category",
+    [c for c in ReasoningErrorCategory if c is not ReasoningErrorCategory.INVALID_MODEL_OUTPUT],
+)
+def test_other_anthropic_categories_stay_technical(category: ReasoningErrorCategory) -> None:
+    result = normalize_anthropic_failure(
+        sample(ANTHROPIC), ReasoningFailure(category, category.value)
+    )
+    assert result.failure_kind is FailureKind.TECHNICAL
+    assert result.domain_valid is None
+    assert result.benchmark_verdict is None
+
+
+def test_output_missing_counts_in_the_quality_denominators() -> None:
+    plan = build_plan((ANTHROPIC,), SUITE[:4], 1)
+    positive, below, zero, unknown = plan.samples
+    rows = [
+        normalize_anthropic_result(positive, anthropic_result(good_assessment(positive.case))),
+        normalize_anthropic_result(below, anthropic_result(good_assessment(below.case))),
+        normalize_anthropic_failure(
+            zero, ReasoningFailure(ReasoningErrorCategory.INVALID_MODEL_OUTPUT, "OUTPUT_MISSING")
+        ),
+        normalize_anthropic_failure(
+            unknown, ReasoningFailure(ReasoningErrorCategory.PROVIDER_TIMEOUT, "PROVIDER_TIMEOUT")
+        ),
+    ]
+    metrics = aggregate(plan, rows)["providers"]["anthropic-claude-opus-5"]  # type: ignore[index]
+    # OUTPUT_MISSING is judged; the timeout is not.
+    assert metrics["judged_samples"] == 3
+    assert metrics["output_contract_failures"] == 1
+    assert metrics["technical_failures"] == 1
+    assert metrics["domain_valid_count"] == 2
+    assert metrics["domain_valid_rate"] == round(2 / 3, 4)
+    assert metrics["benchmark_pass_rate"] == round(2 / 3, 4)
+    # Criteria stay over domain-valid samples only.
+    assert metrics["classification_match_rate"] == 1.0
 
 
 def test_anthropic_schema_valid_domain_invalid_is_completed_domain_invalid() -> None:
@@ -737,7 +802,7 @@ def test_anthropic_cached_input_is_unknown_not_zero() -> None:
 def test_runner_never_retries_a_failed_sample() -> None:
     calls: list[str] = []
 
-    async def failing(planned: PlannedSample) -> SampleResult:
+    async def failing(planned: PlannedSample, mark: InvocationMark) -> SampleResult:
         calls.append(planned.sample_id)
         raise RuntimeError("boom")
 
@@ -750,13 +815,13 @@ def test_runner_never_retries_a_failed_sample() -> None:
 def test_cleanup_failure_halts_the_campaign() -> None:
     seen: list[str] = []
 
-    async def codex_exec(planned: PlannedSample) -> SampleResult:
+    async def codex_exec(planned: PlannedSample, mark: InvocationMark) -> SampleResult:
         seen.append(planned.sample_id)
         return normalize_codex(
             planned, rejected(EvaluationFailure.CLEANUP_INCOMPLETE, "GROUP_NOT_EMPTY")
         )
 
-    async def anthropic_exec(planned: PlannedSample) -> SampleResult:
+    async def anthropic_exec(planned: PlannedSample, mark: InvocationMark) -> SampleResult:
         seen.append(planned.sample_id)
         return normalize_anthropic_result(planned, anthropic_result(good_assessment(planned.case)))
 
@@ -916,3 +981,114 @@ def test_comparison_limits_do_not_claim_identical_controls() -> None:
     assert COMPARISON_LIMITS["identical_provider_controls"] is False
     assert COMPARISON_LIMITS["runner_retries"] == 0
     assert COMPARISON_LIMITS["winner_score"] is None
+
+
+# --- Invocation accounting -----------------------------------------------------------
+
+
+def test_dry_run_reports_zero_invocations_and_no_request_count() -> None:
+    _, out = run_cli(["--provider", "both", "--repetitions", "3"])
+    plan = json.loads(out)
+    assert plan["provider_invocations_started"] == 0
+    assert plan["real_provider_requests_occurred"] == "NO"
+    assert plan["comparison_limits"]["underlying_provider_request_count"] == "UNKNOWN"
+    for controls in plan["provider_controls"].values():
+        assert controls["underlying_provider_request_count"] == "UNKNOWN"
+
+
+def test_prepared_run_without_runner_is_not_an_invocation() -> None:
+    codex = FakeCodex(grant=False)
+    executor = runner_module.CodexExecutor(
+        launcher=LAUNCHER, source_codex_home=Path("/nonexistent"), prepare=codex.prepare
+    )
+    plan = build_plan((CODEX,), SUITE[:1], 1)
+    (result,) = asyncio.run(run_plan(plan, {CODEX: executor}))
+    assert result.failure_detail == "RELEASE_NOT_GRANTED"
+    assert result.provider_invocation_started is False
+    assert runner_module.invocations_started([result]) == 0
+
+
+def test_codex_evaluate_counts_once() -> None:
+    codex = FakeCodex()
+    executor = runner_module.CodexExecutor(
+        launcher=LAUNCHER, source_codex_home=Path("/nonexistent"), prepare=codex.prepare
+    )
+    plan = build_plan((CODEX,), SUITE[:1], 1)
+    results = asyncio.run(run_plan(plan, {CODEX: executor}))
+    assert [r.provider_invocation_started for r in results] == [True]
+    assert runner_module.invocations_started(results) == 1 == codex.evaluate_calls
+
+
+def test_anthropic_generate_structured_counts_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    anthropic = FakeAnthropic()
+    anthropic.install(monkeypatch)
+    executor = runner_module.AnthropicExecutor(
+        runner_module.anthropic_provider_from({ANTHROPIC_KEY_VARIABLE: SECRET})
+    )
+    plan = build_plan((ANTHROPIC,), SUITE[:1], 1)
+    results = asyncio.run(run_plan(plan, {ANTHROPIC: executor}))
+    assert runner_module.invocations_started(results) == 1 == anthropic.calls
+
+
+def test_exception_inside_a_started_call_still_counts(monkeypatch: pytest.MonkeyPatch) -> None:
+    def explode(request: ReasoningRequest[Any]) -> ReasoningResult[Any]:
+        raise RuntimeError("connection dropped mid-call")
+
+    anthropic = FakeAnthropic(respond=explode)
+    anthropic.install(monkeypatch)
+    executor = runner_module.AnthropicExecutor(
+        runner_module.anthropic_provider_from({ANTHROPIC_KEY_VARIABLE: SECRET})
+    )
+    codex = FakeCodex(respond=lambda request: (_ for _ in ()).throw(OSError("pipe")))
+    codex_executor = runner_module.CodexExecutor(
+        launcher=LAUNCHER, source_codex_home=Path("/nonexistent"), prepare=codex.prepare
+    )
+    plan = build_plan((CODEX, ANTHROPIC), SUITE[:1], 1)
+    results = asyncio.run(run_plan(plan, {CODEX: codex_executor, ANTHROPIC: executor}))
+    assert [r.failure for r in results] == ["UNCLASSIFIED_EXCEPTION"] * 2
+    assert [r.provider_invocation_started for r in results] == [True, True]
+
+
+def test_exception_before_the_call_is_not_counted() -> None:
+    @asynccontextmanager
+    async def broken_prepare(**_kwargs: object) -> AsyncIterator[FakePrepared]:
+        raise OSError("could not build the environment")
+        yield FakePrepared(None)  # pragma: no cover
+
+    executor = runner_module.CodexExecutor(
+        launcher=LAUNCHER, source_codex_home=Path("/nonexistent"), prepare=broken_prepare
+    )
+    plan = build_plan((CODEX,), SUITE[:1], 1)
+    (result,) = asyncio.run(run_plan(plan, {CODEX: executor}))
+    assert result.failure == "UNCLASSIFIED_EXCEPTION"
+    assert result.provider_invocation_started is False
+
+
+def test_not_run_samples_are_not_counted() -> None:
+    async def codex_exec(planned: PlannedSample, mark: InvocationMark) -> SampleResult:
+        mark.started = True
+        return normalize_codex(
+            planned, rejected(EvaluationFailure.CLEANUP_INCOMPLETE, "GROUP_NOT_EMPTY")
+        )
+
+    async def anthropic_exec(planned: PlannedSample, mark: InvocationMark) -> SampleResult:
+        raise AssertionError("must not run after a halt")
+
+    plan = build_plan((CODEX, ANTHROPIC), SUITE[:2], 1)
+    results = asyncio.run(run_plan(plan, {CODEX: codex_exec, ANTHROPIC: anthropic_exec}))
+    assert [r.status for r in results][1:] == [SampleStatus.NOT_RUN] * 3
+    assert runner_module.invocations_started(results) == 1
+
+
+def test_codex_domain_rejection_stays_output_contract_after_invocation() -> None:
+    async def codex_exec(planned: PlannedSample, mark: InvocationMark) -> SampleResult:
+        mark.started = True
+        return normalize_codex(
+            planned, rejected(EvaluationFailure.OUTPUT_DOMAIN_INVALID, "CONTRADICTED_VALUE")
+        )
+
+    plan = build_plan((CODEX,), SUITE[:1], 1)
+    (result,) = asyncio.run(run_plan(plan, {CODEX: codex_exec}))
+    assert result.failure_kind is FailureKind.OUTPUT_CONTRACT
+    assert result.domain_reason == "CONTRADICTED_VALUE"
+    assert result.provider_invocation_started is True
