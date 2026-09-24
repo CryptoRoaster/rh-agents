@@ -18,10 +18,22 @@ Item types that indicate tool use are `command_execution`, `file_change`,
 item that starts and completes is one observation rather than two, and an item
 that starts and never completes is still observed.
 
+The order of these is looser than it looks. `item.started`, `item.updated` and
+`item.completed` can arrive **before** `turn.started`: the JSONL processor maps
+`ServerNotification::TurnPlanUpdated` directly onto an `ItemStarted` carrying a
+`TodoListItem`, with no requirement that a `TurnStarted` notification came
+first. This parser used to refuse that as `ITEM_BEFORE_TURN`, and the fourth
+authorised real probe died on it after the CLI had otherwise got all the way to
+emitting events. Pre-turn items are now folded in like any other.
+
 Success needs a consistent ending, not merely a message: the turn must have
 started, an `agent_message` item must have completed, and `turn.completed` must
-have arrived. An earlier `agent_message` on its own proves nothing -- the model
-may speak again, and the turn may still fail afterwards -- so the last completed
+have arrived. Relaxing the ordering did not relax any of that. A pre-turn item
+is never read as an implicit `turn.started`, so items alone can never produce a
+result -- `TURN_NEVER_STARTED` still stands, and so does
+`TURN_END_WITHOUT_START` for a `turn.completed` that no `turn.started`
+preceded. An earlier `agent_message` on its own proves nothing -- the model may
+speak again, and the turn may still fail afterwards -- so the last completed
 `agent_message` before `turn.completed` is the authoritative answer.
 
 Contradictions are rejected. Unknown top-level event types are ignored instead,
@@ -128,8 +140,17 @@ class EventAccumulator:
         self.turn_started = True
 
     def _item(self, kind: str, event: dict[str, Any]) -> None:
-        if not self.turn_started:
-            raise StreamError(EvaluationFailure.EVENT_STREAM_INVALID, "ITEM_BEFORE_TURN")
+        # An item before `turn.started` is ordinary, not a contradiction.
+        # `EventProcessorWithJsonOutput` turns `ServerNotification::
+        # TurnPlanUpdated` straight into `ThreadEvent::ItemStarted` for a
+        # `TodoListItem` without requiring that `TurnStarted` was seen first,
+        # and Codex's own tests call `collect_thread_events` with exactly that
+        # notification alone. Refusing it cost the fourth real probe.
+        #
+        # What is deliberately *not* done here is infer `turn_started = True`.
+        # An item is evidence that the CLI produced events, never evidence that
+        # a turn began; `require_consistent_completion` still demands the
+        # explicit event, so no sequence of items can add up to a success.
         if self.turn_completed:
             raise StreamError(EvaluationFailure.EVENT_STREAM_INVALID, "ITEM_AFTER_TURN")
         item = event.get("item")

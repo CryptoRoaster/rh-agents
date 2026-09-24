@@ -28,6 +28,99 @@ def message(text: str, item_id: str = "i1") -> dict[str, object]:
     }
 
 
+def todo(stage: str, item_id: str = "todo-1") -> dict[str, object]:
+    """The item Codex emits from `TurnPlanUpdated`, which precedes the turn.
+
+    `EventProcessorWithJsonOutput` maps that notification straight onto an
+    `ItemStarted` carrying a `TodoListItem`, without waiting for a
+    `TurnStarted`. This is the shape that the fourth real probe met and that
+    the parser used to refuse.
+    """
+    return {
+        "type": f"item.{stage}",
+        "item": {"id": item_id, "type": "todo_list", "items": []},
+    }
+
+
+def test_a_todo_item_before_the_turn_is_ordinary() -> None:
+    """Case 1: the sequence a real 0.153.4 run actually produces."""
+    state = accumulator()
+    feed(state, THREAD, todo("started"), TURN, message("final"), {"type": "turn.completed"})
+    assert state.require_consistent_completion() == "final"
+    assert state.thread_id == "t-1"
+
+
+def test_a_whole_pre_turn_todo_lifecycle_is_ordinary() -> None:
+    """Case 2: started and updated before the turn, completed after it."""
+    state = accumulator()
+    feed(
+        state,
+        THREAD,
+        todo("started"),
+        todo("updated"),
+        TURN,
+        todo("completed"),
+        message("final"),
+        {"type": "turn.completed"},
+    )
+    assert state.require_consistent_completion() == "final"
+
+
+def test_a_pre_turn_item_is_not_an_implicit_turn_start() -> None:
+    """Case 3: the loosened rule must not become a loosened success rule.
+
+    Accepting the item and inferring a turn from it would be two changes, and
+    only the first one is warranted. An item says the CLI emitted events; it
+    says nothing about a turn having begun.
+    """
+    state = accumulator()
+    feed(state, THREAD, todo("started"))
+    assert state.turn_started is False
+    with pytest.raises(StreamError) as caught:
+        state.require_consistent_completion()
+    assert caught.value.failure is EvaluationFailure.INCONSISTENT_COMPLETION
+    assert caught.value.reason_code == "TURN_NEVER_STARTED"
+
+
+def test_an_agent_message_before_the_turn_is_kept_but_never_suffices() -> None:
+    """Case 7: structurally folded in, and still not a result on its own.
+
+    The message is retained -- refusing to read it would be the old rule under
+    another name -- but the run only succeeds once the explicit `turn.started`
+    and `turn.completed` have both arrived.
+    """
+    state = accumulator()
+    feed(state, THREAD, message("early"))
+    assert state.final_message == "early"
+    with pytest.raises(StreamError) as caught:
+        state.require_consistent_completion()
+    assert caught.value.reason_code == "TURN_NEVER_STARTED"
+
+    feed(state, TURN, {"type": "turn.completed"})
+    assert state.require_consistent_completion() == "early"
+
+
+def test_a_tool_item_before_the_turn_is_still_observed() -> None:
+    """Observation of the stream, not entitlement to the tool.
+
+    A tool-shaped item that arrives early is recorded exactly as a later one
+    would be. Dropping it because of where it sat in the stream would make the
+    observation quieter than the run actually was.
+    """
+    state = accumulator()
+    feed(
+        state,
+        THREAD,
+        {"type": "item.started", "item": {"id": "c1", "type": "command_execution"}},
+        TURN,
+        {"type": "item.completed", "item": {"id": "c1", "type": "command_execution"}},
+        message("final"),
+        {"type": "turn.completed"},
+    )
+    observed = state.observed_tool_activity()
+    assert [(item.item_type, item.count) for item in observed] == [("command_execution", 1)]
+
+
 def test_usage_is_read_only_where_reported() -> None:
     state = accumulator()
     feed(
@@ -113,8 +206,18 @@ def test_turn_failure_is_surfaced_immediately() -> None:
     ("events", "reason"),
     [
         (({"type": "turn.completed"},), "TURN_END_WITHOUT_START"),
-        ((THREAD, message("x")), "ITEM_BEFORE_TURN"),
+        # A pre-turn item is no longer on this list; it is ordinary. What is
+        # still refused is a `turn.completed` that no `turn.started` preceded,
+        # including when items arrived in between.
+        (
+            (THREAD, todo("started"), {"type": "turn.completed"}),
+            "TURN_END_WITHOUT_START",
+        ),
         ((THREAD, TURN, TURN), "TURN_RESTARTED"),
+        (
+            (THREAD, TURN, {"type": "turn.completed"}, todo("started")),
+            "ITEM_AFTER_TURN",
+        ),
         (
             (THREAD, TURN, {"type": "turn.completed"}, {"type": "turn.completed"}),
             "TURN_ENDED_TWICE",
