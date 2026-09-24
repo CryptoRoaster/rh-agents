@@ -46,6 +46,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.evaluation.codex.diagnostics import EMPTY_ALIASES, PathAliases, redact
 from src.evaluation.codex.models import (
     EvaluationFailure,
     EvaluationUsage,
@@ -56,11 +57,23 @@ TOOL_ITEM_TYPES = frozenset({"command_execution", "file_change", "mcp_tool_call"
 
 
 class StreamError(Exception):
-    """The event stream cannot be interpreted, or the turn did not succeed."""
+    """The event stream cannot be interpreted, or the turn did not succeed.
 
-    def __init__(self, failure: EvaluationFailure, reason_code: str) -> None:
+    `safe_lines` carries **already redacted** text and nothing else. There is no
+    raw counterpart, and the exception's own message is the failure and the
+    reason code, so neither `str(error)` nor `repr(error)` can ever show what
+    the CLI actually wrote.
+    """
+
+    def __init__(
+        self,
+        failure: EvaluationFailure,
+        reason_code: str,
+        safe_lines: tuple[str, ...] = (),
+    ) -> None:
         self.failure = failure
         self.reason_code = reason_code
+        self.safe_lines = safe_lines
         super().__init__(f"{failure.value}:{reason_code}")
 
 
@@ -74,6 +87,10 @@ class EventAccumulator:
     """
 
     max_final_message_bytes: int
+    # The running client's bound paths. A Codex `error` event is reported
+    # through the same redaction as stderr, and without these the absolute
+    # paths in it would be reported verbatim.
+    aliases: PathAliases = EMPTY_ALIASES
     thread_id: str | None = None
     reported_model: str | None = None
     reported_effort: str | None = None
@@ -109,12 +126,35 @@ class EventAccumulator:
         elif kind == "turn.failed":
             self._turn_failed(event)
         elif kind == "error":
-            message = event.get("message")
-            raise StreamError(
-                EvaluationFailure.PROCESS_FAILED,
-                "STREAM_ERROR" if isinstance(message, str) else "STREAM_ERROR_MALFORMED",
-            )
+            self._stream_error(event)
         # Any other type is additive and ignored on purpose.
+
+    def _stream_error(self, event: dict[str, Any]) -> None:
+        """Codex reported a failure of its own. Say what it was, safely.
+
+        The fifth real probe ended here and could report nothing but the code:
+        the message was recognised, used to pick between two reason codes, and
+        then dropped. A failure that cannot be described is a failure that gets
+        retried blindly.
+
+        So the message goes through exactly the redaction stderr goes through
+        -- the same sensitive-term rules, the same JWT and long-opaque masking,
+        the same path aliases, the same line and size budgets, and the same
+        fail-closed guarantee. The raw string is never stored, never logged and
+        never reaches the exception's own message.
+
+        `errors="replace"` on the encode is not decoration: a JSON string may
+        contain a lone surrogate, which plain UTF-8 encoding refuses, and a
+        diagnostic must not be able to raise a second failure.
+        """
+        message = event.get("message")
+        if not isinstance(message, str):
+            raise StreamError(EvaluationFailure.PROCESS_FAILED, "STREAM_ERROR_MALFORMED")
+        raise StreamError(
+            EvaluationFailure.PROCESS_FAILED,
+            "STREAM_ERROR",
+            redact(message.encode("utf-8", errors="replace"), self.aliases),
+        )
 
     def _thread_started(self, event: dict[str, Any]) -> None:
         if self.thread_id is not None:

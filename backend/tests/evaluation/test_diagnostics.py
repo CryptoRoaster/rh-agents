@@ -232,3 +232,143 @@ async def test_a_failing_exit_after_a_completed_turn_keeps_its_meaning(probe: Pr
     assert isinstance(outcome, EvaluationRejected)
     assert outcome.reason is EvaluationFailure.INCONSISTENT_COMPLETION
     assert outcome.detail_code == "EXIT_3"
+
+
+# --------------------------------------------------------------------------
+# A stream abort: the other half of the channel, and its own kind of answer
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_codex_stream_error_says_what_codex_said(probe: Probe) -> None:
+    """End to end: the message survives redaction instead of being dropped.
+
+    The fifth authorised real probe ended on `{"type": "error", ...}` and could
+    report nothing but `STREAM_ERROR`. The message was read, used to pick
+    between two reason codes, and discarded -- so the report said a failure had
+    happened and nothing about which one.
+    """
+    probe.scenario("stream_error", stream_error_message="provider rejected request")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.reason is EvaluationFailure.PROCESS_FAILED
+    assert outcome.detail_code == "STREAM_ERROR"
+    assert outcome.stream_diagnostic is not None
+    assert outcome.stream_diagnostic.safe_lines == ("provider rejected request",)
+
+
+@pytest.mark.asyncio
+async def test_no_secret_from_a_stream_error_reaches_the_outcome(probe: Probe) -> None:
+    """The same guarantee the stderr channel gives, on the same shapes.
+
+    Checked over the whole repr, because a caller logging the outcome is the
+    realistic way a secret would escape.
+    """
+    probe.scenario(
+        "stream_error",
+        stream_error_message=f"Authorization: Bearer {SECRETS[0]} for {JWT_LIKE}",
+    )
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    rendered = repr(outcome)
+    assert SECRETS[0] not in rendered
+    assert JWT_LIKE not in rendered
+    assert outcome.stream_diagnostic is not None
+    assert outcome.stream_diagnostic.safe_lines == (REDACTED_LINE,)
+
+
+@pytest.mark.asyncio
+async def test_a_stream_error_names_paths_by_role(probe: Probe) -> None:
+    """The client's own aliases are used, not an empty set of them."""
+    probe.scenario(
+        "stream_error",
+        stream_error_message=f"could not read {probe.codex_home}/auth.json",
+    )
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.stream_diagnostic is not None
+    joined = " ".join(outcome.stream_diagnostic.safe_lines)
+    assert str(probe.codex_home) not in joined
+    assert "<CODEX_HOME>" in joined
+
+
+@pytest.mark.asyncio
+async def test_a_stream_error_reports_what_the_stream_had_established(probe: Probe) -> None:
+    """Whether a turn began, which thread, and what tools had been seen.
+
+    All three were UNKNOWN in the fifth probe's report, and all three are facts
+    the parser already held. None of them can carry a prompt, a payload, a
+    model answer or a credential.
+    """
+    probe.scenario(
+        "stream_error",
+        stream_error_after_turn=True,
+        stream_error_tool_item=True,
+    )
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    diagnostic = outcome.stream_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.turn_started is True
+    assert diagnostic.thread_id == "11111111-2222-3333-4444-555555555555"
+    assert [(item.item_type, item.count) for item in diagnostic.observed_tool_activity] == [
+        ("command_execution", 1)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_stream_error_before_any_turn_says_so(probe: Probe) -> None:
+    """The negative case, stated rather than inferred.
+
+    An empty `observed_tool_activity` means nothing was observed up to the
+    abort. It is not a claim that no tool was offered, and the field name is
+    the only thing that has ever claimed anything here.
+    """
+    probe.scenario("stream_error")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    diagnostic = outcome.stream_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.turn_started is False
+    assert diagnostic.thread_id == "11111111-2222-3333-4444-555555555555"
+    assert diagnostic.observed_tool_activity == ()
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_stream_error_keeps_its_own_code(probe: Probe) -> None:
+    """A non-string message has nothing to redact and says so."""
+    probe.scenario("stream_error", stream_error_message={"not": "a string"})
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "STREAM_ERROR_MALFORMED"
+    assert outcome.stream_diagnostic is not None
+    assert outcome.stream_diagnostic.safe_lines == ()
+
+
+@pytest.mark.asyncio
+async def test_a_stream_abort_gets_no_invented_process_diagnostic(probe: Probe) -> None:
+    """The two channels stay apart, which is why there are two of them.
+
+    A stream abort ends the attempt from our side: the parser refuses an event,
+    the consumer stops reading, and the process layer signals the group. There
+    is no child exit status and no stderr tail, so a `ProcessDiagnostic` here
+    would have to invent an `exit_code` -- and that number would read as the
+    CLI's answer when it is our own signal.
+    """
+    probe.scenario("stream_error")
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.diagnostic is None
+    assert outcome.stream_diagnostic is not None
+
+
+@pytest.mark.asyncio
+async def test_a_process_failure_still_gets_no_stream_diagnostic(probe: Probe) -> None:
+    """And the other way round: the existing channel is untouched."""
+    probe.scenario("fails_before_turn", exit_code=1, stderr_lines=["error: could not start"])
+    outcome = await probe.client().evaluate(probe.request())
+    assert isinstance(outcome, EvaluationRejected)
+    assert outcome.detail_code == "EXIT_1_BEFORE_TURN"
+    assert outcome.diagnostic is not None
+    assert outcome.diagnostic.exit_code == 1
+    assert outcome.stream_diagnostic is None

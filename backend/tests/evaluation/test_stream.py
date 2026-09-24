@@ -1,9 +1,17 @@
 """Folding the JSONL event stream, including the sequences that must be refused."""
 
 import json
+from pathlib import Path
 
 import pytest
 
+from src.evaluation.codex import diagnostics
+from src.evaluation.codex.diagnostics import (
+    MASKED_VALUE,
+    REDACTED_LINE,
+    REDACTION_FAILED,
+    PathAliases,
+)
 from src.evaluation.codex.models import EvaluationFailure
 from src.evaluation.codex.stream import EventAccumulator, StreamError
 
@@ -284,3 +292,148 @@ def test_no_tool_activity_is_not_evidence_of_no_tools() -> None:
     # The stream reports tool *use*. An offered-but-unused tool emits nothing,
     # so this empty tuple says nothing about what the model was offered.
     assert state.observed_tool_activity() == ()
+
+
+# --------------------------------------------------------------------------
+# A Codex `error` event: what it is allowed to say, and what it must not
+# --------------------------------------------------------------------------
+
+
+def stream_error(state: EventAccumulator, message: object) -> StreamError:
+    """Feed one `error` event and return the exception it raised."""
+    with pytest.raises(StreamError) as caught:
+        feed(state, THREAD, {"type": "error", "message": message})
+    return caught.value
+
+
+def test_a_stream_error_reports_what_codex_said(tmp_path: Path) -> None:
+    """Case 1: the message survives, redacted, instead of being dropped.
+
+    The fifth real probe ended on exactly this event and could report nothing
+    but the reason code: the message was read, used to choose between two
+    codes, and then discarded. The code alone says a failure happened and
+    nothing about which one.
+    """
+    state = accumulator()
+    error = stream_error(state, "provider rejected request")
+    assert error.failure is EvaluationFailure.PROCESS_FAILED
+    assert error.reason_code == "STREAM_ERROR"
+    assert error.safe_lines == ("provider rejected request",)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Authorization: Bearer abc123",
+        "request failed: access_token=xyz",
+        "set-cookie: session=nope",
+        "api_key rejected",
+        '{"error": {"message": "bad password"}}',
+    ],
+)
+def test_a_credential_shaped_message_is_dropped_whole(message: str) -> None:
+    """Case 2: the line is replaced, never edited, and the secret never leaks.
+
+    Editing assumes the shape of the value, and a shape assumption is what
+    fails on the message nobody anticipated. Checked against every surface a
+    caller could reach: the lines, the exception's text and its repr.
+    """
+    state = accumulator()
+    error = stream_error(state, message)
+    assert error.reason_code == "STREAM_ERROR"
+    assert error.safe_lines == (REDACTED_LINE,)
+    for surface in (str(error), repr(error), " ".join(error.safe_lines)):
+        assert "abc123" not in surface
+        assert "xyz" not in surface
+        assert "nope" not in surface
+
+
+def test_a_token_shaped_value_is_masked() -> None:
+    """Case 3: what survives the line check is still masked defensively.
+
+    A JWT and any long unbroken opaque run are replaced. Blunt on purpose -- a
+    masked build identifier costs nothing.
+    """
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27u"
+    error = stream_error(accumulator(), f"upstream said {jwt} and gave up")
+    assert jwt not in " ".join(error.safe_lines)
+    assert MASKED_VALUE in error.safe_lines[0]
+
+    opaque = "z" * 48
+    other = stream_error(accumulator(), f"handle {opaque} expired")
+    assert opaque not in " ".join(other.safe_lines)
+    assert MASKED_VALUE in other.safe_lines[0]
+
+
+def test_an_absolute_harness_path_becomes_an_alias(tmp_path: Path) -> None:
+    """Case 4: a diagnostic names roles, not where this machine keeps things."""
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    state = EventAccumulator(
+        max_final_message_bytes=65_536,
+        aliases=PathAliases.build(codex_home=home),
+    )
+    error = stream_error(state, f"could not read {home}/auth.json")
+    joined = " ".join(error.safe_lines)
+    assert str(home) not in joined
+    assert "<CODEX_HOME>" in joined
+
+
+def test_a_broken_redactor_yields_the_marker_and_never_the_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 5: fail closed, including when the redactor itself raises.
+
+    There is no path on which the unredacted message reaches a caller. This
+    breaks redaction from the inside rather than trusting that it cannot fail.
+    """
+
+    class Exploding:
+        def sub(self, *_args: object, **_kwargs: object) -> str:
+            raise RuntimeError("redactor is broken")
+
+    monkeypatch.setattr(diagnostics, "ANSI", Exploding())
+    error = stream_error(accumulator(), "a very specific secret detail")
+    assert error.safe_lines == (REDACTION_FAILED,)
+    assert "specific secret detail" not in repr(error)
+
+
+def test_a_malformed_message_keeps_its_own_code() -> None:
+    """A non-string message is still its own answer, with nothing to redact."""
+    error = stream_error(accumulator(), {"not": "a string"})
+    assert error.reason_code == "STREAM_ERROR_MALFORMED"
+    assert error.safe_lines == ()
+
+
+def test_the_state_before_the_error_is_still_readable() -> None:
+    """Cases 6 and 9: no turn yet, a thread id, and no tool activity."""
+    state = accumulator()
+    stream_error(state, "boom")
+    assert state.turn_started is False
+    assert state.thread_id == "t-1"
+    assert state.observed_tool_activity() == ()
+
+
+def test_a_turn_that_had_started_is_visible_after_the_error() -> None:
+    """Case 7: the one fact that made the fifth probe's report UNKNOWN."""
+    state = accumulator()
+    feed(state, THREAD, TURN)
+    with pytest.raises(StreamError):
+        feed(state, {"type": "error", "message": "boom"})
+    assert state.turn_started is True
+    assert state.thread_id == "t-1"
+
+
+def test_tool_activity_seen_before_the_error_is_still_counted() -> None:
+    """Case 8: observation up to the abort, which is not the same as none."""
+    state = accumulator()
+    feed(
+        state,
+        THREAD,
+        {"type": "item.started", "item": {"id": "c1", "type": "command_execution"}},
+        TURN,
+    )
+    with pytest.raises(StreamError):
+        feed(state, {"type": "error", "message": "boom"})
+    observed = state.observed_tool_activity()
+    assert [(item.item_type, item.count) for item in observed] == [("command_execution", 1)]

@@ -44,7 +44,12 @@ from src.evaluation.codex.command import (
     child_environment,
 )
 from src.evaluation.codex.deadline import Deadline
-from src.evaluation.codex.diagnostics import PathAliases, ProcessDiagnostic, diagnose
+from src.evaluation.codex.diagnostics import (
+    REDACTION_FAILED,
+    PathAliases,
+    ProcessDiagnostic,
+    diagnose,
+)
 from src.evaluation.codex.models import (
     SUPPORTED_CLI_VERSION,
     SUPPORTED_EFFORTS,
@@ -60,6 +65,7 @@ from src.evaluation.codex.models import (
     OutputLimits,
     ProcessLimits,
     SchemaUnsupportedError,
+    StreamDiagnostic,
 )
 from src.evaluation.codex.preflight import check_chatgpt_login, check_cli_version
 from src.evaluation.codex.process import AbortedByConsumer, ProcessError, run_bounded
@@ -382,7 +388,10 @@ class CodexEvaluationClient:
             )
 
         accumulator = EventAccumulator(
-            max_final_message_bytes=request.limits.max_final_message_bytes
+            max_final_message_bytes=request.limits.max_final_message_bytes,
+            # So a Codex `error` event is redacted against the same bound paths
+            # the stderr channel uses, rather than reported verbatim.
+            aliases=self._aliases(),
         )
         payload = json.dumps(
             request.data, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -440,14 +449,25 @@ class CodexEvaluationClient:
         except ProcessError as error:
             return self._reject(error.failure, error.reason_code, deadline, error.cleanup)
         except AbortedByConsumer as error:
+            # The consumer stopped reading and the process layer then signalled
+            # the group, so there is no child exit status and no stderr tail --
+            # nothing a `ProcessDiagnostic` could honestly describe. What the
+            # stream had already established is reported instead.
             cause = error.cause
             if isinstance(cause, StreamError):
-                return self._reject(cause.failure, cause.reason_code, deadline, error.cleanup)
+                return self._reject(
+                    cause.failure,
+                    cause.reason_code,
+                    deadline,
+                    error.cleanup,
+                    stream_diagnostic=self._stream_diagnostic(accumulator, cause.safe_lines),
+                )
             return self._reject(
                 EvaluationFailure.EVENT_STREAM_INVALID,
                 type(cause).__name__.upper(),
                 deadline,
                 error.cleanup,
+                stream_diagnostic=self._stream_diagnostic(accumulator, ()),
             )
 
         # The tail is not dropped any more and is not logged either: it goes
@@ -763,6 +783,7 @@ class CodexEvaluationClient:
         deadline: Deadline,
         cleanup: CleanupReport | None = None,
         diagnostic: ProcessDiagnostic | None = None,
+        stream_diagnostic: StreamDiagnostic | None = None,
     ) -> EvaluationRejected:
         return EvaluationRejected(
             reason=failure,
@@ -770,7 +791,28 @@ class CodexEvaluationClient:
             wall_clock_ms=deadline.elapsed_ms,
             cleanup=cleanup if cleanup is not None else CleanupReport(),
             diagnostic=diagnostic,
+            stream_diagnostic=stream_diagnostic,
         )
+
+    def _stream_diagnostic(
+        self, accumulator: EventAccumulator, safe_lines: tuple[str, ...]
+    ) -> StreamDiagnostic:
+        """What the parser knew when it stopped. Redacted text only.
+
+        `safe_lines` arrives already redacted from `StreamError`; nothing is
+        re-read from the stream here. The rest is state the accumulator holds
+        anyway, and none of it can carry a prompt, a payload, a model answer or
+        a credential.
+        """
+        try:
+            return StreamDiagnostic(
+                safe_lines=safe_lines,
+                turn_started=accumulator.turn_started,
+                thread_id=accumulator.thread_id,
+                observed_tool_activity=accumulator.observed_tool_activity(),
+            )
+        except Exception:  # noqa: BLE001 - a diagnostic may never be the failure
+            return StreamDiagnostic(safe_lines=(REDACTION_FAILED,))
 
     def _aliases(self) -> PathAliases:
         """The bound paths, so a diagnostic names roles rather than locations.

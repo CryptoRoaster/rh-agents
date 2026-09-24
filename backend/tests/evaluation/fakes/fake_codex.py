@@ -322,6 +322,23 @@ def main() -> int:
         emit({"type": "turn.failed", "error": {"message": "model refused"}})
         return 1
 
+    if name == "stream_error":
+        # Codex reporting a failure of its own, which is what ended the fifth
+        # real probe. The scenario controls how far the stream got first, so a
+        # test can pin what the diagnostic is expected to have established.
+        thread_started()
+        if scenario.get("stream_error_after_turn"):
+            emit({"type": "turn.started"})
+        if scenario.get("stream_error_tool_item"):
+            emit({"type": "item.started", "item": {"id": "c1", "type": "command_execution"}})
+        emit(
+            {
+                "type": "error",
+                "message": scenario.get("stream_error_message", "provider rejected request"),
+            }
+        )
+        return 1
+
     if name == "no_final_message":
         thread_started()
         emit({"type": "turn.started"})

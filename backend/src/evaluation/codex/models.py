@@ -197,6 +197,35 @@ class ObservedToolActivity(Immutable):
     count: int = Field(ge=1)
 
 
+@dataclass(frozen=True)
+class StreamDiagnostic:
+    """What the event stream had established when it was cut short.
+
+    A stream abort has no `ProcessDiagnostic` and must not be given an invented
+    one: the child did not fail and did not exit on its own, the consumer
+    stopped reading and the process layer then terminated it. An `exit_code`
+    made up for that case would read as the CLI's answer when it is our own
+    signal. So the two live side by side on `EvaluationRejected`, and each one
+    is absent where it has nothing to say.
+
+    `safe_lines` is present only for a Codex `error` event, and only after the
+    same redaction stderr goes through. There is deliberately no raw field of
+    any kind here -- not the message, not the event, not the line.
+
+    The other three are what the parser had already established, and they are
+    what makes a stream failure legible at all: whether a turn had begun, which
+    thread it was, and what tool-shaped items had been seen. `thread_id` is
+    None when no `thread.started` arrived. An empty `observed_tool_activity`
+    means no tool activity was observed **up to the abort** -- never that no
+    tool was offered.
+    """
+
+    safe_lines: tuple[str, ...] = ()
+    turn_started: bool = False
+    thread_id: str | None = None
+    observed_tool_activity: tuple[ObservedToolActivity, ...] = ()
+
+
 class GroupState(StrEnum):
     """What was established about the child's process group after cleanup.
 
@@ -306,6 +335,14 @@ class EvaluationRejected:
     `diagnostics.ProcessDiagnostic`. Rejections decided before any process
     starts, such as a refused permit, have nothing to diagnose and leave it
     `None`.
+
+    `stream_diagnostic` is the other half, and the two are deliberately not
+    merged. A stream abort ends the attempt from our side -- the parser refuses
+    an event, the consumer stops, the process layer signals the group -- so
+    there is no child exit status to report and no stderr tail was collected.
+    What there is instead is what the stream had already established, and that
+    is what this carries. Both fields being `None` together is the ordinary
+    case for a rejection decided before anything ran.
     """
 
     reason: EvaluationFailure
@@ -313,6 +350,7 @@ class EvaluationRejected:
     wall_clock_ms: int
     cleanup: CleanupReport
     diagnostic: ProcessDiagnostic | None = None
+    stream_diagnostic: StreamDiagnostic | None = None
 
 
 type EvaluationOutcome[Output: BaseModel] = EvaluationCompleted[Output] | EvaluationRejected
