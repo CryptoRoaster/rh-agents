@@ -273,6 +273,7 @@ class PaperExitService:
                 # from the entry's, and giving it the entry's identity would
                 # make two snapshots look like one.
                 identity_key=f"{request_key}:exit",
+                side=Side.SELL,
             )
             stale = too_old_for(market, now, self.limits)
             if stale is not None:

@@ -36,7 +36,7 @@ from src.core.models import (
     TradeIntent,
     TradingMode,
 )
-from src.core.numbers import quantize, quantize_down
+from src.core.numbers import LEDGER_UNIT, fits_ledger, quantize_down, quantize_up
 from src.data.repository import aware, read_position
 from src.data.tables import AccountRow, PositionRow, TradeCaseRiskRequestRow
 from src.ledger.portfolio import (
@@ -285,6 +285,7 @@ class RiskRequestService:
                 costs=assessed.costs,
                 correlation_id=trade_case.correlation_id,
                 identity_key=request_key,
+                side=Side.BUY,
             )
             stale = too_old_for(market, now, self.limits)
             if stale is not None:
@@ -579,6 +580,7 @@ def risk_market(
     costs: PaperCostAssumptions,
     correlation_id: UUID,
     identity_key: str,
+    side: Side,
 ) -> MarketSnapshot:
     """Build SENTINEL's market view from facts that were actually established.
 
@@ -613,18 +615,32 @@ def risk_market(
 
     # The accounting boundary. Recorded market facts carry the market layer's
     # precision; SENTINEL's snapshot is ledger-typed `Numeric(38, 18)`. The
-    # conversion happens here, explicitly and deterministically, rather than as
-    # a validation error somewhere inside the model constructor.
-    price_usd = quantize(price.usd_per_base_unit)
-    if price_usd <= 0:
-        # A real, positive price the ledger cannot express. Never passed on as
-        # zero and never raised to the smallest step: there is no honest ledger
-        # price for it, so there is no request.
+    # conversion happens here, explicitly and in the conservative direction for
+    # each field, rather than as a validation error inside a constructor.
+    #
+    # Price: rounded against the order. A buy is sized by dividing by the exact
+    # recorded price and flooring the quantity, and SENTINEL then checks
+    # `quantity * price_usd`; a ledger price below the recorded one would
+    # understate that notional, which for a cheap enough token is material. So
+    # a buy is priced by a ceiling and a sell (an exit) by a floor: each can
+    # only make the order look more expensive or less rewarding, and never by
+    # as much as one ledger unit per token.
+    recorded_price = price.usd_per_base_unit
+    if recorded_price < LEDGER_UNIT or not fits_ledger(recorded_price):
+        # Below the smallest ledger unit, raising it to that unit would change
+        # the price by up to its whole value; above the ledger's range there is
+        # nothing to store. Neither is zeroed, raised or capped.
         raise RiskRequestUnavailable("REFERENCE_PRICE_OUTSIDE_ACCOUNTING_PRECISION")
-    # Liquidity is floored, never rounded half-even: rounding up could lift a
-    # reading just below `min_liquidity_usd` over it. A floor can only make the
-    # market look thinner, and a sub-precision reading becomes zero, which the
-    # engine rejects as insufficient liquidity.
+    price_usd = quantize_up(recorded_price) if side is Side.BUY else quantize_down(recorded_price)
+    if not fits_ledger(price_usd):
+        # Rounding up carried into a twenty-first integer digit.
+        raise RiskRequestUnavailable("REFERENCE_PRICE_OUTSIDE_ACCOUNTING_PRECISION")
+    # Liquidity: floored, never rounded half-even or up, so a reading just below
+    # `min_liquidity_usd` cannot be lifted over it. A sub-precision reading
+    # becomes zero, which the engine rejects as insufficient liquidity. A
+    # reading too large for the ledger is refused rather than capped.
+    if not fits_ledger(liquidity.value_usd):
+        raise RiskRequestUnavailable("LIQUIDITY_OUTSIDE_ACCOUNTING_PRECISION")
     liquidity_usd = quantize_down(liquidity.value_usd)
 
     price_at = price.observed_at

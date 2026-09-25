@@ -15,16 +15,16 @@ to judge exposure against it.
 """
 
 from datetime import datetime
-from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
+from src.markets.models import MarketPrice
+
 Identifier = Annotated[str, Field(min_length=1, max_length=512, pattern=r"^\S(?:.*\S)?$")]
 Code = Annotated[str, Field(pattern=r"^[A-Z][A-Z0-9_]{0,79}$")]
-Price = Annotated[Decimal, Field(gt=0, allow_inf_nan=False, max_digits=38, decimal_places=18)]
 
 
 class Immutable(BaseModel):
@@ -69,7 +69,9 @@ class PositionMark(Immutable):
     provider: Identifier
     snapshot_id: UUID
     observation_id: UUID
-    price_usd: Price
+    # A recorded market price, at the precision the market recorded it. The
+    # accounting boundary is the valuation result computed from it, not the mark.
+    price_usd: MarketPrice
     # The source's own instant, never when it was read.
     observed_at: AwareDatetime
 

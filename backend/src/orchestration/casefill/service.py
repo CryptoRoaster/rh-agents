@@ -26,6 +26,7 @@ from src.core.models import (
     ExecutionResult,
     RiskDecision,
     RiskLimits,
+    Side,
     TradeIntent,
     TradingMode,
 )
@@ -337,6 +338,7 @@ class CaseFillService:
                 # market reading at a different instant, and giving it the
                 # request's identity would make two snapshots look like one.
                 identity_key=f"{request.request_key}:fill",
+                side=Side.BUY,
             )
             stale = too_old_for(market, now, self.limits)
             if stale is not None:

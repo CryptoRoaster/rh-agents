@@ -14,7 +14,7 @@ on the second.
 
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Any
 from uuid import UUID
 
@@ -22,6 +22,10 @@ from src.core.models import Position, RiskContext, SafetyStatus
 from src.core.numbers import quantize
 from src.markets.models import MarketIdentity
 from src.orchestration.valuation.models import PositionMark
+
+# Enough significant digits for a ledger quantity (38) times a market mark (up to
+# 100) and their sum, so valuation arithmetic is exact before it is quantized.
+EXACT_VALUATION_PRECISION = 250
 
 
 def loss_day(now: datetime) -> date:
@@ -175,18 +179,19 @@ def portfolio_state(
             updated_at=now,
         )
     valid = not unmarked
-    # Quantity and price each carry eighteen places, so their product carries
-    # thirty-six. The sum is exact whatever order the holdings arrive in; only
-    # the result is brought to the ledger's storage precision, so the same
-    # holdings always produce the same figure.
-    exposure = quantize(
-        sum(
+    # Quantity carries the ledger's eighteen places; a mark carries whatever the
+    # market recorded. The products and their sum are computed exactly, in a
+    # context wide enough for both, whatever order the holdings arrive in; only
+    # the USD result is brought to the ledger's storage precision, so the same
+    # holdings always produce the same figure and no mark is rounded before it
+    # is multiplied.
+    with localcontext() as exact:
+        exact.prec = EXACT_VALUATION_PRECISION
+        gross = sum(
             (item.quantity * prices.get(item.asset_id, Decimal("0")) for item in positions),
             Decimal("0"),
         )
-    )
-    unrealized_loss = quantize(
-        sum(
+        underwater = sum(
             (
                 max(
                     Decimal("0"),
@@ -196,7 +201,8 @@ def portfolio_state(
             ),
             Decimal("0"),
         )
-    )
+    exposure = quantize(gross)
+    unrealized_loss = quantize(underwater)
     return PortfolioState(
         inputs=ValuationInputs(
             cash_usd=cash_usd,
