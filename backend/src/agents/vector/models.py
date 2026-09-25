@@ -32,12 +32,15 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from src.core.models import Side
-from src.markets.models import Availability
+from src.markets.models import Amount as MarketAmount
+from src.markets.models import Availability, MarketPrice
 
 Identifier = Annotated[str, Field(min_length=1, max_length=200, pattern=r"^\S(?:.*\S)?$")]
-# Money never passes through a float, and the scale matches the ledger's.
+# Money never passes through a float. Levels VECTOR proposes (entry,
+# invalidation, targets, trigger levels) keep the ledger's scale: a model must not
+# gain precision because a market reported more. Recorded inputs use the market
+# layer's own types instead.
 Price = Annotated[Decimal, Field(gt=0, allow_inf_nan=False, max_digits=38, decimal_places=18)]
-Amount = Annotated[Decimal, Field(ge=0, allow_inf_nan=False, max_digits=38, decimal_places=18)]
 # Free text from a model is bounded hard: a rationale, never a transcript, and
 # never hidden reasoning.
 SafeSummary = Annotated[str, Field(min_length=1, max_length=400)]
@@ -168,7 +171,8 @@ class ObservedMeasurement(Immutable):
 
     observation_id: UUID
     status: Availability
-    value_usd: Amount | None = None
+    # A recorded market fact, copied at the precision the market layer recorded.
+    value_usd: MarketAmount | None = None
     observed_at: AwareDatetime
 
     @model_validator(mode="after")
@@ -187,11 +191,12 @@ class ObservedBar(Immutable):
     """
 
     opened_at: AwareDatetime
-    open: Price
-    high: Price
-    low: Price
-    close: Price
-    volume: Amount
+    # Recorded bar values, not proposal levels: they keep market precision.
+    open: MarketPrice
+    high: MarketPrice
+    low: MarketPrice
+    close: MarketPrice
+    volume: MarketAmount
 
 
 class VectorMarketStructure(Immutable):
@@ -406,5 +411,6 @@ class VectorSetup(Immutable):
     expires_at: AwareDatetime
     reason_codes: tuple[VectorReasonCode, ...] = Field(min_length=1, max_length=8)
     summary: SafeSummary
-    reference_price: Price
+    # The recorded price the setup was judged against, not a model output.
+    reference_price: MarketPrice
     input_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]

@@ -14,9 +14,14 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from src.markets.models import Amount as MarketAmount
 from src.markets.models import Availability
 
-Amount = Annotated[Decimal, Field(ge=0, allow_inf_nan=False, max_digits=38, decimal_places=18)]
+# Configuration such as the discovery floor. Bounded like the ledger, because it
+# is policy rather than something a market reported.
+PolicyAmount = Annotated[
+    Decimal, Field(ge=0, allow_inf_nan=False, max_digits=38, decimal_places=18)
+]
 Identifier = Annotated[str, Field(min_length=1, max_length=200, pattern=r"^\S(?:.*\S)?$")]
 # Free text from a model is bounded hard: a summary, never a transcript.
 SafeSummary = Annotated[str, Field(min_length=1, max_length=400)]
@@ -93,7 +98,8 @@ class ObservedMeasurement(Immutable):
 
     observation_id: UUID
     status: Availability
-    value_usd: Amount | None = None
+    # A recorded market fact, copied at the precision the market layer recorded.
+    value_usd: MarketAmount | None = None
     observed_at: AwareDatetime
 
     @model_validator(mode="after")
@@ -149,7 +155,7 @@ class OrbitTaskInput(Immutable):
     trade_case_id: UUID
     task_id: UUID
     candidate: OrbitCandidateContext
-    discovery_liquidity_floor_usd: Amount
+    discovery_liquidity_floor_usd: PolicyAmount
     evaluated_at: AwareDatetime
     discovery_reference: UUID
     supersedes_evidence_id: UUID | None = None

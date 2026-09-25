@@ -1,4 +1,4 @@
-from decimal import Decimal, localcontext
+from decimal import ROUND_DOWN, Decimal, localcontext
 
 
 def quantize(value: Decimal) -> Decimal:
@@ -6,6 +6,17 @@ def quantize(value: Decimal) -> Decimal:
     with localcontext() as context:
         context.prec = 78
         return value.quantize(Decimal("0.000000000000000001"))
+
+
+def quantize_down(value: Decimal) -> Decimal:
+    """The ledger's 18 places, truncated toward zero instead of rounded.
+
+    For an accounting boundary where rounding up would flatter the value, such
+    as liquidity checked against a minimum: a floor can only understate it.
+    """
+    with localcontext() as context:
+        context.prec = 78
+        return value.quantize(Decimal("0.000000000000000001"), rounding=ROUND_DOWN)
 
 
 def canonical_decimal(value: Decimal) -> str:

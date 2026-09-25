@@ -26,8 +26,6 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-from pydantic import ValidationError
-
 from src.agents.pulse.models import (
     PriceObservation,
     PulseTaskInput,
@@ -116,14 +114,6 @@ def watched_trigger(envelope: EvidenceEnvelope, now: datetime) -> WatchedTrigger
     )
 
 
-# Pydantic's own codes for "this decimal does not fit the declared envelope".
-# Named rather than re-derived: restating the arithmetic here would be a second
-# rule that could disagree with the one the model actually enforces.
-PRICE_ENVELOPE_REFUSALS = frozenset(
-    {"decimal_max_places", "decimal_max_digits", "decimal_whole_digits"}
-)
-
-
 def price_observation(snapshot: MarketSnapshot, trade_case: TradeCase) -> PriceObservation | None:
     """The one recorded price, or nothing when the market has no usable one.
 
@@ -131,24 +121,17 @@ def price_observation(snapshot: MarketSnapshot, trade_case: TradeCase) -> PriceO
     substitutes a previous value, and a market that cannot currently be priced
     simply produces no observation to compare.
 
-    **A price outside the comparison envelope is one of those absences.** The
-    market layer records whatever a provider reports — its `Amount` allows a
-    hundred significant digits — while everything downstream of a trigger holds
-    money in the ledger's `Numeric(38, 18)`, which is the envelope `Price`
-    declares. A real BNB Smart Chain pool reported a price with nineteen decimal
-    places; it recorded correctly, and building the comparison out of it raised
-    a validation error that reached the runtime as an unknown handler bug, spent
-    an attempt from the failure budget, and had to be classified as an incident
-    that had not happened.
-
-    Such a price is *not comparable*, which is exactly what this function's
-    `None` already means, so that is what it returns. It is deliberately **not**
-    rounded into range: quantizing would change what the market said in the one
-    place where a comparison decides whether an order is armed, and it would
-    arm on a number the ledger could not then store. Only the envelope refusal
-    is read this way — every other validation failure is a wiring fault and
-    still raises, because a market answering about the wrong pair must not turn
-    into a monitor quietly seeing no price.
+    **The price is compared at the precision the market recorded.** A real BNB
+    Smart Chain pool reported prices with more than eighteen decimal places. The
+    market layer records them correctly, and an earlier version of this monitor
+    narrowed them to the ledger's `Numeric(38, 18)` here and so could not see
+    them at all. The observation, and the trigger evidence built from it, now
+    carry the market's own type; a comparison between two Decimals needs no
+    rounding. Trigger levels keep VECTOR's bounded contract, and a price enters
+    the ledger only through the explicit conversion at the risk boundary. Any
+    other validation failure is still a wiring fault and raises, because a
+    market answering about the wrong pair must not turn into a monitor quietly
+    seeing no price.
     """
     if snapshot.price.status != Availability.AVAILABLE or snapshot.price.value_usd is None:
         return None
@@ -156,30 +139,20 @@ def price_observation(snapshot: MarketSnapshot, trade_case: TradeCase) -> PriceO
         # The market layer already refuses a non-positive available price; this
         # keeps a malformed one from reaching a comparison if that ever changes.
         return None
-    try:
-        return PriceObservation(
-            observation_id=snapshot.price.id,
-            snapshot_id=snapshot.id,
-            pair_id=snapshot.pair.pair_id,
-            chain=snapshot.chain,
-            network=snapshot.network,
-            venue=snapshot.pair.venue,
-            base_asset_id=trade_case.market.base_asset_id,
-            quote_asset_id=trade_case.market.quote_asset_id,
-            provider=snapshot.provider,
-            is_fixture=snapshot.is_fixture,
-            price=snapshot.price.value_usd,
-            observed_at=snapshot.price.observed_at,
-        )
-    except ValidationError as error:
-        beyond_envelope = [
-            item
-            for item in error.errors()
-            if item["loc"] == ("price",) and item["type"] in PRICE_ENVELOPE_REFUSALS
-        ]
-        if len(beyond_envelope) != len(error.errors()):
-            raise
-        return None
+    return PriceObservation(
+        observation_id=snapshot.price.id,
+        snapshot_id=snapshot.id,
+        pair_id=snapshot.pair.pair_id,
+        chain=snapshot.chain,
+        network=snapshot.network,
+        venue=snapshot.pair.venue,
+        base_asset_id=trade_case.market.base_asset_id,
+        quote_asset_id=trade_case.market.quote_asset_id,
+        provider=snapshot.provider,
+        is_fixture=snapshot.is_fixture,
+        price=snapshot.price.value_usd,
+        observed_at=snapshot.price.observed_at,
+    )
 
 
 @dataclass(frozen=True)

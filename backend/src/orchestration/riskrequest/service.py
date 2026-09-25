@@ -36,6 +36,7 @@ from src.core.models import (
     TradeIntent,
     TradingMode,
 )
+from src.core.numbers import quantize, quantize_down
 from src.data.repository import aware, read_position
 from src.data.tables import AccountRow, PositionRow, TradeCaseRiskRequestRow
 from src.ledger.portfolio import (
@@ -610,6 +611,22 @@ def risk_market(
     def identity(label: str) -> UUID:
         return uuid5(NAMESPACE_URL, f"rh-agents:risk-market:{identity_key}:{label}")
 
+    # The accounting boundary. Recorded market facts carry the market layer's
+    # precision; SENTINEL's snapshot is ledger-typed `Numeric(38, 18)`. The
+    # conversion happens here, explicitly and deterministically, rather than as
+    # a validation error somewhere inside the model constructor.
+    price_usd = quantize(price.usd_per_base_unit)
+    if price_usd <= 0:
+        # A real, positive price the ledger cannot express. Never passed on as
+        # zero and never raised to the smallest step: there is no honest ledger
+        # price for it, so there is no request.
+        raise RiskRequestUnavailable("REFERENCE_PRICE_OUTSIDE_ACCOUNTING_PRECISION")
+    # Liquidity is floored, never rounded half-even: rounding up could lift a
+    # reading just below `min_liquidity_usd` over it. A floor can only make the
+    # market look thinner, and a sub-precision reading becomes zero, which the
+    # engine rejects as insufficient liquidity.
+    liquidity_usd = quantize_down(liquidity.value_usd)
+
     price_at = price.observed_at
     return MarketSnapshot(
         id=identity("market"),
@@ -619,7 +636,7 @@ def risk_market(
         correlation_id=correlation_id,
         asset_id=base_asset_id,
         observed_at=price_at,
-        price_usd=price.usd_per_base_unit,
+        price_usd=price_usd,
         token=TokenSnapshot(
             id=identity("token"),
             created_at=base_asset.source_observed_at,
@@ -641,7 +658,7 @@ def risk_market(
             source=liquidity.provider,
             correlation_id=correlation_id,
             asset_id=base_asset_id,
-            liquidity_usd=liquidity.value_usd,
+            liquidity_usd=liquidity_usd,
             # ANCHOR established an executable route at a tested size, which is
             # what this field asks. It is not a claim about the price.
             routing=SafetyStatus.PASS,

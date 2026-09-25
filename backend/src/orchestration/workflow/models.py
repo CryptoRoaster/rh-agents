@@ -20,7 +20,8 @@ from pydantic import (
 )
 
 from src.core.models import AgentRole, RiskOutcome, Side
-from src.markets.models import MarketIdentity
+from src.markets.models import Amount as MarketAmount
+from src.markets.models import MarketIdentity, MarketPrice
 from src.risk.authorization import RiskAuthorization, classify_risk_authorization
 
 Nonnegative = Annotated[Decimal, Field(ge=0, allow_inf_nan=False, max_digits=38, decimal_places=18)]
@@ -496,11 +497,11 @@ class RecordedBar(Immutable):
     """
 
     opened_at: AwareDatetime
-    open: Positive
-    high: Positive
-    low: Positive
-    close: Positive
-    volume: Nonnegative
+    open: MarketPrice
+    high: MarketPrice
+    low: MarketPrice
+    close: MarketPrice
+    volume: MarketAmount
 
 
 class RecordedMarketStructure(Immutable):
@@ -538,8 +539,8 @@ class RecordedMarketStructure(Immutable):
     missing_intervals: int = Field(ge=0)
     window_start: AwareDatetime
     window_end: AwareDatetime
-    observed_range_low: Positive
-    observed_range_high: Positive
+    observed_range_low: MarketPrice
+    observed_range_high: MarketPrice
     policy_version: Identifier
     # Bounded hard. This is one decision's input, never an archive.
     bars: tuple[RecordedBar, ...] = Field(min_length=1, max_length=200)
@@ -564,7 +565,8 @@ class TradeSetupDetail(Immutable):
     entry_high: Positive
     # The observed price the proposal was drawn from, so a reader can see how far
     # the levels sat from the market at the time.
-    reference_price: Positive
+    # The recorded price the setup was judged against: a market fact.
+    reference_price: MarketPrice
     expires_at: AwareDatetime
     trigger: TradeSetupTrigger
     reason_codes: tuple[Code, ...] = Field(default=(), max_length=8)
@@ -580,8 +582,8 @@ class TradeSetupDetail(Immutable):
     history_window_start: AwareDatetime | None = None
     history_window_end: AwareDatetime | None = None
     history_coverage: Code | None = None
-    observed_range_low: Positive | None = None
-    observed_range_high: Positive | None = None
+    observed_range_low: MarketPrice | None = None
+    observed_range_high: MarketPrice | None = None
     # The exact normalized structure the model reasoned over. Additive and
     # optional, so evidence written before it stays readable.
     structure: "RecordedMarketStructure | None" = None
@@ -663,7 +665,8 @@ class TriggerPayload(AcceptancePayload):
 
     kind: Literal["trigger"] = "trigger"
     setup_evidence_id: UUID
-    observed_price: Positive
+    # The recorded price the condition was compared against: a market fact.
+    observed_price: MarketPrice
     trigger_code: Code
     # Absent on evidence written before Phase 2I; present for anything a PULSE
     # monitor produced.
@@ -783,13 +786,13 @@ class ExecutionAssessmentDetail(Immutable):
     # about the untested sizes between this and the rejected one below.
     largest_tested_acceptable_notional_usd: Positive | None = None
     first_tested_rejected_notional_usd: Positive | None = None
-    reference_price: Positive
+    reference_price: MarketPrice
     reference_price_basis: Code
     reference_observed_at: AwareDatetime
     # What the payment asset was worth when this was assessed, and where that
     # came from. The USD figures above are only as good as this one, so it
     # travels with them rather than being left implicit.
-    quote_asset_usd_price: Positive
+    quote_asset_usd_price: MarketPrice
     quote_asset_usd_observed_at: AwareDatetime
     quote_asset_usd_provider: Identifier
     effective_price_usd_at_capacity: Positive | None = None

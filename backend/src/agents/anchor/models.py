@@ -33,6 +33,7 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from src.markets.models import MarketPrice
 from src.markets.quotes import QuoteFailure
 
 Identifier = Annotated[str, Field(min_length=1, max_length=200, pattern=r"^\S(?:.*\S)?$")]
@@ -172,8 +173,8 @@ class ExecutionAssessment(Immutable):
     # with the figure above this brackets the answer without interpolating
     # between the two or claiming either is a boundary.
     first_tested_rejected_notional_usd: Notional | None = None
-    reference_price: Price
-    quote_asset_usd_price: Price
+    reference_price: MarketPrice
+    quote_asset_usd_price: MarketPrice
     effective_price_usd_at_capacity: Price | None = None
     execution_deviation_bps_at_capacity: Bps | None = None
     ladder: tuple[QuotedPoint, ...] = Field(min_length=1, max_length=12)
@@ -252,7 +253,7 @@ class ReferenceMarket(Immutable):
     chain: Identifier
     network: Identifier
     provider: Identifier
-    price: Price
+    price: MarketPrice
     price_basis: Literal["USD_PER_BASE_UNIT"]
     # Recorded pool liquidity. Context only, and never the source of a capacity
     # figure: reserves are not an assurance that any particular size can be
@@ -280,7 +281,7 @@ class QuoteAssetValuation(Immutable):
     observation_id: UUID
     snapshot_id: UUID
     provider: Identifier
-    usd_per_token: Price
+    usd_per_token: MarketPrice
     observed_at: AwareDatetime
     age_seconds: int = Field(ge=0)
 

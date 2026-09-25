@@ -45,6 +45,21 @@ Amount = Annotated[
     Field(ge=0, allow_inf_nan=False),
     AfterValidator(market_decimal_bounds),
 ]
+# The positive counterpart of `Amount`: a recorded price.
+#
+# Precision rule. A recorded market fact keeps the precision the market layer
+# recorded wherever it is copied: a specialist's view of the market, a stored
+# evidence payload, a monitor's comparison. Model and strategy outputs (setup
+# levels, trigger levels) keep their own bounded contracts, and the ledger keeps
+# `Numeric(38, 18)`; a fact enters the ledger only through an explicit
+# `src.core.numbers.quantize` at the risk/accounting boundary, never through a
+# narrower field type that happens to reject it.
+MarketPrice = Annotated[
+    Decimal,
+    BeforeValidator(exact_number),
+    Field(gt=0, allow_inf_nan=False),
+    AfterValidator(market_decimal_bounds),
+]
 Name = Annotated[str, Field(min_length=1, max_length=200, pattern=r"^\S+$")]
 Namespace = Annotated[str, Field(min_length=1, max_length=60, pattern=r"^[a-zA-Z0-9_-]+$")]
 

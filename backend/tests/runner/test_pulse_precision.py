@@ -1,4 +1,4 @@
-"""A price the ledger envelope cannot express must not crash the monitor.
+"""A price with more decimal places than the ledger holds is still a price.
 
 The first real PAPER smoke run recorded one BNB Smart Chain pool and then wrote
 `PULSE / FAILED_RETRYABLE / HANDLER_ERROR / INTERNAL` into the task history. The
@@ -6,7 +6,10 @@ market layer accepts any decimal a provider reports; PULSE compares prices in
 the envelope the ledger stores them in — `Numeric(38, 18)` — and the recorded
 price had nineteen decimal places. Building the observation raised a validation
 error, which is not a `PulseContextUnavailable`, so it escaped the handler and
-was classified by the runtime as an unknown handler bug.
+was classified by the runtime as an unknown handler bug. The first fix read such
+a price as "not observed"; the precision fix that followed makes the monitor
+compare it exactly, at the precision the market recorded, and leaves conversion
+into the ledger to the explicit risk boundary.
 
 The numbers and identities below are the ones from that run: a real pool, a real
 price, and the instants it actually happened at. Everything between the recorded
@@ -262,8 +265,8 @@ async def test_one_pass_does_not_claim_the_same_waiting_task_twice(risk_db, now,
     assert task.next_eligible_at > RAN_AT.replace(tzinfo=task.next_eligible_at.tzinfo)
 
 
-async def test_an_unrepresentable_price_is_not_recorded_as_a_comparison(risk_db, now, trace):
-    """The price is dropped as uncomparable, never rounded into range.
+async def test_a_wide_price_is_observed_exactly(risk_db, now, trace):
+    """The price is compared as recorded: never dropped, never rounded into range.
 
     Rounding would change what the market said in the one place where a
     comparison decides whether an order is armed.
@@ -279,7 +282,10 @@ async def test_an_unrepresentable_price_is_not_recorded_as_a_comparison(risk_db,
         case_id = await session.scalar(select(TradeCaseRow.id))
     trade_case = await TradeCaseService(sessions).get_trade_case(case_id)
 
-    assert price_observation(observation(UNREPRESENTABLE), trade_case) is None
+    wide = price_observation(observation(UNREPRESENTABLE), trade_case)
+    assert wide is not None
+    assert wide.price == UNREPRESENTABLE
+    assert wide.price.as_tuple() == UNREPRESENTABLE.as_tuple()
     fitting = price_observation(observation(REPRESENTABLE, label="fits"), trade_case)
     assert fitting is not None and fitting.price == REPRESENTABLE
 
@@ -339,12 +345,10 @@ def test_an_unreached_trigger_keeps_waiting(now):
 
 
 async def test_a_live_setup_with_an_unrepresentable_price_still_waits(risk_db, now, trace):
-    """With something to watch, the answer is the contract's existing one.
+    """With something to watch and no price, the answer is the contract's own.
 
-    A price that cannot be compared leaves the monitor with nothing to compare,
-    which the evaluator already answers as patience — `PRICE_UNAVAILABLE` — and
-    not as a fault. The fix therefore changes which outcome is reached, never
-    what any outcome means.
+    No observation at all is answered as patience — `PRICE_UNAVAILABLE` — and not
+    as a fault.
     """
     from src.agents.pulse.evaluator import evaluate
     from src.agents.pulse.models import WAITING_OUTCOMES, PulseReasonCode, TriggerOutcome
@@ -361,7 +365,7 @@ async def test_a_live_setup_with_an_unrepresentable_price_still_waits(risk_db, n
 
 
 async def test_a_wiring_fault_in_the_observation_still_raises(risk_db, now, trace):
-    """Only the envelope refusal is read as "no price".
+    """A market answering about the wrong pair is not read as "no price".
 
     A market answering about something the case is not about is a wiring fault,
     and it must keep reaching the runtime as one rather than turning into a
@@ -388,3 +392,28 @@ async def test_a_wiring_fault_in_the_observation_still_raises(risk_db, now, trac
 
     with pytest.raises(ValidationError):
         price_observation(observation(REPRESENTABLE, label="fits"), broken)
+
+
+def test_a_wide_observed_price_is_compared_exactly_against_a_bounded_level(now):
+    """Decimal comparison at full precision, on both sides of the level.
+
+    The level keeps VECTOR's 18-place contract; only the observation is wide.
+    Neither side is quantized before the comparison.
+    """
+    from src.agents.pulse.handler import evaluate
+    from src.agents.pulse.models import TriggerOutcome
+    from src.agents.pulse.policy import PULSE_TRIGGER_V1
+    from tests.pulse.conftest import LEVEL, observed, task_input
+
+    just_above = LEVEL + Decimal("0.00000000000000000000001")
+    just_below = LEVEL - Decimal("0.00000000000000000000001")
+    assert -just_above.as_tuple().exponent > 18
+
+    above = task_input(now, observation=observed(now, price=just_above))
+    reached = evaluate(above, above.evaluated_at, PULSE_TRIGGER_V1)
+    assert reached.outcome is TriggerOutcome.TRIGGERED, reached.reason_code
+    assert reached.observed_price == just_above
+
+    below = task_input(now, observation=observed(now, price=just_below))
+    waiting = evaluate(below, below.evaluated_at, PULSE_TRIGGER_V1)
+    assert waiting.outcome is TriggerOutcome.NOT_TRIGGERED
