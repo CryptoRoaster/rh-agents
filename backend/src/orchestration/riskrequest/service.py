@@ -323,6 +323,16 @@ class RiskRequestService:
                     assessed.readiness,
                     detail=unvaluable_reason(valuation, state.unmarked_assets),
                 )
+            if state.accounting_issues:
+                # Every mark is known; the figure SENTINEL would judge is not
+                # representable. Asked anyway, it would reject on unknown
+                # accounting and spend the case's one request on a capability gap.
+                return _refused(
+                    trade_case,
+                    RiskRequestRefusal.PORTFOLIO_ACCOUNTING_UNREPRESENTABLE,
+                    assessed.readiness,
+                    detail=state.accounting_issues[0].value,
+                )
             if state.conflicting_market is not None:
                 # This asset is already held, bought in another market. A fill
                 # would merge the two into one position recorded against one of

@@ -15,11 +15,12 @@ on the second.
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, localcontext
+from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
 from src.core.models import Position, RiskContext, SafetyStatus
-from src.core.numbers import quantize
+from src.core.numbers import fits_ledger, quantize_up
 from src.markets.models import MarketIdentity
 from src.orchestration.valuation.models import PositionMark
 
@@ -72,6 +73,34 @@ class ValuationInputs:
     cycle_id: UUID | None = None
 
 
+class PortfolioAccountingIssue(StrEnum):
+    """A figure that was computed exactly but cannot be held by the ledger.
+
+    Different from an unmarked holding: every mark here is known and current.
+    What does not exist is the accounting figure in `Numeric(38, 18)`, so the
+    portfolio's exposure or loss is reported as unknown rather than truncated,
+    capped or raised.
+    """
+
+    EXPOSURE_OUTSIDE_ACCOUNTING_PRECISION = "EXPOSURE_OUTSIDE_ACCOUNTING_PRECISION"
+    DAILY_LOSS_OUTSIDE_ACCOUNTING_PRECISION = "DAILY_LOSS_OUTSIDE_ACCOUNTING_PRECISION"
+
+
+def _ledger_figure(exact: Decimal) -> Decimal | None:
+    """A non-negative risk input at ledger precision, or None if it cannot exist.
+
+    Rounded up: SENTINEL rejects when exposure plus the order exceeds its limit
+    and when the day's loss reaches its limit, so a figure rounded down could
+    pass a check the exact value fails. Checked before rounding, because a value
+    far outside the ledger cannot be quantized at all, and after, because
+    rounding up can carry into one more integer digit.
+    """
+    if not fits_ledger(exact):
+        return None
+    rounded = quantize_up(exact)
+    return rounded if fits_ledger(rounded) else None
+
+
 @dataclass(frozen=True)
 class PortfolioState:
     """What the account holds, valued, and what could not be valued."""
@@ -92,6 +121,10 @@ class PortfolioState:
     # one market into a position recorded against another, which is a top-up
     # across markets — a contract this system does not have.
     conflicting_market: str | None = None
+    # Figures computed exactly from known marks that the ledger cannot hold.
+    # Their presence is why `context` reports unknown accounting; the marks and
+    # prices that produced them stay above for audit.
+    accounting_issues: tuple[PortfolioAccountingIssue, ...] = ()
 
 
 def portfolio_state(
@@ -201,8 +234,18 @@ def portfolio_state(
             ),
             Decimal("0"),
         )
-    exposure = quantize(gross)
-    unrealized_loss = quantize(underwater)
+    exposure = _ledger_figure(gross)
+    unrealized_loss = _ledger_figure(underwater)
+    issues: list[PortfolioAccountingIssue] = []
+    if exposure is None:
+        issues.append(PortfolioAccountingIssue.EXPOSURE_OUTSIDE_ACCOUNTING_PRECISION)
+    # Both parts already carry the ledger's eighteen places, so the sum is exact;
+    # it can still carry past the ledger's twenty integer digits.
+    daily_loss = None if unrealized_loss is None else realized_loss_today_usd + unrealized_loss
+    if daily_loss is None or not fits_ledger(daily_loss):
+        daily_loss = None
+        issues.append(PortfolioAccountingIssue.DAILY_LOSS_OUTSIDE_ACCOUNTING_PRECISION)
+    valid = valid and not issues
     return PortfolioState(
         inputs=ValuationInputs(
             cash_usd=cash_usd,
@@ -220,7 +263,7 @@ def portfolio_state(
             cash_usd=cash_usd,
             exposure_usd=exposure if valid else None,
             position_quantity=position.quantity,
-            daily_loss_usd=realized_loss_today_usd + unrealized_loss if valid else None,
+            daily_loss_usd=daily_loss if valid else None,
             accounting=SafetyStatus.PASS if valid else SafetyStatus.UNKNOWN,
         ),
         position=position,
@@ -228,6 +271,7 @@ def portfolio_state(
         marks_used=tuple(used),
         unmarked_assets=tuple(unmarked),
         conflicting_market=conflicting,
+        accounting_issues=tuple(issues),
     )
 
 
@@ -306,6 +350,7 @@ def portfolio_basis(state: PortfolioState) -> dict[str, Any]:
         "daily_loss_usd": canonical_amount(state.context.daily_loss_usd),
         "accounting": state.context.accounting.value,
         "unmarked_assets": list(state.unmarked_assets),
+        "accounting_issues": [item.value for item in state.accounting_issues],
         "conflicting_market": state.conflicting_market,
     }
 

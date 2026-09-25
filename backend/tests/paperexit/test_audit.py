@@ -297,3 +297,55 @@ async def test_a_strict_limit_refuses_the_sale_without_special_rights(risk_db, n
     assert "SLIPPAGE_LIMIT" in result.reason_codes
     assert (await position_of(sessions)).quantity == position.quantity
     assert await exits(sessions) == []
+
+
+async def test_an_unrepresentable_portfolio_stops_the_exit(risk_db, now, trace):
+    """A known mark whose value the ledger cannot hold: no evaluation, no sale.
+
+    Not an emergency exit either: an exit that cannot be valued is not executed.
+    """
+    from src.core.models import Position
+    from src.data.repository import save_position
+    from tests.paperexit.conftest import market_for
+    from tests.riskdata.conftest import recorded_snapshot
+
+    _, sessions = risk_db
+    feed = market_feed(now)
+    _, _, position = await entered(sessions, now, trace, feed=feed)
+    elsewhere = market_for(token="c7" * 20, pool="d8" * 20)
+    feed.replace(
+        recorded_snapshot(
+            now,
+            age=FRESH,
+            metadata_age=FRESH,
+            base_asset_id=elsewhere.base_asset_id,
+            pair_id=elsewhere.pair_id,
+            label="elsewhere",
+            price=Decimal("1E+25"),
+        )
+    )
+    async with sessions.begin() as session:
+        await save_position(
+            session,
+            Position(
+                source="LEDGER",
+                correlation_id=trace,
+                asset_id=elsewhere.base_asset_id,
+                market_pair_id=elsewhere.pair_id,
+                market_chain=elsewhere.chain,
+                market_network=elsewhere.network,
+                market_provider=elsewhere.provider,
+                quantity=Decimal("3"),
+                cost_basis_usd=Decimal("30"),
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+
+    result = await build_exit_service(sessions, now, feed=feed).execute_position_exit(
+        position.id, request_key="exit-unrepresentable"
+    )
+
+    assert result.reason is ExitRefusal.PORTFOLIO_ACCOUNTING_UNREPRESENTABLE
+    assert result.detail == "EXPOSURE_OUTSIDE_ACCOUNTING_PRECISION"
+    assert await exits(sessions) == []

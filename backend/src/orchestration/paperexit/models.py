@@ -74,6 +74,10 @@ class ExitRefusal(StrEnum):
     DECISION_BASIS_EXPIRED = "DECISION_BASIS_EXPIRED"
     SOURCE_OLDER_THAN_RISK_LIMIT = "SOURCE_OLDER_THAN_RISK_LIMIT"
     PORTFOLIO_MARKS_UNAVAILABLE = "PORTFOLIO_MARKS_UNAVAILABLE"
+    # Every holding has a known mark, but the portfolio's exposure or loss is
+    # larger than the ledger can hold. A capability gap, not a verdict: the
+    # figure SENTINEL would judge does not exist in `Numeric(38, 18)`.
+    PORTFOLIO_ACCOUNTING_UNREPRESENTABLE = "PORTFOLIO_ACCOUNTING_UNREPRESENTABLE"
     PORTFOLIO_CHANGED_DURING_VALUATION = "PORTFOLIO_CHANGED_DURING_VALUATION"
     # ---------------------------------------------------- the stops
     SYSTEM_PAUSED = "SYSTEM_PAUSED"

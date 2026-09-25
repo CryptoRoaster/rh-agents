@@ -351,3 +351,55 @@ async def test_trusted_time_is_read_after_waiting_for_portfolio_lock(sessions, i
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_an_unrepresentable_holding_value_is_rejected_not_crashed(
+    sessions, intent, market, now
+):
+    """The standalone PAPER path has no refusal layer of its own.
+
+    A held position whose recorded mark makes exposure larger than the ledger can
+    hold leaves accounting UNKNOWN, and SENTINEL rejects on that. No exception,
+    no fill.
+    """
+    from src.core.models import Position
+    from src.data.repository import save_position
+    from src.orchestration.valuation.models import PositionMark
+
+    other = "paper:OTHER"
+    async with sessions.begin() as session:
+        await save_position(
+            session,
+            Position(
+                source="LEDGER",
+                correlation_id=uuid4(),
+                asset_id=other,
+                market_pair_id="paper:OTHER-USD",
+                market_chain="paper",
+                market_network="paper",
+                market_provider="paper",
+                quantity=Decimal("1"),
+                cost_basis_usd=Decimal("10"),
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+    mark = PositionMark(
+        asset_id=other,
+        pair_id="paper:OTHER-USD",
+        provider="paper",
+        snapshot_id=uuid4(),
+        observation_id=uuid4(),
+        price_usd=Decimal("1E+25"),
+        observed_at=now - timedelta(seconds=1),
+    )
+    service = PaperTradingService(sessions, RiskLimits(), TradingMode.PAPER, clock=FixedClock(now))
+
+    risk = await service.process(intent, market, marks={other: mark})
+
+    assert isinstance(risk, RiskDecision)
+    assert risk.outcome == RiskOutcome.REJECT
+    assert "ACCOUNTING_UNKNOWN" in risk.reason_codes
+    assert "PORTFOLIO_DATA_UNKNOWN" in risk.reason_codes
+    async with sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(ExecutionRow)) == 0

@@ -27,7 +27,21 @@ worse, never by as much as one ledger unit:
 Position marks (`PositionMark.price_usd`) are recorded market prices and keep
 market precision. The accounting boundary for valuation is the result:
 `portfolio_state` multiplies quantity by the exact mark and sums in a wide
-context, and only exposure and unrealized loss are quantized to 18 places.
+context (`EXACT_VALUATION_PRECISION = 250`), and only exposure, unrealized loss
+and the day's loss are brought to 18 places:
+
+- rounded **up** (`quantize_up`), because SENTINEL rejects when exposure plus the
+  order exceeds its limit and when the day's loss reaches its limit, so a figure
+  rounded down could pass a check the exact value fails;
+- a figure the ledger cannot hold, before or after rounding, becomes a typed
+  `PortfolioAccountingIssue` (`EXPOSURE_OUTSIDE_ACCOUNTING_PRECISION`,
+  `DAILY_LOSS_OUTSIDE_ACCOUNTING_PRECISION`) with accounting `UNKNOWN`. It is
+  never truncated, capped or treated as a missing mark, and the marks and prices
+  that produced it stay in the state for audit;
+- RiskRequest, CaseFill and PaperExit refuse such a portfolio with
+  `PORTFOLIO_ACCOUNTING_UNREPRESENTABLE` before SENTINEL is asked and before any
+  fill; the standalone PAPER service, which has no refusal layer, passes the
+  unknown accounting to SENTINEL, which rejects it.
 
 Derived execution values in ANCHOR (notionals, token amounts, effective prices,
 deviations) were already quantized where they are computed and are unchanged.

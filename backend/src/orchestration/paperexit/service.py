@@ -308,6 +308,17 @@ class PaperExitService:
                     readiness=readiness,
                     detail=unvaluable_reason(valuation, valued.unmarked_assets),
                 )
+            if valued.accounting_issues:
+                # Every mark is known; the portfolio's figure is not
+                # representable in the ledger. An exit that cannot be valued is
+                # not executed, and this is no emergency exception to that.
+                return _refused(
+                    position_id,
+                    ExitRefusal.PORTFOLIO_ACCOUNTING_UNREPRESENTABLE,
+                    trade_case_id=trade_case.id,
+                    readiness=readiness,
+                    detail=valued.accounting_issues[0].value,
+                )
 
             # The whole open holding, as it stands under this lock, fixed into
             # the order now. A later different holding does not become a

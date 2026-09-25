@@ -372,6 +372,15 @@ class CaseFillService:
                     readiness,
                     detail=unvaluable_reason(valuation, valued.unmarked_assets),
                 )
+            if valued.accounting_issues:
+                # Every mark is known; the portfolio's figure is not
+                # representable in the ledger, so there is nothing to recheck.
+                return _refused(
+                    trade_case,
+                    ExecutionRefusal.PORTFOLIO_ACCOUNTING_UNREPRESENTABLE,
+                    readiness,
+                    detail=valued.accounting_issues[0].value,
+                )
             if valued.conflicting_market is not None:
                 # This asset is already held, bought in another market. The fill
                 # would merge inventory from two markets into one position
