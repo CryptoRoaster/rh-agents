@@ -71,6 +71,10 @@ class ExecutionRefusal(StrEnum):
     # A holding exists that this system cannot value, so the portfolio SENTINEL
     # would judge is unknown. A missing capability, not a verdict.
     PORTFOLIO_MARKS_UNAVAILABLE = "PORTFOLIO_MARKS_UNAVAILABLE"
+    # Every holding has a known mark, but the portfolio's exposure or loss is
+    # larger than the ledger can hold. A capability gap, not a verdict: the
+    # figure SENTINEL would judge does not exist in `Numeric(38, 18)`.
+    PORTFOLIO_ACCOUNTING_UNREPRESENTABLE = "PORTFOLIO_ACCOUNTING_UNREPRESENTABLE"
     # This order's asset is already held, bought in another market. Filling
     # would merge inventory from two markets into one position recorded against
     # one of them. Adding to a position across markets is a contract this

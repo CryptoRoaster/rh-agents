@@ -36,6 +36,7 @@ from src.core.models import (
     TradeIntent,
     TradingMode,
 )
+from src.core.numbers import LEDGER_UNIT, fits_ledger, quantize_down, quantize_up
 from src.data.repository import aware, read_position
 from src.data.tables import AccountRow, PositionRow, TradeCaseRiskRequestRow
 from src.ledger.portfolio import (
@@ -284,6 +285,7 @@ class RiskRequestService:
                 costs=assessed.costs,
                 correlation_id=trade_case.correlation_id,
                 identity_key=request_key,
+                side=Side.BUY,
             )
             stale = too_old_for(market, now, self.limits)
             if stale is not None:
@@ -320,6 +322,16 @@ class RiskRequestService:
                     RiskRequestRefusal.PORTFOLIO_MARKS_UNAVAILABLE,
                     assessed.readiness,
                     detail=unvaluable_reason(valuation, state.unmarked_assets),
+                )
+            if state.accounting_issues:
+                # Every mark is known; the figure SENTINEL would judge is not
+                # representable. Asked anyway, it would reject on unknown
+                # accounting and spend the case's one request on a capability gap.
+                return _refused(
+                    trade_case,
+                    RiskRequestRefusal.PORTFOLIO_ACCOUNTING_UNREPRESENTABLE,
+                    assessed.readiness,
+                    detail=state.accounting_issues[0].value,
                 )
             if state.conflicting_market is not None:
                 # This asset is already held, bought in another market. A fill
@@ -578,6 +590,7 @@ def risk_market(
     costs: PaperCostAssumptions,
     correlation_id: UUID,
     identity_key: str,
+    side: Side,
 ) -> MarketSnapshot:
     """Build SENTINEL's market view from facts that were actually established.
 
@@ -610,6 +623,36 @@ def risk_market(
     def identity(label: str) -> UUID:
         return uuid5(NAMESPACE_URL, f"rh-agents:risk-market:{identity_key}:{label}")
 
+    # The accounting boundary. Recorded market facts carry the market layer's
+    # precision; SENTINEL's snapshot is ledger-typed `Numeric(38, 18)`. The
+    # conversion happens here, explicitly and in the conservative direction for
+    # each field, rather than as a validation error inside a constructor.
+    #
+    # Price: rounded against the order. A buy is sized by dividing by the exact
+    # recorded price and flooring the quantity, and SENTINEL then checks
+    # `quantity * price_usd`; a ledger price below the recorded one would
+    # understate that notional, which for a cheap enough token is material. So
+    # a buy is priced by a ceiling and a sell (an exit) by a floor: each can
+    # only make the order look more expensive or less rewarding, and never by
+    # as much as one ledger unit per token.
+    recorded_price = price.usd_per_base_unit
+    if recorded_price < LEDGER_UNIT or not fits_ledger(recorded_price):
+        # Below the smallest ledger unit, raising it to that unit would change
+        # the price by up to its whole value; above the ledger's range there is
+        # nothing to store. Neither is zeroed, raised or capped.
+        raise RiskRequestUnavailable("REFERENCE_PRICE_OUTSIDE_ACCOUNTING_PRECISION")
+    price_usd = quantize_up(recorded_price) if side is Side.BUY else quantize_down(recorded_price)
+    if not fits_ledger(price_usd):
+        # Rounding up carried into a twenty-first integer digit.
+        raise RiskRequestUnavailable("REFERENCE_PRICE_OUTSIDE_ACCOUNTING_PRECISION")
+    # Liquidity: floored, never rounded half-even or up, so a reading just below
+    # `min_liquidity_usd` cannot be lifted over it. A sub-precision reading
+    # becomes zero, which the engine rejects as insufficient liquidity. A
+    # reading too large for the ledger is refused rather than capped.
+    if not fits_ledger(liquidity.value_usd):
+        raise RiskRequestUnavailable("LIQUIDITY_OUTSIDE_ACCOUNTING_PRECISION")
+    liquidity_usd = quantize_down(liquidity.value_usd)
+
     price_at = price.observed_at
     return MarketSnapshot(
         id=identity("market"),
@@ -619,7 +662,7 @@ def risk_market(
         correlation_id=correlation_id,
         asset_id=base_asset_id,
         observed_at=price_at,
-        price_usd=price.usd_per_base_unit,
+        price_usd=price_usd,
         token=TokenSnapshot(
             id=identity("token"),
             created_at=base_asset.source_observed_at,
@@ -641,7 +684,7 @@ def risk_market(
             source=liquidity.provider,
             correlation_id=correlation_id,
             asset_id=base_asset_id,
-            liquidity_usd=liquidity.value_usd,
+            liquidity_usd=liquidity_usd,
             # ANCHOR established an executable route at a tested size, which is
             # what this field asks. It is not a claim about the price.
             routing=SafetyStatus.PASS,

@@ -26,6 +26,7 @@ from src.core.models import (
     ExecutionResult,
     RiskDecision,
     RiskLimits,
+    Side,
     TradeIntent,
     TradingMode,
 )
@@ -337,6 +338,7 @@ class CaseFillService:
                 # market reading at a different instant, and giving it the
                 # request's identity would make two snapshots look like one.
                 identity_key=f"{request.request_key}:fill",
+                side=Side.BUY,
             )
             stale = too_old_for(market, now, self.limits)
             if stale is not None:
@@ -369,6 +371,15 @@ class CaseFillService:
                     ExecutionRefusal.PORTFOLIO_MARKS_UNAVAILABLE,
                     readiness,
                     detail=unvaluable_reason(valuation, valued.unmarked_assets),
+                )
+            if valued.accounting_issues:
+                # Every mark is known; the portfolio's figure is not
+                # representable in the ledger, so there is nothing to recheck.
+                return _refused(
+                    trade_case,
+                    ExecutionRefusal.PORTFOLIO_ACCOUNTING_UNREPRESENTABLE,
+                    readiness,
+                    detail=valued.accounting_issues[0].value,
                 )
             if valued.conflicting_market is not None:
                 # This asset is already held, bought in another market. The fill

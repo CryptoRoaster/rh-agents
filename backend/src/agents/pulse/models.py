@@ -31,6 +31,7 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from src.agents.vector.models import PRICE_BASIS, TriggerType
+from src.markets.models import MarketPrice
 
 Identifier = Annotated[str, Field(min_length=1, max_length=200, pattern=r"^\S(?:.*\S)?$")]
 Price = Annotated[Decimal, Field(gt=0, allow_inf_nan=False, max_digits=38, decimal_places=18)]
@@ -167,7 +168,7 @@ class PriceObservation(Immutable):
     provider: Identifier
     is_fixture: bool = Field(strict=True)
     price_basis: Literal["USD_PER_BASE_UNIT"] = PRICE_BASIS
-    price: Price
+    price: MarketPrice
     observed_at: AwareDatetime
 
 
@@ -218,7 +219,7 @@ class TriggerEvaluation(Immutable):
     outcome: TriggerOutcome
     reason_code: PulseReasonCode
     evaluated_at: AwareDatetime
-    observed_price: Price | None = None
+    observed_price: MarketPrice | None = None
     observed_at: AwareDatetime | None = None
 
     @model_validator(mode="after")
