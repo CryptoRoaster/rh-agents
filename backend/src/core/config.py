@@ -276,9 +276,15 @@ class Settings(BaseSettings):
     early_scout_enabled: bool = False
     # Pools one new-pool read may bring back, per configured chain.
     early_scout_max_discovery_pools: int = Field(default=10, ge=1, le=20)
-    early_scout_max_new_watches_per_run: int = Field(default=10, ge=1, le=50)
+    # New watches per run, and the paid ORBIT reviews that serve them. Each watch
+    # is owed six reviews (T+0, 1h, 3h, 6h, 12h, 24h), so the review budget must
+    # be at least six times the new-watch budget or the due queue grows without
+    # bound. The defaults — one new watch and eight reviews per run, run every 15
+    # minutes — cover the steady state (6) with room (2) to drain a backlog, and
+    # cap model calls at 8 per run, 768 per day. See docs/early-discovery-watch.md.
+    early_scout_max_new_watches_per_run: int = Field(default=1, ge=1, le=50)
     # Paid model calls. One per due watch at most, and never more than this.
-    early_scout_max_orbit_reviews_per_run: int = Field(default=1, ge=0, le=10)
+    early_scout_max_orbit_reviews_per_run: int = Field(default=8, ge=0, le=10)
     # History reads for the structural VECTOR check. No model call is involved.
     early_scout_max_history_checks_per_run: int = Field(default=1, ge=0, le=10)
     # Watches re-observed by exact pool locator in one run.

@@ -135,6 +135,16 @@ def _same_market(stored: MarketIdentity, observed: MarketIdentity) -> bool:
 
 
 @dataclass(frozen=True)
+class Backlog:
+    """ORBIT work that is due and not yet done, at one instant."""
+
+    due: int
+    oldest_due_age_seconds: int | None
+    # Reviewable watches that have never had an ORBIT review.
+    unreviewed: int
+
+
+@dataclass(frozen=True)
 class WatchRepository:
     sessions: async_sessionmaker[AsyncSession]
     policy: EarlyScoutPolicy = EARLY_SCOUT_V1
@@ -240,6 +250,34 @@ class WatchRepository:
                 )
             )
         return int(orbit or 0), int(history or 0)
+
+    async def backlog(self, now: datetime) -> "Backlog":
+        """How far ORBIT is behind: due reviews, the oldest one, and unreviewed watches.
+
+        Counts over the reviewable set only. DORMANT and RETIRED watches cause no
+        traffic and are not work anybody owes.
+        """
+        reviewable = DiscoveryWatchRow.status.in_([item.value for item in REVIEWABLE])
+        due = self._due(DiscoveryWatchRow.next_orbit_review_at, REVIEWABLE, now)
+        async with self.sessions() as session:
+            count = await session.scalar(
+                select(func.count()).select_from(DiscoveryWatchRow).where(due)
+            )
+            oldest = await session.scalar(
+                select(func.min(DiscoveryWatchRow.next_orbit_review_at)).where(due)
+            )
+            unreviewed = await session.scalar(
+                select(func.count())
+                .select_from(DiscoveryWatchRow)
+                .where(reviewable, DiscoveryWatchRow.orbit_checkpoint_index.is_(None))
+            )
+        return Backlog(
+            due=int(count or 0),
+            oldest_due_age_seconds=None
+            if oldest is None
+            else max(0, int((now - aware(oldest)).total_seconds())),
+            unreviewed=int(unreviewed or 0),
+        )
 
     async def promotable(self, limit: int) -> tuple[DiscoveryWatch, ...]:
         """PROMOTABLE watches in discovery order. Never ranked by market size."""

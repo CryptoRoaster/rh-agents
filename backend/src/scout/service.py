@@ -32,11 +32,14 @@ unchanged rules.
 """
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from uuid import uuid4
 
 import httpx
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -76,8 +79,12 @@ from src.runner.models import ConfigurationRefused
 from src.scout.models import DiscoveryWatch, ScoutReview, ScoutSummary, WatchAssessment
 from src.scout.policy import EARLY_SCOUT_V1, EarlyScoutPolicy, WatchStatus
 from src.scout.repository import SyncResult, WatchRepository, refreshed_identity_contradicts
+from src.scout.runs import ScoutRunRepository
 
 ScoutReading = ScoutSummary | ConfigurationRefused
+
+# One scout run at a time across every process on this database.
+RUN_LOCK = "rh-agents:early-scout"
 
 
 @dataclass(frozen=True)
@@ -162,6 +169,10 @@ class Tally:
     retired_new: int = 0
     provider_failures: int = 0
     model_failures: int = 0
+    orbit_backlog_before: int = 0
+    orbit_backlog_after: int = 0
+    oldest_orbit_due_age_seconds: int | None = None
+    new_watches_without_orbit_assessment: int = 0
     reviews: list[ScoutReview] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -210,22 +221,63 @@ class EarlyScoutCycle:
         refusal = refuse_scout(self._settings, self._ports)
         if refusal is not None:
             return refusal
+        async with self._exclusive() as held:
+            if not held:
+                # Another scout run holds the lock. Not a fault and not a run: it
+                # made no call and leaves no history row.
+                now = self._clock.now().isoformat()
+                return ScoutSummary(
+                    policy_version=self._policy.version,
+                    started_at=now,
+                    finished_at=now,
+                    stop="ALREADY_RUNNING",
+                )
+            return await self._run()
+
+    @asynccontextmanager
+    async def _exclusive(self) -> AsyncIterator[bool]:
+        """At most one scout run at a time, whoever starts it.
+
+        A session-level PostgreSQL advisory lock on a connection held for the
+        whole run: a scheduled run that starts while a manual one is still going
+        gives way instead of reviewing the same due watches twice. The lock is
+        released on every path and dies with the connection if the process does.
+        The metadata-only SQLite test engine has no advisory locks.
+        """
+        async with self._sessions() as session:
+            if session.get_bind().dialect.name != "postgresql":
+                yield True
+                return
+            held = bool(
+                await session.scalar(
+                    text("SELECT pg_try_advisory_lock(hashtext(:key))"), {"key": RUN_LOCK}
+                )
+            )
+            try:
+                yield held
+            finally:
+                if held:
+                    await session.scalar(
+                        text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": RUN_LOCK}
+                    )
+                    await session.commit()
+
+    async def _run(self) -> ScoutSummary:
         started = self._clock.now()
         tally = Tally()
         transport: GeckoTerminalTransport | None = None
         try:
-            if not await self._permitted(tally):
-                return self._summary(started, tally, transport)
-            tally.bootstrapped = await self._watches.bootstrap(
-                started, self._settings.early_scout_max_bootstrap_streams
-            )
-            transport = GeckoTerminalTransport(
-                self._settings, transport=self._ports.market_http, clock=self._clock
-            )
-            directory = NetworkDirectory(transport, self._settings)
-            recorder = MarketRecorder(self._sessions, clock=self._clock)
-            fresh = await self._discover(transport, directory, recorder, tally)
-            await self._scheduled(transport, directory, recorder, fresh, tally)
+            if await self._permitted(tally):
+                tally.bootstrapped = await self._watches.bootstrap(
+                    started, self._settings.early_scout_max_bootstrap_streams
+                )
+                transport = GeckoTerminalTransport(
+                    self._settings, transport=self._ports.market_http, clock=self._clock
+                )
+                directory = NetworkDirectory(transport, self._settings)
+                recorder = MarketRecorder(self._sessions, clock=self._clock)
+                fresh = await self._discover(transport, directory, recorder, tally)
+                await self._scheduled(transport, directory, recorder, fresh, tally)
         except SystemPauseUnavailable:
             tally.stop = "SYSTEM_STOPPED"
             tally.fail("SYSTEM_STOP_UNREADABLE")
@@ -236,7 +288,17 @@ class EarlyScoutCycle:
         finally:
             if transport is not None:
                 await transport.__aexit__(None, None, None)
-        return self._summary(started, tally, transport)
+        summary = self._summary(started, tally, transport)
+        run_id = uuid4()
+        try:
+            await ScoutRunRepository(self._sessions).record(
+                run_id, started, self._clock.now(), summary
+            )
+        except (SQLAlchemyError, OSError):
+            return summary.model_copy(
+                update={"errors": (*summary.errors, "RUN_HISTORY_UNAVAILABLE")[:16]}
+            )
+        return summary.model_copy(update={"run_id": run_id})
 
     async def _permitted(self, tally: Tally) -> bool:
         """A durable stop, or one that cannot be read, means nobody is asked anything."""
@@ -327,6 +389,9 @@ class EarlyScoutCycle:
         """
         now = self._clock.now()
         tally.watches_due_orbit, tally.watches_due_history = await self._watches.count_due(now)
+        before = await self._watches.backlog(now)
+        tally.orbit_backlog_before = before.due
+        tally.oldest_orbit_due_age_seconds = before.oldest_due_age_seconds
         readings = Readings(
             recorded=fresh, refresh_budget=self._settings.early_scout_max_refresh_markets_per_run
         )
@@ -346,6 +411,9 @@ class EarlyScoutCycle:
                 continue
             attempted += 1
             await self._check_history(watch, snapshot, transport, directory, tally)
+        after = await self._watches.backlog(now)
+        tally.orbit_backlog_after = after.due
+        tally.new_watches_without_orbit_assessment = after.unreviewed
 
     def _is_fresh(self, snapshot: MarketSnapshot, now: datetime) -> bool:
         return snapshot.observed_at <= now and now - snapshot.freshness_at <= self._max_input_age
@@ -657,6 +725,10 @@ class EarlyScoutCycle:
             provider_failures=tally.provider_failures,
             model_failures=tally.model_failures,
             provider_requests=0 if transport is None else transport.logical_requests,
+            orbit_backlog_before=tally.orbit_backlog_before,
+            orbit_backlog_after=tally.orbit_backlog_after,
+            oldest_orbit_due_age_seconds=tally.oldest_orbit_due_age_seconds,
+            new_watches_without_orbit_assessment=tally.new_watches_without_orbit_assessment,
             reviews=tuple(tally.reviews[:16]),
             errors=tuple(tally.errors),
         )

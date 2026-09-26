@@ -114,8 +114,9 @@ VALUES (:id, :watch, :snapshot, :now, :index, 0, 'COMPLETED', NULL, 'NOT_INTERES
 """
 
 
-async def test_the_chain_has_one_head_at_0012():
-    assert expected_revision() == "0012"
+async def test_0012_sits_on_0011_in_a_single_headed_chain():
+    assert load(MODULE).down_revision == "0011"
+    assert expected_revision() >= "0012"
 
 
 async def test_upgrade_from_0011_creates_both_tables_and_their_indexes(at_0011):
