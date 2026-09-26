@@ -2234,3 +2234,9 @@ main {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+.scout .panel-heading {
+  height: auto;
+  min-height: 43px;
+  flex-wrap: wrap;
+  padding-block: 6px;
+}
