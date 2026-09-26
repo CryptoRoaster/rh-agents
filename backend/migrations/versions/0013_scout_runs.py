@@ -59,9 +59,7 @@ def upgrade() -> None:
         sa.Column("new_watches_without_orbit_assessment", sa.Integer(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         # A row is written once, when the run is over, so it is always terminal.
-        sa.CheckConstraint(
-            "status IN ('COMPLETED', 'STOPPED', 'FAILED')", name="scout_run_status"
-        ),
+        sa.CheckConstraint("status IN ('COMPLETED', 'STOPPED', 'FAILED')", name="scout_run_status"),
         sa.CheckConstraint("completed_at >= started_at", name="scout_run_ordering"),
     )
     op.create_index("ix_scout_runs_started", "scout_runs", ["started_at"])
