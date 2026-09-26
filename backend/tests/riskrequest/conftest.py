@@ -93,6 +93,7 @@ async def risk_db():
                 "0009_position_market_identity",
                 "0010_trade_case_exits",
                 "0011_trade_cycles",
+                "0012_discovery_watches",
             ):
                 spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
                 module = importlib.util.module_from_spec(spec)

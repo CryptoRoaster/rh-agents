@@ -64,6 +64,8 @@ from src.reasoning.provider import ReasoningProvider
 from src.runner.acquisition import BoundedMarketAcquisition
 from src.runner.models import AcquisitionLimits, RoleAvailability, RunLimits
 from src.runtime.models import chain_configs
+from src.scout.candidates import PromotedWatchCandidates, PromotionRefresh
+from src.scout.repository import WatchRepository
 
 Closer = Callable[[], Awaitable[None]]
 
@@ -267,6 +269,14 @@ class RunnerStack:
     # the ordinary case and means exactly what it did before this contract: the
     # run trades whatever was already recorded and asks nobody for anything.
     acquisition: BoundedMarketAcquisition | None = None
+    # Present only with the early scout enabled: intake then reads PROMOTABLE
+    # watches instead of every fresh new pool, and this re-observes them by
+    # exact locator first. Absent means intake is exactly what it always was.
+    promotion: PromotionRefresh | None = None
+    watches: WatchRepository | None = None
+    # Why no model can be asked, or None when one can. Read by preflight for the
+    # scout, which needs ORBIT's model whether or not the ORBIT worker is on.
+    reasoning_unavailable: str | None = None
     closers: tuple[Closer, ...] = ()
 
     @property
@@ -310,9 +320,23 @@ def build_stack(
     )
     paper = PaperTradingService(sessions, RiskLimits(), settings.trading_mode, clock=tick)
     limits = limits_from_settings(settings)
+    watches: WatchRepository | None = None
+    promotion: PromotionRefresh | None = None
+    candidates: MarketReader | PromotedWatchCandidates = markets
+    if settings.early_scout_enabled:
+        watches = WatchRepository(sessions)
+        candidates = PromotedWatchCandidates(sessions=sessions, markets=markets, watches=watches)
+        promotion = PromotionRefresh(
+            settings=settings,
+            sessions=sessions,
+            source=candidates,
+            pause=supplied.pause,
+            clock=tick,
+            http=supplied.market_http,
+        )
     intake = CommanderIntakeService(
         cases=cases,
-        markets=markets,
+        markets=candidates,
         sessions=sessions,
         # The opening budget, enforced where cases are actually written. A
         # ceiling applied to the result would mean opening cases and then
@@ -386,6 +410,11 @@ def build_stack(
         clock=tick,
         pause=supplied.pause,
         acquisition=acquisition,
+        promotion=promotion,
+        watches=watches,
+        reasoning_unavailable=None
+        if supplied.reasoning is not None
+        else supplied.reasoning_unavailable,
         closers=supplied.closers,
     )
 

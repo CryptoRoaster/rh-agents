@@ -392,6 +392,19 @@ class CaseProgress(Immutable):
     replayed: bool = Field(default=False, strict=True)
 
 
+class PromotionReading(Immutable):
+    """What the early-scout promotion stage did before intake, when enabled.
+
+    Present only with `EARLY_SCOUT_ENABLED`. Intake then reads PROMOTABLE
+    watches rather than every fresh new pool; this says how many of them were
+    re-observed by exact locator first and how many cases they formed.
+    """
+
+    refreshed: int = Field(default=0, ge=0)
+    stop: Code | None = None
+    cases_formed: int = Field(default=0, ge=0)
+
+
 class RunSummary(Immutable):
     """One structured account of one pass, safe to print anywhere.
 
@@ -426,6 +439,7 @@ class RunSummary(Immutable):
     # Absent when acquisition is switched off, which is the ordinary case and
     # is what every run before this contract did.
     acquisition: MarketAcquisition | None = None
+    promotion: PromotionReading | None = None
     cases: tuple[CaseProgress, ...] = Field(default=(), max_length=64)
     risk_requests: int = Field(default=0, ge=0)
     fills: int = Field(default=0, ge=0)

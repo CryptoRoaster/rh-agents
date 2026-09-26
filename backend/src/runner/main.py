@@ -1,14 +1,18 @@
-"""One bounded PAPER run, or one look at whether it could happen.
+"""One bounded PAPER run, one scout run, or one look at whether it could happen.
 
     python -m src.runner.main --once        perform exactly one bounded pass
+    python -m src.runner.main --scout-once  one early-discovery scout run; never trades
     python -m src.runner.main --preflight   check this configuration, change nothing
 
-Exactly one of the two is required and they cannot be combined. They make
-opposite promises — one is allowed to trade and one writes nothing at all — and
-a single invocation that did both would leave an operator unable to say which
-of them produced what they are reading. There is no daemon flag, no interval and
-no scheduler: a run happens because somebody asked for one, and ends when it has
-nothing left it may do.
+Exactly one mode is required and they cannot be combined. `--scout-once`
+discovers, watches and reviews young markets and opens no TradeCase, asks no
+risk question and executes nothing: see `src.scout.service`.
+
+`--once` and `--preflight` make opposite promises — one is allowed to trade and
+one writes nothing at all — and a single invocation that did both would leave
+an operator unable to say which of them produced what they are reading. There is
+no daemon flag, no interval and no scheduler: a run happens because somebody
+asked for one, and ends when it has nothing left it may do.
 
 Nothing about this is reachable from the web process. The API never reads
 `PAPER_RUNNER_ENABLED` and starts no task, so booting it can never begin a run.
@@ -57,6 +61,8 @@ from src.runner.preflight import PreflightReading, preflight
 from src.runner.preflight import refused as preflight_refused
 from src.runner.preflight import unavailable as preflight_unavailable
 from src.runner.service import BoundedPaperRun
+from src.scout.models import ScoutSummary
+from src.scout.service import run_scout
 
 
 async def run_once(settings: Settings, *, ports: RunnerPorts | None = None) -> RunReading:
@@ -100,7 +106,7 @@ async def check_only(settings: Settings, *, ports: RunnerPorts | None = None) ->
     return await preflight(settings, ports=ports)
 
 
-def render(reading: RunReading | PreflightReading) -> str:
+def render(reading: RunReading | PreflightReading | ScoutSummary) -> str:
     """The structured account, as one JSON object of codes and counts.
 
     Safe by construction: every value is an identifier this system already
@@ -126,6 +132,11 @@ def main() -> int:
         action="store_true",
         help="Report what this configuration could do. Writes nothing and calls nobody.",
     )
+    mode.add_argument(
+        "--scout-once",
+        action="store_true",
+        help="One early-discovery scout run. Opens no case and executes nothing.",
+    )
     arguments = parser.parse_args()
     try:
         settings = Settings()
@@ -140,6 +151,8 @@ def main() -> int:
         return int(refused.exit_code)
     if arguments.preflight:
         return _preflight(settings)
+    if arguments.scout_once:
+        return _scout(settings)
     try:
         reading = asyncio.run(run_once(settings))
     except KeyboardInterrupt:
@@ -152,6 +165,18 @@ def main() -> int:
         failure = TechnicalFailure(reason="RUN_STARTUP_FAILED")
         print(render(failure))
         return int(failure.exit_code)
+    print(render(reading))
+    return int(reading.exit_code)
+
+
+def _scout(settings: Settings) -> int:
+    """One scout run, reported whatever happens to it, under the same exit codes."""
+    try:
+        reading: RunReading | ScoutSummary = asyncio.run(run_scout(settings))
+    except KeyboardInterrupt:
+        reading = TechnicalFailure(reason="SCOUT_INTERRUPTED")
+    except (SQLAlchemyError, OSError, ValueError):
+        reading = TechnicalFailure(reason="SCOUT_STARTUP_FAILED")
     print(render(reading))
     return int(reading.exit_code)
 

@@ -144,19 +144,30 @@ class OrbitCandidateContext(Immutable):
         )
 
 
-class OrbitTaskInput(Immutable):
-    """The exact snapshot ORBIT reasons over, plus the identity it must not stray from.
+class OrbitEvaluationInput(Immutable):
+    """Exactly what one ORBIT evaluation is about, and nothing that says who asked.
 
-    ``discovery_reference`` and ``supersedes_evidence_id`` are runtime bookkeeping
-    used to build the evidence envelope. They are never shown to the model, which
-    sees only ``candidate``.
+    Shared by every caller of ORBIT. The TradeCase worker and the early-discovery
+    scout both build one of these from a recorded snapshot, so the document the
+    model sees, the digest of it and the validation of the answer are the same
+    whichever of them is asking.
+    """
+
+    candidate: OrbitCandidateContext
+    discovery_liquidity_floor_usd: PolicyAmount
+    evaluated_at: AwareDatetime
+
+
+class OrbitTaskInput(OrbitEvaluationInput):
+    """An evaluation input plus the workflow bookkeeping of one TradeCase task.
+
+    ``trade_case_id``, ``task_id``, ``discovery_reference`` and
+    ``supersedes_evidence_id`` build the evidence envelope. They are never shown
+    to the model, which sees only ``candidate``.
     """
 
     trade_case_id: UUID
     task_id: UUID
-    candidate: OrbitCandidateContext
-    discovery_liquidity_floor_usd: PolicyAmount
-    evaluated_at: AwareDatetime
     discovery_reference: UUID
     supersedes_evidence_id: UUID | None = None
 

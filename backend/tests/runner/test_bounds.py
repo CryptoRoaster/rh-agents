@@ -340,6 +340,8 @@ def test_the_summary_carries_no_secret_and_no_payload(risk_db):
         "intake_outcome_unknown",
         "intake_refusals",
         "acquisition",
+        # Counts and codes only; absent unless the early scout is enabled.
+        "promotion",
         "steps_taken",
         "steps_timed_out",
         "cases",
