@@ -43,6 +43,45 @@ from src.orchestration.workflow.service import TradeCaseService
 logger = logging.getLogger(__name__)
 
 
+async def active_case_exists(session: AsyncSession, pair_id: str) -> bool:
+    """Whether any live case exists for this market. See `_active_case`.
+
+    Module-level so a candidate source can ask COMMANDER's exact question
+    before its limit is applied, rather than restating the rule.
+    """
+    row = await session.scalar(
+        select(TradeCaseRow.id)
+        .where(
+            TradeCaseRow.market_key == pair_id,
+            TradeCaseRow.status.notin_([item.value for item in TERMINAL_CASE_STATUSES]),
+        )
+        .limit(1)
+    )
+    return row is not None
+
+
+async def market_barring(session: AsyncSession, pair_id: str) -> TradeCaseStatus | None:
+    """Which case, if any, has spoken for this market. See `_barred`.
+
+    `EXECUTED` wins over `RISK_REJECTED` when both appear, because it is the one
+    that left a position and the one whose successor has a contract.
+    """
+    rows = (
+        await session.scalars(
+            select(TradeCaseRow.status).where(
+                TradeCaseRow.market_key == pair_id,
+                TradeCaseRow.status.in_([item.value for item in MARKET_BARRING_CASE_STATUSES]),
+            )
+        )
+    ).all()
+    found = {TradeCaseStatus(item) for item in rows}
+    if TradeCaseStatus.EXECUTED in found:
+        return TradeCaseStatus.EXECUTED
+    if TradeCaseStatus.RISK_REJECTED in found:
+        return TradeCaseStatus.RISK_REJECTED
+    return None
+
+
 class SystemPaused(Exception):
     """A stop was in force when the opening transaction reached it."""
 
@@ -225,15 +264,7 @@ class CommanderIntakeService:
         active case per market", so that is the question asked.
         """
         async with self.sessions() as session:
-            row = await session.scalar(
-                select(TradeCaseRow.id)
-                .where(
-                    TradeCaseRow.market_key == candidate.pair_id,
-                    TradeCaseRow.status.notin_([item.value for item in TERMINAL_CASE_STATUSES]),
-                )
-                .limit(1)
-            )
-        return row is not None
+            return await active_case_exists(session, candidate.pair_id)
 
     async def _barred(self, candidate: MarketCandidate) -> TradeCaseStatus | None:
         """Whether *any* case for this market has spoken for it.
@@ -250,22 +281,7 @@ class CommanderIntakeService:
         one that left a position and the one whose successor has a contract.
         """
         async with self.sessions() as session:
-            rows = (
-                await session.scalars(
-                    select(TradeCaseRow.status).where(
-                        TradeCaseRow.market_key == candidate.pair_id,
-                        TradeCaseRow.status.in_(
-                            [item.value for item in MARKET_BARRING_CASE_STATUSES]
-                        ),
-                    )
-                )
-            ).all()
-        found = {TradeCaseStatus(item) for item in rows}
-        if TradeCaseStatus.EXECUTED in found:
-            return TradeCaseStatus.EXECUTED
-        if TradeCaseStatus.RISK_REJECTED in found:
-            return TradeCaseStatus.RISK_REJECTED
-        return None
+            return await market_barring(session, candidate.pair_id)
 
     async def _latest_terminal(
         self, candidate: MarketCandidate

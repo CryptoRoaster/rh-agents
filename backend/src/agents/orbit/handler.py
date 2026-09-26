@@ -13,19 +13,15 @@ task attempt, not on the model call.
 from dataclasses import dataclass
 from datetime import timedelta
 
-from src.agents.orbit.context import (
-    OrbitContextUnavailable,
-    orbit_input_digest,
-    reasoning_payload,
-)
+from src.agents.orbit.context import OrbitContextUnavailable
+from src.agents.orbit.evaluator import OrbitEvaluation, OrbitEvaluator
 from src.agents.orbit.models import (
     ORBIT_OUTPUT_SCHEMA_VERSION,
-    OrbitAssessment,
     OrbitClassification,
     OrbitTaskInput,
 )
-from src.agents.orbit.prompt import ORBIT_INSTRUCTIONS, ORBIT_PROMPT_HASH, ORBIT_PROMPT_VERSION
-from src.agents.orbit.validation import OrbitValidationError, validate_assessment
+from src.agents.orbit.prompt import ORBIT_PROMPT_HASH, ORBIT_PROMPT_VERSION
+from src.agents.orbit.validation import OrbitValidationError
 from src.core.models import AgentRole
 from src.orchestration.worker.capabilities import OrbitCapabilities
 from src.orchestration.worker.models import (
@@ -43,12 +39,7 @@ from src.orchestration.workflow.models import (
     EvidenceSubmission,
     EvidenceType,
 )
-from src.reasoning.models import (
-    ReasoningErrorCategory,
-    ReasoningFailure,
-    ReasoningRequest,
-    ReasoningResult,
-)
+from src.reasoning.models import ReasoningErrorCategory, ReasoningFailure
 from src.reasoning.provider import ReasoningProvider
 
 ORBIT_TASK_TYPE = "VERIFY_DISCOVERY"
@@ -119,44 +110,37 @@ class OrbitWorkerHandler:
                 category=WorkerFailureCategory.INTERNAL, reason_code="CONTEXT_SCHEMA_MISMATCH"
             )
 
-        digest = orbit_input_digest(task_input)
-        request: ReasoningRequest[OrbitAssessment] = ReasoningRequest(
-            instructions=ORBIT_INSTRUCTIONS,
-            data=reasoning_payload(task_input),
-            output_model=OrbitAssessment,
+        evaluator = OrbitEvaluator(
+            provider=self.provider,
             max_output_tokens=self.max_output_tokens,
-            timeout_seconds=self.timeout.total_seconds(),
+            timeout=self.timeout,
         )
         try:
-            result: ReasoningResult[OrbitAssessment] = await self.provider.generate_structured(
-                request
-            )
+            result = await evaluator.evaluate(task_input)
         except ReasoningFailure as error:
             return TaskFailureReport(
                 category=PROVIDER_FAILURES.get(error.category, WorkerFailureCategory.INTERNAL),
                 reason_code=error.category.value,
             )
-        try:
-            validate_assessment(result.output, task_input)
         except OrbitValidationError as error:
             # Contradicted output is never persisted, not even as UNKNOWN evidence.
             return TaskFailureReport(
                 category=WorkerFailureCategory.INVALID_RESULT, reason_code=error.reason_code
             )
         return EvidenceTaskResult(
-            submission=self._submission(lease, task_input, result, digest),
-            result_key=f"orbit:{digest}",
+            submission=self._submission(lease, task_input, result),
+            result_key=f"orbit:{result.input_digest}",
         )
 
     def _submission(
         self,
         lease: TaskLease,
         task_input: OrbitTaskInput,
-        result: ReasoningResult[OrbitAssessment],
-        digest: str,
+        result: OrbitEvaluation,
     ) -> EvidenceSubmission:
         """Build the envelope from runtime facts. The model fills only the payload."""
-        assessment = result.output
+        assessment = result.assessment
+        digest = result.input_digest
         gaps = tuple(code.value for code in assessment.data_gaps)
         status = EVIDENCE_STATUS[assessment.classification]
         return EvidenceSubmission(

@@ -8,7 +8,7 @@ from a worker.
 
 import json
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from typing import Protocol
@@ -17,6 +17,7 @@ from uuid import UUID
 from src.agents.orbit.models import (
     ObservedMeasurement,
     OrbitCandidateContext,
+    OrbitEvaluationInput,
     OrbitTaskInput,
     age_seconds,
 )
@@ -93,29 +94,11 @@ class OrbitContextReader:
             raise OrbitContextUnavailable("MARKET_OBSERVATION_MISSING")
         if snapshot.pair.pair_id != trade_case.market.pair_id:
             raise OrbitContextUnavailable("MARKET_IDENTITY_MISMATCH")
-        now = self.clock.now()
-        # Discovery freshness is its own policy, deliberately separate from the
-        # execution and risk thresholds that ANCHOR and SENTINEL apply later.
-        if snapshot.observed_at > now:
-            raise OrbitContextUnavailable("MARKET_OBSERVATION_IN_FUTURE")
-        if now - snapshot.freshness_at > self.max_input_age:
-            raise OrbitContextUnavailable("MARKET_OBSERVATION_TOO_STALE")
-        candidate = OrbitCandidateContext(
-            snapshot_id=snapshot.id,
-            pair_id=snapshot.pair.pair_id,
-            chain=snapshot.chain,
-            network=snapshot.network,
-            venue=snapshot.pair.venue,
-            base_symbol=snapshot.pair.base.symbol,
-            quote_symbol=snapshot.pair.quote.symbol,
-            provider=snapshot.provider,
-            is_fixture=snapshot.is_fixture,
-            observed_at=snapshot.observed_at,
-            age_seconds=age_seconds(snapshot.observed_at, now),
-            price=measurement_view(snapshot.price),
-            liquidity=measurement_view(snapshot.liquidity),
-            volume=measurement_view(snapshot.volume),
-            volume_window_seconds=snapshot.volume.window_seconds,
+        evaluation = evaluation_input(
+            snapshot,
+            liquidity_floor_usd=self.liquidity_floor_usd,
+            max_input_age=self.max_input_age,
+            now=self.clock.now(),
         )
         # Opening a case records a provenance discovery envelope. ORBIT's verified
         # assessment supersedes it, so only the one identifier it must replace is
@@ -123,14 +106,56 @@ class OrbitContextReader:
         current = active_evidence(await self.cases.evidence(trade_case_id))
         existing = current.get(EvidenceType.DISCOVERY)
         return OrbitTaskInput(
+            **dict(evaluation),
             trade_case_id=trade_case_id,
             task_id=task_id,
-            candidate=candidate,
-            discovery_liquidity_floor_usd=self.liquidity_floor_usd,
-            evaluated_at=now,
             discovery_reference=trade_case.originating_discovery_reference,
             supersedes_evidence_id=existing.evidence_id if existing is not None else None,
         )
+
+
+def evaluation_input(
+    snapshot: MarketSnapshot,
+    *,
+    liquidity_floor_usd: Decimal,
+    max_input_age: timedelta,
+    now: datetime,
+) -> OrbitEvaluationInput:
+    """The ORBIT input for one recorded snapshot, or a typed refusal.
+
+    The one place a snapshot becomes what ORBIT is shown. The TradeCase reader
+    above and the early-discovery scout both come through here, so a market
+    looks identical to ORBIT whoever is asking about it, and the same
+    freshness rule refuses it before any model is called.
+    """
+    # Discovery freshness is its own policy, deliberately separate from the
+    # execution and risk thresholds that ANCHOR and SENTINEL apply later.
+    if snapshot.observed_at > now:
+        raise OrbitContextUnavailable("MARKET_OBSERVATION_IN_FUTURE")
+    if now - snapshot.freshness_at > max_input_age:
+        raise OrbitContextUnavailable("MARKET_OBSERVATION_TOO_STALE")
+    candidate = OrbitCandidateContext(
+        snapshot_id=snapshot.id,
+        pair_id=snapshot.pair.pair_id,
+        chain=snapshot.chain,
+        network=snapshot.network,
+        venue=snapshot.pair.venue,
+        base_symbol=snapshot.pair.base.symbol,
+        quote_symbol=snapshot.pair.quote.symbol,
+        provider=snapshot.provider,
+        is_fixture=snapshot.is_fixture,
+        observed_at=snapshot.observed_at,
+        age_seconds=age_seconds(snapshot.observed_at, now),
+        price=measurement_view(snapshot.price),
+        liquidity=measurement_view(snapshot.liquidity),
+        volume=measurement_view(snapshot.volume),
+        volume_window_seconds=snapshot.volume.window_seconds,
+    )
+    return OrbitEvaluationInput(
+        candidate=candidate,
+        discovery_liquidity_floor_usd=liquidity_floor_usd,
+        evaluated_at=now,
+    )
 
 
 def _measurement_document(measurement: ObservedMeasurement) -> dict[str, object]:
@@ -145,7 +170,7 @@ def _measurement_document(measurement: ObservedMeasurement) -> dict[str, object]
     }
 
 
-def observation_document(task_input: OrbitTaskInput) -> dict[str, object]:
+def observation_document(task_input: OrbitEvaluationInput) -> dict[str, object]:
     """The exact document ORBIT is shown, built in one place.
 
     Both the provider payload and the input digest come from here, so the digest
@@ -174,7 +199,7 @@ def observation_document(task_input: OrbitTaskInput) -> dict[str, object]:
     }
 
 
-def orbit_input_digest(task_input: OrbitTaskInput) -> str:
+def orbit_input_digest(task_input: OrbitEvaluationInput) -> str:
     """Canonical fingerprint of exactly what ORBIT was shown.
 
     This identifies the input only. It is never a claim that the model's output is
@@ -192,7 +217,7 @@ def orbit_input_digest(task_input: OrbitTaskInput) -> str:
     return sha256(canonical.encode()).hexdigest()
 
 
-def reasoning_payload(task_input: OrbitTaskInput) -> dict[str, object]:
+def reasoning_payload(task_input: OrbitEvaluationInput) -> dict[str, object]:
     """The quoted data document handed to the provider, with no instructions in it."""
     document = observation_document(task_input)
     document["age_seconds"] = task_input.candidate.age_seconds

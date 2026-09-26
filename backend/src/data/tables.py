@@ -650,3 +650,126 @@ class WorkerTaskAttemptRow(Base):
     failure_category: Mapped[str | None] = mapped_column(String(40))
     runtime_version: Mapped[str] = mapped_column(String(40))
     correlation_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+
+
+class DiscoveryWatchRow(Base):
+    """One market the early-discovery scout found and keeps looking at.
+
+    Deliberately not a TradeCase. A case is a short-lived decision workflow that
+    ends in a verdict; a watch is a long-lived observation schedule that ends in
+    nothing more than PROMOTABLE or DORMANT. Mixing the two would either keep a
+    case open for days or throw a young market away after its first reading.
+
+    One row per market stream — provider, chain, network, pair and fixture flag —
+    so repeated discovery updates the same watch. `first_seen_at` is the source
+    instant of the first observation this system recorded, never a claim about
+    when the pool was created.
+    """
+
+    __tablename__ = "discovery_watches"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "chain",
+            "network",
+            "pair_id",
+            "is_fixture",
+            name="uq_discovery_watch_stream",
+        ),
+        CheckConstraint(
+            "status IN ('WATCHING', 'PROMOTABLE', 'DORMANT', 'RETIRED')",
+            name="discovery_watch_status",
+        ),
+        CheckConstraint("last_seen_at >= first_seen_at", name="discovery_watch_seen_order"),
+        CheckConstraint(
+            "orbit_checkpoint_index IS NULL OR orbit_checkpoint_index >= 0",
+            name="discovery_watch_checkpoint_index",
+        ),
+        Index("ix_discovery_watches_orbit_due", "status", "next_orbit_review_at"),
+        Index("ix_discovery_watches_history_due", "status", "next_history_review_at"),
+        Index("ix_discovery_watches_first_seen", "first_seen_at", "pair_id"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    schema_version: Mapped[int] = mapped_column(Integer)
+    policy_version: Mapped[str] = mapped_column(String(40))
+    provider: Mapped[str] = mapped_column(String(200))
+    chain: Mapped[str] = mapped_column(String(60))
+    network: Mapped[str] = mapped_column(String(60))
+    pair_id: Mapped[str] = mapped_column(String(512))
+    is_fixture: Mapped[bool] = mapped_column(Boolean)
+    # The canonical `MarketIdentity`, pool locator included. Refresh addresses
+    # the market by this and nothing else.
+    market_payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    latest_snapshot_id: Mapped[UUID] = mapped_column(Uuid)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20))
+    next_orbit_review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The last checkpoint an ORBIT review was taken for. NULL before the first.
+    orbit_checkpoint_index: Mapped[int | None] = mapped_column(Integer)
+    next_history_review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    latest_vector_sufficiency: Mapped[str | None] = mapped_column(String(60))
+    vector_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reason_code: Mapped[str] = mapped_column(String(80))
+    last_promoted_trade_case_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("trade_cases.id", ondelete="SET NULL")
+    )
+
+
+class DiscoveryWatchAssessmentRow(Base):
+    """One scout ORBIT review of one watch at one checkpoint. Append-only.
+
+    Discovery history, never case evidence: nothing reads these rows into a
+    TradeCase. A failed review is recorded as FAILED with its reason and no
+    classification, so a contradicted answer can never be read back as a valid
+    one.
+    """
+
+    __tablename__ = "discovery_watch_assessments"
+    __table_args__ = (
+        UniqueConstraint("watch_id", "checkpoint_index", name="uq_discovery_watch_checkpoint"),
+        CheckConstraint(
+            "status IN ('COMPLETED', 'FAILED')", name="discovery_watch_assessment_status"
+        ),
+        CheckConstraint(
+            "(status = 'COMPLETED') = (classification IS NOT NULL)",
+            name="discovery_watch_assessment_classified",
+        ),
+        CheckConstraint(
+            "(status = 'FAILED') = (failure_reason IS NOT NULL)",
+            name="discovery_watch_assessment_failure_named",
+        ),
+        CheckConstraint(
+            "checkpoint_index >= 0 AND checkpoint_seconds >= 0",
+            name="discovery_watch_assessment_checkpoint",
+        ),
+        Index("ix_discovery_watch_assessments_watch_time", "watch_id", "assessed_at"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    watch_id: Mapped[UUID] = mapped_column(ForeignKey("discovery_watches.id", ondelete="RESTRICT"))
+    snapshot_id: Mapped[UUID] = mapped_column(Uuid)
+    assessed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    checkpoint_index: Mapped[int] = mapped_column(Integer)
+    checkpoint_seconds: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20))
+    failure_reason: Mapped[str | None] = mapped_column(String(80))
+    classification: Mapped[str | None] = mapped_column(String(40))
+    strength: Mapped[str | None] = mapped_column(String(20))
+    reason_codes: Mapped[list[str]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+    data_gaps: Mapped[list[str]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+    cited_observation_ids: Mapped[list[str]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql")
+    )
+    summary: Mapped[str | None] = mapped_column(String(400))
+    input_digest: Mapped[str] = mapped_column(String(64))
+    policy_version: Mapped[str] = mapped_column(String(40))
+    prompt_version: Mapped[str] = mapped_column(String(40))
+    prompt_hash: Mapped[str] = mapped_column(String(64))
+    output_schema_version: Mapped[int] = mapped_column(Integer)
+    reasoning_provider: Mapped[str | None] = mapped_column(String(200))
+    reasoning_model: Mapped[str | None] = mapped_column(String(200))
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)

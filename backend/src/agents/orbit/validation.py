@@ -10,8 +10,8 @@ from decimal import Decimal
 from src.agents.orbit.models import (
     ObservedMeasurement,
     OrbitAssessment,
+    OrbitEvaluationInput,
     OrbitReasonCode,
-    OrbitTaskInput,
 )
 from src.markets.models import Availability
 
@@ -69,7 +69,7 @@ def _check_measurement(
             raise OrbitValidationError("CONTRADICTED_AVAILABILITY")
 
 
-def validate_assessment(assessment: OrbitAssessment, task_input: OrbitTaskInput) -> None:
+def validate_assessment(assessment: OrbitAssessment, task_input: OrbitEvaluationInput) -> None:
     """Reject output that strays from the market, the data or the observations given."""
     candidate = task_input.candidate
     if assessment.pair_id != candidate.pair_id:

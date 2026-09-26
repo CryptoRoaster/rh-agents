@@ -264,6 +264,27 @@ class Settings(BaseSettings):
     # The whole acquisition stage, measured monotonically and additionally
     # bounded by whatever is left of the run's own runtime.
     paper_runner_acquisition_max_seconds: int = Field(default=60, ge=1, le=600)
+    # Early discovery scout. Disabled by default, and it grants no trading
+    # authority of any kind: `python -m src.runner.main --scout-once` discovers
+    # new pools, keeps a persistent watch on each, asks ORBIT about them at fixed
+    # checkpoints and checks VECTOR history maturity — and never opens a case.
+    # With it enabled, the full PAPER run takes its candidates only from
+    # PROMOTABLE watches instead of from whatever new pool was recorded last.
+    #
+    # Every bound below is per scout run. None of them is a strategy: nothing
+    # here ranks, floors or filters markets by size, volume or opinion.
+    early_scout_enabled: bool = False
+    # Pools one new-pool read may bring back, per configured chain.
+    early_scout_max_discovery_pools: int = Field(default=10, ge=1, le=20)
+    early_scout_max_new_watches_per_run: int = Field(default=10, ge=1, le=50)
+    # Paid model calls. One per due watch at most, and never more than this.
+    early_scout_max_orbit_reviews_per_run: int = Field(default=1, ge=0, le=10)
+    # History reads for the structural VECTOR check. No model call is involved.
+    early_scout_max_history_checks_per_run: int = Field(default=1, ge=0, le=10)
+    # Watches re-observed by exact pool locator in one run.
+    early_scout_max_refresh_markets_per_run: int = Field(default=1, ge=0, le=10)
+    # Recorded market streams from before the scout existed, adopted per run.
+    early_scout_max_bootstrap_streams: int = Field(default=100, ge=0, le=100)
     # Where executable quotes come from. "disabled" fails closed: without a quote
     # source ANCHOR establishes no capacity at all, which is the correct outcome
     # rather than a gap to be filled with pool liquidity multiplied by a guess.

@@ -191,6 +191,7 @@ class Preflight:
         checks.append(self._chains())
         checks.extend(self._budgets(stack))
         checks.extend(self._roles(stack))
+        checks.extend(self._scout(stack))
         checks.append(await self._schema(errors))
         checks.append(await self._pause(errors))
         checks.extend(self._unverifiable())
@@ -310,6 +311,55 @@ class Preflight:
                 )
             else:
                 found.append(_satisfied(name, "Deliberately not enabled."))
+        return found
+
+    def _scout(self, stack: RunnerStack) -> list[Check]:
+        """The early-discovery scout, only when it is switched on.
+
+        Reported beside the run's own checks rather than folded into them: the
+        scout holds no trading authority, so nothing here asks for PAPER mode,
+        and nothing here makes a run more or less permitted than it was.
+        """
+        settings = self._settings
+        if not settings.early_scout_enabled:
+            return []
+        found: list[Check] = []
+        if settings.market_provider == "geckoterminal":
+            found.append(
+                _satisfied("EARLY_SCOUT_MARKET_PROVIDER", "New pools come from GeckoTerminal.")
+            )
+        else:
+            found.append(
+                _blocked(
+                    "EARLY_SCOUT_MARKET_PROVIDER",
+                    "EARLY_SCOUT_PROVIDER_NOT_GECKOTERMINAL",
+                    "The scout discovers and re-observes through GeckoTerminal only.",
+                )
+            )
+        if stack.reasoning_unavailable is None:
+            found.append(
+                _satisfied(
+                    "EARLY_SCOUT_REASONING", "ORBIT's model is configured; nothing is called."
+                )
+            )
+        else:
+            found.append(
+                _blocked(
+                    "EARLY_SCOUT_REASONING",
+                    stack.reasoning_unavailable,
+                    "Scout reviews use ORBIT, and no model is configured for it.",
+                )
+            )
+        found.append(
+            _satisfied(
+                "EARLY_SCOUT_BUDGETS",
+                f"discovery pools {settings.early_scout_max_discovery_pools}, new watches "
+                f"{settings.early_scout_max_new_watches_per_run}, reviews "
+                f"{settings.early_scout_max_orbit_reviews_per_run}, history checks "
+                f"{settings.early_scout_max_history_checks_per_run}, refreshes "
+                f"{settings.early_scout_max_refresh_markets_per_run}.",
+            )
+        )
         return found
 
     # ---------------------------------------------------------------- database

@@ -77,6 +77,7 @@ from src.runner.models import (
     CaseProgress,
     ConfigurationRefused,
     MarketAcquisition,
+    PromotionReading,
     RunLimits,
     RunReading,
     RunStop,
@@ -152,6 +153,7 @@ class Account:
     stop: RunStop = RunStop.NOTHING_LEFT_TO_DO
     # What this run asked the market provider for, before it traded anything.
     acquisition: MarketAcquisition | None = None
+    promotion: PromotionReading | None = None
     candidates_seen: int = 0
     cases_opened: int = 0
     intake_refusals: tuple[str, ...] = ()
@@ -239,6 +241,7 @@ class BoundedPaperRun:
                 # observation may or may not have been recorded. Both end the
                 # pass before a single mutating trading stage runs.
                 return self._summary(started, account)
+            await self._promote(account, deadline)
             await self._intake(account, deadline)
             if account.intake_unknown:
                 # The cycle committed an unknown number of cases, and this run
@@ -368,6 +371,37 @@ class BoundedPaperRun:
             if not account.admits(case.id):
                 break
             account.cases_opened += 1
+        await self._promoted(account, outcome.opened)
+
+    async def _promote(self, account: Account, deadline: Deadline) -> None:
+        """Re-observe PROMOTABLE watches by locator, when the early scout is on.
+
+        A prelude to intake and never a permission: it records observations and
+        nothing else. A provider failure leaves intake to work on whatever is
+        recorded, exactly as a failed acquisition does.
+        """
+        stage = self.stack.promotion
+        if stage is None:
+            return
+        if deadline.expired:
+            account.promotion = PromotionReading(stop="TIME_BUDGET_REACHED")
+            return
+        try:
+            refreshed, stop = await self._bounded(stage.execute(), deadline)
+        except TimeoutError:
+            refreshed, stop = 0, "TIME_BUDGET_REACHED"
+        account.promotion = PromotionReading(refreshed=refreshed, stop=stop)
+
+    async def _promoted(self, account: Account, opened: Any) -> None:
+        """Remember which case each PROMOTABLE watch formed. Audit only."""
+        watches = self.stack.watches
+        if watches is None or account.promotion is None:
+            return
+        formed = 0
+        for case in opened:
+            await watches.mark_promoted(case.market.pair_id, case.id, self.stack.clock.now())
+            formed += 1
+        account.promotion = account.promotion.model_copy(update={"cases_formed": formed})
 
     async def _work(self, account: Account, deadline: Deadline) -> None:
         """Let every available role take steps until nobody can claim anything.
@@ -878,6 +912,7 @@ class BoundedPaperRun:
             limits=self.stack.limits,
             roles=self.stack.roles,
             acquisition=account.acquisition,
+            promotion=account.promotion,
             candidates_seen=account.candidates_seen,
             cases_opened=account.cases_opened,
             intake_refusals=account.intake_refusals,
