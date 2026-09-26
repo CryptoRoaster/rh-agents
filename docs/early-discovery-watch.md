@@ -124,3 +124,37 @@ is never bypassed.
 
 Streams recorded before the scout existed are adopted by a bounded, idempotent
 application bootstrap. Migration `0012` creates only the schema.
+
+## Provider identity and coverage
+
+GeckoTerminal names a chain's **native asset** as a token resource at the zero
+address (`bsc_0x0000…0000`, declared as BNB with 18 decimals). This is the same
+convention Uniswap V4 uses for native currency, and four.meme bonding curves
+trade against native BNB. Normalization accepts the zero address as a token
+only in that exact role:
+
+- the token resource must be bound to that same address on the resolved
+  network, as for every token;
+- it must declare the chain's native decimals (`Chain.native_decimals`, 18 on
+  both configured chains);
+- any other zero address, a pool at the zero address, base = quote, a
+  contradicting resource binding, another network or another provider is still
+  `provider_identity`.
+
+The canonical asset id is `chain:mainnet:0x0000…0000`, so every downstream
+contract that reads a token address sees the native sentinel exactly as the
+provider sent it. ATLAS already refuses a zero base token (`TOKEN_ADDRESS_ZERO`),
+and SIGNAL treats a zero base token as having no address. No symbol or name is
+used for identity at any point.
+
+Each scout summary reports discovery coverage:
+
+```
+discovered = valid_markets + provider_identity_rejects + other_provider_rejects
+identity acceptance rate = valid_markets / discovered
+watch creation rate      = watches_created / valid_markets
+```
+
+A live BSC `new_pools` sample on 2026-09-26 contained 20 pools. 10 of them were
+rejected, all at this one rule (8 four.meme curves and 2 Uniswap V4 pools, each
+quoted in native BNB), and there were no other identity failures.

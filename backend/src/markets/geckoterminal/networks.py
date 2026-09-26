@@ -20,11 +20,15 @@ class Chain:
     name: str
     chain_id: int
     platform: str
+    # Decimals of the chain's native asset. GeckoTerminal names that asset by the
+    # zero address, and these decimals are what it must declare to be accepted
+    # as it; see `adapter.token_address`.
+    native_decimals: int = 18
 
 
 CHAINS = {
-    "robinhood": Chain("robinhood", 4663, "robinhood"),
-    "bsc": Chain("bsc", 56, "binance-smart-chain"),
+    "robinhood": Chain("robinhood", 4663, "robinhood", native_decimals=18),
+    "bsc": Chain("bsc", 56, "binance-smart-chain", native_decimals=18),
 }
 
 

@@ -58,7 +58,7 @@ from src.core.clock import Clock, SystemClock
 from src.core.config import Settings
 from src.data.database import connect
 from src.markets.geckoterminal.adapter import GeckoTerminalAdapter
-from src.markets.geckoterminal.errors import ProviderError
+from src.markets.geckoterminal.errors import IdentityError, ProviderError
 from src.markets.geckoterminal.networks import CHAINS, Chain, NetworkDirectory, selected_chains
 from src.markets.geckoterminal.ohlcv import GeckoTerminalOhlcvSource
 from src.markets.geckoterminal.transport import GeckoTerminalTransport
@@ -144,6 +144,8 @@ class Tally:
     bootstrapped: int = 0
     discovered: int = 0
     valid_markets: int = 0
+    provider_identity_rejects: int = 0
+    other_provider_rejects: int = 0
     rejections: dict[str, int] = field(default_factory=dict)
     watches_created: int = 0
     watches_updated: int = 0
@@ -276,6 +278,10 @@ class EarlyScoutCycle:
                 tally.discovered += adapter.discovered
                 for code, count in adapter.rejections.items():
                     tally.rejections[code.upper()] = tally.rejections.get(code.upper(), 0) + count
+                    if code == IdentityError.code:
+                        tally.provider_identity_rejects += count
+                    else:
+                        tally.other_provider_rejects += count
             tally.valid_markets += len(pairs)
             for pair in pairs:
                 snapshot = await self._record(adapter, pair, recorder, tally)
@@ -630,6 +636,8 @@ class EarlyScoutCycle:
             bootstrapped=tally.bootstrapped,
             discovered=tally.discovered,
             valid_markets=tally.valid_markets,
+            provider_identity_rejects=tally.provider_identity_rejects,
+            other_provider_rejects=tally.other_provider_rejects,
             rejections=tuple(sorted(tally.rejections))[:32],
             watches_created=tally.watches_created,
             watches_updated=tally.watches_updated,
