@@ -210,9 +210,7 @@ async def test_the_timeline_is_chronological_and_shows_failures_and_coalescing(c
     )
     watch = await watch_id(sessions, 0)
     async with sessions() as session:
-        before = await session.scalar(
-            select(func.count()).select_from(DiscoveryWatchAssessmentRow)
-        )
+        before = await session.scalar(select(func.count()).select_from(DiscoveryWatchAssessmentRow))
     timeline = (await http.get(f"/api/scout/watches/{watch}/assessments")).json()
     assert [item["checkpoint_seconds"] for item in timeline] == [0, 10800]
     assert timeline[0]["status"] == "COMPLETED" and timeline[0]["classification"]
