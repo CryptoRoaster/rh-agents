@@ -19,7 +19,7 @@ The shapes below keep the provider's structure; every address is synthetic.
 """
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -228,3 +228,62 @@ async def test_the_native_asset_on_another_network_resource_is_rejected():
     pools[0]["relationships"]["quote_token"]["data"]["id"] = wrong["id"]
     adapter, pairs = await discover(pools, [token(MEME, "MEME"), wrong])
     assert pairs == [] and adapter.rejections == {"provider_identity": 1}
+
+
+# ------------------------------------------------ OHLCV orientation, native quote
+#
+# Verified live on 2026-09-26: for a four.meme pool quoted in native BNB,
+# GeckoTerminal's OHLCV `meta.quote.address` is the zero address itself, so the
+# unchanged orientation check accepts the canonical native quote as-is.
+
+
+def native_quoted_market():
+    from src.markets.models import MarketIdentity
+
+    return MarketIdentity(
+        provider="geckoterminal",
+        chain="bsc",
+        network="mainnet",
+        pair_id=f"bsc:mainnet:contract_address:{MEME}",
+        base_asset_id=f"bsc:mainnet:{MEME}",
+        quote_asset_id=f"bsc:mainnet:{NATIVE}",
+        venue="four-meme",
+        is_fixture=False,
+    )
+
+
+async def test_a_native_quote_passes_the_ohlcv_orientation_check():
+    from tests.markets.test_ohlcv import ANCHOR, body, fetch, rows
+
+    settings = Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://test@localhost/test",
+        market_provider="geckoterminal",
+        market_chains="bsc",
+    )
+    history = await fetch(
+        settings,
+        body(rows(3), base=MEME, quote=NATIVE),
+        now=ANCHOR + timedelta(hours=1),
+        market=native_quoted_market(),
+    )
+    assert history.quote_asset_id == f"bsc:mainnet:{NATIVE}"
+    assert len(history.bars) == 3
+
+
+async def test_an_ohlcv_quote_other_than_the_native_asset_is_refused():
+    from tests.markets.test_ohlcv import ANCHOR, body, fetch, refuses, rows
+
+    settings = Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://test@localhost/test",
+        market_provider="geckoterminal",
+        market_chains="bsc",
+    )
+    with refuses("MARKET_HISTORY_PROVIDER_IDENTITY"):
+        await fetch(
+            settings,
+            body(rows(3), base=MEME, quote=USDT),
+            now=ANCHOR + timedelta(hours=1),
+            market=native_quoted_market(),
+        )
