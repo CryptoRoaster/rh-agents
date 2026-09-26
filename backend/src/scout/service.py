@@ -75,7 +75,7 @@ from src.reasoning.provider import ReasoningProvider
 from src.runner.models import ConfigurationRefused
 from src.scout.models import DiscoveryWatch, ScoutReview, ScoutSummary, WatchAssessment
 from src.scout.policy import EARLY_SCOUT_V1, EarlyScoutPolicy, WatchStatus
-from src.scout.repository import SyncResult, WatchRepository
+from src.scout.repository import SyncResult, WatchRepository, refreshed_identity_contradicts
 
 ScoutReading = ScoutSummary | ConfigurationRefused
 
@@ -415,9 +415,7 @@ class EarlyScoutCycle:
         if pair is None:
             await self._watches.note(watch.id, "MARKET_NOT_RETURNED", now)
             return None
-        if pair.market_identity.model_copy(update={"pool_locator": None}) != (
-            watch.market.model_copy(update={"pool_locator": None})
-        ):
+        if refreshed_identity_contradicts(watch.market, pair.market_identity):
             # The same pool now names a different market. Fail closed.
             await self._watches.retire(watch.id, "MARKET_IDENTITY_MISMATCH", now)
             tally.retired_new += 1

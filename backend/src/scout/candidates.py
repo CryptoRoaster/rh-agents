@@ -38,7 +38,7 @@ from src.markets.recorder import MarketRecorder, ObservationConflict, record_pai
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.commander.intake import active_case_exists, market_barring
 from src.scout.models import DiscoveryWatch
-from src.scout.repository import SyncResult, WatchRepository
+from src.scout.repository import SyncResult, WatchRepository, refreshed_identity_contradicts
 
 # How many PROMOTABLE watches one intake read may walk past while looking for
 # eligible ones. A bound on the scan, not on what may be opened.
@@ -153,6 +153,14 @@ class PromotionRefresh:
                     pair = answered.get(watch.pair_id)
                     if pair is None:
                         continue
+                    if refreshed_identity_contradicts(watch.market, pair.market_identity):
+                        # The exact locator now names another market. Fail closed
+                        # before anything is recorded, exactly as the scout does, so
+                        # this reading can never reach intake.
+                        await self.source.watches.retire(
+                            watch.id, "MARKET_IDENTITY_MISMATCH", self.clock.now()
+                        )
+                        continue
                     try:
                         written = await record_pair_reporting(adapter, pair, recorder)
                     except (ObservationConflict, ValueError):
@@ -160,6 +168,10 @@ class PromotionRefresh:
                     result = await self.source.watches.sync(
                         written.observation, now=self.clock.now(), allow_create=False
                     )
-                    if result is not SyncResult.CONFLICT:
-                        refreshed += 1
+                    if result is SyncResult.CONFLICT:
+                        await self.source.watches.retire(
+                            watch.id, "MARKET_IDENTITY_MISMATCH", self.clock.now()
+                        )
+                        continue
+                    refreshed += 1
         return refreshed, None

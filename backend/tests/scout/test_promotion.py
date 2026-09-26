@@ -192,3 +192,94 @@ async def test_the_promoted_case_still_needs_its_own_orbit_evidence(risk_db):
         ).all()
     assert rows, "the provenance envelope intake always records"
     assert all(row.payload.get("assessment") is None for row in rows)
+
+
+# ------------------------------------------------ exact-locator refresh before intake
+
+
+async def located_promotable(sessions, provider):
+    """A PROMOTABLE watch with a stored pool locator, its last reading 30h old."""
+    from src.core.clock import FixedClock
+    from src.scout.service import EarlyScoutCycle, ScoutPorts
+    from tests.scout.conftest import EchoOrbit, scout_settings
+
+    await EarlyScoutCycle(
+        scout_settings(),
+        sessions,
+        ports=ScoutPorts(reasoning=EchoOrbit(), market_http=provider.transport()),
+        clock=FixedClock(FIRST),
+    ).execute()
+    repository = WatchRepository(sessions)
+    watch = await repository.by_pair(located_pair())
+    assert watch is not None and watch.market.pool_locator is not None
+    await repository.settle_history(
+        watch.id,
+        expected_next=watch.next_history_review_at,
+        verdict="SUFFICIENT",
+        status=WatchStatus.PROMOTABLE,
+        next_at=None,
+        now=FIRST + EARLY_SCOUT_V1.history_checkpoints[0],
+    )
+    return await repository.by_pair(located_pair())
+
+
+def located_pair():
+    from tests.scout.conftest import POOLS, pair_id
+
+    return pair_id(POOLS[0])
+
+
+def refreshing(**overrides):
+    return scouted(market_provider="geckoterminal", market_chains="robinhood", **overrides)
+
+
+async def test_an_identity_conflict_on_refresh_retires_the_watch(risk_db):
+    """The exact locator now names another market: fail closed, open nothing."""
+    from src.runner.composition import RunnerPorts
+    from tests.atlas.conftest import QUOTE
+    from tests.runner.provider import pool
+    from tests.scout.conftest import POOLS, MarketProvider, young
+
+    _, sessions = risk_db
+    provider = MarketProvider(discovery=[young(0)])
+    await located_promotable(sessions, provider)
+    impostor = pool(POOLS[0], base="0x" + "ee" * 20, quote=QUOTE, price="0.002")
+    provider.discovery = []
+    provider.targeted = {POOLS[0]: impostor}
+
+    summary = await run(
+        sessions, refreshing(), NOW, ports=RunnerPorts(market_http=provider.transport())
+    )
+
+    watch = await WatchRepository(sessions).by_pair(located_pair())
+    assert provider.multi_requests, "the locator was asked about"
+    assert watch.status is WatchStatus.RETIRED
+    assert watch.reason_code == "MARKET_IDENTITY_MISMATCH"
+    assert watch.next_orbit_review_at is None and watch.next_history_review_at is None
+    assert summary.promotion.refreshed == 0
+    assert summary.cases_opened == 0
+    assert await cases_in(sessions) == []
+
+
+async def test_a_matching_exact_locator_refresh_feeds_intake(risk_db):
+    from src.runner.composition import RunnerPorts
+    from tests.scout.conftest import MarketProvider, young
+
+    _, sessions = risk_db
+    provider = MarketProvider(discovery=[young(0)])
+    watch = await located_promotable(sessions, provider)
+    provider.discovery = []
+    provider.targeted = {young(0)["attributes"]["address"]: young(0)}
+
+    summary = await run(
+        sessions, refreshing(), NOW, ports=RunnerPorts(market_http=provider.transport())
+    )
+
+    after = await WatchRepository(sessions).by_pair(located_pair())
+    assert after.status is WatchStatus.PROMOTABLE
+    assert after.last_seen_at == NOW
+    assert after.latest_snapshot_id != watch.latest_snapshot_id
+    assert summary.promotion.refreshed == 1
+    assert not provider.discovery_requests[1:], "no discovery scan in the full run"
+    assert summary.cases_opened == 1
+    assert await opened_for(sessions) == [watch.pair_id]

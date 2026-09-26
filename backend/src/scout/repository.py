@@ -106,6 +106,19 @@ def _assessment(row: DiscoveryWatchAssessmentRow) -> WatchAssessment:
     )
 
 
+def refreshed_identity_contradicts(stored: MarketIdentity, observed: MarketIdentity) -> bool:
+    """Whether a pool re-observed by its stored locator now names another market.
+
+    The one identity check for exact-locator refresh, used by the scout and by
+    the full run's promotion refresh alike. The locator is compared apart from
+    the rest: it is what was asked for, so the question is whether everything
+    else the answer says about the market still agrees with the watch.
+    """
+    return stored.model_copy(update={"pool_locator": None}) != observed.model_copy(
+        update={"pool_locator": None}
+    )
+
+
 def _same_market(stored: MarketIdentity, observed: MarketIdentity) -> bool:
     """Whether an observation describes the market a watch was opened for.
 
