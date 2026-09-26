@@ -44,31 +44,34 @@ from tests.riskrequest.conftest import (  # noqa: F401
 TEST_DATABASE = "postgresql+asyncpg://runner@localhost:5432/rh_agents_runner"
 
 
-def runner_settings(**overrides) -> Settings:
-    """A configuration that permits a run, stated in full.
+# A configuration that permits a run, stated in full. Every value a run needs is
+# set here explicitly. Nothing is defaulted into existence: an unset entry size or
+# cost basis is a refusal, which is the behaviour the rest of this system already
+# has.
+RUNNER_BASELINE = {
+    "database_url": TEST_DATABASE,
+    # The key is never used: every test that selects a provider supplies the
+    # port itself, and the setting exists only because a selected provider must
+    # be fully configured.
+    "anthropic_api_key": "unused-the-reasoning-port-is-supplied",
+    "trading_mode": "PAPER",
+    "paper_runner_enabled": True,
+    "paper_requested_notional_usd": "500",
+    "paper_fee_bps": "30",
+    "paper_slippage_bps": "50",
+    "paper_runner_max_seconds": 60,
+    "paper_runner_step_timeout_seconds": 10,
+}
 
-    Every value a run needs is set here explicitly. Nothing is defaulted into
-    existence: an unset entry size or cost basis is a refusal, which is the
-    behaviour the rest of this system already has.
+
+def runner_settings(**overrides) -> Settings:
+    """The baseline plus whatever a test states on top of it, and nothing else.
+
+    `Settings` reads `../.env` by design, which is how a deployment is
+    configured and exactly what a test must not be: a developer's own PAPER
+    setup would otherwise decide which roles run and how much a pass may do.
     """
-    base = {
-        "database_url": TEST_DATABASE,
-        # Stated rather than inherited. `Settings` still consults the ambient
-        # environment for anything a test leaves unset, so a value that happens
-        # to sit in a developer's `.env` would make a fixture pass there and
-        # fail everywhere else. The key is never used: every test that selects
-        # a provider supplies the port itself, and the setting exists only
-        # because a selected provider must be fully configured.
-        "anthropic_api_key": "unused-the-reasoning-port-is-supplied",
-        "trading_mode": "PAPER",
-        "paper_runner_enabled": True,
-        "paper_requested_notional_usd": "500",
-        "paper_fee_bps": "30",
-        "paper_slippage_bps": "50",
-        "paper_runner_max_seconds": 60,
-        "paper_runner_step_timeout_seconds": 10,
-    }
-    return Settings.model_validate({**base, **overrides})
+    return Settings(_env_file=None, **{**RUNNER_BASELINE, **overrides})
 
 
 async def record_market(sessions, now, *, age=FRESH, price=None, label=""):
