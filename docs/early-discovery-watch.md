@@ -116,14 +116,17 @@ is never bypassed.
 |---|---|
 | `EARLY_SCOUT_ENABLED` | `false` |
 | `EARLY_SCOUT_MAX_DISCOVERY_POOLS` | 10 per chain |
-| `EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN` | 10 |
-| `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN` | 1 |
+| `EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN` | 1 |
+| `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN` | 8 |
 | `EARLY_SCOUT_MAX_HISTORY_CHECKS_PER_RUN` | 1 |
 | `EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN` | 1 |
 | `EARLY_SCOUT_MAX_BOOTSTRAP_STREAMS` | 100 |
 
 Streams recorded before the scout existed are adopted by a bounded, idempotent
 application bootstrap. Migration `0012` creates only the schema.
+
+Operating the scout on a schedule, the cockpit and run history are covered in
+[scout-cockpit.md](scout-cockpit.md).
 
 ## Provider identity and coverage
 
