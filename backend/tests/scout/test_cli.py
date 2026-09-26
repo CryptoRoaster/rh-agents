@@ -46,7 +46,8 @@ def test_scout_settings_are_bounded_and_off_by_default():
     assert settings.early_scout_enabled is False
     assert settings.early_scout_max_orbit_reviews_per_run == 8
     assert settings.early_scout_max_history_checks_per_run == 1
-    assert settings.early_scout_max_refresh_markets_per_run == 1
+    # A due review of an older watch needs a fresh reading: refreshes match reviews.
+    assert settings.early_scout_max_refresh_markets_per_run == 8
     assert settings.early_scout_max_discovery_pools == 10
     assert settings.early_scout_max_new_watches_per_run == 1
     # Each watch is owed six reviews: the review budget covers the steady state.

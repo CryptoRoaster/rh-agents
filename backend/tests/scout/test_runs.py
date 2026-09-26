@@ -136,3 +136,57 @@ async def test_a_second_scout_run_gives_way_to_one_already_running(db):
     # And the lock is released after a normal run: the next one proceeds.
     after = await scout(sessions, T0, provider=MarketProvider(discovery=[young(0)]))
     assert after.stop == "COMPLETED"
+
+
+async def test_stale_due_watches_are_refreshed_in_one_batch_and_all_reviewed(db):
+    """Throughput: every review slot can be used, at one provider request per chain."""
+    _, sessions = db
+    three = [young(0), young(1), young(2)]
+    provider = MarketProvider(discovery=three, targeted=three)
+    await scout(
+        sessions,
+        T0,
+        provider=provider,
+        settings=scout_settings(early_scout_max_orbit_reviews_per_run=0),
+    )
+    provider.discovery = []
+    orbit = EchoOrbit()
+    summary = await scout(
+        sessions,
+        T0 + HOUR,
+        provider=provider,
+        orbit=orbit,
+        settings=scout_settings(
+            early_scout_max_orbit_reviews_per_run=3, early_scout_max_refresh_markets_per_run=3
+        ),
+    )
+    assert len(orbit.calls) == 3
+    assert summary.refreshed == 3
+    assert len(provider.multi_requests) == 1
+    assert (summary.orbit_backlog_before, summary.orbit_backlog_after) == (3, 0)
+
+
+async def test_the_refresh_budget_still_bounds_how_many_are_re_observed(db):
+    _, sessions = db
+    three = [young(0), young(1), young(2)]
+    provider = MarketProvider(discovery=three, targeted=three)
+    await scout(
+        sessions,
+        T0,
+        provider=provider,
+        settings=scout_settings(early_scout_max_orbit_reviews_per_run=0),
+    )
+    provider.discovery = []
+    orbit = EchoOrbit()
+    summary = await scout(
+        sessions,
+        T0 + HOUR,
+        provider=provider,
+        orbit=orbit,
+        settings=scout_settings(
+            early_scout_max_orbit_reviews_per_run=3, early_scout_max_refresh_markets_per_run=1
+        ),
+    )
+    assert len(orbit.calls) == 1
+    assert summary.refreshed == 1
+    assert summary.orbit_backlog_after == 2

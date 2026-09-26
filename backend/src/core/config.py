@@ -287,8 +287,10 @@ class Settings(BaseSettings):
     early_scout_max_orbit_reviews_per_run: int = Field(default=8, ge=0, le=10)
     # History reads for the structural VECTOR check. No model call is involved.
     early_scout_max_history_checks_per_run: int = Field(default=1, ge=0, le=10)
-    # Watches re-observed by exact pool locator in one run.
-    early_scout_max_refresh_markets_per_run: int = Field(default=1, ge=0, le=10)
+    # Watches re-observed by exact pool locator in one run, in one request per
+    # chain. A due review of an older watch needs a fresh reading first, so this
+    # matches the review budget: fewer and the review slots go unused.
+    early_scout_max_refresh_markets_per_run: int = Field(default=8, ge=0, le=20)
     # Recorded market streams from before the scout existed, adopted per run.
     early_scout_max_bootstrap_streams: int = Field(default=100, ge=0, le=100)
     # Where executable quotes come from. "disabled" fails closed: without a quote

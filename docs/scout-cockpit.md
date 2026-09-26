@@ -16,10 +16,12 @@ EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN`, the due queue grows without bound.
 | cadence | every 15 min | The shortest checkpoint gap is 1h, so a 15-minute run is late by at most 15 minutes per checkpoint. |
 | `EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN` | 1 | 96 new watches a day, taken in the provider's `new_pools` order. There is no ranking of any kind. |
 | `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN` | 8 | 6 cover the steady state and 2 drain a backlog. |
+| `EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN` | 8 | A due review of an older watch needs a fresh reading first, so this matches the review budget. Refreshes are batched into one `pools/multi` request per chain. |
 | model calls | ≤ 8 per run, ≤ 768 per day | This is a hard bound. There is at most one review per watch per run, and missed checkpoints are never replayed. |
+| GeckoTerminal requests | ≈ 4 per run | One network lookup, one `new_pools` read, one batched refresh and at most one history read. This stays inside the default transport budget of 5. |
 
-To watch more new pools per run, raise both settings together and keep the
-ratio at 1:6 or higher. The cost grows linearly with it. The run summary and
+To watch more new pools per run, raise the new-watch, review and refresh
+settings together and keep new watches to reviews at 1:6 or higher. The cost grows linearly with it. The run summary and
 the cockpit show whether the scout keeps up:
 
 - `orbit_backlog_before` / `orbit_backlog_after` are the due reviews when the

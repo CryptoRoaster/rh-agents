@@ -119,7 +119,7 @@ is never bypassed.
 | `EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN` | 1 |
 | `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN` | 8 |
 | `EARLY_SCOUT_MAX_HISTORY_CHECKS_PER_RUN` | 1 |
-| `EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN` | 1 |
+| `EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN` | 8 |
 | `EARLY_SCOUT_MAX_BOOTSTRAP_STREAMS` | 100 |
 
 Streams recorded before the scout existed are adopted by a bounded, idempotent
