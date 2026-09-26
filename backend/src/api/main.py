@@ -3,7 +3,9 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from src.agents.registry import COMPONENTS
 from src.api.markets import router as markets_router
+from src.api.paper import router as paper_router
 from src.api.runtime import router as runtime_router
+from src.api.scout import router as scout_router
 from src.api.trade_cases import router as trade_cases_router
 from src.api.workers import router as workers_router
 from src.core.config import Settings
@@ -20,6 +22,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(runtime_router)
     app.include_router(trade_cases_router)
     app.include_router(workers_router)
+    # Read-only cockpit views. GET only; see tests/scout/test_api.py.
+    app.include_router(scout_router)
+    app.include_router(paper_router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

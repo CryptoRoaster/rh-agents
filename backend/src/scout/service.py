@@ -32,11 +32,14 @@ unchanged rules.
 """
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from uuid import uuid4
 
 import httpx
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -76,8 +79,12 @@ from src.runner.models import ConfigurationRefused
 from src.scout.models import DiscoveryWatch, ScoutReview, ScoutSummary, WatchAssessment
 from src.scout.policy import EARLY_SCOUT_V1, EarlyScoutPolicy, WatchStatus
 from src.scout.repository import SyncResult, WatchRepository, refreshed_identity_contradicts
+from src.scout.runs import ScoutRunRepository
 
 ScoutReading = ScoutSummary | ConfigurationRefused
+
+# One scout run at a time across every process on this database.
+RUN_LOCK = "rh-agents:early-scout"
 
 
 @dataclass(frozen=True)
@@ -162,6 +169,10 @@ class Tally:
     retired_new: int = 0
     provider_failures: int = 0
     model_failures: int = 0
+    orbit_backlog_before: int = 0
+    orbit_backlog_after: int = 0
+    oldest_orbit_due_age_seconds: int | None = None
+    new_watches_without_orbit_assessment: int = 0
     reviews: list[ScoutReview] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -210,22 +221,63 @@ class EarlyScoutCycle:
         refusal = refuse_scout(self._settings, self._ports)
         if refusal is not None:
             return refusal
+        async with self._exclusive() as held:
+            if not held:
+                # Another scout run holds the lock. Not a fault and not a run: it
+                # made no call and leaves no history row.
+                now = self._clock.now().isoformat()
+                return ScoutSummary(
+                    policy_version=self._policy.version,
+                    started_at=now,
+                    finished_at=now,
+                    stop="ALREADY_RUNNING",
+                )
+            return await self._run()
+
+    @asynccontextmanager
+    async def _exclusive(self) -> AsyncIterator[bool]:
+        """At most one scout run at a time, whoever starts it.
+
+        A session-level PostgreSQL advisory lock on a connection held for the
+        whole run: a scheduled run that starts while a manual one is still going
+        gives way instead of reviewing the same due watches twice. The lock is
+        released on every path and dies with the connection if the process does.
+        The metadata-only SQLite test engine has no advisory locks.
+        """
+        async with self._sessions() as session:
+            if session.get_bind().dialect.name != "postgresql":
+                yield True
+                return
+            held = bool(
+                await session.scalar(
+                    text("SELECT pg_try_advisory_lock(hashtext(:key))"), {"key": RUN_LOCK}
+                )
+            )
+            try:
+                yield held
+            finally:
+                if held:
+                    await session.scalar(
+                        text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": RUN_LOCK}
+                    )
+                    await session.commit()
+
+    async def _run(self) -> ScoutSummary:
         started = self._clock.now()
         tally = Tally()
         transport: GeckoTerminalTransport | None = None
         try:
-            if not await self._permitted(tally):
-                return self._summary(started, tally, transport)
-            tally.bootstrapped = await self._watches.bootstrap(
-                started, self._settings.early_scout_max_bootstrap_streams
-            )
-            transport = GeckoTerminalTransport(
-                self._settings, transport=self._ports.market_http, clock=self._clock
-            )
-            directory = NetworkDirectory(transport, self._settings)
-            recorder = MarketRecorder(self._sessions, clock=self._clock)
-            fresh = await self._discover(transport, directory, recorder, tally)
-            await self._scheduled(transport, directory, recorder, fresh, tally)
+            if await self._permitted(tally):
+                tally.bootstrapped = await self._watches.bootstrap(
+                    started, self._settings.early_scout_max_bootstrap_streams
+                )
+                transport = GeckoTerminalTransport(
+                    self._settings, transport=self._ports.market_http, clock=self._clock
+                )
+                directory = NetworkDirectory(transport, self._settings)
+                recorder = MarketRecorder(self._sessions, clock=self._clock)
+                fresh = await self._discover(transport, directory, recorder, tally)
+                await self._scheduled(transport, directory, recorder, fresh, tally)
         except SystemPauseUnavailable:
             tally.stop = "SYSTEM_STOPPED"
             tally.fail("SYSTEM_STOP_UNREADABLE")
@@ -236,7 +288,17 @@ class EarlyScoutCycle:
         finally:
             if transport is not None:
                 await transport.__aexit__(None, None, None)
-        return self._summary(started, tally, transport)
+        summary = self._summary(started, tally, transport)
+        run_id = uuid4()
+        try:
+            await ScoutRunRepository(self._sessions).record(
+                run_id, started, self._clock.now(), summary
+            )
+        except (SQLAlchemyError, OSError):
+            return summary.model_copy(
+                update={"errors": (*summary.errors, "RUN_HISTORY_UNAVAILABLE")[:16]}
+            )
+        return summary.model_copy(update={"run_id": run_id})
 
     async def _permitted(self, tally: Tally) -> bool:
         """A durable stop, or one that cannot be read, means nobody is asked anything."""
@@ -324,117 +386,157 @@ class EarlyScoutCycle:
         cannot be worked on this run — no fresh reading and nothing that could
         re-observe it — is noted and passed over, so it can never hold the only
         slot of a one-review budget run after run.
+
+        Stale readings are re-observed in one batch per chain before the work
+        starts, so every review slot can be used at one provider request rather
+        than one request per watch.
         """
         now = self._clock.now()
         tally.watches_due_orbit, tally.watches_due_history = await self._watches.count_due(now)
+        before = await self._watches.backlog(now)
+        tally.orbit_backlog_before = before.due
+        tally.oldest_orbit_due_age_seconds = before.oldest_due_age_seconds
         readings = Readings(
             recorded=fresh, refresh_budget=self._settings.early_scout_max_refresh_markets_per_run
         )
-        reviews = self._settings.early_scout_max_orbit_reviews_per_run
-        for watch in await self._watches.due_for_orbit(now, DUE_SCAN):
-            if tally.orbit_reviews_started >= reviews:
-                break
-            snapshot = await self._reading(watch, readings, transport, directory, recorder, tally)
+        reviews = await self._prepare(
+            await self._watches.due_for_orbit(now, DUE_SCAN),
+            self._settings.early_scout_max_orbit_reviews_per_run,
+            readings,
+            transport,
+            directory,
+            recorder,
+            tally,
+        )
+        for watch, snapshot in reviews:
             await self._review(watch, snapshot, tally)
-        checks = self._settings.early_scout_max_history_checks_per_run
-        attempted = 0
-        for watch in await self._watches.due_for_history(now, DUE_SCAN):
-            if attempted >= checks:
-                break
-            snapshot = await self._reading(watch, readings, transport, directory, recorder, tally)
-            if snapshot is None:
-                continue
-            attempted += 1
+        checks = await self._prepare(
+            await self._watches.due_for_history(now, DUE_SCAN),
+            self._settings.early_scout_max_history_checks_per_run,
+            readings,
+            transport,
+            directory,
+            recorder,
+            tally,
+        )
+        for watch, snapshot in checks:
             await self._check_history(watch, snapshot, transport, directory, tally)
+        after = await self._watches.backlog(now)
+        tally.orbit_backlog_after = after.due
+        tally.new_watches_without_orbit_assessment = after.unreviewed
 
     def _is_fresh(self, snapshot: MarketSnapshot, now: datetime) -> bool:
         return snapshot.observed_at <= now and now - snapshot.freshness_at <= self._max_input_age
 
-    async def _reading(
+    async def _prepare(
         self,
-        watch: DiscoveryWatch,
+        due: tuple[DiscoveryWatch, ...],
+        limit: int,
         readings: "Readings",
         transport: GeckoTerminalTransport,
         directory: NetworkDirectory,
         recorder: MarketRecorder,
         tally: Tally,
-    ) -> MarketSnapshot | None:
-        """A fresh reading of this watch's market, re-observed by locator if needed.
+    ) -> list[tuple[DiscoveryWatch, MarketSnapshot]]:
+        """Choose up to `limit` workable due watches, in queue order, with fresh readings.
 
-        One attempt per market per run: a pair that was already re-observed, or
-        already failed to be, is answered from that attempt.
+        A watch is workable when it already has a fresh reading, or when it can
+        be re-observed by its locator within the refresh budget. The ones to
+        re-observe are then asked about together. One attempt per market per
+        run: a pair already re-observed, or already failed, is answered from it.
         """
         now = self._clock.now()
-        if watch.pair_id in readings.by_pair:
-            return readings.by_pair[watch.pair_id]
-        snapshot = readings.recorded.get(watch.pair_id)
-        if snapshot is None:
-            snapshot = await self._watches.snapshot(watch.latest_snapshot_id)
-        if snapshot is not None and self._is_fresh(snapshot, now):
-            readings.by_pair[watch.pair_id] = snapshot
-            return snapshot
-        reason: str | None = None
-        chain = CHAINS.get(watch.chain)
-        if watch.market.pool_locator is None:
-            # Never addressed by a name, a symbol or an identifier's text.
-            reason = "POOL_LOCATOR_UNKNOWN"
-        elif chain is None or watch.chain not in {
-            item.name for item in selected_chains(self._settings)
-        }:
-            reason = "CHAIN_NOT_CONFIGURED"
-        elif readings.refresh_budget <= 0:
-            reason = "REFRESH_BUDGET_REACHED"
-        if reason is not None or chain is None:
-            await self._watches.note(watch.id, reason or "CHAIN_NOT_CONFIGURED", now)
-            if reason != "REFRESH_BUDGET_REACHED":
+        chosen: list[DiscoveryWatch] = []
+        stale: list[DiscoveryWatch] = []
+        configured = {item.name for item in selected_chains(self._settings)}
+        for watch in due:
+            if len(chosen) >= limit:
+                break
+            if watch.pair_id in readings.by_pair:
+                if readings.by_pair[watch.pair_id] is not None:
+                    chosen.append(watch)
+                continue
+            snapshot = readings.recorded.get(watch.pair_id)
+            if snapshot is None:
+                snapshot = await self._watches.snapshot(watch.latest_snapshot_id)
+            if snapshot is not None and self._is_fresh(snapshot, now):
+                readings.by_pair[watch.pair_id] = snapshot
+                chosen.append(watch)
+                continue
+            if watch.market.pool_locator is None:
+                # Never addressed by a name, a symbol or an identifier's text.
+                await self._watches.note(watch.id, "POOL_LOCATOR_UNKNOWN", now)
                 readings.by_pair[watch.pair_id] = None
-            return None
-        readings.refresh_budget -= 1
-        refreshed = await self._refresh(chain, watch, transport, directory, recorder, tally)
-        readings.by_pair[watch.pair_id] = refreshed
-        return refreshed
+                continue
+            if watch.chain not in configured or CHAINS.get(watch.chain) is None:
+                await self._watches.note(watch.id, "CHAIN_NOT_CONFIGURED", now)
+                readings.by_pair[watch.pair_id] = None
+                continue
+            if readings.refresh_budget <= 0:
+                await self._watches.note(watch.id, "REFRESH_BUDGET_REACHED", now)
+                continue
+            readings.refresh_budget -= 1
+            stale.append(watch)
+            chosen.append(watch)
+        await self._refresh(stale, readings, transport, directory, recorder, tally)
+        prepared = []
+        for watch in chosen:
+            snapshot = readings.by_pair.get(watch.pair_id)
+            if snapshot is not None:
+                prepared.append((watch, snapshot))
+        return prepared
 
     async def _refresh(
         self,
-        chain: Chain,
-        watch: DiscoveryWatch,
+        watches: list[DiscoveryWatch],
+        readings: "Readings",
         transport: GeckoTerminalTransport,
         directory: NetworkDirectory,
         recorder: MarketRecorder,
         tally: Tally,
-    ) -> MarketSnapshot | None:
-        """Observe exactly this pool again, by its stored locator."""
+    ) -> None:
+        """Observe exactly these pools again by their stored locators, one request per chain."""
         now = self._clock.now()
-        locator = watch.market.pool_locator
-        if locator is None:  # pragma: no cover - checked by the caller
-            return None
-        adapter = GeckoTerminalAdapter(
-            transport, directory, chain, self._settings, clock=self._clock
-        )
-        try:
-            confirmed = await adapter.observe((locator,))
-        except ProviderError as error:
-            tally.provider_failures += 1
-            await self._watches.note(watch.id, error.code.upper(), now)
-            return None
-        pair = next((item for item in confirmed if item.pair_id == watch.pair_id), None)
-        if pair is None:
-            await self._watches.note(watch.id, "MARKET_NOT_RETURNED", now)
-            return None
-        if refreshed_identity_contradicts(watch.market, pair.market_identity):
-            # The same pool now names a different market. Fail closed.
-            await self._watches.retire(watch.id, "MARKET_IDENTITY_MISMATCH", now)
-            tally.retired_new += 1
-            return None
-        snapshot = await self._record(adapter, pair, recorder, tally)
-        if snapshot is None:
-            return None
-        if await self._watches.sync(snapshot, now=now, allow_create=False) is SyncResult.CONFLICT:
-            await self._watches.retire(watch.id, "MARKET_IDENTITY_MISMATCH", now)
-            tally.retired_new += 1
-            return None
-        tally.refreshed += 1
-        return snapshot
+        by_chain: dict[str, list[DiscoveryWatch]] = {}
+        for watch in watches:
+            by_chain.setdefault(watch.chain, []).append(watch)
+        for chain_name, batch in by_chain.items():
+            for watch in batch:
+                readings.by_pair[watch.pair_id] = None
+            adapter = GeckoTerminalAdapter(
+                transport, directory, CHAINS[chain_name], self._settings, clock=self._clock
+            )
+            locators = tuple(
+                watch.market.pool_locator for watch in batch if watch.market.pool_locator
+            )
+            try:
+                confirmed = await adapter.observe(locators)
+            except ProviderError as error:
+                tally.provider_failures += 1
+                for watch in batch:
+                    await self._watches.note(watch.id, error.code.upper(), now)
+                continue
+            answered = {pair.pair_id: pair for pair in confirmed}
+            for watch in batch:
+                pair = answered.get(watch.pair_id)
+                if pair is None:
+                    await self._watches.note(watch.id, "MARKET_NOT_RETURNED", now)
+                    continue
+                if refreshed_identity_contradicts(watch.market, pair.market_identity):
+                    # The same pool now names a different market. Fail closed.
+                    await self._watches.retire(watch.id, "MARKET_IDENTITY_MISMATCH", now)
+                    tally.retired_new += 1
+                    continue
+                snapshot = await self._record(adapter, pair, recorder, tally)
+                if snapshot is None:
+                    continue
+                result = await self._watches.sync(snapshot, now=now, allow_create=False)
+                if result is SyncResult.CONFLICT:
+                    await self._watches.retire(watch.id, "MARKET_IDENTITY_MISMATCH", now)
+                    tally.retired_new += 1
+                    continue
+                tally.refreshed += 1
+                readings.by_pair[watch.pair_id] = snapshot
 
     # ------------------------------------------------------------------ ORBIT
 
@@ -657,6 +759,10 @@ class EarlyScoutCycle:
             provider_failures=tally.provider_failures,
             model_failures=tally.model_failures,
             provider_requests=0 if transport is None else transport.logical_requests,
+            orbit_backlog_before=tally.orbit_backlog_before,
+            orbit_backlog_after=tally.orbit_backlog_after,
+            oldest_orbit_due_age_seconds=tally.oldest_orbit_due_age_seconds,
+            new_watches_without_orbit_assessment=tally.new_watches_without_orbit_assessment,
             reviews=tuple(tally.reviews[:16]),
             errors=tuple(tally.errors),
         )

@@ -94,6 +94,8 @@ class ScoutSummary(Immutable):
     """
 
     kind: Literal["early_scout_summary"] = "early_scout_summary"
+    # Present when the run was recorded in the run history.
+    run_id: UUID | None = None
     policy_version: Identifier
     started_at: str
     finished_at: str
@@ -124,6 +126,12 @@ class ScoutSummary(Immutable):
     provider_failures: int = Field(default=0, ge=0)
     model_failures: int = Field(default=0, ge=0)
     provider_requests: int = Field(default=0, ge=0)
+    # Whether ORBIT keeps up: due reviews when the review phase began and when it
+    # ended, the oldest due review's age, and watches never reviewed at all.
+    orbit_backlog_before: int = Field(default=0, ge=0)
+    orbit_backlog_after: int = Field(default=0, ge=0)
+    oldest_orbit_due_age_seconds: int | None = Field(default=None, ge=0)
+    new_watches_without_orbit_assessment: int = Field(default=0, ge=0)
     reviews: tuple[ScoutReview, ...] = Field(default=(), max_length=16)
     errors: tuple[Code, ...] = Field(default=(), max_length=16)
     # Stated in every summary, because it is the whole contract of this mode.
@@ -132,3 +140,52 @@ class ScoutSummary(Immutable):
     @property
     def exit_code(self) -> ExitCode:
         return ExitCode.TECHNICAL_FAILURE if self.errors else ExitCode.COMPLETED
+
+
+class ScoutRun(Immutable):
+    """One persisted scout run, as the cockpit reads it."""
+
+    id: UUID
+    started_at: AwareDatetime
+    completed_at: AwareDatetime
+    status: Literal["COMPLETED", "STOPPED", "FAILED"]
+    stop: Code
+    errors: tuple[Code, ...] = ()
+    policy_version: Identifier
+    discovered: int
+    valid_markets: int
+    provider_identity_rejects: int
+    other_provider_rejects: int
+    watches_created: int
+    watches_updated: int
+    bootstrapped: int
+    refreshed: int
+    watches_due_orbit: int
+    orbit_reviews_started: int
+    orbit_reviews_completed: int
+    interesting: int
+    not_interesting: int
+    insufficient_data: int
+    watches_due_history: int
+    history_checks: int
+    vector_sufficient: int
+    promotable_new: int
+    dormant_new: int
+    retired_new: int
+    provider_failures: int
+    model_failures: int
+    provider_requests: int
+    orbit_backlog_before: int
+    orbit_backlog_after: int
+    oldest_orbit_due_age_seconds: int | None = None
+    new_watches_without_orbit_assessment: int
+
+    @property
+    def identity_acceptance_rate(self) -> float | None:
+        """valid / discovered, or None when nothing was discovered."""
+        return None if self.discovered == 0 else self.valid_markets / self.discovered
+
+    @property
+    def watch_creation_rate(self) -> float | None:
+        """watches created / valid markets, or None when nothing was valid."""
+        return None if self.valid_markets == 0 else self.watches_created / self.valid_markets
