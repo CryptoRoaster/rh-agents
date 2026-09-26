@@ -27,10 +27,33 @@ from src.markets.models import (
 MAX_POOLS_PER_REQUEST = 20
 
 
+# The zero address, as GeckoTerminal names a chain's native asset (BNB on BSC).
+NATIVE_ASSET_ADDRESS = "0x" + "0" * 40
+
+
 def address(value: str) -> str:
     if re.fullmatch(r"0x[0-9a-fA-F]{40}", value) is None or int(value[2:], 16) == 0:
         raise IdentityError()
     return value.lower()
+
+
+def token_address(value: str, decimals: int | None, chain: Chain) -> str:
+    """A token's address, with the chain's native asset accepted as exactly that.
+
+    GeckoTerminal represents the native asset as a token resource at the zero
+    address — the convention Uniswap V4 uses for native currency, and the side
+    four.meme bonding curves trade against. It is accepted as a token only when
+    the resource also declares the chain's native decimals; the resource binding
+    to that exact address is checked by the caller as for any token. Any other
+    zero address stays an identity failure. No symbol or name is consulted.
+    """
+    if re.fullmatch(r"0x[0-9a-fA-F]{40}", value) is None:
+        raise IdentityError()
+    if value == NATIVE_ASSET_ADDRESS:
+        if decimals != chain.native_decimals:
+            raise IdentityError()
+        return value
+    return address(value)
 
 
 def provenance(value: Provenance, chain: Chain) -> None:
@@ -110,13 +133,13 @@ def normalize(
         token = validate(Token, included[relation.data.id])
         provenance(token, chain)
         provenance(token.attributes, chain)
-        token_address = address(token.attributes.address)
-        bind_resource(token.id, token_address, network_id)
+        asset_address = token_address(token.attributes.address, token.attributes.decimals, chain)
+        bind_resource(token.id, asset_address, network_id)
         assets.append(
             {
                 **meta,
                 "id": uuid4(),
-                "asset_id": f"{chain.name}:mainnet:{token_address}",
+                "asset_id": f"{chain.name}:mainnet:{asset_address}",
                 "symbol": token.attributes.symbol,
                 "decimals": token.attributes.decimals,
             }

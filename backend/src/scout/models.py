@@ -101,6 +101,10 @@ class ScoutSummary(Immutable):
     bootstrapped: int = Field(default=0, ge=0)
     discovered: int = Field(default=0, ge=0)
     valid_markets: int = Field(default=0, ge=0)
+    # Pools the adapter refused, split so coverage is countable:
+    # discovered = valid_markets + provider_identity_rejects + other_provider_rejects.
+    provider_identity_rejects: int = Field(default=0, ge=0)
+    other_provider_rejects: int = Field(default=0, ge=0)
     rejections: tuple[Code, ...] = Field(default=(), max_length=32)
     watches_created: int = Field(default=0, ge=0)
     watches_updated: int = Field(default=0, ge=0)

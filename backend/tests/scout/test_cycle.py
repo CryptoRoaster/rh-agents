@@ -516,3 +516,42 @@ async def test_an_unrefreshable_watch_does_not_starve_the_review_budget(db):
     )
     assert legacy.reason_code == "POOL_LOCATOR_UNKNOWN"
     assert legacy.next_orbit_review_at == legacy.first_seen_at  # still due, nothing spent
+
+
+async def test_discovery_coverage_is_countable_from_the_summary(db):
+    """Raw, valid, identity rejects and other rejects add up; watches follow valid only."""
+    _, sessions = db
+    identity_broken = young(1)
+    identity_broken["id"] = "robinhood_" + POOLS[2]
+    shape_broken = young(2)
+    del shape_broken["attributes"]["address"]
+    summary = await scout(
+        sessions,
+        T0,
+        provider=MarketProvider(discovery=[young(0), identity_broken, shape_broken]),
+    )
+    assert summary.discovered == 3
+    assert summary.valid_markets == 1
+    assert summary.provider_identity_rejects == 1
+    assert summary.other_provider_rejects == 1
+    assert (
+        summary.valid_markets + summary.provider_identity_rejects + summary.other_provider_rejects
+        == summary.discovered
+    )
+    assert summary.watches_created == 1
+
+
+async def test_a_native_quoted_pool_becomes_a_watch(db):
+    """The reproduced false rejection, end to end: discovered, normalized, watched."""
+    _, sessions = db
+    from tests.runner.provider import NETWORK_ID
+
+    native = "0x" + "0" * 40
+    meme = young(0)
+    meme["relationships"]["quote_token"]["data"]["id"] = f"{NETWORK_ID}_{native}"
+    summary = await scout(sessions, T0, provider=MarketProvider(discovery=[meme]))
+    watch = await watch_for(sessions, 0)
+    assert summary.provider_identity_rejects == 0
+    assert summary.valid_markets == 1
+    assert watch is not None
+    assert watch.market.quote_asset_id == f"robinhood:mainnet:{native}"
