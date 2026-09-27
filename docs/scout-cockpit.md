@@ -6,32 +6,56 @@
 
 ## Cadence and ORBIT budget
 
-Every watch is owed six ORBIT reviews: T+0, 1h, 3h, 6h, 12h and 24h. A run that
-creates `W` new watches therefore adds `6·W` reviews to the steady-state
-workload. Unless `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN ≥ 6 ×
-EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN`, the due queue grows without bound.
+**Discovery capacity is intentionally decoupled from model-review capacity.**
+Discovery is the cheap input. Every valid pool a run finds, up to its own bound,
+becomes a watch, whether or not ORBIT can review it right away. A watch waits
+in the deterministic due queue. If it is reviewed late, its missed checkpoints
+coalesce into one review. Nothing is dropped, retired or made dormant for lack
+of model budget.
+
+Paid ORBIT calls are bounded twice: per run and per UTC day.
 
 | Setting | Default | Why |
 |---|---|---|
-| cadence | every 15 min | The shortest checkpoint gap is 1h, so a 15-minute run is late by at most 15 minutes per checkpoint. |
-| `EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN` | 1 | 96 new watches a day, taken in the provider's `new_pools` order. There is no ranking of any kind. |
-| `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN` | 8 | 6 cover the steady state and 2 drain a backlog. |
-| `EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN` | 8 | A due review of an older watch needs a fresh reading first, so this matches the review budget. Refreshes are batched into one `pools/multi` request per chain. |
-| model calls | ≤ 8 per run, ≤ 768 per day | This is a hard bound. There is at most one review per watch per run, and missed checkpoints are never replayed. |
-| GeckoTerminal requests | ≈ 4 per run | One network lookup, one `new_pools` read, one batched refresh and at most one history read. This stays inside the default transport budget of 5. |
+| cadence | every 15 min | Discovery every 15 minutes, so a young pool is seen early. |
+| `EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN` | 10 | Every valid pool on the `new_pools` page becomes a watch. No ranking, no filter. |
+| `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN` | 4 | Four calls at the observed 7-10 s latency (60 s timeout worst case) fit well inside one 15-minute run. |
+| `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_DAY` | 96 | The hard daily cost bound: on average one review per run. A run may burst up to its per-run bound while the day has budget. |
+| `EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN` | 4 | A stale due watch needs a fresh reading before review. Refreshes are batched into one `pools/multi` request per chain. A watch that is already fresh costs nothing. |
+| GeckoTerminal requests | ≈ 4 per run | One network lookup, one `new_pools` read, one batched refresh and at most one history read, inside the default transport budget of 5. |
 
-To watch more new pools per run, raise the new-watch, review and refresh
-settings together and keep new watches to reviews at 1:6 or higher. The cost grows linearly with it. The run summary and
-the cockpit show whether the scout keeps up:
+The daily bound is counted from the persisted assessment history of the
+current UTC day. That count includes every review whose model call started,
+including failed reviews. It therefore holds across scheduled processes, and it
+resets at 00:00 UTC.
 
-- `orbit_backlog_before` / `orbit_backlog_after` are the due reviews when the
-  review phase began and ended.
-- `oldest_orbit_due_age_seconds` is the age of the longest-waiting due review.
-- `new_watches_without_orbit_assessment` is the number of watches that have
-  never been reviewed.
+If the count cannot be read, no model is asked (fail closed). The one gap is a
+process that dies between starting a call and recording its assessment: that
+call is not counted, which is at most one per-run bound.
 
-The due queue itself stays neutral: it is ordered by `next_orbit_review_at`,
-then `first_seen_at`, then `pair_id`. It is never ordered by liquidity, volume,
+A 15-minute schedule therefore does **not** guarantee six assessments per
+watch. It guarantees:
+
+- discovery every 15 minutes;
+- ORBIT bounded per run and per day;
+- checkpoints coalesced when there is a backlog;
+- backlog and coverage visible in the cockpit.
+
+Each run summary and run row reports:
+
+- `orbit_backlog_before` and `orbit_backlog_after`;
+- `oldest_orbit_due_age_seconds`;
+- `new_watches_without_orbit_assessment`;
+- `orbit_daily_budget` and `orbit_daily_used_before` / `_after`, with the
+  remaining budget.
+
+The cockpit shows "ORBIT budget today: used / cap", or "Daily ORBIT budget
+reached" once the cap is hit. The latter is a normal state, not an error:
+discovery continues and due reviews wait. The cockpit shows calls and token
+counts, never an estimated dollar amount.
+
+The due queue stays neutral: it is ordered by `next_orbit_review_at`, then
+`first_seen_at`, then `pair_id`. It is never ordered by liquidity, volume,
 market cap or classification.
 
 ## Running the scout on a schedule (macOS launchd)

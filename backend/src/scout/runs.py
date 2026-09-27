@@ -39,6 +39,11 @@ COUNTERS = (
     "orbit_backlog_before",
     "orbit_backlog_after",
     "new_watches_without_orbit_assessment",
+    "orbit_daily_budget",
+    "orbit_daily_used_before",
+    "orbit_daily_remaining_before",
+    "orbit_daily_used_after",
+    "orbit_daily_remaining_after",
 )
 
 

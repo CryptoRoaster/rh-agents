@@ -31,13 +31,14 @@ COUNTS = (
     " insufficient_data, watches_due_history, history_checks, vector_sufficient,"
     " promotable_new, dormant_new, retired_new, provider_failures, model_failures,"
     " provider_requests, orbit_backlog_before, orbit_backlog_after,"
-    " new_watches_without_orbit_assessment"
+    " new_watches_without_orbit_assessment, orbit_daily_budget, orbit_daily_used_before,"
+    " orbit_daily_remaining_before, orbit_daily_used_after, orbit_daily_remaining_after"
 )
 ROW = (
     "INSERT INTO scout_runs (id, started_at, completed_at, status, stop, errors,"
     f" policy_version, {COUNTS}, oldest_orbit_due_age_seconds, created_at)"
     " VALUES (:id, now(), now(), :status, 'COMPLETED', '[]'::jsonb, 'early-scout-v1',"
-    + ", ".join(["0"] * 26)
+    + ", ".join(["0"] * 31)
     + ", NULL, now())"
 )
 

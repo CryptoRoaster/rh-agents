@@ -39,7 +39,7 @@ async def client(db, monkeypatch):
     app = create_app(Settings(_env_file=None))
 
     async def scout_override():
-        yield ScoutReadService(sessions)
+        yield ScoutReadService(sessions, daily_budget=96)
 
     async def paper_override():
         yield PaperReadService(sessions)

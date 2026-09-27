@@ -24,7 +24,10 @@ router = APIRouter(prefix="/api/scout")
 async def scout_reader(request: Request) -> AsyncIterator[ScoutReadService]:
     engine, sessions = connect(request.app.state.settings.database_url)
     try:
-        yield ScoutReadService(sessions)
+        yield ScoutReadService(
+            sessions,
+            daily_budget=request.app.state.settings.early_scout_max_orbit_reviews_per_day,
+        )
     finally:
         await engine.dispose()
 

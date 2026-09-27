@@ -3,7 +3,8 @@
 Until now a scout run's coverage and backlog existed only as the summary it
 printed. The cockpit needs them over time: how many pools were discovered, how
 many had a valid identity, how many watches were created, and whether ORBIT is
-keeping up with the checkpoints that fall due.
+keeping up with the checkpoints that fall due, and how much of the day's
+paid-review budget was used.
 
 **Structure only.** No row is reconstructed from old output: runs before this
 migration simply have no history. Existing watches and assessments are
@@ -57,6 +58,12 @@ def upgrade() -> None:
         sa.Column("orbit_backlog_after", sa.Integer(), nullable=False),
         sa.Column("oldest_orbit_due_age_seconds", sa.Integer(), nullable=True),
         sa.Column("new_watches_without_orbit_assessment", sa.Integer(), nullable=False),
+        # The persistent daily bound on paid ORBIT calls, before and after the run.
+        sa.Column("orbit_daily_budget", sa.Integer(), nullable=False),
+        sa.Column("orbit_daily_used_before", sa.Integer(), nullable=False),
+        sa.Column("orbit_daily_remaining_before", sa.Integer(), nullable=False),
+        sa.Column("orbit_daily_used_after", sa.Integer(), nullable=False),
+        sa.Column("orbit_daily_remaining_after", sa.Integer(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         # A row is written once, when the run is over, so it is always terminal.
         sa.CheckConstraint("status IN ('COMPLETED', 'STOPPED', 'FAILED')", name="scout_run_status"),

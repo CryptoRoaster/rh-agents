@@ -132,6 +132,13 @@ class ScoutSummary(Immutable):
     orbit_backlog_after: int = Field(default=0, ge=0)
     oldest_orbit_due_age_seconds: int | None = Field(default=None, ge=0)
     new_watches_without_orbit_assessment: int = Field(default=0, ge=0)
+    # The persistent daily bound on paid ORBIT calls (current UTC day), before
+    # and after this run's reviews.
+    orbit_daily_budget: int = Field(default=0, ge=0)
+    orbit_daily_used_before: int = Field(default=0, ge=0)
+    orbit_daily_remaining_before: int = Field(default=0, ge=0)
+    orbit_daily_used_after: int = Field(default=0, ge=0)
+    orbit_daily_remaining_after: int = Field(default=0, ge=0)
     reviews: tuple[ScoutReview, ...] = Field(default=(), max_length=16)
     errors: tuple[Code, ...] = Field(default=(), max_length=16)
     # Stated in every summary, because it is the whole contract of this mode.
@@ -179,6 +186,11 @@ class ScoutRun(Immutable):
     orbit_backlog_after: int
     oldest_orbit_due_age_seconds: int | None = None
     new_watches_without_orbit_assessment: int
+    orbit_daily_budget: int
+    orbit_daily_used_before: int
+    orbit_daily_remaining_before: int
+    orbit_daily_used_after: int
+    orbit_daily_remaining_after: int
 
     @property
     def identity_acceptance_rate(self) -> float | None:

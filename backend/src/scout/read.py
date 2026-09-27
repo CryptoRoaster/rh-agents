@@ -12,7 +12,7 @@ wrong source for a watch list and is not used.
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
@@ -152,6 +152,10 @@ class ScoutOverview(Immutable):
     unreviewed_watches: int
     latest_run: RunView | None = None
     very_young_seconds: int = Field(default=21600)
+    # Paid scout ORBIT calls started today (UTC) against the configured cap.
+    orbit_daily_budget: int
+    orbit_daily_used: int
+    orbit_daily_remaining: int
 
 
 def snapshot_view(snapshot: MarketSnapshot) -> SnapshotView:
@@ -218,6 +222,8 @@ def checkpoint_plan(
 class ScoutReadService:
     sessions: async_sessionmaker[AsyncSession]
     policy: EarlyScoutPolicy = EARLY_SCOUT_V1
+    # The configured daily cap, shown beside what was used. Read-only.
+    daily_budget: int = 0
 
     async def watches(
         self,
@@ -393,7 +399,10 @@ class ScoutReadService:
         )
 
     async def overview(self, now: datetime) -> ScoutOverview:
-        backlog: Backlog = await WatchRepository(self.sessions, policy=self.policy).backlog(now)
+        repository = WatchRepository(self.sessions, policy=self.policy)
+        backlog: Backlog = await repository.backlog(now)
+        day_start = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        used = await repository.reviews_started_on(day_start)
         async with self.sessions() as session:
             grouped = (
                 await session.execute(
@@ -415,4 +424,7 @@ class ScoutReadService:
             oldest_orbit_due_age_seconds=backlog.oldest_due_age_seconds,
             unreviewed_watches=backlog.unreviewed,
             latest_run=None if latest is None else run_view(latest),
+            orbit_daily_budget=self.daily_budget,
+            orbit_daily_used=used,
+            orbit_daily_remaining=max(0, self.daily_budget - used),
         )

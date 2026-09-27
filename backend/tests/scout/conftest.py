@@ -51,8 +51,10 @@ CHAIN = "robinhood"
 # Three unrelated young pools. Addresses sort c1 < c2 < c3, so the pair
 # identifiers do too — which is what lets a test tell "ordered by identity" from
 # "ordered by liquidity".
-POOLS = ("0x" + "c1" * 20, "0x" + "c2" * 20, "0x" + "c3" * 20)
-TOKENS = ("0x" + "a3" * 20, "0x" + "a4" * 20, "0x" + "a5" * 20)
+POOLS = tuple("0x" + f"c{digit}" * 20 for digit in "123456789a")
+TOKENS = tuple(
+    "0x" + f"{pair}" * 20 for pair in ("a3", "a4", "a5", "a6", "a7", "a8", "a9", "aa", "ab", "ac")
+)
 
 
 def pair_id(address: str) -> str:

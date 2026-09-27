@@ -35,7 +35,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import httpx
@@ -173,6 +173,11 @@ class Tally:
     orbit_backlog_after: int = 0
     oldest_orbit_due_age_seconds: int | None = None
     new_watches_without_orbit_assessment: int = 0
+    orbit_daily_budget: int = 0
+    orbit_daily_used_before: int = 0
+    orbit_daily_remaining_before: int = 0
+    orbit_daily_used_after: int = 0
+    orbit_daily_remaining_after: int = 0
     reviews: list[ScoutReview] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -399,9 +404,20 @@ class EarlyScoutCycle:
         readings = Readings(
             recorded=fresh, refresh_budget=self._settings.early_scout_max_refresh_markets_per_run
         )
+        # The persistent daily bound, read before any call. A count that cannot be
+        # read raises, and the run ends without asking any model.
+        day_start = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        cap = self._settings.early_scout_max_orbit_reviews_per_day
+        used = await self._watches.reviews_started_on(day_start)
+        tally.orbit_daily_budget = cap
+        tally.orbit_daily_used_before = used
+        tally.orbit_daily_remaining_before = max(0, cap - used)
         reviews = await self._prepare(
             await self._watches.due_for_orbit(now, DUE_SCAN),
-            self._settings.early_scout_max_orbit_reviews_per_run,
+            min(
+                self._settings.early_scout_max_orbit_reviews_per_run,
+                tally.orbit_daily_remaining_before,
+            ),
             readings,
             transport,
             directory,
@@ -424,6 +440,8 @@ class EarlyScoutCycle:
         after = await self._watches.backlog(now)
         tally.orbit_backlog_after = after.due
         tally.new_watches_without_orbit_assessment = after.unreviewed
+        tally.orbit_daily_used_after = await self._watches.reviews_started_on(day_start)
+        tally.orbit_daily_remaining_after = max(0, cap - tally.orbit_daily_used_after)
 
     def _is_fresh(self, snapshot: MarketSnapshot, now: datetime) -> bool:
         return snapshot.observed_at <= now and now - snapshot.freshness_at <= self._max_input_age
@@ -763,6 +781,11 @@ class EarlyScoutCycle:
             orbit_backlog_after=tally.orbit_backlog_after,
             oldest_orbit_due_age_seconds=tally.oldest_orbit_due_age_seconds,
             new_watches_without_orbit_assessment=tally.new_watches_without_orbit_assessment,
+            orbit_daily_budget=tally.orbit_daily_budget,
+            orbit_daily_used_before=tally.orbit_daily_used_before,
+            orbit_daily_remaining_before=tally.orbit_daily_remaining_before,
+            orbit_daily_used_after=tally.orbit_daily_used_after,
+            orbit_daily_remaining_after=tally.orbit_daily_remaining_after,
             reviews=tuple(tally.reviews[:16]),
             errors=tuple(tally.errors),
         )
