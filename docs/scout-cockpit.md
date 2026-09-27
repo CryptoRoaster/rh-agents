@@ -22,7 +22,7 @@ Paid ORBIT calls are bounded twice: per run and per UTC day.
 | `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN` | 4 | Four calls at the observed 7-10 s latency (60 s timeout worst case) fit well inside one 15-minute run. |
 | `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_DAY` | 96 | The hard daily cost bound: on average one review per run. A run may burst up to its per-run bound while the day has budget. |
 | `EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN` | 4 | A stale due watch needs a fresh reading before review. Refreshes are batched into one `pools/multi` request per chain. A watch that is already fresh costs nothing. |
-| GeckoTerminal requests | ≈ 4 per run | One network lookup, one `new_pools` read, one batched refresh and at most one history read, inside the default transport budget of 5. |
+| GeckoTerminal requests | ≤ 5 per run | One network lookup, one `new_pools` read, one batched refresh for the reviews, one for the history check, and at most one history read. This is exactly the default transport budget of 5 (`GECKOTERMINAL_MAX_REQUESTS`). A run that meets that budget stops asking and reports it as a provider failure. |
 
 The daily bound is counted from the persisted assessment history of the
 current UTC day. That count includes every review whose model call started,
