@@ -35,7 +35,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import httpx
@@ -76,6 +76,7 @@ from src.orchestration.commander.context import (
 from src.reasoning.models import ReasoningFailure
 from src.reasoning.provider import ReasoningProvider
 from src.runner.models import ConfigurationRefused
+from src.scout.budget import OrbitBudget, utc_day
 from src.scout.models import DiscoveryWatch, ScoutReview, ScoutSummary, WatchAssessment
 from src.scout.policy import EARLY_SCOUT_V1, EarlyScoutPolicy, WatchStatus
 from src.scout.repository import SyncResult, WatchRepository, refreshed_identity_contradicts
@@ -219,6 +220,7 @@ class EarlyScoutCycle:
         self._clock = clock if clock is not None else SystemClock()
         self._policy = policy
         self._watches = WatchRepository(sessions, policy=policy)
+        self._budget = OrbitBudget(sessions)
         # Discovery and refresh freshness is ORBIT's own discovery freshness.
         self._max_input_age = timedelta(seconds=settings.orbit_input_max_age_seconds)
 
@@ -406,70 +408,74 @@ class EarlyScoutCycle:
         )
         # The persistent daily bound, read before any call. A count that cannot be
         # read raises, and the run ends without asking any model.
-        day_start = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        day = utc_day(now)
         cap = self._settings.early_scout_max_orbit_reviews_per_day
-        used = await self._watches.reviews_started_on(day_start)
+        used = await self._budget.used(day)
         tally.orbit_daily_budget = cap
         tally.orbit_daily_used_before = used
         tally.orbit_daily_remaining_before = max(0, cap - used)
-        reviews = await self._prepare(
+        # Choose the workable reviews and history checks first, then re-observe
+        # every stale one in a single batch per chain: one refresh request for
+        # the whole run instead of one per stage.
+        stale: list[DiscoveryWatch] = []
+        reviews = await self._select(
             await self._watches.due_for_orbit(now, DUE_SCAN),
             min(
                 self._settings.early_scout_max_orbit_reviews_per_run,
                 tally.orbit_daily_remaining_before,
             ),
             readings,
-            transport,
-            directory,
-            recorder,
-            tally,
+            stale,
         )
-        for watch, snapshot in reviews:
-            await self._review(watch, snapshot, tally)
-        checks = await self._prepare(
+        checks = await self._select(
             await self._watches.due_for_history(now, DUE_SCAN),
             self._settings.early_scout_max_history_checks_per_run,
             readings,
-            transport,
-            directory,
-            recorder,
-            tally,
+            stale,
         )
-        for watch, snapshot in checks:
-            await self._check_history(watch, snapshot, transport, directory, tally)
+        await self._refresh(stale, readings, transport, directory, recorder, tally)
+        for watch in reviews:
+            reading = readings.by_pair.get(watch.pair_id)
+            if reading is not None:
+                await self._review(watch, reading, tally)
+        for watch in checks:
+            reading = readings.by_pair.get(watch.pair_id)
+            if reading is not None:
+                await self._check_history(watch, reading, transport, directory, tally)
         after = await self._watches.backlog(now)
         tally.orbit_backlog_after = after.due
         tally.new_watches_without_orbit_assessment = after.unreviewed
-        tally.orbit_daily_used_after = await self._watches.reviews_started_on(day_start)
+        tally.orbit_daily_used_after = await self._budget.used(day)
         tally.orbit_daily_remaining_after = max(0, cap - tally.orbit_daily_used_after)
 
     def _is_fresh(self, snapshot: MarketSnapshot, now: datetime) -> bool:
         return snapshot.observed_at <= now and now - snapshot.freshness_at <= self._max_input_age
 
-    async def _prepare(
+    async def _select(
         self,
         due: tuple[DiscoveryWatch, ...],
         limit: int,
         readings: "Readings",
-        transport: GeckoTerminalTransport,
-        directory: NetworkDirectory,
-        recorder: MarketRecorder,
-        tally: Tally,
-    ) -> list[tuple[DiscoveryWatch, MarketSnapshot]]:
-        """Choose up to `limit` workable due watches, in queue order, with fresh readings.
+        stale: list[DiscoveryWatch],
+    ) -> list[DiscoveryWatch]:
+        """Choose up to `limit` workable due watches, in queue order.
 
         A watch is workable when it already has a fresh reading, or when it can
-        be re-observed by its locator within the refresh budget. The ones to
-        re-observe are then asked about together. One attempt per market per
-        run: a pair already re-observed, or already failed, is answered from it.
+        be re-observed by its locator within the refresh budget; those are added
+        to `stale` for the run's single refresh batch. One attempt per market per
+        run: a pair already chosen for re-observation, or already failed, is
+        answered from that.
         """
         now = self._clock.now()
         chosen: list[DiscoveryWatch] = []
-        stale: list[DiscoveryWatch] = []
         configured = {item.name for item in selected_chains(self._settings)}
+        pending = {item.pair_id for item in stale}
         for watch in due:
             if len(chosen) >= limit:
                 break
+            if watch.pair_id in pending:
+                chosen.append(watch)
+                continue
             if watch.pair_id in readings.by_pair:
                 if readings.by_pair[watch.pair_id] is not None:
                     chosen.append(watch)
@@ -495,14 +501,9 @@ class EarlyScoutCycle:
                 continue
             readings.refresh_budget -= 1
             stale.append(watch)
+            pending.add(watch.pair_id)
             chosen.append(watch)
-        await self._refresh(stale, readings, transport, directory, recorder, tally)
-        prepared = []
-        for watch in chosen:
-            snapshot = readings.by_pair.get(watch.pair_id)
-            if snapshot is not None:
-                prepared.append((watch, snapshot))
-        return prepared
+        return chosen
 
     async def _refresh(
         self,
@@ -576,14 +577,32 @@ class EarlyScoutCycle:
             await self._watches.note(watch.id, error.reason_code, now)
             return
         review = self._policy.orbit_review(watch.first_seen_at, now)
-        if watch.next_orbit_review_at is None or not await self._watches.claim_orbit(
+        if watch.next_orbit_review_at is None:
+            return
+        # A durable budget slot first, committed before anything else happens:
+        # no reservation, no model call.
+        reservation = await self._budget.reserve(
+            watch.id,
+            review.checkpoint_index,
+            now,
+            self._settings.early_scout_max_orbit_reviews_per_day,
+        )
+        if reservation is None:
+            await self._watches.note(watch.id, "ORBIT_DAILY_BUDGET_REACHED", now)
+            return
+        if not await self._watches.claim_orbit(
             watch.id,
             expected=watch.next_orbit_review_at,
             next_at=review.next_review_at,
             checkpoint_index=review.checkpoint_index,
             now=now,
         ):
-            return  # another run took this checkpoint; nobody was asked anything
+            # Another run took this checkpoint; nobody was asked anything. The
+            # slot stays spent — conservative, never the other way round.
+            await self._budget.settle(
+                reservation, status="FAILED", now=now, failure_reason="CHECKPOINT_TAKEN"
+            )
+            return
         tally.orbit_reviews_started += 1
         assert self._ports.reasoning is not None  # refused before the run otherwise
         evaluator = OrbitEvaluator(
@@ -607,10 +626,24 @@ class EarlyScoutCycle:
             result = await evaluator.evaluate(evaluation)
         except ReasoningFailure as error:
             await self._failed(base, evaluation, error.category.value, watch, review, tally)
+            await self._budget.settle(
+                reservation,
+                status="FAILED",
+                now=self._clock.now(),
+                assessment_id=base["id"],  # type: ignore[arg-type]
+                failure_reason=error.category.value,
+            )
             return
         except OrbitValidationError as error:
             # Contradicted output is recorded as a failure, never as an assessment.
             await self._failed(base, evaluation, error.reason_code, watch, review, tally)
+            await self._budget.settle(
+                reservation,
+                status="FAILED",
+                now=self._clock.now(),
+                assessment_id=base["id"],  # type: ignore[arg-type]
+                failure_reason=error.reason_code,
+            )
             return
         assessment = result.assessment
         await self._watches.append_assessment(
@@ -630,6 +663,12 @@ class EarlyScoutCycle:
                 output_tokens=result.usage.output_tokens,
                 latency_ms=result.usage.latency_ms,
             )
+        )
+        await self._budget.settle(
+            reservation,
+            status="COMPLETED",
+            now=self._clock.now(),
+            assessment_id=base["id"],  # type: ignore[arg-type]
         )
         tally.orbit_reviews_completed += 1
         key = assessment.classification.value
