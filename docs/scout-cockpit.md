@@ -22,16 +22,28 @@ Paid ORBIT calls are bounded twice: per run and per UTC day.
 | `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN` | 4 | Four calls at the observed 7-10 s latency (60 s timeout worst case) fit well inside one 15-minute run. |
 | `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_DAY` | 96 | The hard daily cost bound: on average one review per run. A run may burst up to its per-run bound while the day has budget. |
 | `EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN` | 4 | A stale due watch needs a fresh reading before review. Refreshes are batched into one `pools/multi` request per chain. A watch that is already fresh costs nothing. |
-| GeckoTerminal requests | ≤ 5 per run | One network lookup, one `new_pools` read, one batched refresh for the reviews, one for the history check, and at most one history read. This is exactly the default transport budget of 5 (`GECKOTERMINAL_MAX_REQUESTS`). A run that meets that budget stops asking and reports it as a provider failure. |
+| GeckoTerminal requests | ≤ 4 per normal run | One network lookup, one `new_pools` read, **one** batched refresh shared by the reviews and the history check, and at most one history read. That leaves one request of headroom under the unchanged default transport budget of 5 (`GECKOTERMINAL_MAX_REQUESTS`). The scout never loosens that operator setting. A run that meets it stops asking and reports a provider failure. |
 
-The daily bound is counted from the persisted assessment history of the
-current UTC day. That count includes every review whose model call started,
-including failed reviews. It therefore holds across scheduled processes, and it
-resets at 00:00 UTC.
+The daily bound is a **hard** bound held by durable reservations. Before every
+scout ORBIT call, one slot is reserved and committed in
+`scout_orbit_reservations`. The order is:
 
-If the count cannot be read, no model is asked (fail closed). The one gap is a
-process that dies between starting a call and recording its assessment: that
-call is not counted, which is at most one per-run bound.
+1. read the UTC day's usage under a transaction advisory lock;
+2. refuse if the cap is reached;
+3. reserve the slot;
+4. claim the checkpoint;
+5. call the model;
+6. write the assessment;
+7. settle the reservation as COMPLETED or FAILED.
+
+RESERVED, COMPLETED and FAILED all count. A process that dies mid-call leaves
+its RESERVED slot counted. That is conservative by design: a slot may be spent
+for a call that never reached the provider, never the other way round. If a run
+dies after reserving but before claiming, no call was made, and the next run
+reuses that slot instead of counting it twice.
+
+If the reservation cannot be written, or the day's usage cannot be read, no
+model is asked. The budget resets at 00:00 UTC.
 
 A 15-minute schedule therefore does **not** guarantee six assessments per
 watch. It guarantees:
