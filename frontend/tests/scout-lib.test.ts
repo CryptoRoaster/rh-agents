@@ -101,3 +101,12 @@ describe("cockpit proxy allowlist", () => {
     ).toBeNull();
   });
 });
+
+describe("daily budget label", () => {
+  it("counts calls and never money", async () => {
+    const { dailyBudgetLabel } = await import("@/lib/scout");
+    expect(dailyBudgetLabel(37, 96)).toBe("59 of 96 remaining today");
+    expect(dailyBudgetLabel(96, 96)).toBe("Daily ORBIT budget reached");
+    expect(dailyBudgetLabel(120, 96)).toBe("Daily ORBIT budget reached");
+  });
+});

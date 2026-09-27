@@ -146,6 +146,11 @@ export type ScoutRun = {
   orbit_backlog_after: number;
   oldest_orbit_due_age_seconds: number | null;
   new_watches_without_orbit_assessment: number;
+  orbit_daily_budget: number;
+  orbit_daily_used_before: number;
+  orbit_daily_remaining_before: number;
+  orbit_daily_used_after: number;
+  orbit_daily_remaining_after: number;
 };
 
 export type RunView = {
@@ -172,6 +177,9 @@ export type ScoutOverview = {
   unreviewed_watches: number;
   latest_run: RunView | null;
   very_young_seconds: number;
+  orbit_daily_budget: number;
+  orbit_daily_used: number;
+  orbit_daily_remaining: number;
 };
 
 export type PositionView = {
@@ -352,6 +360,12 @@ export function backlogLabel(
   if (backlog <= 0) return "ORBIT queue caught up";
   const noun = backlog === 1 ? "review" : "reviews";
   return `${backlog} ORBIT ${noun} pending · oldest due ${formatAge(oldestSeconds)}`;
+}
+
+// Calls and budget only. No dollar estimate is shown without a real price basis.
+export function dailyBudgetLabel(used: number, cap: number): string {
+  if (cap > 0 && used >= cap) return "Daily ORBIT budget reached";
+  return `${Math.max(0, cap - used)} of ${cap} remaining today`;
 }
 
 export async function readJson<T>(path: string): Promise<T> {

@@ -1,6 +1,7 @@
 import { StatusBadge } from "@/components/console/ui";
 import {
   backlogLabel,
+  dailyBudgetLabel,
   formatAge,
   formatRate,
   type ScoutOverview,
@@ -49,6 +50,14 @@ export function OverviewStrip({ overview }: { overview: ScoutOverview }) {
           value={formatAge(overview.oldest_orbit_due_age_seconds)}
         />
         <Kpi
+          label="ORBIT budget today"
+          value={`${overview.orbit_daily_used} / ${overview.orbit_daily_budget}`}
+          detail={dailyBudgetLabel(
+            overview.orbit_daily_used,
+            overview.orbit_daily_budget,
+          )}
+        />
+        <Kpi
           label="Latest run"
           value={
             latest
@@ -70,6 +79,10 @@ export function OverviewStrip({ overview }: { overview: ScoutOverview }) {
           overview.orbit_backlog,
           overview.oldest_orbit_due_age_seconds,
         )}
+        {overview.orbit_daily_budget > 0 &&
+        overview.orbit_daily_used >= overview.orbit_daily_budget
+          ? " · Daily ORBIT budget reached; discovery continues and due reviews wait for tomorrow."
+          : ""}
       </p>
     </section>
   );

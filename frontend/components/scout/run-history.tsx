@@ -18,6 +18,7 @@ export function RunHistoryTable({ page }: { page: RunPage }) {
             <th>Watches created</th>
             <th>ORBIT done</th>
             <th>Backlog before → after</th>
+            <th>ORBIT today (after run)</th>
             <th>History checks</th>
             <th>Promotable</th>
             <th>Provider failures</th>
@@ -53,6 +54,9 @@ export function RunHistoryTable({ page }: { page: RunPage }) {
                 </td>
                 <td>
                   {run.orbit_backlog_before} → {run.orbit_backlog_after}
+                </td>
+                <td>
+                  {run.orbit_daily_used_after} / {run.orbit_daily_budget}
                 </td>
                 <td>{run.history_checks}</td>
                 <td>{run.promotable_new}</td>

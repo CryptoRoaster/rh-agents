@@ -94,6 +94,11 @@ const run = {
     orbit_backlog_after: 1,
     oldest_orbit_due_age_seconds: 5400,
     new_watches_without_orbit_assessment: 1,
+    orbit_daily_budget: 96,
+    orbit_daily_used_before: 34,
+    orbit_daily_remaining_before: 62,
+    orbit_daily_used_after: 37,
+    orbit_daily_remaining_after: 59,
   },
   duration_seconds: 12,
   identity_acceptance_rate: 1,
@@ -110,6 +115,9 @@ const overview = {
   unreviewed_watches: 1,
   latest_run: run,
   very_young_seconds: 21600,
+  orbit_daily_budget: 96,
+  orbit_daily_used: 37,
+  orbit_daily_remaining: 59,
 };
 
 const detail = {
@@ -271,6 +279,35 @@ describe("early discovery cockpit", () => {
     const runs = await screen.findByRole("table", { name: /Scout runs/ });
     expect(within(runs).getByText("100%")).toBeTruthy();
     expect(within(runs).getByText("4 → 1")).toBeTruthy();
+  });
+
+  it("shows the daily ORBIT budget as calls, not money", async () => {
+    vi.stubGlobal("fetch", respond(routes));
+    const { container } = render(<ScoutCockpit />);
+    const status = await screen.findByRole("region", { name: "Scout status" });
+    expect(within(status).getByText("37 / 96")).toBeTruthy();
+    expect(within(status).getByText("59 of 96 remaining today")).toBeTruthy();
+    const runs = await screen.findByRole("table", { name: /Scout runs/ });
+    expect(within(runs).getByText("37 / 96")).toBeTruthy();
+    expect(container.textContent).not.toMatch(/\$\s?\d.*(cost|spend)/i);
+  });
+
+  it("reports a spent daily budget plainly, not as an error", async () => {
+    vi.stubGlobal(
+      "fetch",
+      respond({
+        ...routes,
+        "scout/overview": {
+          ...overview,
+          orbit_daily_used: 96,
+          orbit_daily_remaining: 0,
+        },
+      }),
+    );
+    render(<ScoutCockpit />);
+    expect(await screen.findByText("Daily ORBIT budget reached")).toBeTruthy();
+    expect(screen.getByText(/discovery continues/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("opens the ORBIT timeline with completed, failed and pending checkpoints", async () => {
