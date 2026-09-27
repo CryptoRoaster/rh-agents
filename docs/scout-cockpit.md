@@ -111,7 +111,7 @@ ops/scout/uninstall.sh           # unload and remove it (logs stay)
   `Background`, which lets macOS throttle CPU, I/O and network for the whole
   process tree, Codex included. Measured on the development machine (Codex
   preflight only, 5 runs each): Standard median 0.49 s, Background median
-  5.4 s, and under the full background policy (`taskpolicy -b`) the preflight
+  5.6 s, and under the full background policy (`taskpolicy -b`) the preflight
   refused its own release gates in 3 of 5 runs, taking up to 94 s. Standard
   adds no priority boost; it only stops the throttling.
 - **Why a review failed.** A failed review keeps its category

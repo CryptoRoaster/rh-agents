@@ -31,7 +31,7 @@
     runs a Codex subprocess against a bounded, latency-sensitive deadline.
     Background lets macOS throttle CPU, I/O and network for the whole process
     tree: measured locally, the Codex preflight went from ~0.5 s (Standard) to
-    ~5.4 s (Background, median of 5), and under full background policy it
+    ~5.6 s (Background, median of 5), and under full background policy it
     refused its own release gates 3 times in 5. Standard adds no priority boost
     (no nice, no QoS override); it only stops the throttling.
   -->
