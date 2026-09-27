@@ -176,6 +176,12 @@ def ports_from_settings(
             model=settings.reasoning_model,
             effort=settings.reasoning_effort,
         )
+    elif settings.reasoning_provider == "codex":
+        from src.codex_reasoning.provider import codex_provider_from
+
+        reasoning = codex_provider_from(settings)
+        if reasoning is None:
+            unavailable = "REASONING_PROVIDER_CLI_NOT_FOUND"
     elif settings.reasoning_provider == "fake":
         # Selectable in settings, and deliberately not constructible here: the
         # deterministic provider replays a script, and a configuration has no

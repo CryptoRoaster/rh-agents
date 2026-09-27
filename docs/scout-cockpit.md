@@ -86,11 +86,19 @@ ops/scout/uninstall.sh           # unload and remove it (logs stay)
   second one reports `ALREADY_RUNNING` and does nothing.
 - **Configuration.** The agent reads the same root `.env` a manual run reads.
   It must set `EARLY_SCOUT_ENABLED=true`, `MARKET_PROVIDER=geckoterminal`,
-  `MARKET_CHAINS=bsc` and `REASONING_PROVIDER=anthropic`. Put secrets such as
+  `MARKET_CHAINS=bsc` and a reasoning provider. Put secrets such as
   `ANTHROPIC_API_KEY` in the `.env` (gitignored) or in
   `~/.config/rh-agents/scout.env` (`chmod 600`, outside the repository). The
   wrapper exports that file first. Nothing secret is committed, and none is
   written into the plist.
+- **ChatGPT subscription instead of an API key.** `REASONING_PROVIDER=codex`
+  asks GPT-5.5 through the local Codex CLI and its ChatGPT login; no key is
+  configured anywhere. launchd's PATH does not contain the CLI, so the scout
+  env must name it, for example `CODEX_EXECUTABLE=/opt/homebrew/bin/codex`.
+  The login stays in `~/.codex` (or `CODEX_HOME`); every call copies
+  `auth.json` into a throwaway isolated home and runs behind the harness's
+  Seatbelt profile and release gates. A refused gate is a failed review, never
+  an unsandboxed one. The daily ORBIT cap applies unchanged.
 - **Logs.** `~/Library/Logs/rh-agents/scout.log` holds the run summary JSON
   plus start and exit lines. It rotates at 5 MB and keeps 3 generations.
   launchd's own output goes to `scout.launchd.log`. A failed run keeps its exit

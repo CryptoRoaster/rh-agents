@@ -1,7 +1,9 @@
-"""Offline evaluation harnesses. Never part of the production runtime.
+"""Evaluation harnesses, and the gated Codex path the runtime may opt into.
 
 Nothing under this package may be imported by `src.agents`, `src.orchestration`,
-`src.runner`, `src.risk`, `src.execution` or `src.ledger`, and nothing here is
-reachable from `Settings` or `ports_from_settings`. A test enforces both, so the
-separation is a property of the build rather than a promise in a document.
+`src.runner`, `src.risk`, `src.execution` or `src.ledger`, and nothing here
+reads `Settings`. The only bridge is `src.codex_reasoning`, which the runtime
+imports lazily when `REASONING_PROVIDER=codex` is chosen. Tests enforce all of
+it, so the separation is a property of the build rather than a promise in a
+document.
 """

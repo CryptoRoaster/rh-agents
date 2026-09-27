@@ -260,6 +260,13 @@ launcher either, so even a fully configured environment cannot make a paid call
 without new code. Phase 2C adds no migration. See
 [the ORBIT reference implementation](docs/phase-2c.md).
 
+`REASONING_PROVIDER=codex` is the second real provider: GPT-5.5 through the
+local Codex CLI on its ChatGPT login, with no API key. It reuses the gated
+harness in `backend/src/evaluation/codex` for every call (isolated home,
+pinned catalog, Seatbelt profile, release gates), and the runtime reaches it
+only through `backend/src/codex_reasoning`. See
+[the scout cockpit notes](docs/scout-cockpit.md) for the scheduler setup.
+
 ## Phase 2D ATLAS on-chain intelligence
 
 ATLAS is the first safety-critical specialist worker. Deterministic collectors

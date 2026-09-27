@@ -10,7 +10,7 @@
 # root `.env` (gitignored). An optional file outside the repository,
 # $RH_AGENTS_SCOUT_ENV (default ~/.config/rh-agents/scout.env), is exported
 # first, for values such as ANTHROPIC_API_KEY that must not live in any
-# committed file. Nothing secret is written here or in the plist.
+# committed file, or CODEX_EXECUTABLE, which launchd's PATH cannot find. Nothing secret is written here or in the plist.
 #
 # The scout's exit code is this script's exit code, so launchd and the log both
 # show a failed run as failed.

@@ -1,8 +1,10 @@
-"""The probe stays outside the runtime, and the runtime stays unaware of it.
+"""The harness stays outside the runtime except through one explicit bridge.
 
-"Test artifact, not workflow evidence" has to be more than a sentence in a
-docstring. These tests make it a property of the tree: no runtime package can
-import the harness, and no configuration path can select it.
+Codex became selectable as `REASONING_PROVIDER=codex`. That has to stay more
+than a sentence in a docstring, so these tests make it a property of the tree:
+no runtime package imports the harness, the only bridge is
+`src.codex_reasoning`, it is reached lazily and only when chosen, and the
+default configuration selects nothing.
 """
 
 import ast
@@ -63,17 +65,41 @@ def test_no_runtime_package_imports_the_probe(package: str) -> None:
     assert offenders == []
 
 
-def test_the_probe_is_not_a_selectable_reasoning_provider() -> None:
+def test_codex_is_selectable_only_explicitly() -> None:
     field = Settings.model_fields["reasoning_provider"]
     allowed = str(field.annotation)
-    assert "codex" not in allowed
-    assert "anthropic" in allowed
+    assert "codex" in allowed
+    assert field.default == "disabled"
 
 
-def test_production_composition_mentions_no_codex_wiring() -> None:
-    composition = (SOURCE_ROOT / "runner" / "composition.py").read_text(encoding="utf-8")
-    assert "codex" not in composition.lower()
-    assert "evaluation" not in composition.lower()
+def test_only_the_bridge_imports_the_harness() -> None:
+    offenders = [
+        str(path.relative_to(SOURCE_ROOT))
+        for path in SOURCE_ROOT.rglob("*.py")
+        if not path.is_relative_to(SOURCE_ROOT / "evaluation")
+        and not path.is_relative_to(SOURCE_ROOT / "codex_reasoning")
+        and any(name.startswith("src.evaluation") for name in imported_modules(path))
+    ]
+    assert offenders == []
+
+
+def module_level_imports(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            names.add(node.module)
+    return names
+
+
+@pytest.mark.parametrize("module", ["runner/composition.py", "scout/service.py"])
+def test_the_bridge_is_imported_only_when_codex_is_chosen(module: str) -> None:
+    path = SOURCE_ROOT / module
+    assert not any(name.startswith("src.codex_reasoning") for name in module_level_imports(path))
+    assert "src.codex_reasoning.provider" in imported_modules(path)
+    assert "src.evaluation" not in path.read_text(encoding="utf-8")
 
 
 def test_the_reasoning_contract_is_untouched_by_the_probe() -> None:

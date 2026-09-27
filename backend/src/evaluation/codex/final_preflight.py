@@ -39,10 +39,14 @@ async def run_preflight(
         return prepared.status, prepared.runner is not None
 
 
-def default_launcher() -> CodexLauncher | None:
-    """The platform binary, which is the only form allowed to carry a descriptor."""
-    node_entry = shutil.which("codex")
-    if node_entry is None:
+def default_launcher(entry: Path | None = None) -> CodexLauncher | None:
+    """The platform binary, which is the only form allowed to carry a descriptor.
+
+    `entry` is the installed `codex` command. Without one it is looked up on
+    PATH, which a scheduler's minimal PATH may not include.
+    """
+    node_entry = str(entry) if entry is not None else shutil.which("codex")
+    if node_entry is None or not Path(node_entry).exists():
         return None
     vendor = Path(node_entry).resolve().parent.parent
     for candidate in vendor.rglob("vendor/*/bin/codex"):

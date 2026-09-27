@@ -117,6 +117,13 @@ def scout_ports_from_settings(settings: Settings) -> ScoutPorts:
                 effort=settings.reasoning_effort,
             )
         )
+    if settings.reasoning_provider == "codex":
+        from src.codex_reasoning.provider import codex_provider_from
+
+        codex = codex_provider_from(settings)
+        if codex is None:
+            return ScoutPorts(reasoning_unavailable="REASONING_PROVIDER_CLI_NOT_FOUND")
+        return ScoutPorts(reasoning=codex)
     if settings.reasoning_provider == "fake":
         # A scripted model is test code, never a configuration.
         return ScoutPorts(reasoning_unavailable="REASONING_PROVIDER_NOT_COMPOSABLE")

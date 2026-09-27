@@ -238,6 +238,17 @@ def test_a_disabled_reasoning_provider_is_reported_not_substituted():
     assert ports.reasoning_unavailable == "REASONING_PROVIDER_NOT_CONFIGURED"
 
 
+def test_codex_without_a_cli_is_reported_not_substituted(tmp_path):
+    settings = runner_settings(
+        reasoning_provider="codex", codex_executable=str(tmp_path / "missing")
+    )
+
+    ports = ports_from_settings(settings, None)  # type: ignore[arg-type]
+
+    assert ports.reasoning is None
+    assert ports.reasoning_unavailable == "REASONING_PROVIDER_CLI_NOT_FOUND"
+
+
 async def test_a_role_that_needs_an_unbuildable_port_is_reported(risk_db, now, trace):
     """Enabled and unwired is a different answer from enabled and idle."""
     _, sessions = risk_db
