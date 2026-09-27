@@ -116,6 +116,8 @@ def test_the_rendered_plist_runs_the_wrapper_every_fifteen_minutes(tmp_path):
     assert plist["WorkingDirectory"] == f"{REPO}/backend"
     assert plist["StartInterval"] == 900
     assert plist["RunAtLoad"] is False
+    # Background throttles the Codex subprocess past its own deadlines.
+    assert plist["ProcessType"] == "Standard"
     assert set(plist["EnvironmentVariables"]) == {"PATH", "RH_AGENTS_SCOUT_LOG_DIR"}
     # A dry run installs nothing.
     assert not (tmp_path / "agents").exists()
@@ -124,3 +126,37 @@ def test_the_rendered_plist_runs_the_wrapper_every_fifteen_minutes(tmp_path):
 def test_the_scripts_are_executable():
     for name in ("run-scout.sh", "install.sh", "uninstall.sh"):
         assert os.access(SCOUT / name, os.X_OK), name
+
+
+def test_background_cannot_quietly_return_as_the_process_type():
+    template = plistlib.loads((SCOUT / "com.rh-agents.scout.plist.template").read_text().encode())
+    assert template["ProcessType"] == "Standard"
+    assert "Nice" not in template and "LowPriorityIO" not in template
+
+
+def test_the_scout_env_reaches_the_scout_process(tmp_path):
+    """A provider-local override, such as the Codex timeout, is exported to the run."""
+    uv = tmp_path / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "${{REASONING_TIMEOUT_SECONDS:-unset}} ${{REASONING_PROVIDER:-unset}}"'
+        f' > "{tmp_path}/seen"\n'
+    )
+    uv.chmod(uv.stat().st_mode | stat.S_IEXEC)
+    scout_env = tmp_path / "scout.env"
+    scout_env.write_text("REASONING_PROVIDER=codex\nREASONING_TIMEOUT_SECONDS=120\n")
+    subprocess.run(
+        ["/bin/bash", str(SCOUT / "run-scout.sh")],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "RH_AGENTS_UV": str(uv),
+            "RH_AGENTS_SCOUT_LOG_DIR": str(tmp_path / "logs"),
+            "RH_AGENTS_SCOUT_ENV": str(scout_env),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    assert (tmp_path / "seen").read_text().split() == ["120", "codex"]

@@ -2221,6 +2221,11 @@ main {
   color: var(--text-secondary);
   font-size: 9px;
 }
+
+.scout-failure-reason {
+  display: block;
+  white-space: nowrap;
+}
 .sr-only {
   position: absolute;
   width: 1px;

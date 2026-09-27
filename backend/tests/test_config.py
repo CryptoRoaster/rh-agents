@@ -83,6 +83,7 @@ def settings(monkeypatch, **env: str) -> Settings:
         "REASONING_EFFORT",
         "CODEX_EXECUTABLE",
         "CODEX_HOME",
+        "REASONING_TIMEOUT_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
         monkeypatch.delenv(name.lower(), raising=False)
@@ -127,6 +128,13 @@ def test_codex_needs_no_key_and_refuses_an_effort_it_does_not_have(monkeypatch):
     assert chosen.orbit_worker_enabled is False
     with pytest.raises(ValidationError):
         settings(monkeypatch, REASONING_PROVIDER="codex", REASONING_EFFORT="max")
+
+
+def test_the_codex_timeout_is_a_local_override_not_a_new_default(monkeypatch):
+    # The scout's env file raises it for Codex; every other process keeps 60 s.
+    assert settings(monkeypatch).reasoning_timeout_seconds == 60
+    scout = settings(monkeypatch, REASONING_PROVIDER="codex", REASONING_TIMEOUT_SECONDS="120")
+    assert scout.reasoning_timeout_seconds == 120
 
 
 def test_enabling_orbit_without_a_provider_fails_loudly(monkeypatch):

@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.data.repository import aware
 from src.data.tables import ScoutRunRow
-from src.scout.models import ScoutRun, ScoutSummary
+from src.scout.models import ModelFailureCount, ScoutRun, ScoutSummary
 
 # Every counter the summary carries and the table stores, by the same name.
 COUNTERS = (
@@ -66,6 +66,9 @@ def _run(row: ScoutRunRow) -> ScoutRun:
         errors=tuple(row.errors),
         policy_version=row.policy_version,
         oldest_orbit_due_age_seconds=row.oldest_orbit_due_age_seconds,
+        model_failure_reasons=tuple(
+            ModelFailureCount.model_validate(item) for item in row.model_failure_reasons or ()
+        ),
         **{name: getattr(row, name) for name in COUNTERS},
     )
 
@@ -88,6 +91,9 @@ class ScoutRunRepository:
                     errors=list(summary.errors),
                     policy_version=summary.policy_version,
                     oldest_orbit_due_age_seconds=summary.oldest_orbit_due_age_seconds,
+                    model_failure_reasons=[
+                        item.model_dump() for item in summary.model_failure_reasons
+                    ],
                     created_at=completed,
                     **{name: getattr(summary, name) for name in COUNTERS},
                 )

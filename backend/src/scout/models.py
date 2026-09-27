@@ -51,7 +51,10 @@ class WatchAssessment(Immutable):
     checkpoint_index: int
     checkpoint_seconds: int
     status: Literal["COMPLETED", "FAILED"]
+    # The category (`PROVIDER_TIMEOUT`), and beside it the provider's own
+    # sanitised reason (`CODEX_DEADLINE_EXCEEDED`) where one was given.
     failure_reason: Code | None = None
+    failure_reason_code: Code | None = None
     classification: Code | None = None
     strength: Code | None = None
     reason_codes: tuple[Code, ...] = ()
@@ -79,11 +82,21 @@ class ScoutReview(Immutable):
     checkpoint_seconds: int = Field(ge=0)
     status: Literal["COMPLETED", "FAILED"]
     failure_reason: Code | None = None
+    failure_reason_code: Code | None = None
     classification: Code | None = None
     strength: Code | None = None
     reason_codes: tuple[Code, ...] = ()
     data_gaps: tuple[Code, ...] = ()
     next_review_at: str | None = None
+
+
+class ModelFailureCount(Immutable):
+    """How often one provider failed one way in one run. Codes only."""
+
+    provider: Identifier
+    category: Code
+    reason_code: Code
+    count: int = Field(ge=1)
 
 
 class ScoutSummary(Immutable):
@@ -140,6 +153,8 @@ class ScoutSummary(Immutable):
     orbit_daily_used_after: int = Field(default=0, ge=0)
     orbit_daily_remaining_after: int = Field(default=0, ge=0)
     reviews: tuple[ScoutReview, ...] = Field(default=(), max_length=16)
+    # Every model failure of this run, counted by provider, category and code.
+    model_failure_reasons: tuple[ModelFailureCount, ...] = Field(default=(), max_length=32)
     errors: tuple[Code, ...] = Field(default=(), max_length=16)
     # Stated in every summary, because it is the whole contract of this mode.
     trade_cases_opened: Literal[0] = 0
@@ -191,6 +206,7 @@ class ScoutRun(Immutable):
     orbit_daily_remaining_before: int
     orbit_daily_used_after: int
     orbit_daily_remaining_after: int
+    model_failure_reasons: tuple[ModelFailureCount, ...] = ()
 
     @property
     def identity_acceptance_rate(self) -> float | None:

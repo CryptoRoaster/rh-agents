@@ -130,7 +130,17 @@ export function WatchDetailView({
                     {new Date(assessment.assessed_at).toLocaleString("en-GB")}
                   </small>
                   {assessment.status === "FAILED" ? (
-                    <p>Review failed: {assessment.failure_reason}</p>
+                    <p>
+                      Review failed: {assessment.failure_reason}
+                      {assessment.failure_reason_code &&
+                      assessment.failure_reason_code !==
+                        assessment.failure_reason ? (
+                        <span className="scout-codes">
+                          {" "}
+                          · {assessment.failure_reason_code}
+                        </span>
+                      ) : null}
+                    </p>
                   ) : (
                     <>
                       <p>{assessment.summary}</p>

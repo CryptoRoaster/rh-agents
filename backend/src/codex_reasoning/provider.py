@@ -15,8 +15,9 @@ The port's `max_output_tokens` has no Codex counterpart and is not enforced
 here; the harness bounds the final message by bytes instead.
 """
 
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -50,6 +51,9 @@ CODEX_PROVIDER = "codex"
 CLEANUP_RESERVE_SECONDS = 5.0
 # Below this, what the preflight left over is not worth starting a turn with.
 MIN_TURN_SECONDS = 10.0
+# A probe is not started with less than its own cleanup reserve left, so a
+# preflight that ended within this much of its budget ran out of time.
+PREFLIGHT_SLACK_SECONDS = 2.5
 
 _Category = ReasoningErrorCategory
 
@@ -82,6 +86,8 @@ FAILURE_CATEGORIES: dict[EvaluationFailure, ReasoningErrorCategory] = {
 
 PrepareRun = Callable[..., AbstractAsyncContextManager[Any]]
 
+_SAFE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,79}$")
+
 
 def _canonical(value: object) -> object:
     """Serialize domain values without ever passing money through a float."""
@@ -96,6 +102,13 @@ def _canonical(value: object) -> object:
 
 def _accept(_: object) -> None:
     """The caller validates its own domain after the call returns."""
+
+
+def _refused(blocking: Sequence[Any]) -> str:
+    """The first gate that refused the release, as a code. Never its detail text."""
+    name = str(getattr(blocking[0], "name", "")) if blocking else ""
+    code = f"CODEX_GATE_{name}"
+    return code if _SAFE_CODE.fullmatch(code) else "CODEX_RELEASE_NOT_GRANTED"
 
 
 def find_launcher(executable: str) -> CodexLauncher | None:
@@ -119,18 +132,28 @@ class CodexReasoningProvider:
         self, request: ReasoningRequest[Output]
     ) -> ReasoningResult[Output]:
         started = self.monotonic()
+        # One budget for the whole call. The probes before the turn draw on it
+        # and must leave enough for a turn and its cleanup; they never get a
+        # budget of their own on top of the caller's.
+        probe_budget = request.timeout_seconds - CLEANUP_RESERVE_SECONDS - MIN_TURN_SECONDS
+        if probe_budget <= 0:
+            raise ReasoningFailure(_Category.PROVIDER_REJECTED_REQUEST, "CODEX_TIMEOUT_TOO_SHORT")
         try:
             async with self.prepare(
                 launcher=self.launcher,
                 source_codex_home=self.source_codex_home,
                 effort=self.effort,
+                probe_budget_seconds=probe_budget,
             ) as prepared:
                 if prepared.runner is None:
+                    elapsed = self.monotonic() - started
+                    if elapsed >= probe_budget - PREFLIGHT_SLACK_SECONDS:
+                        raise ReasoningFailure(
+                            _Category.PROVIDER_TIMEOUT, "CODEX_PREFLIGHT_TOO_SLOW"
+                        )
                     raise ReasoningFailure(
-                        _Category.PROVIDER_NOT_CONFIGURED, "CODEX_RELEASE_NOT_GRANTED"
+                        _Category.PROVIDER_NOT_CONFIGURED, _refused(prepared.status.blocking)
                     )
-                # The probes before the turn spend from the same budget the
-                # caller gave the whole call.
                 remaining = request.timeout_seconds - (self.monotonic() - started)
                 if remaining < CLEANUP_RESERVE_SECONDS + MIN_TURN_SECONDS:
                     raise ReasoningFailure(_Category.PROVIDER_TIMEOUT, "CODEX_PREFLIGHT_TOO_SLOW")

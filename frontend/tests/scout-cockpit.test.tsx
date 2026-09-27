@@ -88,7 +88,7 @@ const run = {
     dormant_new: 0,
     retired_new: 0,
     provider_failures: 0,
-    model_failures: 0,
+    model_failures: 2,
     provider_requests: 3,
     orbit_backlog_before: 4,
     orbit_backlog_after: 1,
@@ -99,6 +99,14 @@ const run = {
     orbit_daily_remaining_before: 62,
     orbit_daily_used_after: 37,
     orbit_daily_remaining_after: 59,
+    model_failure_reasons: [
+      {
+        provider: "codex",
+        category: "PROVIDER_TIMEOUT",
+        reason_code: "CODEX_DEADLINE_EXCEEDED",
+        count: 2,
+      },
+    ],
   },
   duration_seconds: 12,
   identity_acceptance_rate: 1,
@@ -155,6 +163,7 @@ const detail = {
       checkpoint_seconds: 0,
       status: "COMPLETED",
       failure_reason: null,
+      failure_reason_code: null,
       classification: "NOT_INTERESTING",
       strength: "WEAK",
       reason_codes: ["PRICE_AVAILABLE", "LIQUIDITY_UNKNOWN"],
@@ -181,6 +190,7 @@ const detail = {
       checkpoint_seconds: 3600,
       status: "FAILED",
       failure_reason: "PROVIDER_TIMEOUT",
+      failure_reason_code: "CODEX_DEADLINE_EXCEEDED",
       classification: null,
       strength: null,
       reason_codes: [],
@@ -279,6 +289,9 @@ describe("early discovery cockpit", () => {
     const runs = await screen.findByRole("table", { name: /Scout runs/ });
     expect(within(runs).getByText("100%")).toBeTruthy();
     expect(within(runs).getByText("4 → 1")).toBeTruthy();
+    expect(
+      within(runs).getByText("codex CODEX_DEADLINE_EXCEEDED ×2"),
+    ).toBeTruthy();
   });
 
   it("shows the daily ORBIT budget as calls, not money", async () => {
@@ -320,7 +333,8 @@ describe("early discovery cockpit", () => {
     expect(
       await screen.findByText("Price observed; liquidity unknown."),
     ).toBeTruthy();
-    expect(screen.getByText("Review failed: PROVIDER_TIMEOUT")).toBeTruthy();
+    expect(screen.getByText(/Review failed: PROVIDER_TIMEOUT/)).toBeTruthy();
+    expect(screen.getByText("· CODEX_DEADLINE_EXCEEDED")).toBeTruthy();
     expect(screen.getByText(/no assessment yet/)).toBeTruthy();
     expect(screen.getByText(/never TradeCase evidence/)).toBeTruthy();
   });

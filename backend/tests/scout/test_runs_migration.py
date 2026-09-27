@@ -14,7 +14,6 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from src.data.schema import expected_revision
 from tests.reentry.test_migration import load
 from tests.scout.test_migration import THROUGH_0011
 
@@ -85,8 +84,7 @@ async def tables(engine):
         return await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
 
 
-def test_the_chain_ends_at_0013():
-    assert expected_revision() == "0013"
+def test_0013_follows_0012():
     assert load(MODULE).down_revision == "0012"
 
 

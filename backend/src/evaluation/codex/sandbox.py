@@ -308,7 +308,9 @@ class LoopbackTarget:
         self._thread.join(timeout=2)
 
 
-def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> ProbeResult:
+def probe_boundaries(
+    roots: SandboxRoots, profile: Path, outside: Path, *, timeout: float = PROBE_TIMEOUT_SECONDS
+) -> ProbeResult:
     """Measure the read boundary, the write scope and egress under the profile.
 
     Sentinels stand in for the repository, HOME and credential classes. Reading
@@ -431,7 +433,7 @@ def probe_boundaries(roots: SandboxRoots, profile: Path, outside: Path) -> Probe
                 command,
                 capture_output=True,
                 text=True,
-                timeout=PROBE_TIMEOUT_SECONDS,
+                timeout=timeout,
                 check=False,
                 env={"PATH": "/usr/bin:/bin"},
             )

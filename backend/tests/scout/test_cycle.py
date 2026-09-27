@@ -22,6 +22,7 @@ from src.markets.history import MarketHistoryUnavailable
 from src.reasoning.models import ReasoningErrorCategory
 from src.scout.policy import WatchStatus
 from src.scout.repository import WatchRepository
+from src.scout.runs import ScoutRunRepository
 from tests.scout.conftest import (
     HOUR,
     POOLS,
@@ -267,6 +268,57 @@ async def test_a_provider_failure_is_recorded_typed_and_keeps_the_watch(db):
     assert watch.next_orbit_review_at == T0 + HOUR
 
 
+async def test_a_failure_keeps_its_exact_reason_beside_its_category(db):
+    """The category alone could not tell a refused gate from a probe out of time."""
+    _, sessions = db
+    orbit = EchoOrbit(
+        failure=ReasoningErrorCategory.PROVIDER_NOT_CONFIGURED,
+        reason_code="CODEX_GATE_NETWORK_EGRESS",
+    )
+    summary = await scout(
+        sessions, T0, provider=MarketProvider(discovery=[young(0), young(1)]), orbit=orbit
+    )
+
+    rows = [
+        row
+        for index in (0, 1)
+        for row in await assessments(sessions, await watch_for(sessions, index))
+    ]
+    assert {row.failure_reason for row in rows} == {"PROVIDER_NOT_CONFIGURED"}
+    assert {row.failure_reason_code for row in rows} == {"CODEX_GATE_NETWORK_EGRESS"}
+    assert {row.reasoning_provider for row in rows} == {"fake"}
+    # One call per due review, no retry inside a slot.
+    assert len(orbit.calls) == 2
+    assert [item.model_dump() for item in summary.model_failure_reasons] == [
+        {
+            "provider": "fake",
+            "category": "PROVIDER_NOT_CONFIGURED",
+            "reason_code": "CODEX_GATE_NETWORK_EGRESS",
+            "count": 2,
+        }
+    ]
+    assert {review.failure_reason_code for review in summary.reviews} == {
+        "CODEX_GATE_NETWORK_EGRESS"
+    }
+    (run,) = await ScoutRunRepository(sessions).recent(1)
+    assert run.model_failure_reasons == summary.model_failure_reasons
+
+
+async def test_an_unsafe_reason_is_stored_as_unclassified(db):
+    _, sessions = db
+    orbit = EchoOrbit(
+        failure=ReasoningErrorCategory.PROVIDER_UNAVAILABLE,
+        reason_code="/Users/someone/.codex/auth.json: token=abc",
+    )
+    summary = await scout(sessions, T0, provider=MarketProvider(discovery=[young(0)]), orbit=orbit)
+
+    (row,) = await assessments(sessions, await watch_for(sessions, 0))
+    assert row.failure_reason == "PROVIDER_UNAVAILABLE"
+    assert row.failure_reason_code == "UNCLASSIFIED"
+    printed = summary.model_dump_json()
+    assert "auth.json" not in printed and "token" not in printed
+
+
 async def test_invalid_output_is_never_stored_as_a_valid_assessment(db):
     _, sessions = db
     summary = await scout(
@@ -276,7 +328,10 @@ async def test_invalid_output_is_never_stored_as_a_valid_assessment(db):
     (row,) = await assessments(sessions, watch)
     assert row.status == "FAILED"
     assert row.failure_reason == "MARKET_MISMATCH"
+    assert row.failure_reason_code == "MARKET_MISMATCH"
     assert row.classification is None and row.summary is None
+    (reason,) = summary.model_failure_reasons
+    assert (reason.category, reason.reason_code) == ("INVALID_MODEL_OUTPUT", "MARKET_MISMATCH")
     assert summary.model_failures == 1
     assert summary.orbit_reviews_completed == 0
 

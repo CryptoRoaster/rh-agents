@@ -87,6 +87,7 @@ def _assessment(row: DiscoveryWatchAssessmentRow) -> WatchAssessment:
         checkpoint_seconds=row.checkpoint_seconds,
         status=row.status,  # type: ignore[arg-type]
         failure_reason=row.failure_reason,
+        failure_reason_code=row.failure_reason_code,
         classification=row.classification,
         strength=row.strength,
         reason_codes=tuple(row.reason_codes),

@@ -61,7 +61,21 @@ export function RunHistoryTable({ page }: { page: RunPage }) {
                 <td>{run.history_checks}</td>
                 <td>{run.promotable_new}</td>
                 <td>{run.provider_failures}</td>
-                <td>{run.model_failures}</td>
+                <td>
+                  {run.model_failures}
+                  {run.model_failure_reasons.length ? (
+                    <span className="scout-codes">
+                      {run.model_failure_reasons.map((item) => (
+                        <span
+                          key={`${item.provider}:${item.category}:${item.reason_code}`}
+                          className="scout-failure-reason"
+                        >
+                          {item.provider} {item.reason_code} ×{item.count}
+                        </span>
+                      ))}
+                    </span>
+                  ) : null}
+                </td>
               </tr>
             ),
           )}

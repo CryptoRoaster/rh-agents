@@ -303,13 +303,19 @@ def evaluate_release(
     roots: sandbox.SandboxRoots | None,
     probe_outside: Path | None,
     isolated_home: IsolatedHome | None,
+    probe_timeout_seconds: float = sandbox.PROBE_TIMEOUT_SECONDS,
 ) -> PreflightStatus:
-    """Work out, without contacting a model, whether a real turn could proceed."""
+    """Work out, without contacting a model, whether a real turn could proceed.
+
+    `probe_timeout_seconds` bounds the synchronous boundary probe. A caller with
+    a deadline of its own passes what is left of it, so the probe can never
+    spend time the caller does not have.
+    """
     gates = [
         _catalog_gates(catalog_path, expected_digest, model, snapshot_dir),
         _version_gate(cli_version, supported_version),
         _session_gate(chatgpt_session),
-        _sandbox_gate(roots, probe_outside),
+        _sandbox_gate(roots, probe_outside, probe_timeout_seconds),
         _home_gate(isolated_home),
         _remote_validity_gate(),
     ]
@@ -406,7 +412,11 @@ def _unmeasurable(reason: str) -> list[Gate]:
     ]
 
 
-def _sandbox_gate(roots: sandbox.SandboxRoots | None, probe_outside: Path | None) -> list[Gate]:
+def _sandbox_gate(
+    roots: sandbox.SandboxRoots | None,
+    probe_outside: Path | None,
+    probe_timeout_seconds: float = sandbox.PROBE_TIMEOUT_SECONDS,
+) -> list[Gate]:
     if not sandbox.macos():
         # Linux would need bwrap or landlock, which is not implemented. Refusing
         # is the only honest answer; there is no degraded mode here.
@@ -415,10 +425,15 @@ def _sandbox_gate(roots: sandbox.SandboxRoots | None, probe_outside: Path | None
         return _unmeasurable("sandbox-exec or profile missing")
     if roots is None or probe_outside is None:
         return _unmeasurable("no outer sandbox configured")
+    if probe_timeout_seconds <= 0:
+        # Unmeasured is a failure, never a pass: no time is left to probe.
+        return _unmeasurable("no time left to probe the boundary")
 
     profile = sandbox.write_profile(probe_outside)
     try:
-        result = sandbox.probe_boundaries(roots, profile, probe_outside)
+        result = sandbox.probe_boundaries(
+            roots, profile, probe_outside, timeout=probe_timeout_seconds
+        )
     finally:
         profile.unlink(missing_ok=True)
 
