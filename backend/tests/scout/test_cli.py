@@ -89,3 +89,22 @@ async def test_preflight_blocks_a_scout_without_a_model_or_a_real_provider(risk_
     assert checks["EARLY_SCOUT_MARKET_PROVIDER"].reason == "EARLY_SCOUT_PROVIDER_NOT_GECKOTERMINAL"
     assert checks["EARLY_SCOUT_REASONING"].status == CheckStatus.BLOCKED.value
     assert checks["EARLY_SCOUT_REASONING"].reason == "REASONING_PROVIDER_NOT_CONFIGURED"
+
+
+def test_a_codex_scout_without_a_cli_refuses_before_any_budget_is_touched(tmp_path):
+    from src.scout.service import refuse_scout, scout_ports_from_settings
+
+    settings = runner_settings(
+        early_scout_enabled=True,
+        market_provider="geckoterminal",
+        reasoning_provider="codex",
+        codex_executable=str(tmp_path / "missing"),
+    )
+
+    ports = scout_ports_from_settings(settings)
+    refused = refuse_scout(settings, ports)
+
+    assert ports.reasoning is None
+    assert refused is not None
+    assert refused.reason == "EARLY_SCOUT_REASONING_UNAVAILABLE"
+    assert refused.detail == "REASONING_PROVIDER_CLI_NOT_FOUND"

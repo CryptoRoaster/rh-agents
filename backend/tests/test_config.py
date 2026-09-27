@@ -80,6 +80,9 @@ def settings(monkeypatch, **env: str) -> Settings:
         "ANTHROPIC_API_KEY",
         "ORBIT_WORKER_ENABLED",
         "REASONING_MODEL",
+        "REASONING_EFFORT",
+        "CODEX_EXECUTABLE",
+        "CODEX_HOME",
     ):
         monkeypatch.delenv(name, raising=False)
         monkeypatch.delenv(name.lower(), raising=False)
@@ -115,6 +118,15 @@ def test_a_real_provider_must_be_chosen_and_credentialed(monkeypatch):
     assert chosen.reasoning_provider == "anthropic"
     # Choosing a provider still does not start ORBIT.
     assert chosen.orbit_worker_enabled is False
+
+
+def test_codex_needs_no_key_and_refuses_an_effort_it_does_not_have(monkeypatch):
+    chosen = settings(monkeypatch, REASONING_PROVIDER="codex")
+    assert chosen.reasoning_provider == "codex"
+    assert chosen.anthropic_api_key.get_secret_value() == ""
+    assert chosen.orbit_worker_enabled is False
+    with pytest.raises(ValidationError):
+        settings(monkeypatch, REASONING_PROVIDER="codex", REASONING_EFFORT="max")
 
 
 def test_enabling_orbit_without_a_provider_fails_loudly(monkeypatch):

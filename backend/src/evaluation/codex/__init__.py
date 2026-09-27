@@ -1,1 +1,1 @@
-"""Codex evaluation probe. Offline harness, never production wiring."""
+"""Codex harness. Reached from the runtime only through `src.codex_reasoning`."""

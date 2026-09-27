@@ -247,6 +247,7 @@ def _configuration(
     roots: sandbox.SandboxRoots,
     profile: sandbox.WrittenProfile,
     runtime_catalog: RuntimeCatalog | None,
+    effort: str | None,
 ) -> CodexClientConfig:
     """Exactly the configuration that was measured, and the one that is bound."""
     return CodexClientConfig(
@@ -260,6 +261,7 @@ def _configuration(
         expected_catalog_sha256=GPT_5_5_CATALOG_SHA256,
         runtime_catalog=runtime_catalog,
         model=GPT_5_5_CATALOG_SLUG,
+        effort=effort,
         process_limits=ProcessLimits(),
         run_preflight=True,
         outer_sandbox=roots,
@@ -279,9 +281,13 @@ def _reopen_for_teardown(directory: Path) -> None:
 
 @asynccontextmanager
 async def prepare_real_run(
-    *, launcher: CodexLauncher, source_codex_home: Path
+    *, launcher: CodexLauncher, source_codex_home: Path, effort: str | None = None
 ) -> AsyncIterator[PreparedRealRun]:
-    """Build the environment, measure it, and hold it open while it is valid."""
+    """Build the environment, measure it, and hold it open while it is valid.
+
+    `effort` is carried into the bound configuration unchanged; an effort the
+    client does not support is refused at the attempt, before any exec.
+    """
     root = Path(tempfile.mkdtemp(prefix="codex-preflight-"))
     os.chmod(root, 0o700)
     tree = _build_tree(root)
@@ -354,6 +360,7 @@ async def prepare_real_run(
             roots=roots,
             profile=profile,
             runtime_catalog=runtime_catalog,
+            effort=effort,
         )
         authorization: ReleaseAuthorization | None = None
         runner: RealCodexRunner | None = None
