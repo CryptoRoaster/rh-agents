@@ -48,6 +48,7 @@ process.
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -79,7 +80,7 @@ from src.evaluation.codex.command import (
     build_version_arguments,
     child_environment,
 )
-from src.evaluation.codex.deadline import Deadline
+from src.evaluation.codex.deadline import MIN_WORK_SECONDS, Deadline
 from src.evaluation.codex.models import (
     SUPPORTED_CLI_VERSION,
     CodexLauncher,
@@ -98,6 +99,7 @@ from src.evaluation.codex.release import (
 )
 
 PROBE_BUDGET_SECONDS = 30.0
+PROBE_CLEANUP_RESERVE_SECONDS = 2.0
 PLACEHOLDER_AUTH = '{"placeholder": "not a credential"}\n'
 # A fixed nil-ish UUID. The machine's own installation identifier is never
 # used for a destructive probe.
@@ -194,6 +196,13 @@ def _build_tree(root: Path) -> _Tree:
     )
 
 
+def _left(ends: float | None, cap: float) -> float:
+    """`cap`, or less when a caller's deadline leaves less."""
+    if ends is None:
+        return cap
+    return min(cap, ends - time.monotonic())
+
+
 async def _ask_the_cli(
     *,
     launcher: CodexLauncher,
@@ -201,25 +210,42 @@ async def _ask_the_cli(
     profile: sandbox.WrittenProfile,
     environment: dict[str, str],
     workspace: Path,
+    ends: float | None = None,
 ) -> tuple[str | None, bool | None]:
-    """Run both probes behind this profile, in this home. No turn, no model."""
+    """Run both probes behind this profile, in this home. No turn, no model.
+
+    With `ends`, both probes share what is left until that monotonic instant
+    instead of each taking a full budget of its own. A probe that no longer has
+    time to run is not started, and its answer stays unknown.
+    """
     limits = OutputLimits()
 
-    def budget() -> Deadline:
-        return Deadline(total_seconds=PROBE_BUDGET_SECONDS, cleanup_reserve_seconds=2.0)
+    def budget() -> Deadline | None:
+        total = _left(ends, PROBE_BUDGET_SECONDS)
+        if total - PROBE_CLEANUP_RESERVE_SECONDS < MIN_WORK_SECONDS:
+            return None
+        return Deadline(total_seconds=total, cleanup_reserve_seconds=PROBE_CLEANUP_RESERVE_SECONDS)
 
+    version: str | None = None
+    session: bool | None = None
+    deadline = budget()
+    if deadline is None:
+        return version, session
     try:
         reported = await check_cli_version(
             arguments=sandbox.wrap(build_version_arguments(launcher=launcher), profile.path, roots),
             environment=environment,
             working_directory=workspace,
             limits=limits,
-            deadline=budget(),
+            deadline=deadline,
         )
-        version: str | None = reported.version
+        version = reported.version
     except ProcessError:
         version = None
 
+    deadline = budget()
+    if deadline is None:
+        return version, session
     try:
         login = await check_chatgpt_login(
             arguments=sandbox.wrap(
@@ -228,9 +254,9 @@ async def _ask_the_cli(
             environment=environment,
             working_directory=workspace,
             limits=limits,
-            deadline=budget(),
+            deadline=deadline,
         )
-        session: bool | None = login.chatgpt_session
+        session = login.chatgpt_session
     except ProcessError:
         # `login status` exits non-zero when there is no session, and the
         # process layer reports a non-zero exit as a failure. That is an
@@ -281,13 +307,23 @@ def _reopen_for_teardown(directory: Path) -> None:
 
 @asynccontextmanager
 async def prepare_real_run(
-    *, launcher: CodexLauncher, source_codex_home: Path, effort: str | None = None
+    *,
+    launcher: CodexLauncher,
+    source_codex_home: Path,
+    effort: str | None = None,
+    probe_budget_seconds: float | None = None,
 ) -> AsyncIterator[PreparedRealRun]:
     """Build the environment, measure it, and hold it open while it is valid.
 
     `effort` is carried into the bound configuration unchanged; an effort the
     client does not support is refused at the attempt, before any exec.
+
+    `probe_budget_seconds` bounds every probe together: the version and login
+    probes and the boundary probe all draw on it, so a caller's deadline also
+    holds for the preflight. Without it each probe keeps its own fixed budget.
+    A probe that ran out of time fails its gate; it never passes one.
     """
+    ends = None if probe_budget_seconds is None else time.monotonic() + probe_budget_seconds
     root = Path(tempfile.mkdtemp(prefix="codex-preflight-"))
     os.chmod(root, 0o700)
     tree = _build_tree(root)
@@ -325,9 +361,16 @@ async def prepare_real_run(
                     path_entries=launcher.path_entries,
                 ),
                 workspace=tree.workspace,
+                ends=ends,
             )
 
+        # The boundary probe gets the same floor as the CLI probes: below it,
+        # it is not started and both sandbox gates fail as unmeasured.
+        boundary_seconds = _left(ends, sandbox.PROBE_TIMEOUT_SECONDS)
+        if boundary_seconds - PROBE_CLEANUP_RESERVE_SECONDS < MIN_WORK_SECONDS:
+            boundary_seconds = 0.0
         status = evaluate_release(
+            probe_timeout_seconds=boundary_seconds,
             catalog_path=GPT_5_5_CATALOG,
             expected_digest=GPT_5_5_CATALOG_SHA256,
             model=GPT_5_5_CATALOG_SLUG,

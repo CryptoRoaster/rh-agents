@@ -220,3 +220,33 @@ async def test_a_missing_source_home_blocks_the_release() -> None:
         assert prepared.authorization is None
         blocking = [gate.name for gate in prepared.status.blocking]
         assert "AUTH_HOME_ISOLATION" in blocking
+
+
+@pytest.mark.asyncio
+async def test_an_exhausted_probe_budget_starts_no_probe_and_passes_no_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caller's deadline holds for the preflight too: no probe on borrowed time."""
+    from src.evaluation.codex import prepared_run
+    from src.evaluation.codex.models import CodexLauncher, LauncherKind
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("no probe may start without time left")
+
+    monkeypatch.setattr(prepared_run, "check_cli_version", refuse)
+    monkeypatch.setattr(prepared_run, "check_chatgpt_login", refuse)
+    monkeypatch.setattr(sandbox, "probe_boundaries", refuse)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "auth.json").write_text(PLACEHOLDER_AUTH)
+    executable = tmp_path / "vendor" / "bin" / "codex"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("")
+    launcher = CodexLauncher(kind=LauncherKind.FAKE_EXECUTABLE, executable=executable)
+
+    async with prepare_real_run(
+        launcher=launcher, source_codex_home=home, probe_budget_seconds=0.5
+    ) as prepared:
+        assert prepared.runner is None
+        blocking = {gate.name for gate in prepared.status.blocking}
+        assert {"CODEX_VERSION", "CHATGPT_SESSION", "OUTER_READ_SANDBOX"} <= blocking

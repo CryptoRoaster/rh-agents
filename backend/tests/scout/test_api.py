@@ -216,7 +216,19 @@ async def test_the_timeline_is_chronological_and_shows_failures_and_coalescing(c
     assert timeline[0]["status"] == "COMPLETED" and timeline[0]["classification"]
     assert timeline[1]["status"] == "FAILED"
     assert timeline[1]["failure_reason"] == "PROVIDER_TIMEOUT"
+    assert timeline[1]["failure_reason_code"] == "SCRIPTED_FAILURE"
+    assert timeline[0]["failure_reason_code"] is None
     assert timeline[1]["classification"] is None
+    runs = (await http.get("/api/scout/runs")).json()["items"]
+    assert runs[0]["run"]["model_failure_reasons"] == [
+        {
+            "provider": "fake",
+            "category": "PROVIDER_TIMEOUT",
+            "reason_code": "SCRIPTED_FAILURE",
+            "count": 1,
+        }
+    ]
+    assert runs[1]["run"]["model_failure_reasons"] == []
     assert "prompt" not in timeline[0] and "instructions" not in timeline[0]
     detail = (await http.get(f"/api/scout/watches/{watch}")).json()
     states = [item["state"] for item in detail["checkpoints"]]

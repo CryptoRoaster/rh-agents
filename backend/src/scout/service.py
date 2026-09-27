@@ -32,6 +32,7 @@ unchanged rules.
 """
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -73,11 +74,17 @@ from src.orchestration.commander.context import (
     SystemPausePort,
     SystemPauseUnavailable,
 )
-from src.reasoning.models import ReasoningFailure
+from src.reasoning.models import ReasoningErrorCategory, ReasoningFailure
 from src.reasoning.provider import ReasoningProvider
 from src.runner.models import ConfigurationRefused
 from src.scout.budget import OrbitBudget, utc_day
-from src.scout.models import DiscoveryWatch, ScoutReview, ScoutSummary, WatchAssessment
+from src.scout.models import (
+    DiscoveryWatch,
+    ModelFailureCount,
+    ScoutReview,
+    ScoutSummary,
+    WatchAssessment,
+)
 from src.scout.policy import EARLY_SCOUT_V1, EarlyScoutPolicy, WatchStatus
 from src.scout.repository import SyncResult, WatchRepository, refreshed_identity_contradicts
 from src.scout.runs import ScoutRunRepository
@@ -151,6 +158,15 @@ def refuse_scout(settings: Settings, ports: ScoutPorts) -> ConfigurationRefused 
     return None
 
 
+_SAFE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,79}$")
+UNCLASSIFIED = "UNCLASSIFIED"
+
+
+def safe_code(value: str) -> str:
+    """A failure reason as a code, or UNCLASSIFIED: never a path, message or payload."""
+    return value if _SAFE_CODE.fullmatch(value) else UNCLASSIFIED
+
+
 @dataclass
 class Tally:
     """What the run did, accumulated as it happens rather than assembled at the end."""
@@ -177,6 +193,8 @@ class Tally:
     retired_new: int = 0
     provider_failures: int = 0
     model_failures: int = 0
+    # (provider, category, reason code) -> failures.
+    model_failure_reasons: dict[tuple[str, str, str], int] = field(default_factory=dict)
     orbit_backlog_before: int = 0
     orbit_backlog_after: int = 0
     oldest_orbit_due_age_seconds: int | None = None
@@ -632,7 +650,16 @@ class EarlyScoutCycle:
         try:
             result = await evaluator.evaluate(evaluation)
         except ReasoningFailure as error:
-            await self._failed(base, evaluation, error.category.value, watch, review, tally)
+            await self._failed(
+                base,
+                evaluation,
+                watch,
+                review,
+                tally,
+                reason=error.category.value,
+                code=safe_code(error.reason_code),
+                category=error.category.value,
+            )
             await self._budget.settle(
                 reservation,
                 status="FAILED",
@@ -643,7 +670,16 @@ class EarlyScoutCycle:
             return
         except OrbitValidationError as error:
             # Contradicted output is recorded as a failure, never as an assessment.
-            await self._failed(base, evaluation, error.reason_code, watch, review, tally)
+            await self._failed(
+                base,
+                evaluation,
+                watch,
+                review,
+                tally,
+                reason=error.reason_code,
+                code=safe_code(error.reason_code),
+                category=ReasoningErrorCategory.INVALID_MODEL_OUTPUT.value,
+            )
             await self._budget.settle(
                 reservation,
                 status="FAILED",
@@ -701,21 +737,31 @@ class EarlyScoutCycle:
         self,
         base: dict[str, object],
         evaluation: OrbitEvaluationInput,
-        reason: str,
         watch: DiscoveryWatch,
         review: object,
         tally: Tally,
+        *,
+        reason: str,
+        code: str,
+        category: str,
     ) -> None:
+        """Record a failed review with its category and its sanitised reason code."""
         now = self._clock.now()
+        assert self._ports.reasoning is not None  # a review only runs with a provider
+        provider = self._ports.reasoning.name
         await self._watches.append_assessment(
             WatchAssessment(
                 **base,  # type: ignore[arg-type]
                 status="FAILED",
                 failure_reason=reason,
+                failure_reason_code=code,
+                reasoning_provider=provider,
                 input_digest=orbit_input_digest(evaluation),
             )
         )
         tally.model_failures += 1
+        key = (provider, category, code)
+        tally.model_failure_reasons[key] = tally.model_failure_reasons.get(key, 0) + 1
         next_at = getattr(review, "next_review_at", None)
         tally.reviews.append(
             ScoutReview(
@@ -725,6 +771,7 @@ class EarlyScoutCycle:
                 checkpoint_seconds=base["checkpoint_seconds"],  # type: ignore[arg-type]
                 status="FAILED",
                 failure_reason=reason,
+                failure_reason_code=code,
                 next_review_at=None if next_at is None else next_at.isoformat(),
             )
         )
@@ -833,6 +880,10 @@ class EarlyScoutCycle:
             orbit_daily_used_after=tally.orbit_daily_used_after,
             orbit_daily_remaining_after=tally.orbit_daily_remaining_after,
             reviews=tuple(tally.reviews[:16]),
+            model_failure_reasons=tuple(
+                ModelFailureCount(provider=provider, category=category, reason_code=code, count=n)
+                for (provider, category, code), n in sorted(tally.model_failure_reasons.items())
+            )[:32],
             errors=tuple(tally.errors),
         )
 

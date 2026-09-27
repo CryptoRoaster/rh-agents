@@ -99,6 +99,29 @@ ops/scout/uninstall.sh           # unload and remove it (logs stay)
   `auth.json` into a throwaway isolated home and runs behind the harness's
   Seatbelt profile and release gates. A refused gate is a failed review, never
   an unsandboxed one. The daily ORBIT cap applies unchanged.
+- **Codex timeout.** Put `REASONING_TIMEOUT_SECONDS=120` in the scout env, not
+  in the root `.env`: it is a local override for the scout process, and the
+  global default stays 60 s for every other caller. The 120 s are the whole
+  call. The preflight probes (CLI version, login, sandbox boundary) share it
+  and must leave at least 15 s (a 10 s turn minimum plus its 5 s cleanup
+  reserve); the turn then gets exactly what is left. There is no separate
+  preflight budget on top, and a probe that runs out of time fails its gate
+  (`CODEX_PREFLIGHT_TOO_SLOW`), it never passes one.
+- **Process class.** The agent runs as `ProcessType=Standard`. It used to be
+  `Background`, which lets macOS throttle CPU, I/O and network for the whole
+  process tree, Codex included. Measured on the development machine (Codex
+  preflight only, 5 runs each): Standard median 0.49 s, Background median
+  5.6 s, and under the full background policy (`taskpolicy -b`) the preflight
+  refused its own release gates in 3 of 5 runs, taking up to 94 s. Standard
+  adds no priority boost; it only stops the throttling.
+- **Why a review failed.** A failed review keeps its category
+  (`failure_reason`, such as `PROVIDER_NOT_CONFIGURED`) and the provider's
+  reason (`failure_reason_code`, such as `CODEX_GATE_NETWORK_EGRESS`,
+  `CODEX_PREFLIGHT_TOO_SLOW` or `CODEX_DEADLINE_EXCEEDED`). Each run also
+  records its failures counted by provider, category and code
+  (`model_failure_reasons`), which the run history shows beside the failure
+  count. Codes only: a reason that is not a plain code is stored as
+  `UNCLASSIFIED`, so no path, message, stderr or login detail is kept.
 - **Logs.** `~/Library/Logs/rh-agents/scout.log` holds the run summary JSON
   plus start and exit lines. It rotates at 5 MB and keeps 3 generations.
   launchd's own output goes to `scout.launchd.log`. A failed run keeps its exit

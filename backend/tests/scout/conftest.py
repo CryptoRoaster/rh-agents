@@ -104,16 +104,18 @@ class EchoOrbit:
         *,
         lie: bool = False,
         failure: ReasoningErrorCategory | None = None,
+        reason_code: str = "SCRIPTED_FAILURE",
     ) -> None:
         self.classification = classification
         self.lie = lie
         self.failure = failure
+        self.reason_code = reason_code
         self.calls: list[ReasoningRequest[Any]] = []
 
     async def generate_structured(self, request):
         self.calls.append(request)
         if self.failure is not None:
-            raise ReasoningFailure(self.failure, "SCRIPTED_FAILURE")
+            raise ReasoningFailure(self.failure, self.reason_code)
         shown = request.data["market_observation"]
         codes = []
         gaps = []

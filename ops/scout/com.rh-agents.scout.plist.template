@@ -26,8 +26,17 @@
   <integer>900</integer>
   <key>RunAtLoad</key>
   <false/>
+  <!--
+    Standard, never Background. The scout is periodic, but each ORBIT review
+    runs a Codex subprocess against a bounded, latency-sensitive deadline.
+    Background lets macOS throttle CPU, I/O and network for the whole process
+    tree: measured locally, the Codex preflight went from ~0.5 s (Standard) to
+    ~5.6 s (Background, median of 5), and under full background policy it
+    refused its own release gates 3 times in 5. Standard adds no priority boost
+    (no nice, no QoS override); it only stops the throttling.
+  -->
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
   <key>StandardOutPath</key>
   <string>__LOG_DIR__/scout.launchd.log</string>
   <key>StandardErrorPath</key>

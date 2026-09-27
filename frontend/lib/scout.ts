@@ -71,6 +71,7 @@ export type WatchAssessment = {
   checkpoint_seconds: number;
   status: "COMPLETED" | "FAILED";
   failure_reason: string | null;
+  failure_reason_code: string | null;
   classification: string | null;
   strength: string | null;
   reason_codes: string[];
@@ -151,6 +152,15 @@ export type ScoutRun = {
   orbit_daily_remaining_before: number;
   orbit_daily_used_after: number;
   orbit_daily_remaining_after: number;
+  model_failure_reasons: ModelFailureCount[];
+};
+
+// One provider failing one way in one run: codes only, never a message.
+export type ModelFailureCount = {
+  provider: string;
+  category: string;
+  reason_code: string;
+  count: number;
 };
 
 export type RunView = {

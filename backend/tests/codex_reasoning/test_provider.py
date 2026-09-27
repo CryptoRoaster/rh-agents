@@ -71,9 +71,21 @@ class Runner:
         return self.respond(request)
 
 
+@dataclass(frozen=True)
+class Gate:
+    name: str
+    detail: str = "/Users/someone/.codex/auth.json unreadable"
+
+
+@dataclass
+class Status:
+    blocking: tuple[Gate, ...] = ()
+
+
 @dataclass
 class Prepared:
     runner: Runner | None
+    status: Status = field(default_factory=Status)
 
 
 @dataclass
@@ -83,6 +95,7 @@ class FakePrepare:
     respond: Callable[[EvaluationRequest[Any]], Any] = lambda _: completed()
     grant: bool = True
     fail: bool = False
+    blocking: tuple[Gate, ...] = (Gate("CODEX_VERSION"),)
     entries: list[dict[str, Any]] = field(default_factory=list)
     runners: list[Runner] = field(default_factory=list)
     exits: int = 0
@@ -96,7 +109,7 @@ class FakePrepare:
         if runner is not None:
             self.runners.append(runner)
         try:
-            yield Prepared(runner)
+            yield Prepared(runner, Status(() if runner is not None else self.blocking))
         finally:
             self.exits += 1
 
@@ -142,7 +155,16 @@ async def test_a_completed_turn_becomes_a_reasoning_result() -> None:
     assert result.usage.latency_ms == 11500
     # A thread id is local; it is never published as a provider request id.
     assert result.usage.provider_request_id is None
-    assert prepare.entries == [{"launcher": LAUNCHER, "source_codex_home": HOME, "effort": "high"}]
+    # The preflight draws on the caller's budget: 180 s minus the turn's
+    # minimum and its cleanup reserve, never a budget of its own on top.
+    assert prepare.entries == [
+        {
+            "launcher": LAUNCHER,
+            "source_codex_home": HOME,
+            "effort": "high",
+            "probe_budget_seconds": 165.0,
+        }
+    ]
     assert prepare.exits == 1
 
 
@@ -177,10 +199,41 @@ async def test_a_refused_release_makes_no_turn() -> None:
     with pytest.raises(ReasoningFailure) as raised:
         await provider(prepare).generate_structured(request())
 
+    # The refusing gate is named by code; its detail text never leaves.
     assert raised.value.category is ReasoningErrorCategory.PROVIDER_NOT_CONFIGURED
-    assert raised.value.reason_code == "CODEX_RELEASE_NOT_GRANTED"
+    assert raised.value.reason_code == "CODEX_GATE_CODEX_VERSION"
+    assert "auth.json" not in str(raised.value)
     assert prepare.runners == []
     assert prepare.exits == 1
+
+
+async def test_an_unsafe_gate_name_falls_back_to_a_generic_code() -> None:
+    prepare = FakePrepare(grant=False, blocking=(Gate("/private/var/secret path"),))
+    with pytest.raises(ReasoningFailure) as raised:
+        await provider(prepare).generate_structured(request())
+
+    assert raised.value.reason_code == "CODEX_RELEASE_NOT_GRANTED"
+
+
+async def test_a_refusal_after_the_preflight_budget_ran_out_is_a_timeout() -> None:
+    # 60 s call: 45 s for the probes. Refused at 44 s means they ran out.
+    prepare = FakePrepare(grant=False)
+    with pytest.raises(ReasoningFailure) as raised:
+        await provider(prepare, Clock(0.0, 44.0)).generate_structured(request(timeout=60))
+
+    assert raised.value.category is ReasoningErrorCategory.PROVIDER_TIMEOUT
+    assert raised.value.reason_code == "CODEX_PREFLIGHT_TOO_SLOW"
+    assert prepare.entries[0]["probe_budget_seconds"] == 45.0
+
+
+async def test_a_budget_with_no_room_for_a_turn_starts_nothing() -> None:
+    prepare = FakePrepare()
+    with pytest.raises(ReasoningFailure) as raised:
+        await provider(prepare).generate_structured(request(timeout=12))
+
+    assert raised.value.category is ReasoningErrorCategory.PROVIDER_REJECTED_REQUEST
+    assert raised.value.reason_code == "CODEX_TIMEOUT_TOO_SHORT"
+    assert prepare.entries == []
 
 
 async def test_a_preflight_that_ate_the_budget_starts_no_turn() -> None:

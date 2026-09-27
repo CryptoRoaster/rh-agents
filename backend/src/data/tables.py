@@ -742,6 +742,10 @@ class DiscoveryWatchAssessmentRow(Base):
             name="discovery_watch_assessment_failure_named",
         ),
         CheckConstraint(
+            "failure_reason_code IS NULL OR status = 'FAILED'",
+            name="discovery_watch_assessment_failure_code",
+        ),
+        CheckConstraint(
             "checkpoint_index >= 0 AND checkpoint_seconds >= 0",
             name="discovery_watch_assessment_checkpoint",
         ),
@@ -755,6 +759,8 @@ class DiscoveryWatchAssessmentRow(Base):
     checkpoint_seconds: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(20))
     failure_reason: Mapped[str | None] = mapped_column(String(80))
+    # The provider's sanitised reason beside the category in `failure_reason`.
+    failure_reason_code: Mapped[str | None] = mapped_column(String(80))
     classification: Mapped[str | None] = mapped_column(String(40))
     strength: Mapped[str | None] = mapped_column(String(20))
     reason_codes: Mapped[list[str]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
@@ -829,6 +835,11 @@ class ScoutRunRow(Base):
     orbit_daily_remaining_before: Mapped[int] = mapped_column(Integer)
     orbit_daily_used_after: Mapped[int] = mapped_column(Integer)
     orbit_daily_remaining_after: Mapped[int] = mapped_column(Integer)
+    # Model failures by provider, category and reason code: a list of
+    # {"provider", "category", "reason_code", "count"}. Codes only.
+    model_failure_reasons: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), server_default=text("'[]'")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
