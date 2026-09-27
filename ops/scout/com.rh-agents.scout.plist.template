@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Early-discovery scout, every 15 minutes. Rendered by install.sh; never edit the
+  installed copy by hand. Scout mode only (see run-scout.sh). No secrets here.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.rh-agents.scout</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/ops/scout/run-scout.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__/backend</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__UV_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>RH_AGENTS_SCOUT_LOG_DIR</key>
+    <string>__LOG_DIR__</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/scout.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/scout.launchd.log</string>
+</dict>
+</plist>

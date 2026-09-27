@@ -773,3 +773,89 @@ class DiscoveryWatchAssessmentRow(Base):
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
+
+
+class ScoutRunRow(Base):
+    """One `--scout-once` execution that reached the scout, as it ended.
+
+    Written once, when the run is over, so a row is always terminal. Counts and
+    typed codes only: no provider payload, token name, address or model text.
+    Runs refused before they started (the scout disabled, another run holding
+    the lock) are not runs and leave no row.
+    """
+
+    __tablename__ = "scout_runs"
+    __table_args__ = (
+        CheckConstraint("status IN ('COMPLETED', 'STOPPED', 'FAILED')", name="scout_run_status"),
+        CheckConstraint("completed_at >= started_at", name="scout_run_ordering"),
+        Index("ix_scout_runs_started", "started_at"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20))
+    stop: Mapped[str] = mapped_column(String(80))
+    errors: Mapped[list[str]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+    policy_version: Mapped[str] = mapped_column(String(40))
+    discovered: Mapped[int] = mapped_column(Integer)
+    valid_markets: Mapped[int] = mapped_column(Integer)
+    provider_identity_rejects: Mapped[int] = mapped_column(Integer)
+    other_provider_rejects: Mapped[int] = mapped_column(Integer)
+    watches_created: Mapped[int] = mapped_column(Integer)
+    watches_updated: Mapped[int] = mapped_column(Integer)
+    bootstrapped: Mapped[int] = mapped_column(Integer)
+    refreshed: Mapped[int] = mapped_column(Integer)
+    watches_due_orbit: Mapped[int] = mapped_column(Integer)
+    orbit_reviews_started: Mapped[int] = mapped_column(Integer)
+    orbit_reviews_completed: Mapped[int] = mapped_column(Integer)
+    interesting: Mapped[int] = mapped_column(Integer)
+    not_interesting: Mapped[int] = mapped_column(Integer)
+    insufficient_data: Mapped[int] = mapped_column(Integer)
+    watches_due_history: Mapped[int] = mapped_column(Integer)
+    history_checks: Mapped[int] = mapped_column(Integer)
+    vector_sufficient: Mapped[int] = mapped_column(Integer)
+    promotable_new: Mapped[int] = mapped_column(Integer)
+    dormant_new: Mapped[int] = mapped_column(Integer)
+    retired_new: Mapped[int] = mapped_column(Integer)
+    provider_failures: Mapped[int] = mapped_column(Integer)
+    model_failures: Mapped[int] = mapped_column(Integer)
+    provider_requests: Mapped[int] = mapped_column(Integer)
+    orbit_backlog_before: Mapped[int] = mapped_column(Integer)
+    orbit_backlog_after: Mapped[int] = mapped_column(Integer)
+    oldest_orbit_due_age_seconds: Mapped[int | None] = mapped_column(Integer)
+    new_watches_without_orbit_assessment: Mapped[int] = mapped_column(Integer)
+    orbit_daily_budget: Mapped[int] = mapped_column(Integer)
+    orbit_daily_used_before: Mapped[int] = mapped_column(Integer)
+    orbit_daily_remaining_before: Mapped[int] = mapped_column(Integer)
+    orbit_daily_used_after: Mapped[int] = mapped_column(Integer)
+    orbit_daily_remaining_after: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ScoutOrbitReservationRow(Base):
+    """One durable slot of the daily paid-ORBIT budget, taken before the call.
+
+    Written and committed before the model is asked, so a process that dies
+    mid-call still leaves the slot spent: RESERVED, COMPLETED and FAILED all
+    count toward the UTC day. Conservative by design — a slot may be spent for a
+    call that never reached the provider, never the other way round. No prompt,
+    payload or model text.
+    """
+
+    __tablename__ = "scout_orbit_reservations"
+    __table_args__ = (
+        UniqueConstraint("watch_id", "checkpoint_index", name="uq_scout_orbit_reservation"),
+        CheckConstraint(
+            "status IN ('RESERVED', 'COMPLETED', 'FAILED')", name="scout_orbit_reservation_status"
+        ),
+        Index("ix_scout_orbit_reservations_day", "utc_day"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    watch_id: Mapped[UUID] = mapped_column(ForeignKey("discovery_watches.id", ondelete="RESTRICT"))
+    checkpoint_index: Mapped[int] = mapped_column(Integer)
+    utc_day: Mapped[date] = mapped_column(Date)
+    reserved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20))
+    assessment_id: Mapped[UUID | None] = mapped_column(Uuid)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_reason: Mapped[str | None] = mapped_column(String(80))

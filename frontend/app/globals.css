@@ -2047,3 +2047,196 @@ main {
   outline-offset: 2px;
   border-radius: var(--radius);
 }
+
+/* Early-discovery cockpit (/scout). Read-only views in the console's own style. */
+.scout {
+  display: grid;
+  gap: var(--gap);
+  padding-top: 14px;
+}
+.scout-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.scout-heading h1 {
+  font-size: 18px;
+  margin: 0;
+}
+.scout-heading p {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.scout-refresh,
+.scout-filters button,
+.scout-link {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-primary);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 10px;
+  padding: 5px 9px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.scout-link {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--info);
+  text-decoration: none;
+}
+.scout-filters {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.scout-filters button.active {
+  background: var(--blue-soft);
+  border-color: var(--info);
+  color: var(--info);
+}
+.scout-overview {
+  padding: var(--panel-padding);
+}
+.scout-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 10px;
+}
+.scout-kpi {
+  display: grid;
+  gap: 2px;
+}
+.scout-kpi span,
+.scout-kpi small,
+.scout-muted {
+  color: var(--text-secondary);
+  font-size: 9px;
+}
+.scout-kpi strong {
+  font-size: 16px;
+}
+.scout-backlog {
+  margin: 10px 0 0;
+  font-size: 10px;
+}
+.scout-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+  gap: var(--gap);
+  align-items: start;
+}
+.scout-table table td,
+.scout-table table th {
+  padding: 6px 8px;
+}
+.scout-table tbody tr {
+  cursor: pointer;
+}
+.scout-table tbody tr.selected {
+  background: var(--blue-soft);
+}
+.scout-young {
+  color: var(--info);
+}
+.scout-state {
+  padding: var(--panel-padding);
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+.scout-error {
+  color: var(--danger);
+}
+.scout-detail,
+.scout-paper {
+  padding: 0 var(--panel-padding) var(--panel-padding);
+  font-size: 10px;
+}
+.scout-detail header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.scout-detail h3,
+.scout-detail h4,
+.scout-paper h4 {
+  margin: 10px 0 6px;
+  font-size: 11px;
+}
+.scout-note {
+  color: var(--text-secondary);
+  margin: 4px 0;
+}
+.scout-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 10px;
+  margin: 8px 0;
+}
+.scout-facts dt {
+  color: var(--text-secondary);
+}
+.scout-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.scout-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  overflow-wrap: anywhere;
+}
+.scout-timeline {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 8px;
+}
+.scout-timeline li {
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+}
+.scout-timeline-head {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.scout-assessment p {
+  margin: 3px 0;
+}
+.scout-codes {
+  color: var(--text-secondary);
+  font-size: 9px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+@media (max-width: 1200px) {
+  .scout-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.scout .panel-heading {
+  height: auto;
+  min-height: 43px;
+  flex-wrap: wrap;
+  padding-block: 6px;
+}

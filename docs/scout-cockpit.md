@@ -1,0 +1,155 @@
+# Early discovery: operating the scout and the cockpit
+
+> A scout watch is **not** a trade recommendation. PROMOTABLE is **not** a buy
+> approval. The cockpit is read-only. It shows what the scout recorded and
+> cannot trade, approve, sign or change a setting.
+
+## Cadence and ORBIT budget
+
+**Discovery capacity is intentionally decoupled from model-review capacity.**
+Discovery is the cheap input. Every valid pool a run finds, up to its own bound,
+becomes a watch, whether or not ORBIT can review it right away. A watch waits
+in the deterministic due queue. If it is reviewed late, its missed checkpoints
+coalesce into one review. Nothing is dropped, retired or made dormant for lack
+of model budget.
+
+Paid ORBIT calls are bounded twice: per run and per UTC day.
+
+| Setting | Default | Why |
+|---|---|---|
+| cadence | every 15 min | Discovery every 15 minutes, so a young pool is seen early. |
+| `EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN` | 10 | Every valid pool on the `new_pools` page becomes a watch. No ranking, no filter. |
+| `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN` | 4 | Four calls at the observed 7-10 s latency (60 s timeout worst case) fit well inside one 15-minute run. |
+| `EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_DAY` | 96 | The hard daily cost bound: on average one review per run. A run may burst up to its per-run bound while the day has budget. |
+| `EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN` | 4 | A stale due watch needs a fresh reading before review. Refreshes are batched into one `pools/multi` request per chain. A watch that is already fresh costs nothing. |
+| GeckoTerminal requests | ≤ 4 per normal run | One network lookup, one `new_pools` read, **one** batched refresh shared by the reviews and the history check, and at most one history read. That leaves one request of headroom under the unchanged default transport budget of 5 (`GECKOTERMINAL_MAX_REQUESTS`). The scout never loosens that operator setting. A run that meets it stops asking and reports a provider failure. |
+
+The daily bound is a **hard** bound held by durable reservations. Before every
+scout ORBIT call, one slot is reserved and committed in
+`scout_orbit_reservations`. The order is:
+
+1. read the UTC day's usage under a transaction advisory lock;
+2. refuse if the cap is reached;
+3. reserve the slot;
+4. claim the checkpoint;
+5. call the model;
+6. write the assessment;
+7. settle the reservation as COMPLETED or FAILED.
+
+RESERVED, COMPLETED and FAILED all count. A process that dies mid-call leaves
+its RESERVED slot counted. That is conservative by design: a slot may be spent
+for a call that never reached the provider, never the other way round. If a run
+dies after reserving but before claiming, no call was made, and the next run
+reuses that slot instead of counting it twice.
+
+If the reservation cannot be written, or the day's usage cannot be read, no
+model is asked. The budget resets at 00:00 UTC.
+
+A 15-minute schedule therefore does **not** guarantee six assessments per
+watch. It guarantees:
+
+- discovery every 15 minutes;
+- ORBIT bounded per run and per day;
+- checkpoints coalesced when there is a backlog;
+- backlog and coverage visible in the cockpit.
+
+Each run summary and run row reports:
+
+- `orbit_backlog_before` and `orbit_backlog_after`;
+- `oldest_orbit_due_age_seconds`;
+- `new_watches_without_orbit_assessment`;
+- `orbit_daily_budget` and `orbit_daily_used_before` / `_after`, with the
+  remaining budget.
+
+The cockpit shows "ORBIT budget today: used / cap", or "Daily ORBIT budget
+reached" once the cap is hit. The latter is a normal state, not an error:
+discovery continues and due reviews wait. The cockpit shows calls and token
+counts, never an estimated dollar amount.
+
+The due queue stays neutral: it is ordered by `next_orbit_review_at`, then
+`first_seen_at`, then `pair_id`. It is never ordered by liquidity, volume,
+market cap or classification.
+
+## Running the scout on a schedule (macOS launchd)
+
+```
+ops/scout/install.sh --dry-run   # print the rendered plist, change nothing
+ops/scout/install.sh             # install and load the per-user agent
+ops/scout/uninstall.sh           # unload and remove it (logs stay)
+```
+
+- The agent runs only `python -m src.runner.main --scout-once` from `backend/`,
+  every 900 seconds. It never runs the full PAPER run.
+- **No overlap.** launchd never starts a job again while the previous run is
+  still going. The scout also holds a PostgreSQL advisory lock for the whole
+  run, so a manual run and a scheduled one cannot run together either. The
+  second one reports `ALREADY_RUNNING` and does nothing.
+- **Configuration.** The agent reads the same root `.env` a manual run reads.
+  It must set `EARLY_SCOUT_ENABLED=true`, `MARKET_PROVIDER=geckoterminal`,
+  `MARKET_CHAINS=bsc` and `REASONING_PROVIDER=anthropic`. Put secrets such as
+  `ANTHROPIC_API_KEY` in the `.env` (gitignored) or in
+  `~/.config/rh-agents/scout.env` (`chmod 600`, outside the repository). The
+  wrapper exports that file first. Nothing secret is committed, and none is
+  written into the plist.
+- **Logs.** `~/Library/Logs/rh-agents/scout.log` holds the run summary JSON
+  plus start and exit lines. It rotates at 5 MB and keeps 3 generations.
+  launchd's own output goes to `scout.launchd.log`. A failed run keeps its exit
+  code in both.
+
+## Run history
+
+Every run that reaches the scout writes exactly one terminal row to
+`scout_runs` (migration `0013`):
+
+- `COMPLETED` is an ordinary run.
+- `STOPPED` means a durable system stop was in force and nothing was asked.
+- `FAILED` means a technical fault; its typed codes are in `errors`.
+
+A row is written once, at the end, so there are no half-finished rows. Runs
+refused before they start (scout disabled, or another run holds the lock) are
+not runs and leave no row. History starts with the first run after `0013`:
+nothing earlier is reconstructed.
+
+Rates are computed on read: identity acceptance is `valid_markets / discovered`
+and watch creation is `watches_created / valid_markets`. Both are `null` (shown
+as N/A) when the denominator is zero, never 0%.
+
+## The cockpit
+
+Start the backend and the frontend locally:
+
+```
+cd backend && uv run uvicorn src.api.main:app --port 8000
+cd frontend && npm run dev        # http://127.0.0.1:3000/scout
+```
+
+The page shows:
+
+- scout status and coverage;
+- the watch list, filterable by all, very young (under 6 hours), watching,
+  promotable, dormant or retired;
+- a watch's detail with its ORBIT timeline, where each checkpoint is
+  `ASSESSED`, `FAILED`, `COALESCED` (covered by a later review), `DUE`,
+  `PENDING` or `NOT_SCHEDULED`;
+- the run history;
+- the booked paper ledger.
+
+The watch list is ordered newest-discovery-first. That is a display order only
+and does not change what the scout works on next.
+
+The page reads through `/api/cockpit/...`, a GET-only proxy with a fixed path
+allowlist. The allowed backend read APIs are:
+
+- `GET /api/scout/overview`
+- `GET /api/scout/watches`
+- `GET /api/scout/watches/{id}`
+- `GET /api/scout/watches/{id}/assessments`
+- `GET /api/scout/runs`
+- `GET /api/paper/portfolio`
+- the existing read-only `/api/trade-cases/{id}` views, used to follow a
+  promoted watch to its case
+
+Scout assessments are discovery history. A TradeCase formed from a PROMOTABLE
+watch runs its own ORBIT review and never uses the scout's assessments as
+evidence. The paper section shows booked ledger rows only. Without positions,
+fills or P&L snapshots it says so and shows no example values.

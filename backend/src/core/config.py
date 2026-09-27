@@ -276,13 +276,27 @@ class Settings(BaseSettings):
     early_scout_enabled: bool = False
     # Pools one new-pool read may bring back, per configured chain.
     early_scout_max_discovery_pools: int = Field(default=10, ge=1, le=20)
+    # Discovery capacity is deliberately decoupled from model-review capacity.
+    # Discovery is the cheap input: every valid pool it finds, up to this bound,
+    # becomes a watch. A watch does not demand an immediate review — it waits in
+    # the deterministic due queue, and missed checkpoints coalesce into one.
     early_scout_max_new_watches_per_run: int = Field(default=10, ge=1, le=50)
-    # Paid model calls. One per due watch at most, and never more than this.
-    early_scout_max_orbit_reviews_per_run: int = Field(default=1, ge=0, le=10)
+    # Paid ORBIT calls per run: one per due watch at most, and never more than
+    # this. Four reviews at the observed 7-10 s latency (60 s timeout worst case)
+    # fit well inside a 15-minute cadence.
+    early_scout_max_orbit_reviews_per_run: int = Field(default=4, ge=0, le=10)
+    # The hard daily bound on paid scout ORBIT calls in the current UTC day. A
+    # durable slot is reserved and committed before every call, so a call counts
+    # even if its process dies mid-call (see src/scout/budget.py). 96 is on
+    # average one review per 15-minute run; a run may burst up to its per-run
+    # bound while the day still has budget.
+    early_scout_max_orbit_reviews_per_day: int = Field(default=96, ge=0, le=2000)
     # History reads for the structural VECTOR check. No model call is involved.
     early_scout_max_history_checks_per_run: int = Field(default=1, ge=0, le=10)
-    # Watches re-observed by exact pool locator in one run.
-    early_scout_max_refresh_markets_per_run: int = Field(default=1, ge=0, le=10)
+    # Watches re-observed by exact pool locator in one run, batched into one
+    # request per chain. Only due watches whose reading is stale are refreshed;
+    # one that is already fresh costs nothing. Matches the review budget.
+    early_scout_max_refresh_markets_per_run: int = Field(default=4, ge=0, le=20)
     # Recorded market streams from before the scout existed, adopted per run.
     early_scout_max_bootstrap_streams: int = Field(default=100, ge=0, le=100)
     # Where executable quotes come from. "disabled" fails closed: without a quote

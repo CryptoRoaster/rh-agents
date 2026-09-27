@@ -8,9 +8,11 @@ import {
   ScrollText,
   Settings2,
   ShieldCheck,
+  Radar,
 } from "lucide-react";
 const links = [
   ["Dashboard", "dashboard", LayoutDashboard],
+  ["Discovery", "scout", Radar],
   ["Agents", "agents", UsersRound],
   ["Trading", "trades", ArrowLeftRight],
   ["Analytics", "analytics", ChartNoAxesCombined],
@@ -19,28 +21,45 @@ const links = [
   ["Logs", "activity", ScrollText],
   ["Settings", "controls", Settings2],
 ] as const;
-export function Sidebar() {
+// `scout` is its own page; every other entry is a section of the dashboard.
+export function Sidebar({
+  current = "dashboard",
+}: {
+  current?: "dashboard" | "scout";
+}) {
   return (
     <aside className="sidebar">
       <a
-        href="#dashboard"
+        href={current === "dashboard" ? "#dashboard" : "/"}
         className="brand-mark"
         aria-label="RH Agents dashboard"
       >
         rh<span>/</span>
       </a>
       <nav aria-label="Main navigation">
-        {links.map(([name, id, Icon], i) => (
-          <a
-            key={name}
-            href={`#${id}`}
-            className={`nav-link ${i === 0 ? "active" : ""}`}
-            aria-current={i === 0 ? "page" : undefined}
-          >
-            <Icon size={20} />
-            <span>{name}</span>
-          </a>
-        ))}
+        {links.map(([name, id, Icon], i) => {
+          const active =
+            id === "scout"
+              ? current === "scout"
+              : current === "dashboard" && i === 0;
+          const href =
+            id === "scout"
+              ? "/scout"
+              : current === "dashboard"
+                ? `#${id}`
+                : `/#${id}`;
+          return (
+            <a
+              key={name}
+              href={href}
+              className={`nav-link ${active ? "active" : ""}`}
+              aria-current={active ? "page" : undefined}
+            >
+              <Icon size={20} />
+              <span>{name}</span>
+            </a>
+          );
+        })}
       </nav>
       <div className="sidebar-foot">
         <ShieldCheck size={20} />
