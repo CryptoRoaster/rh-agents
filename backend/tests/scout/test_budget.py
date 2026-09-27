@@ -10,8 +10,9 @@ holds across scheduled processes. A watch the budget cannot reach waits.
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from src.data.tables import DiscoveryWatchAssessmentRow
+from src.data.tables import DiscoveryWatchAssessmentRow, ScoutOrbitReservationRow
 from src.reasoning.models import ReasoningErrorCategory
+from src.scout.budget import OrbitBudget
 from src.scout.policy import WatchStatus
 from src.scout.repository import WatchRepository
 from tests.runner.provider import MarketProvider as BaseProvider
@@ -40,7 +41,7 @@ def budget(*, per_run=4, per_day=96, new=10, refresh=4):
 
 
 async def spend(sessions, count: int, at: datetime) -> None:
-    """Record `count` already-started reviews on a separate watch at `at`."""
+    """Record `count` already-reserved paid reviews on a separate watch at `at`."""
     await scout(
         sessions,
         at - timedelta(hours=1),
@@ -54,31 +55,16 @@ async def spend(sessions, count: int, at: datetime) -> None:
     async with sessions.begin() as session:
         for index in range(count):
             session.add(
-                DiscoveryWatchAssessmentRow(
+                ScoutOrbitReservationRow(
                     id=uuid4(),
                     watch_id=watch.id,
-                    snapshot_id=watch.latest_snapshot_id,
-                    assessed_at=at,
                     checkpoint_index=100 + index,
-                    checkpoint_seconds=0,
-                    status="FAILED",
-                    failure_reason="PROVIDER_TIMEOUT",
-                    classification=None,
-                    strength=None,
-                    reason_codes=[],
-                    data_gaps=[],
-                    cited_observation_ids=[],
-                    summary=None,
-                    input_digest="0" * 64,
-                    policy_version="early-scout-v1",
-                    prompt_version="orbit-v1",
-                    prompt_hash="0" * 64,
-                    output_schema_version=1,
-                    reasoning_provider=None,
-                    reasoning_model=None,
-                    input_tokens=None,
-                    output_tokens=None,
-                    latency_ms=None,
+                    utc_day=at.astimezone(UTC).date(),
+                    reserved_at=at,
+                    status="COMPLETED",
+                    assessment_id=None,
+                    completed_at=at,
+                    failure_reason=None,
                 )
             )
 
@@ -315,3 +301,167 @@ async def test_the_refresh_asks_by_the_stored_locators_only(db):
     (request,) = provider.multi_requests
     asked = request.rsplit("/", 1)[-1].split(",")
     assert asked == [POOLS[0], POOLS[1]]
+
+
+# ------------------------------------------------ durable pre-call reservation
+
+
+class ReservationCheckingOrbit(EchoOrbit):
+    """Asserts, on entering the model call, that its slot is already committed."""
+
+    def __init__(self, sessions, **kwargs):
+        super().__init__(**kwargs)
+        self.sessions = sessions
+        self.seen: list[int] = []
+
+    async def generate_structured(self, request):
+        from sqlalchemy import func, select
+
+        # A separate session: only what is committed is visible here.
+        async with self.sessions() as session:
+            reserved = await session.scalar(
+                select(func.count())
+                .select_from(ScoutOrbitReservationRow)
+                .where(ScoutOrbitReservationRow.status == "RESERVED")
+            )
+        self.seen.append(int(reserved or 0))
+        return await super().generate_structured(request)
+
+
+async def test_no_model_call_starts_without_a_committed_reservation(db):
+    _, sessions = db
+    orbit = ReservationCheckingOrbit(sessions)
+    await scout(
+        sessions, T0, provider=MarketProvider(discovery=TEN[:3]), orbit=orbit, settings=budget()
+    )
+    assert len(orbit.calls) == 3
+    # Exactly this call's slot was RESERVED and committed when the call began.
+    assert orbit.seen == [1, 1, 1]
+    async with sessions() as session:
+        from sqlalchemy import select
+
+        rows = (await session.scalars(select(ScoutOrbitReservationRow))).all()
+    assert sorted(row.status for row in rows) == ["COMPLETED"] * 3
+    assert all(row.assessment_id is not None for row in rows)
+
+
+class CrashingOrbit(EchoOrbit):
+    """The process dies inside the model call, before any assessment is written."""
+
+    async def generate_structured(self, request):
+        self.calls.append(request)
+        raise KeyboardInterrupt
+
+
+async def test_a_call_that_crashes_before_its_assessment_still_counts(db):
+    import pytest
+
+    _, sessions = db
+    provider = MarketProvider(discovery=TEN[:6])
+    for attempt in range(4):
+        with pytest.raises(KeyboardInterrupt):
+            await scout(
+                sessions,
+                T0 + timedelta(minutes=attempt),
+                provider=provider,
+                orbit=CrashingOrbit(),
+                settings=budget(per_run=4, per_day=4),
+            )
+        used = await OrbitBudget(sessions).used(T0.date())
+        assert used == attempt + 1
+    orbit = EchoOrbit()
+    summary = await scout(
+        sessions,
+        T0 + timedelta(minutes=5),
+        provider=provider,
+        orbit=orbit,
+        settings=budget(per_run=4, per_day=4),
+    )
+    assert orbit.calls == []
+    assert summary.orbit_daily_used_before == 4
+    async with sessions() as session:
+        from sqlalchemy import select
+
+        statuses = (await session.scalars(select(ScoutOrbitReservationRow.status))).all()
+        assessments = (await session.scalars(select(DiscoveryWatchAssessmentRow.id))).all()
+    assert sorted(statuses) == ["RESERVED"] * 4
+    assert assessments == []
+
+
+async def test_a_reservation_that_cannot_be_written_means_no_model_call(db, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    _, sessions = db
+
+    async def refuse(*args, **kwargs):
+        raise OperationalError("insert", {}, Exception("database gone"))
+
+    monkeypatch.setattr(OrbitBudget, "reserve", refuse)
+    orbit = EchoOrbit()
+    summary = await scout(
+        sessions, T0, provider=MarketProvider(discovery=TEN[:3]), orbit=orbit, settings=budget()
+    )
+    assert orbit.calls == []
+    assert "DATABASE_UNAVAILABLE" in summary.errors
+    # Discovery still happened and nothing was dropped.
+    assert summary.watches_created == 3
+
+
+async def test_an_unreadable_daily_count_means_no_model_call(db, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    _, sessions = db
+
+    async def unreadable(*args, **kwargs):
+        raise OperationalError("select", {}, Exception("database gone"))
+
+    monkeypatch.setattr(OrbitBudget, "used", unreadable)
+    orbit = EchoOrbit()
+    summary = await scout(
+        sessions, T0, provider=MarketProvider(discovery=TEN[:3]), orbit=orbit, settings=budget()
+    )
+    assert orbit.calls == []
+    assert "DATABASE_UNAVAILABLE" in summary.errors
+
+
+async def test_a_slot_left_before_its_checkpoint_was_claimed_is_reused_not_doubled(db):
+    """Reserve, then claim, then call: an unclaimed RESERVED slot means no call was made."""
+    _, sessions = db
+    await scout(
+        sessions, T0, provider=MarketProvider(discovery=[young(0)]), settings=budget(per_run=0)
+    )
+    watch = await WatchRepository(sessions).by_pair(pair_id(POOLS[0]))
+    first = await OrbitBudget(sessions).reserve(watch.id, 0, T0, 96)
+    orbit = EchoOrbit()
+    summary = await scout(
+        sessions, T0, provider=MarketProvider(discovery=[young(0)]), orbit=orbit, settings=budget()
+    )
+    assert len(orbit.calls) == 1
+    assert summary.orbit_daily_used_before == 1
+    assert summary.orbit_daily_used_after == 1
+    async with sessions() as session:
+        from sqlalchemy import select
+
+        (row,) = (await session.scalars(select(ScoutOrbitReservationRow))).all()
+    assert row.id == first and row.status == "COMPLETED"
+
+
+async def test_reviews_and_history_checks_share_one_refresh_request(db):
+    _, sessions = db
+    pools = [young(0), young(1)]
+    provider = MarketProvider(discovery=pools, targeted=pools)
+    await scout(sessions, T0, provider=provider, settings=budget(per_run=0))
+    provider.discovery = []
+    from tests.scout.conftest import ScriptedHistory
+
+    summary = await scout(
+        sessions,
+        T0 + timedelta(hours=24),
+        provider=provider,
+        history=ScriptedHistory(3),
+        settings=budget(per_run=1).model_copy(update={"early_scout_max_history_checks_per_run": 1}),
+    )
+    assert summary.orbit_reviews_started == 1 and summary.history_checks == 1
+    assert len(provider.multi_requests) == 1
+    # networks + new_pools + one batched refresh (history is scripted here).
+    assert summary.provider_requests == 3

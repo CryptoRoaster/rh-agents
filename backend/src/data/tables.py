@@ -830,3 +830,32 @@ class ScoutRunRow(Base):
     orbit_daily_used_after: Mapped[int] = mapped_column(Integer)
     orbit_daily_remaining_after: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ScoutOrbitReservationRow(Base):
+    """One durable slot of the daily paid-ORBIT budget, taken before the call.
+
+    Written and committed before the model is asked, so a process that dies
+    mid-call still leaves the slot spent: RESERVED, COMPLETED and FAILED all
+    count toward the UTC day. Conservative by design — a slot may be spent for a
+    call that never reached the provider, never the other way round. No prompt,
+    payload or model text.
+    """
+
+    __tablename__ = "scout_orbit_reservations"
+    __table_args__ = (
+        UniqueConstraint("watch_id", "checkpoint_index", name="uq_scout_orbit_reservation"),
+        CheckConstraint(
+            "status IN ('RESERVED', 'COMPLETED', 'FAILED')", name="scout_orbit_reservation_status"
+        ),
+        Index("ix_scout_orbit_reservations_day", "utc_day"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    watch_id: Mapped[UUID] = mapped_column(ForeignKey("discovery_watches.id", ondelete="RESTRICT"))
+    checkpoint_index: Mapped[int] = mapped_column(Integer)
+    utc_day: Mapped[date] = mapped_column(Date)
+    reserved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20))
+    assessment_id: Mapped[UUID | None] = mapped_column(Uuid)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_reason: Mapped[str | None] = mapped_column(String(80))

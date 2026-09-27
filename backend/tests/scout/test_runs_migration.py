@@ -92,7 +92,7 @@ def test_the_chain_ends_at_0013():
 
 async def test_upgrade_creates_an_empty_run_table(at_0012):
     await apply(at_0012)
-    assert "scout_runs" in await tables(at_0012)
+    assert {"scout_runs", "scout_orbit_reservations"} <= await tables(at_0012)
     async with at_0012.connect() as connection:
         assert await connection.scalar(text("SELECT count(*) FROM scout_runs")) == 0
         indexes = await connection.run_sync(
@@ -115,4 +115,43 @@ async def test_downgrade_removes_only_the_run_table(at_0012):
     await apply(at_0012, "downgrade")
     remaining = await tables(at_0012)
     assert "scout_runs" not in remaining
+    assert "scout_orbit_reservations" not in remaining
     assert {"discovery_watches", "discovery_watch_assessments"} <= remaining
+
+
+async def test_a_reservation_status_is_one_of_three(at_0012):
+    await apply(at_0012)
+    watch = uuid4()
+    async with at_0012.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO discovery_watches (id, schema_version, policy_version, provider,"
+                " chain, network, pair_id, is_fixture, market_payload, first_seen_at,"
+                " last_seen_at, latest_snapshot_id, created_at, updated_at, status,"
+                " next_orbit_review_at, orbit_checkpoint_index, next_history_review_at,"
+                " latest_vector_sufficiency, vector_checked_at, reason_code,"
+                " last_promoted_trade_case_id) VALUES (:id, 1, 'early-scout-v1', 'geckoterminal',"
+                " 'bsc', 'mainnet', 'bsc:mainnet:contract_address:0xc5', false, '{}'::jsonb,"
+                " now(), now(), gen_random_uuid(), now(), now(), 'WATCHING', now(), NULL, now(),"
+                " NULL, NULL, 'WATCH_OPENED', NULL)"
+            ),
+            {"id": watch},
+        )
+    insert = text(
+        "INSERT INTO scout_orbit_reservations (id, watch_id, checkpoint_index, utc_day,"
+        " reserved_at, status) VALUES (:id, :watch, :index, current_date, now(), :status)"
+    )
+    async with at_0012.begin() as connection:
+        await connection.execute(
+            insert, {"id": uuid4(), "watch": watch, "index": 0, "status": "RESERVED"}
+        )
+    with pytest.raises(IntegrityError):
+        async with at_0012.begin() as connection:
+            await connection.execute(
+                insert, {"id": uuid4(), "watch": watch, "index": 1, "status": "CANCELLED"}
+            )
+    with pytest.raises(IntegrityError):
+        async with at_0012.begin() as connection:
+            await connection.execute(
+                insert, {"id": uuid4(), "watch": watch, "index": 0, "status": "RESERVED"}
+            )

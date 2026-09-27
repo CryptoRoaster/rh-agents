@@ -12,7 +12,7 @@ wrong source for a watch list and is not used.
 """
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
@@ -30,6 +30,7 @@ from src.data.tables import (
 )
 from src.markets.models import MarketSnapshot
 from src.runner.models import Code, Identifier, Immutable
+from src.scout.budget import OrbitBudget, utc_day
 from src.scout.models import DiscoveryWatch, ScoutRun, WatchAssessment
 from src.scout.policy import EARLY_SCOUT_V1, REVIEWABLE, EarlyScoutPolicy, WatchStatus
 from src.scout.repository import Backlog, WatchRepository, _watch
@@ -401,8 +402,7 @@ class ScoutReadService:
     async def overview(self, now: datetime) -> ScoutOverview:
         repository = WatchRepository(self.sessions, policy=self.policy)
         backlog: Backlog = await repository.backlog(now)
-        day_start = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-        used = await repository.reviews_started_on(day_start)
+        used = await OrbitBudget(self.sessions).used(utc_day(now))
         async with self.sessions() as session:
             grouped = (
                 await session.execute(

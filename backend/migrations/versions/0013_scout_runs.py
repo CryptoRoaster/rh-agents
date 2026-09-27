@@ -6,6 +6,10 @@ many had a valid identity, how many watches were created, and whether ORBIT is
 keeping up with the checkpoints that fall due, and how much of the day's
 paid-review budget was used.
 
+`scout_orbit_reservations` makes the daily paid-ORBIT budget a hard bound: a
+slot is reserved and committed before every scout model call, so a process that
+dies mid-call still leaves its slot counted.
+
 **Structure only.** No row is reconstructed from old output: runs before this
 migration simply have no history. Existing watches and assessments are
 untouched.
@@ -71,6 +75,33 @@ def upgrade() -> None:
     )
     op.create_index("ix_scout_runs_started", "scout_runs", ["started_at"])
 
+    op.create_table(
+        "scout_orbit_reservations",
+        sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column(
+            "watch_id",
+            sa.Uuid(),
+            sa.ForeignKey("discovery_watches.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column("checkpoint_index", sa.Integer(), nullable=False),
+        sa.Column("utc_day", sa.Date(), nullable=False),
+        sa.Column("reserved_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("status", sa.String(20), nullable=False),
+        sa.Column("assessment_id", sa.Uuid(), nullable=True),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("failure_reason", sa.String(80), nullable=True),
+        # One slot per watch checkpoint: a checkpoint is reviewed at most once.
+        sa.UniqueConstraint("watch_id", "checkpoint_index", name="uq_scout_orbit_reservation"),
+        # Every status counts toward the day; RESERVED is what a crash leaves.
+        sa.CheckConstraint(
+            "status IN ('RESERVED', 'COMPLETED', 'FAILED')",
+            name="scout_orbit_reservation_status",
+        ),
+    )
+    op.create_index("ix_scout_orbit_reservations_day", "scout_orbit_reservations", ["utc_day"])
+
 
 def downgrade() -> None:
+    op.drop_table("scout_orbit_reservations")
     op.drop_table("scout_runs")

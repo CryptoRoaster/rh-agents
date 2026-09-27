@@ -11,7 +11,7 @@ while a transaction opened here is still open.
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
@@ -278,25 +278,6 @@ class WatchRepository:
             else max(0, int((now - aware(oldest)).total_seconds())),
             unreviewed=int(unreviewed or 0),
         )
-
-    async def reviews_started_on(self, day_start: datetime) -> int:
-        """Scout ORBIT reviews started in the UTC day beginning at `day_start`.
-
-        Read from the append-only assessment history, which records every
-        review whose model call was started — failed ones included — so the
-        count is the same whichever process asks.
-        """
-        day_end = day_start + timedelta(days=1)
-        async with self.sessions() as session:
-            count = await session.scalar(
-                select(func.count())
-                .select_from(DiscoveryWatchAssessmentRow)
-                .where(
-                    DiscoveryWatchAssessmentRow.assessed_at >= day_start,
-                    DiscoveryWatchAssessmentRow.assessed_at < day_end,
-                )
-            )
-        return int(count or 0)
 
     async def promotable(self, limit: int) -> tuple[DiscoveryWatch, ...]:
         """PROMOTABLE watches in discovery order. Never ranked by market size."""

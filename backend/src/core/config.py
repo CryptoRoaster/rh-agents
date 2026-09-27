@@ -285,9 +285,9 @@ class Settings(BaseSettings):
     # this. Four reviews at the observed 7-10 s latency (60 s timeout worst case)
     # fit well inside a 15-minute cadence.
     early_scout_max_orbit_reviews_per_run: int = Field(default=4, ge=0, le=10)
-    # The hard daily bound on paid scout ORBIT calls, counted from the persisted
-    # assessment history of the current UTC day — every started review counts,
-    # failed ones included — so it holds across scheduled processes. 96 is on
+    # The hard daily bound on paid scout ORBIT calls in the current UTC day. A
+    # durable slot is reserved and committed before every call, so a call counts
+    # even if its process dies mid-call (see src/scout/budget.py). 96 is on
     # average one review per 15-minute run; a run may burst up to its per-run
     # bound while the day still has budget.
     early_scout_max_orbit_reviews_per_day: int = Field(default=96, ge=0, le=2000)
