@@ -37,6 +37,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 import httpx
@@ -62,13 +63,13 @@ from src.core.clock import Clock, SystemClock
 from src.core.config import Settings
 from src.data.database import connect
 from src.fast_reasoning.provider import FastAssessmentProvider
-from src.markets.geckoterminal.adapter import GeckoTerminalAdapter
+from src.markets.geckoterminal.adapter import MAX_POOLS_PER_REQUEST, GeckoTerminalAdapter
 from src.markets.geckoterminal.errors import IdentityError, ProviderError
 from src.markets.geckoterminal.networks import CHAINS, Chain, NetworkDirectory, selected_chains
 from src.markets.geckoterminal.ohlcv import GeckoTerminalOhlcvSource
 from src.markets.geckoterminal.transport import GeckoTerminalTransport
-from src.markets.history import MarketHistorySource, MarketHistoryUnavailable
-from src.markets.models import MarketSnapshot
+from src.markets.history import MarketHistory, MarketHistorySource, MarketHistoryUnavailable
+from src.markets.models import Availability, MarketSnapshot
 from src.markets.recorder import MarketRecorder, ObservationConflict, record_pair_reporting
 from src.orchestration.commander.context import (
     AccountPauseReader,
@@ -85,6 +86,19 @@ from src.scout.models import (
     ScoutReview,
     ScoutSummary,
     WatchAssessment,
+)
+from src.scout.outcomes import (
+    SAMPLE_AGGREGATE,
+    SAMPLE_STEP,
+    SAMPLE_TIMEFRAME,
+    BarStore,
+    Candidate,
+    OutcomeSampler,
+    OutcomeStore,
+    OutcomeTally,
+    SamplerSkip,
+    SamplerStop,
+    classify_history_failure,
 )
 from src.scout.policy import EARLY_SCOUT_V1, EarlyScoutPolicy, WatchStatus
 from src.scout.repository import SyncResult, WatchRepository, refreshed_identity_contradicts
@@ -241,6 +255,7 @@ class Tally:
     reviews: list[ScoutReview] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     shadow: ShadowTally = field(default_factory=ShadowTally)
+    outcomes: OutcomeTally = field(default_factory=OutcomeTally)
 
     def fail(self, code: str) -> None:
         if code not in self.errors:
@@ -348,6 +363,8 @@ class EarlyScoutCycle:
                 # Last, after every review and check: shadow work cannot change
                 # what the run already decided, nor delay it.
                 await self._shadow(tally)
+                # Outcome labels, after everything else and on their own budget.
+                await self._outcomes(tally)
         except SystemPauseUnavailable:
             tally.stop = "SYSTEM_STOPPED"
             tally.fail("SYSTEM_STOP_UNREADABLE")
@@ -412,6 +429,96 @@ class EarlyScoutCycle:
             tally.shadow = result
         except (SQLAlchemyError, OSError):
             tally.shadow.failure("SHADOW_STORE_UNAVAILABLE")
+
+    async def _outcomes(self, tally: Tally) -> None:
+        """Label eligible discovery streams within the sampler's own budget. Never raises."""
+        settings = self._settings
+        if not settings.outcome_sampler_enabled or settings.outcome_max_requests_per_run <= 0:
+            return
+        chains = selected_chains(settings)
+        budget = settings.model_copy(
+            update={"geckoterminal_max_requests": settings.outcome_max_requests_per_run}
+        )
+        transport = GeckoTerminalTransport(
+            budget, transport=self._ports.market_http, clock=self._clock
+        )
+        directory = NetworkDirectory(transport, budget)
+        recorder = MarketRecorder(self._sessions, clock=self._clock)
+        now = self._clock.now()
+
+        async def fetch(candidate: Candidate) -> MarketHistory:
+            chain = CHAINS.get(candidate.key[1])
+            if chain is None or chain not in chains:
+                raise SamplerSkip("CHAIN_NOT_CONFIGURED", final=False)
+            source = self._history_source(chain, transport, directory)
+            span = now - candidate.first_seen
+            bars = min(1000, int(span / SAMPLE_STEP) + 2)
+            try:
+                return await source.history(
+                    candidate.reference.pair.market_identity,
+                    timeframe=SAMPLE_TIMEFRAME,
+                    aggregate=SAMPLE_AGGREGATE,
+                    bars=bars,
+                )
+            except MarketHistoryUnavailable as error:
+                raise classify_history_failure(error.reason_code) from None
+
+        async def observe(candidates: list[Candidate]) -> dict[str, Decimal]:
+            """Current liquidity, one batched re-observation per chain (recorded as usual)."""
+            found: dict[str, Decimal] = {}
+            by_chain: dict[str, list[Candidate]] = {}
+            for item in candidates:
+                if item.reference.pair.pool_locator is not None:
+                    by_chain.setdefault(item.key[1], []).append(item)
+            for chain_name, batch in by_chain.items():
+                chain = CHAINS.get(chain_name)
+                if chain is None or chain not in chains:
+                    continue
+                adapter = GeckoTerminalAdapter(
+                    transport, directory, chain, budget, clock=self._clock
+                )
+                for start in range(0, len(batch), MAX_POOLS_PER_REQUEST):
+                    part = batch[start : start + MAX_POOLS_PER_REQUEST]
+                    try:
+                        pairs = await adapter.observe(
+                            tuple(
+                                item.reference.pair.market_identity.pool_locator
+                                for item in part
+                                if item.reference.pair.market_identity.pool_locator is not None
+                            )
+                        )
+                    except ProviderError as error:
+                        raise SamplerStop(error.code.upper()) from None
+                    for pair in pairs:
+                        try:
+                            written = await record_pair_reporting(adapter, pair, recorder)
+                        except (ObservationConflict, ValueError):
+                            continue
+                        liquidity = written.observation.liquidity
+                        if liquidity.status == Availability.AVAILABLE and liquidity.value_usd:
+                            found[pair.pair_id] = liquidity.value_usd
+            return found
+
+        sampler = OutcomeSampler(
+            bars=BarStore(self._sessions),
+            store=OutcomeStore(self._sessions),
+            seed=settings.outcome_sample_seed,
+            max_streams=settings.outcome_max_streams_per_run,
+            # One request resolves the networks; one per chain re-observes liquidity.
+            max_fetches=max(0, settings.outcome_max_requests_per_run - 1 - len(chains)),
+        )
+        try:
+            result = await sampler.run(now, fetch, observe)
+            for code, count in tally.outcomes.failure_codes.items():
+                result.failure_codes[code] = result.failure_codes.get(code, 0) + count
+            tally.outcomes = result
+        except (SQLAlchemyError, OSError):
+            tally.outcomes.failure("OUTCOME_STORE_UNAVAILABLE")
+        except ProviderError as error:
+            tally.outcomes.failure(error.code.upper())
+        finally:
+            tally.outcomes.requests = transport.logical_requests
+            await transport.__aexit__(None, None, None)
 
     async def _permitted(self, tally: Tally) -> bool:
         """A durable stop, or one that cannot be read, means nobody is asked anything."""
@@ -934,6 +1041,14 @@ class EarlyScoutCycle:
             return
         tally.history_checks += 1
         verdict = assess(history, watch.market, now, vector)
+        # The same read labels outcomes later: keep its bars. Recording never
+        # changes the verdict, and a store that cannot be written costs nothing.
+        try:
+            await BarStore(self._sessions).record(
+                history, watch.market, source="SCOUT_VECTOR_HISTORY"
+            )
+        except (SQLAlchemyError, OSError, ValueError):
+            tally.outcomes.failure("BAR_STORE_UNAVAILABLE")
         sufficient = verdict is VectorMarketDataSufficiency.SUFFICIENT
         if sufficient:
             tally.vector_sufficient += 1
@@ -1001,6 +1116,12 @@ class EarlyScoutCycle:
                 ModelFailureCount(provider=provider, category=category, reason_code=code, count=n)
                 for (provider, category, code), n in sorted(tally.model_failure_reasons.items())
             )[:32],
+            outcome_eligible=tally.outcomes.eligible,
+            outcome_sampled=tally.outcomes.sampled,
+            outcome_reused=tally.outcomes.reused,
+            outcome_fetched=tally.outcomes.fetched,
+            outcome_requests=tally.outcomes.requests,
+            outcome_failure_codes=tuple(sorted(tally.outcomes.failure_codes))[:16],
             shadow_candidates=len(tally.shadow_candidates),
             shadow_assessments_started=tally.shadow.started,
             shadow_assessments_completed=tally.shadow.completed,

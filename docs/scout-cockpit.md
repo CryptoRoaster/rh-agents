@@ -157,6 +157,11 @@ ops/scout/uninstall.sh           # unload and remove it (logs stay)
   (`watches_declined` in the summary) as NOT_OPENED_AS_WATCH_DUE_TO_WATCH_LIMIT:
   it is never adopted by the recovery bootstrap and never opened by a later
   discovery run, but it is still observed and still gets its JEV-0 assessment.
+- **Outcome labels.** Optional, off by default (`OUTCOME_SAMPLER_ENABLED`).
+  Objective returns, drawdowns and survival for watched and declined
+  candidates, on the sampler's own request budget; see
+  [discovery outcomes](architecture/discovery-outcomes.md) and
+  `GET /api/scout/outcomes/summary`.
 - **JEV shadow triage.** Optional, off by default. Every new discovery
   candidate is assessed, declined ones included; see
   [JEV-0](architecture/jev-shadow-triage.md). The watch detail shows the

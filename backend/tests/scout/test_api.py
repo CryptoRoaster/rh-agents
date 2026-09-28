@@ -9,11 +9,12 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
 from src.api.paper import paper_reader
-from src.api.scout import scout_reader, shadow_reader
+from src.api.scout import outcome_reader, scout_reader, shadow_reader
 from src.core.config import Settings
 from src.data.tables import DiscoveryWatchAssessmentRow, PnLRow, PositionRow, TradeCaseRow
 from src.ledger.read import PaperReadService
 from src.reasoning.models import ReasoningErrorCategory
+from src.scout.outcome_read import OutcomeReadService
 from src.scout.policy import WatchStatus
 from src.scout.read import ScoutReadService
 from src.scout.repository import WatchRepository
@@ -48,9 +49,13 @@ async def client(db, monkeypatch):
     async def shadow_override():
         yield ShadowReadService(sessions)
 
+    async def outcome_override():
+        yield OutcomeReadService(sessions)
+
     app.dependency_overrides[scout_reader] = scout_override
     app.dependency_overrides[paper_reader] = paper_override
     app.dependency_overrides[shadow_reader] = shadow_override
+    app.dependency_overrides[outcome_reader] = outcome_override
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
         yield http, sessions, app
 
@@ -413,3 +418,21 @@ async def test_the_summary_counts_candidates_that_never_became_watches(client):
     assert summary["total"] == 2
     assert (summary["with_watch"], summary["without_watch"]) == (1, 1)
     assert summary["by_chain"] == {"robinhood": 2}
+
+
+async def test_the_outcome_summary_is_read_only_and_labels_only(client):
+    http, _, _ = client
+    summary = (await http.get("/api/scout/outcomes/summary")).json()
+    assert summary["notice"] == "LABELS ONLY - NO DECISION EFFECT"
+    assert summary["candidates"] == 0 and summary["sampled"] == 0
+    assert [item["horizon_minutes"] for item in summary["horizons"]] == [
+        15,
+        60,
+        180,
+        360,
+        720,
+        1440,
+        2880,
+        4320,
+    ]
+    assert (await http.post("/api/scout/outcomes/summary")).status_code == 405

@@ -125,6 +125,15 @@ class Settings(BaseSettings):
     # requests/min, so neither bound is set by the provider.
     jev_max_assessments_per_run: int = Field(default=20, ge=0, le=50)
     jev_max_assessments_per_day: int = Field(default=1920, ge=0, le=5000)
+    # Objective outcome labels for discovery candidates (watched and declined).
+    # Off by default. The sampler runs last in a scout run with its own
+    # GeckoTerminal transport and request cap, so it never displaces discovery,
+    # ORBIT refreshes or history checks. One 15-minute OHLCV read per stream
+    # labels all horizons; streams already covered by stored bars cost nothing.
+    outcome_sampler_enabled: bool = False
+    outcome_max_requests_per_run: int = Field(default=10, ge=0, le=30)
+    outcome_max_streams_per_run: int = Field(default=40, ge=0, le=500)
+    outcome_sample_seed: str = Field(default="rh-agents-outcomes-v1", min_length=1, max_length=80)
     orbit_worker_enabled: bool = False
     orbit_input_max_age_seconds: int = Field(default=900, ge=30, le=86400)
     orbit_discovery_liquidity_floor_usd: Decimal = Field(

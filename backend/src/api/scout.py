@@ -15,6 +15,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from src.data.database import connect
 from src.scout.models import WatchAssessment
+from src.scout.outcome_read import OutcomeReadService, OutcomeSummary
 from src.scout.policy import WatchStatus
 from src.scout.read import RunPage, ScoutOverview, ScoutReadService, WatchDetail, WatchPage
 from src.scout.shadow_read import ShadowReadService, ShadowSummary
@@ -126,6 +127,26 @@ ShadowReader = Annotated[ShadowReadService, Depends(shadow_reader)]
 @router.get("/shadow/summary")
 async def shadow_summary(reader: ShadowReader) -> ShadowSummary:
     """Descriptive statistics of the JEV shadow assessments. Decides nothing."""
+    try:
+        return await reader.summary()
+    except (SQLAlchemyError, OSError) as error:
+        raise unavailable() from error
+
+
+async def outcome_reader(request: Request) -> AsyncIterator[OutcomeReadService]:
+    engine, sessions = connect(request.app.state.settings.database_url)
+    try:
+        yield OutcomeReadService(sessions)
+    finally:
+        await engine.dispose()
+
+
+OutcomeReader = Annotated[OutcomeReadService, Depends(outcome_reader)]
+
+
+@router.get("/outcomes/summary")
+async def outcome_summary(reader: OutcomeReader) -> OutcomeSummary:
+    """Discovery outcomes against JEV, ORBIT and the watch decision. Decides nothing."""
     try:
         return await reader.summary()
     except (SQLAlchemyError, OSError) as error:
