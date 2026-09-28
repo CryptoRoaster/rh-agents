@@ -149,7 +149,9 @@ async def test_a_completed_turn_becomes_a_reasoning_result() -> None:
     assert result.output == Answer(verdict="ok")
     assert result.model.provider == "codex"
     assert result.model.model == "gpt-5.5"
+    # Requested effort is kept; nothing was reported, so nothing is claimed.
     assert result.model.effort == "high"
+    assert result.model.reported_effort is None
     assert result.usage.input_tokens == 6000
     assert result.usage.output_tokens == 280
     assert result.usage.latency_ms == 11500
@@ -166,6 +168,17 @@ async def test_a_completed_turn_becomes_a_reasoning_result() -> None:
         }
     ]
     assert prepare.exits == 1
+
+
+async def test_a_reported_effort_is_kept_apart_from_the_requested_one() -> None:
+    configuration = AttemptConfiguration(
+        configured_model="gpt-5.5", configured_effort="high", reported_effort="medium"
+    )
+    prepare = FakePrepare(respond=lambda _: completed(configuration=configuration))
+    result = await provider(prepare).generate_structured(request())
+
+    assert result.model.effort == "high"
+    assert result.model.reported_effort == "medium"
 
 
 async def test_the_turn_gets_the_same_channels_and_what_is_left_of_the_budget() -> None:

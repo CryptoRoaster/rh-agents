@@ -68,6 +68,10 @@ class WatchAssessment(Immutable):
     output_schema_version: int
     reasoning_provider: Identifier | None = None
     reasoning_model: Identifier | None = None
+    # The effort asked for, and the effort the provider reported. The second
+    # stays None when the provider says nothing; it is never copied from the first.
+    reasoning_effort: Identifier | None = None
+    reported_effort: Identifier | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     latency_ms: int | None = None

@@ -105,7 +105,11 @@ class EchoOrbit:
         lie: bool = False,
         failure: ReasoningErrorCategory | None = None,
         reason_code: str = "SCRIPTED_FAILURE",
+        effort: str | None = None,
+        reported_effort: str | None = None,
     ) -> None:
+        self.effort = effort
+        self.reported_effort = reported_effort
         self.classification = classification
         self.lie = lie
         self.failure = failure
@@ -146,7 +150,12 @@ class EchoOrbit:
         )
         return ReasoningResult(
             output=output,
-            model=ReasoningModel(provider="fake", model="echo-orbit"),
+            model=ReasoningModel(
+                provider="fake",
+                model="echo-orbit",
+                effort=self.effort,
+                reported_effort=self.reported_effort,
+            ),
             usage=ReasoningUsage(input_tokens=100, output_tokens=40, latency_ms=5),
         )
 

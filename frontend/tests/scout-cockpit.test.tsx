@@ -177,6 +177,8 @@ const detail = {
       output_schema_version: 1,
       reasoning_provider: "anthropic",
       reasoning_model: "claude-opus-5",
+      reasoning_effort: "high",
+      reported_effort: null,
       input_tokens: 2700,
       output_tokens: 400,
       latency_ms: 9000,
@@ -204,6 +206,8 @@ const detail = {
       output_schema_version: 1,
       reasoning_provider: null,
       reasoning_model: null,
+      reasoning_effort: null,
+      reported_effort: null,
       input_tokens: null,
       output_tokens: null,
       latency_ms: null,
@@ -335,6 +339,10 @@ describe("early discovery cockpit", () => {
     ).toBeTruthy();
     expect(screen.getByText(/Review failed: PROVIDER_TIMEOUT/)).toBeTruthy();
     expect(screen.getByText("· CODEX_DEADLINE_EXCEEDED")).toBeTruthy();
+    // Requested effort is shown as requested, never as reported.
+    expect(
+      screen.getByText(/effort high \(requested, not reported\)/),
+    ).toBeTruthy();
     expect(screen.getByText(/no assessment yet/)).toBeTruthy();
     expect(screen.getByText(/never TradeCase evidence/)).toBeTruthy();
   });

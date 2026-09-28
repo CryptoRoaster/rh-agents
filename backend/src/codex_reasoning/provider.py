@@ -188,7 +188,11 @@ class CodexReasoningProvider:
             model=ReasoningModel(
                 provider=CODEX_PROVIDER,
                 model=configuration.reported_model or configuration.configured_model,
-                effort=configuration.reported_effort or configuration.configured_effort,
+                # What was asked for, and separately what the CLI said it ran.
+                # Codex 0.153.4 does not report an effort, so the second stays
+                # None rather than echoing the first.
+                effort=configuration.configured_effort,
+                reported_effort=configuration.reported_effort,
             ),
             usage=ReasoningUsage(
                 input_tokens=outcome.usage.input_tokens,

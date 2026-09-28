@@ -50,11 +50,17 @@ class ReasoningUsage(Immutable):
 
 
 class ReasoningModel(Immutable):
-    """Which reasoning produced an output, for provenance and later upgrades."""
+    """Which reasoning produced an output, for provenance and later upgrades.
+
+    `effort` is the effort that was requested. `reported_effort` is what the
+    provider itself said it used, and stays None when it said nothing: a
+    requested value is never passed off as a reported one.
+    """
 
     provider: Identifier
     model: Identifier
     effort: Identifier | None = None
+    reported_effort: Identifier | None = None
 
 
 class ReasoningRequest[Output: BaseModel](Immutable):
