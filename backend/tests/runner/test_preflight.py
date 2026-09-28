@@ -202,8 +202,8 @@ async def test_an_enabled_role_that_cannot_be_composed_blocks(risk_db, now):
     assert "not enabled" in named(reading, "ROLE_ATLAS").note.lower()
 
 
-async def test_an_ambiguous_chain_binding_blocks_the_role_that_needs_it(risk_db, now):
-    """Two chains and a port that can only serve one is the existing limit."""
+async def test_two_chains_no_longer_block_the_role_that_needs_history(risk_db, now):
+    """Two chains: history is built per chain and routed by each case's market."""
     _, sessions = risk_db
     await migrate_marker(sessions)
     settings = preflight_settings(
@@ -217,9 +217,8 @@ async def test_an_ambiguous_chain_binding_blocks_the_role_that_needs_it(risk_db,
     reading = await check(sessions, settings, now)
 
     vector = named(reading, "ROLE_VECTOR")
-    assert vector.status == CheckStatus.BLOCKED.value
-    assert vector.reason == "MARKET_HISTORY_CHAIN_AMBIGUOUS"
-    assert reading.ready is False
+    assert vector.status == CheckStatus.SATISFIED.value, vector
+    assert vector.reason is None
 
 
 async def test_more_chains_than_the_provider_permits_are_refused(risk_db, now):
