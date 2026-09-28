@@ -21,6 +21,8 @@
     <string>__UV_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>RH_AGENTS_SCOUT_LOG_DIR</key>
     <string>__LOG_DIR__</string>
+    <key>RH_AGENTS_SCOUT_REQUIRE_BRANCH</key>
+    <string>main</string>
   </dict>
   <key>StartInterval</key>
   <integer>900</integer>

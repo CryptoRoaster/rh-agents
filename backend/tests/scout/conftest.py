@@ -194,6 +194,7 @@ async def scout(
     orbit: EchoOrbit | None = None,
     history: ScriptedHistory | None = None,
     settings: Settings | None = None,
+    fast=None,
 ):
     """One real scout cycle at `now`, with the outside edges replaced."""
     history = history if history is not None else ScriptedHistory()
@@ -205,6 +206,7 @@ async def scout(
             reasoning=orbit if orbit is not None else EchoOrbit(),
             market_http=provider.transport(),
             history=history,
+            fast=fast,
         ),
         clock=FixedClock(now),
     )

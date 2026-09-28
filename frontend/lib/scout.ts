@@ -103,10 +103,56 @@ export type CheckpointView = {
   assessment_id: string | null;
 };
 
+// A JEV shadow fast assessment. Shadow only: no trading or promotion effect.
+export type FastAnswer =
+  | { type: "noul"; noul: number }
+  | {
+      type: "choice";
+      choice: string;
+      probabilities: Record<string, number>;
+      confidence: number;
+    }
+  | {
+      type: "score";
+      score: number;
+      legend: Record<string, string>;
+      probabilities: Record<string, number>;
+      confidence: number;
+    };
+
+// Evidence about a discovered stream, not a watch: candidates the watch limit
+// declined have these too. A watch shows the ones for its own stream.
+export type FastAssessment = {
+  id: string;
+  market_provider: string;
+  chain: string;
+  network: string;
+  pair_id: string;
+  is_fixture: boolean;
+  snapshot_id: string;
+  reserved_at: string;
+  assessed_at: string | null;
+  status: "PENDING" | "COMPLETED" | "FAILED";
+  provider: string;
+  model: string;
+  model_version: string | null;
+  question_version: string;
+  input_schema_version: number;
+  input_digest: string;
+  input_payload: Record<string, unknown>;
+  answers: Record<string, FastAnswer> | null;
+  latency_ms: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  failure_category: string | null;
+  failure_reason_code: string | null;
+};
+
 export type WatchDetail = {
   watch: WatchView;
   checkpoints: CheckpointView[];
   assessments: WatchAssessment[];
+  fast_assessments: FastAssessment[];
   trade_case: {
     trade_case_id: string;
     status: string;

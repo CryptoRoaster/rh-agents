@@ -127,6 +127,9 @@ class ScoutSummary(Immutable):
     rejections: tuple[Code, ...] = Field(default=(), max_length=32)
     watches_created: int = Field(default=0, ge=0)
     watches_updated: int = Field(default=0, ge=0)
+    # Discovered streams the per-run watch limit turned away (kept as
+    # observations, never adopted by the recovery bootstrap).
+    watches_declined: int = Field(default=0, ge=0)
     refreshed: int = Field(default=0, ge=0)
     watches_due_orbit: int = Field(default=0, ge=0)
     orbit_reviews_started: int = Field(default=0, ge=0)
@@ -159,6 +162,15 @@ class ScoutSummary(Immutable):
     reviews: tuple[ScoutReview, ...] = Field(default=(), max_length=16)
     # Every model failure of this run, counted by provider, category and code.
     model_failure_reasons: tuple[ModelFailureCount, ...] = Field(default=(), max_length=32)
+    # Shadow fast assessments (JEV) of the watches this run opened. Shadow only:
+    # none of these counts feeds any decision, and none is a run error.
+    # New discovery candidates, fixed before watch allocation (declined included).
+    shadow_candidates: int = Field(default=0, ge=0)
+    shadow_assessments_started: int = Field(default=0, ge=0)
+    shadow_assessments_completed: int = Field(default=0, ge=0)
+    shadow_assessments_failed: int = Field(default=0, ge=0)
+    shadow_skipped_budget: int = Field(default=0, ge=0)
+    shadow_failure_codes: tuple[Code, ...] = Field(default=(), max_length=16)
     errors: tuple[Code, ...] = Field(default=(), max_length=16)
     # Stated in every summary, because it is the whole contract of this mode.
     trade_cases_opened: Literal[0] = 0

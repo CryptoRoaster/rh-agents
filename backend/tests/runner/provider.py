@@ -54,9 +54,11 @@ NETWORKS = {
 }
 
 
-def token(address: str, symbol: str, decimals: int = 18) -> dict[str, Any]:
+def token(
+    address: str, symbol: str, decimals: int = 18, network: str = NETWORK_ID
+) -> dict[str, Any]:
     return {
-        "id": f"{NETWORK_ID}_{address}",
+        "id": f"{network}_{address}",
         "type": "token",
         "attributes": {"address": address, "symbol": symbol, "decimals": decimals},
     }
@@ -71,6 +73,7 @@ def pool(
     liquidity: str = "750000",
     volume: str = "125000",
     venue: str = VENUE,
+    network: str = NETWORK_ID,
 ) -> dict[str, Any]:
     """One pool resource, as the documented schema carries it.
 
@@ -80,7 +83,7 @@ def pool(
     reading from falling back to a usable old one.
     """
     return {
-        "id": f"{NETWORK_ID}_{address}",
+        "id": f"{network}_{address}",
         "type": "pool",
         "attributes": {
             "address": address,
@@ -90,8 +93,8 @@ def pool(
             "volume_usd": {"h24": volume},
         },
         "relationships": {
-            "base_token": {"data": {"type": "token", "id": f"{NETWORK_ID}_{base}"}},
-            "quote_token": {"data": {"type": "token", "id": f"{NETWORK_ID}_{quote}"}},
+            "base_token": {"data": {"type": "token", "id": f"{network}_{base}"}},
+            "quote_token": {"data": {"type": "token", "id": f"{network}_{quote}"}},
             "dex": {"data": {"id": venue, "type": "dex"}},
         },
     }
@@ -114,11 +117,11 @@ def document(pools: list[dict[str, Any]]) -> dict[str, Any]:
     for item in pools:
         for relation in ("base_token", "quote_token"):
             resource = item["relationships"][relation]["data"]["id"]
-            address = resource.removeprefix(f"{NETWORK_ID}_")
+            network, _, address = resource.partition("_")
             if resource in seen:
                 continue
             seen.add(resource)
-            included.append(token(address, symbols.get(address, "SYM")))
+            included.append(token(address, symbols.get(address, "SYM"), network=network))
     return {"data": pools, "included": included}
 
 
@@ -139,8 +142,11 @@ class MarketProvider:
         status: int | None = None,
         discovery_status: int | None = None,
         networks: dict[str, Any] | None = None,
+        discovery_by_network: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         self.discovery = discovery if discovery is not None else []
+        # Per-network new pools, for a test with more than one chain.
+        self.discovery_by_network = discovery_by_network
         # What `pools/multi` knows about, by address. Anything not here is a
         # market the provider does not return, which is a real answer.
         self.targeted = {
@@ -174,6 +180,9 @@ class MarketProvider:
                 return httpx.Response(
                     self.discovery_status, text=json.dumps({"errors": [{"status": "boom"}]})
                 )
+            if self.discovery_by_network is not None:
+                network = path.split("/networks/", 1)[1].split("/", 1)[0]
+                return self._json(document(self.discovery_by_network.get(network, [])))
             return self._json(document(self.discovery))
         if "/pools/multi/" in path:
             wanted = path.rsplit("/", 1)[-1].split(",")

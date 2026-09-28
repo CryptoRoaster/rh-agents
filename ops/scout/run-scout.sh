@@ -45,6 +45,24 @@ if [[ -z "$UV" ]]; then
   exit 127
 fi
 
+# The scheduler runs the code of the worktree it was installed from. When that
+# worktree is required to be on a branch (the plist sets main), refuse to run
+# anything else: a feature branch with a newer ORM must never meet the live
+# database through the scheduler. Tracked changes count too; untracked files
+# such as `.env` and `.venv` do not.
+REQUIRED_BRANCH="${RH_AGENTS_SCOUT_REQUIRE_BRANCH:-}"
+if [[ -n "$REQUIRED_BRANCH" ]]; then
+  current="$(git -C "$REPO" symbolic-ref --quiet --short HEAD || echo DETACHED)"
+  if [[ "$current" != "$REQUIRED_BRANCH" ]]; then
+    echo "$(date -u +%FT%TZ) scout: refused RUNTIME_NOT_ON_$(echo "$REQUIRED_BRANCH" | tr '[:lower:]' '[:upper:]')" >>"$LOG"
+    exit 78
+  fi
+  if ! git -C "$REPO" diff --quiet HEAD --; then
+    echo "$(date -u +%FT%TZ) scout: refused RUNTIME_WORKTREE_MODIFIED" >>"$LOG"
+    exit 78
+  fi
+fi
+
 cd "$REPO/backend"
 status=0
 {

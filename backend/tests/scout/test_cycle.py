@@ -640,3 +640,145 @@ async def test_a_native_quoted_pool_becomes_a_watch(db):
     assert summary.valid_markets == 1
     assert watch is not None
     assert watch.market.quote_asset_id == f"robinhood:mainnet:{native}"
+
+
+# ------------------------------------------------- the watch limit holds
+
+
+async def observations_count(sessions) -> int:
+    from sqlalchemy import func, select
+
+    from src.data.tables import MarketObservationRow
+
+    async with sessions() as session:
+        return int(await session.scalar(select(func.count()).select_from(MarketObservationRow)))
+
+
+async def watch_count(sessions) -> int:
+    from sqlalchemy import func, select
+
+    from src.data.tables import DiscoveryWatchRow
+
+    async with sessions() as session:
+        return int(await session.scalar(select(func.count()).select_from(DiscoveryWatchRow)))
+
+
+async def test_the_watch_limit_is_not_doubled_by_the_next_runs_bootstrap(db):
+    """Discovered 10, limit 4: 4 watches, 6 declined, and the next run adopts none of them."""
+    _, sessions = db
+    ten = [young(index) for index in range(10)]
+    limited = scout_settings(early_scout_max_new_watches_per_run=4)
+    first = await scout(sessions, T0, provider=MarketProvider(discovery=ten), settings=limited)
+    assert (first.discovered, first.watches_created, first.watches_declined) == (10, 4, 6)
+    # Every discovered pool is still recorded: nothing is dropped.
+    assert await observations_count(sessions) == 10
+
+    second = await scout(
+        sessions, T0 + timedelta(minutes=15), provider=MarketProvider(), settings=limited
+    )
+    assert second.bootstrapped == 0
+    assert await watch_count(sessions) == 4
+    assert await observations_count(sessions) == 10
+
+
+async def test_a_declined_pool_never_becomes_a_watch_later(db):
+    """Seen again by discovery, a declined stream still gets no watch: new pools get the slot."""
+    _, sessions = db
+    limited = scout_settings(early_scout_max_new_watches_per_run=1)
+    await scout(
+        sessions, T0, provider=MarketProvider(discovery=[young(0), young(1)]), settings=limited
+    )
+    later = await scout(
+        sessions,
+        T0 + timedelta(minutes=15),
+        provider=MarketProvider(discovery=[young(0), young(1), young(2)]),
+        settings=limited,
+    )
+    # young(1) was declined; the one slot goes to the genuinely new young(2).
+    assert (later.watches_created, later.watches_declined) == (1, 0)
+    async with sessions() as session:
+        from src.data.tables import DiscoveryWatchRow
+
+        pairs = set((await session.scalars(select(DiscoveryWatchRow.pair_id))).all())
+    assert pair_id(POOLS[1]) not in pairs
+    assert {pair_id(POOLS[0]), pair_id(POOLS[2])} <= pairs
+
+
+async def test_recovery_bootstrap_still_adopts_streams_nobody_declined(db):
+    """Observations recorded outside a scout run, with no decline, are still adopted."""
+    _, sessions = db
+    from src.markets.recorder import MarketRecorder
+    from tests.riskdata.conftest import recorded_snapshot
+
+    await MarketRecorder(sessions).record(
+        recorded_snapshot(
+            T0,
+            age=HOUR,
+            pair_id="robinhood:mainnet:contract_address:0x" + "0d" * 20,
+            base_asset_id="robinhood:mainnet:0x" + "9d" * 20,
+            label="recovery",
+        )
+    )
+    limited = scout_settings(early_scout_max_new_watches_per_run=1)
+    summary = await scout(
+        sessions, T0, provider=MarketProvider(discovery=[young(0), young(1)]), settings=limited
+    )
+    assert summary.bootstrapped == 1
+    assert summary.watches_created == 1
+    assert summary.watches_declined == 1
+
+
+def test_watch_creation_takes_chains_in_turn_without_ranking():
+    from src.scout.service import round_robin
+
+    robinhood = ["r1", "r2", "r3", "r4"]
+    bsc = ["b1", "b2"]
+    assert round_robin([robinhood, bsc]) == ["r1", "b1", "r2", "b2", "r3", "r4"]
+    assert round_robin([]) == []
+    assert round_robin([[], bsc]) == bsc
+
+
+def bsc_pool(index: int):
+    from tests.atlas.conftest import QUOTE
+    from tests.runner.provider import pool
+
+    return pool(
+        "0x" + f"d{index}" * 20,
+        base="0x" + f"e{index}" * 20,
+        quote=QUOTE,
+        price="0.001",
+        liquidity="5000",
+        volume="100",
+        network="bsc",
+    )
+
+
+async def test_two_chains_share_the_watch_limit(db):
+    """Without the turn-taking, the first configured chain would take the whole limit."""
+    _, sessions = db
+    both = scout_settings(market_chains="robinhood,bsc", early_scout_max_new_watches_per_run=4)
+    summary = await scout(
+        sessions,
+        T0,
+        provider=MarketProvider(
+            discovery_by_network={
+                "robinhood": [young(index) for index in range(5)],
+                "bsc": [bsc_pool(index) for index in range(5)],
+            }
+        ),
+        settings=both,
+    )
+    assert summary.watches_created == 4
+    from sqlalchemy import func, select
+
+    from src.data.tables import DiscoveryWatchRow
+
+    async with sessions() as session:
+        by_chain = dict(
+            (
+                await session.execute(
+                    select(DiscoveryWatchRow.chain, func.count()).group_by(DiscoveryWatchRow.chain)
+                )
+            ).all()
+        )
+    assert by_chain == {"robinhood": 2, "bsc": 2}
