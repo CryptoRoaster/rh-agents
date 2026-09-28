@@ -117,6 +117,9 @@ class PaperExitRecorded(Immutable):
     realized_pnl_usd: Signed
     cost_basis_released_usd: Amount
     filled_at: AwareDatetime
+    # Set when an automatic exit policy fired; absent for a direct request.
+    exit_trigger: Code | None = None
+    exit_policy_version: Identifier | None = None
     # True when this call found the stored exit rather than performing one.
     replayed: bool = Field(strict=True)
 

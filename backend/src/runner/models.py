@@ -405,6 +405,17 @@ class PromotionReading(Immutable):
     cases_formed: int = Field(default=0, ge=0)
 
 
+class ExitReport(Immutable):
+    """The automatic exit sweep of one run: counts and codes only."""
+
+    evaluated: int = Field(default=0, ge=0)
+    triggered: int = Field(default=0, ge=0)
+    executed: int = Field(default=0, ge=0)
+    held: int = Field(default=0, ge=0)
+    triggers: tuple[Code, ...] = Field(default=(), max_length=8)
+    refusals: tuple[Code, ...] = Field(default=(), max_length=32)
+
+
 class RunSummary(Immutable):
     """One structured account of one pass, safe to print anywhere.
 
@@ -444,6 +455,8 @@ class RunSummary(Immutable):
     risk_requests: int = Field(default=0, ge=0)
     fills: int = Field(default=0, ge=0)
     replays: int = Field(default=0, ge=0)
+    # Absent unless automatic PAPER exits are configured.
+    exits: ExitReport | None = None
     # Technical faults, as codes. Never a provider message and never a traceback.
     errors: tuple[Code, ...] = Field(default=(), max_length=32)
 

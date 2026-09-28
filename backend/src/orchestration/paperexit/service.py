@@ -98,6 +98,18 @@ class _Abort(Exception):  # noqa: N818 - carries a reading, not an error conditi
         super().__init__(refusal.reason.value)
 
 
+@dataclass(frozen=True)
+class ExitTriggerRecord:
+    """Why an automatic policy asked for this exit. Recorded, never obeyed.
+
+    Plain values so this module depends on no policy: the policy depends on it.
+    """
+
+    trigger: str
+    policy_version: str
+    basis: dict[str, Any]
+
+
 class PaperExitUnavailable(Exception):
     """The call could not be attempted at all. Safe reason code only."""
 
@@ -129,15 +141,24 @@ class PaperExitService:
         """SENTINEL's limits, from the one place that owns them."""
         return self.paper.limits
 
-    async def execute_position_exit(self, position_id: UUID, *, request_key: str) -> ExitReading:
-        """Sell the whole open holding of one position, once, or say why not."""
+    async def execute_position_exit(
+        self, position_id: UUID, *, request_key: str, trigger: ExitTriggerRecord | None = None
+    ) -> ExitReading:
+        """Sell the whole open holding of one position, once, or say why not.
+
+        `trigger` is recorded with the exit when an automatic policy asked for
+        it. It authorises nothing: every check below runs exactly as for a
+        direct request, SENTINEL's SELL verdict included.
+        """
         try:
-            return await self._attempt(position_id, request_key=request_key)
+            return await self._attempt(position_id, request_key=request_key, trigger=trigger)
         except _Abort as abort:
             # The transaction has rolled back; the answer survives it.
             return abort.refusal
 
-    async def _attempt(self, position_id: UUID, *, request_key: str) -> ExitReading:
+    async def _attempt(
+        self, position_id: UUID, *, request_key: str, trigger: ExitTriggerRecord | None
+    ) -> ExitReading:
         feed = OneSnapshot(self.markets, self.include_fixtures)
         intent_id = _intent_identity(request_key)
         # History needs no current prices. Checked before anything is valued, so
@@ -372,7 +393,7 @@ class PaperExitService:
                     outcome=outcome.decision,
                 )
             return self._record(
-                session, position, trade_case, entry, outcome, market, now, request_key
+                session, position, trade_case, entry, outcome, market, now, request_key, trigger
             )
 
     # ------------------------------------------------------------------ reads
@@ -506,6 +527,7 @@ class PaperExitService:
         market: Any,
         now: datetime,
         request_key: str,
+        trigger: "ExitTriggerRecord | None" = None,
     ) -> PaperExitRecorded:
         """Bind the sale to the holding, the entry and the decision behind it."""
         fill, order, trade = outcome.fill, outcome.order, outcome.trade
@@ -565,6 +587,9 @@ class PaperExitService:
                 "position_before": state.position.model_dump(mode="json"),
                 "position_after": closed.model_dump(mode="json"),
             },
+            exit_trigger=None if trigger is None else trigger.trigger,
+            exit_policy_version=None if trigger is None else trigger.policy_version,
+            exit_trigger_basis=None if trigger is None else trigger.basis,
         )
         session.add(row)
         return _recorded(row, replayed=False)
@@ -646,6 +671,8 @@ def _recorded(row: TradeCaseExitRow, *, replayed: bool) -> PaperExitRecorded:
         realized_pnl_usd=row.realized_pnl_usd,
         cost_basis_released_usd=row.cost_basis_released_usd,
         filled_at=aware(row.filled_at),
+        exit_trigger=row.exit_trigger,
+        exit_policy_version=row.exit_policy_version,
         replayed=replayed,
     )
 

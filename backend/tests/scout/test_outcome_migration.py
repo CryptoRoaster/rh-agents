@@ -11,7 +11,6 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from src.data.schema import expected_revision
 from tests.reentry.test_migration import load
 from tests.scout.test_shadow_migration import THROUGH_0015, an_observation
 
@@ -97,8 +96,7 @@ LABEL = (
 )
 
 
-def test_the_chain_ends_at_0017():
-    assert expected_revision() == "0017"
+def test_0017_follows_0016():
     assert load(MODULE).down_revision == "0016"
 
 

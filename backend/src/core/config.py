@@ -246,6 +246,15 @@ class Settings(BaseSettings):
     # Configuring them authorises nothing.
     paper_fee_bps: ConfiguredBps | None = None
     paper_slippage_bps: ConfiguredBps | None = None
+    # Automatic PAPER exits (PAPER_EXIT_V1). Off by default, and there are
+    # deliberately no default stop, target or holding time: those are product
+    # decisions a deployment states. Enabling without all three fails loudly.
+    paper_auto_exit_enabled: bool = False
+    paper_exit_stop_loss_bps: int | None = Field(default=None, gt=0, le=10000)
+    paper_exit_take_profit_bps: int | None = Field(default=None, gt=0, le=1_000_000)
+    paper_exit_max_holding_minutes: int | None = Field(default=None, gt=0, le=129600)
+    paper_exit_invalidate_below_min_liquidity: bool = True
+    paper_exit_max_per_run: int = Field(default=5, ge=1, le=50)
     # Phase 2N-A bounded PAPER run. Disabled by default like every other
     # runnable thing here, and it starts nothing on its own: the flag says the
     # operator consents to a run existing, and a run still only happens when
@@ -367,6 +376,19 @@ class Settings(BaseSettings):
                 raise ValueError("Market acquisition requires a real market provider")
             if self.paper_runner_acquisition_max_seconds > self.paper_runner_max_seconds:
                 raise ValueError("Acquisition may not be allowed to outlast the run")
+        return self
+
+    @model_validator(mode="after")
+    def paper_exit_configuration(self) -> "Settings":
+        if self.paper_auto_exit_enabled and None in (
+            self.paper_exit_stop_loss_bps,
+            self.paper_exit_take_profit_bps,
+            self.paper_exit_max_holding_minutes,
+        ):
+            raise ValueError(
+                "Automatic PAPER exits need PAPER_EXIT_STOP_LOSS_BPS, "
+                "PAPER_EXIT_TAKE_PROFIT_BPS and PAPER_EXIT_MAX_HOLDING_MINUTES"
+            )
         return self
 
     @model_validator(mode="after")

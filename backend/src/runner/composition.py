@@ -55,7 +55,10 @@ from src.orchestration.commander.context import AccountPauseReader, SystemPauseP
 from src.orchestration.commander.intake import CommanderIntakeService
 from src.orchestration.commander.policy import COMMANDER_CONTROL_V1
 from src.orchestration.costs.models import PaperCostReading, paper_cost_assumptions
+from src.orchestration.exitpolicy.policy import PaperExitPolicy
+from src.orchestration.exitpolicy.service import AutoExitService
 from src.orchestration.paper import PaperTradingService
+from src.orchestration.paperexit.service import PaperExitService
 from src.orchestration.riskrequest.service import RiskRequestService
 from src.orchestration.worker.runner import CapabilityProvider, WorkerHandler, WorkerRunner
 from src.orchestration.worker.service import WorkerRuntimeService
@@ -280,6 +283,10 @@ class RunnerStack:
     # exact locator first. Absent means intake is exactly what it always was.
     promotion: PromotionRefresh | None = None
     watches: WatchRepository | None = None
+    # Present only with automatic PAPER exits configured: the sweep that asks
+    # PAPER_EXIT_V1 and exits through PaperExitService. Absent means no position
+    # is ever closed without an explicit request, as before.
+    exits: AutoExitService | None = None
     # Why no model can be asked, or None when one can. Read by preflight for the
     # scout, which needs ORBIT's model whether or not the ORBIT worker is on.
     reasoning_unavailable: str | None = None
@@ -385,6 +392,34 @@ def build_stack(
         pause=supplied.pause,
         clock=tick,
     )
+    exits = None
+    if settings.paper_auto_exit_enabled:
+        # The one exit path, driven by a deterministic policy. Built only when
+        # an operator stated the policy's numbers; validation refuses otherwise.
+        exits = AutoExitService(
+            sessions=sessions,
+            exits=PaperExitService(
+                sessions=sessions,
+                cases=cases,
+                paper=paper,
+                markets=markets,
+                costs=costs,
+                trading_mode=settings.trading_mode,
+                kill_switch=settings.commander_kill_switch,
+                pause=supplied.pause,
+                clock=tick,
+            ),
+            markets=markets,
+            policy=PaperExitPolicy(
+                stop_loss_bps=settings.paper_exit_stop_loss_bps or 0,
+                take_profit_bps=settings.paper_exit_take_profit_bps or 0,
+                max_holding_seconds=(settings.paper_exit_max_holding_minutes or 0) * 60,
+                invalidate_below_min_liquidity=settings.paper_exit_invalidate_below_min_liquidity,
+            ),
+            limits=paper.limits,
+            max_exits=settings.paper_exit_max_per_run,
+            clock=tick,
+        )
     runners, roles = _runners(settings, sessions, runtime, markets, supplied, tick)
     acquisition = None
     if settings.paper_runner_market_acquisition_enabled:
@@ -418,6 +453,7 @@ def build_stack(
         acquisition=acquisition,
         promotion=promotion,
         watches=watches,
+        exits=exits,
         reasoning_unavailable=None
         if supplied.reasoning is not None
         else supplied.reasoning_unavailable,
