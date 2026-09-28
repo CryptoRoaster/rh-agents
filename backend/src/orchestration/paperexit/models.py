@@ -71,6 +71,12 @@ class ExitRefusal(StrEnum):
     EXIT_KEY_MISMATCH = "EXIT_KEY_MISMATCH"
     # ---------------------------------------------------- the data
     RISK_DATA_INCOMPLETE = "RISK_DATA_INCOMPLETE"
+    # The exit's own fresh on-chain read could not be taken, or was taken for
+    # a different case than the one the sale is bound to.
+    EXIT_READ_UNAVAILABLE = "EXIT_READ_UNAVAILABLE"
+    # A fresh input the sale needs is missing: market, price, token metadata,
+    # cost basis or the holder measurement. Missing is never defaulted.
+    EXIT_DATA_INCOMPLETE = "EXIT_DATA_INCOMPLETE"
     DECISION_BASIS_EXPIRED = "DECISION_BASIS_EXPIRED"
     SOURCE_OLDER_THAN_RISK_LIMIT = "SOURCE_OLDER_THAN_RISK_LIMIT"
     PORTFOLIO_MARKS_UNAVAILABLE = "PORTFOLIO_MARKS_UNAVAILABLE"
@@ -117,6 +123,9 @@ class PaperExitRecorded(Immutable):
     realized_pnl_usd: Signed
     cost_basis_released_usd: Amount
     filled_at: AwareDatetime
+    # Set when an automatic exit policy fired; absent for a direct request.
+    exit_trigger: Code | None = None
+    exit_policy_version: Identifier | None = None
     # True when this call found the stored exit rather than performing one.
     replayed: bool = Field(strict=True)
 

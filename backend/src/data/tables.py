@@ -521,6 +521,10 @@ class TradeCaseExitRow(Base):
         CheckConstraint("fees_usd >= 0", name="trade_case_exit_fees_nonnegative"),
         CheckConstraint("cost_basis_released_usd >= 0", name="trade_case_exit_basis_nonnegative"),
         UniqueConstraint("trade_case_id", name="uq_trade_case_exit_case"),
+        CheckConstraint(
+            "(exit_trigger IS NULL) = (exit_policy_version IS NULL)",
+            name="trade_case_exit_trigger_versioned",
+        ),
         # One exit per *cycle* rather than per position: the position row
         # outlives the cycle and is reused by the next one. Two sales of one
         # holding inside a cycle stay impossible.
@@ -555,6 +559,13 @@ class TradeCaseExitRow(Base):
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     correlation_id: Mapped[UUID] = mapped_column(Uuid)
     basis: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+    # Why an automatic exit fired: the policy's trigger, its version, and the
+    # numbers it was decided on. NULL for an exit a caller asked for directly.
+    exit_trigger: Mapped[str | None] = mapped_column(String(40))
+    exit_policy_version: Mapped[str | None] = mapped_column(String(40))
+    exit_trigger_basis: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
+    )
 
 
 class TradeCaseTransitionRow(Base):

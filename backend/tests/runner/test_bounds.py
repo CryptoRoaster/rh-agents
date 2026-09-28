@@ -359,6 +359,8 @@ def test_the_summary_carries_no_secret_and_no_payload(risk_db):
         "risk_requests",
         "fills",
         "replays",
+        # Counts and codes only; absent unless automatic PAPER exits are configured.
+        "exits",
         "errors",
     }
     assert summary.exit_code is ExitCode.COMPLETED

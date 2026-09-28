@@ -40,9 +40,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.core.clock import Clock, SystemClock
 from src.core.models import (
     ExecutionTiming,
+    MarketSnapshot,
     Position,
     RiskDecision,
     RiskLimits,
+    SafetyStatus,
     Side,
     TradeIntent,
     TradingMode,
@@ -57,11 +59,16 @@ from src.data.tables import (
     TradeCycleRow,
 )
 from src.ledger.portfolio import portfolio_basis, portfolio_state
-from src.markets.models import MarketIdentity
+from src.markets.models import Availability, MarketIdentity
 from src.orchestration.casefill.models import notional_of
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
 from src.orchestration.paper import PaperOutcome, PaperTradingService
+from src.orchestration.paperexit.exitread import (
+    ExitOnchainRead,
+    ExitOnchainReadPort,
+    ExitReadUnavailable,
+)
 from src.orchestration.paperexit.models import (
     ExitReading,
     ExitRefusal,
@@ -70,7 +77,12 @@ from src.orchestration.paperexit.models import (
 )
 from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
-from src.orchestration.riskrequest.service import OneSnapshot, risk_market, too_old_for
+from src.orchestration.riskrequest.service import (
+    OneSnapshot,
+    market_view,
+    risk_market,
+    too_old_for,
+)
 from src.orchestration.sizing.context import base_asset_metadata, reference_price
 from src.orchestration.valuation.models import PortfolioValuation, unvaluable_reason
 from src.orchestration.valuation.service import PositionValuationReader
@@ -98,6 +110,18 @@ class _Abort(Exception):  # noqa: N818 - carries a reading, not an error conditi
         super().__init__(refusal.reason.value)
 
 
+@dataclass(frozen=True)
+class ExitTriggerRecord:
+    """Why an automatic policy asked for this exit. Recorded, never obeyed.
+
+    Plain values so this module depends on no policy: the policy depends on it.
+    """
+
+    trigger: str
+    policy_version: str
+    basis: dict[str, Any]
+
+
 class PaperExitUnavailable(Exception):
     """The call could not be attempted at all. Safe reason code only."""
 
@@ -123,30 +147,51 @@ class PaperExitService:
     pause: SystemPausePort | None = None
     clock: Clock = SystemClock()
     include_fixtures: bool = False
+    # When supplied, a sale is judged on its own fresh on-chain read rather than
+    # on the entry's evidence. The entry's evidence belongs to a terminal case
+    # and ages past SENTINEL's bound within seconds; the fresh read is taken
+    # when the sale is asked for and never written to the case.
+    exit_read: ExitOnchainReadPort | None = None
 
     @property
     def limits(self) -> RiskLimits:
         """SENTINEL's limits, from the one place that owns them."""
         return self.paper.limits
 
-    async def execute_position_exit(self, position_id: UUID, *, request_key: str) -> ExitReading:
-        """Sell the whole open holding of one position, once, or say why not."""
+    async def execute_position_exit(
+        self, position_id: UUID, *, request_key: str, trigger: ExitTriggerRecord | None = None
+    ) -> ExitReading:
+        """Sell the whole open holding of one position, once, or say why not.
+
+        `trigger` is recorded with the exit when an automatic policy asked for
+        it. It authorises nothing: every check below runs exactly as for a
+        direct request, SENTINEL's SELL verdict included.
+        """
         try:
-            return await self._attempt(position_id, request_key=request_key)
+            return await self._attempt(position_id, request_key=request_key, trigger=trigger)
         except _Abort as abort:
             # The transaction has rolled back; the answer survives it.
             return abort.refusal
 
-    async def _attempt(self, position_id: UUID, *, request_key: str) -> ExitReading:
+    async def _attempt(
+        self, position_id: UUID, *, request_key: str, trigger: ExitTriggerRecord | None
+    ) -> ExitReading:
         feed = OneSnapshot(self.markets, self.include_fixtures)
         intent_id = _intent_identity(request_key)
         # History needs no current prices. Checked before anything is valued, so
         # replaying a stored outcome — a completed sale or a stored refusal —
         # never depends on the market layer being reachable. The authoritative
         # replay still happens under the locks, on the intent identity.
+        fresh: ExitOnchainRead | str | None = None
         if await self._already_decided(intent_id):
             valuation = PortfolioValuation()
         else:
+            if self.exit_read is not None:
+                # Before any lock: a chain read is a network call, and holding
+                # the account lock across one is a latency every other writer
+                # pays for. What it read is bound to the case again under the
+                # lock.
+                fresh = await self._fresh_read(position_id, request_key)
             # Every open holding is priced before the account lock is taken.
             # Holding a portfolio-wide lock across an injected port is a latency
             # somebody else pays for; what that costs is the chance of a
@@ -206,75 +251,19 @@ class PaperExitService:
             if refusal is not None:
                 return refusal
 
-            readiness = await RiskDataReader(
-                cases=self.cases,
-                markets=feed,
-                costs=self.costs,
-                clock=self.clock,
-                pause=self.pause,
-                include_fixtures=self.include_fixtures,
-            ).readiness(trade_case.id)
-            snapshot = await feed.latest(trade_case.market.pair_id)
-            current = active_evidence(await self.cases.evidence(trade_case.id))
             positions = await self.paper.positions_in_session(session)
             held = {item.asset_id for item in positions if item.quantity != 0}
-            appeared = valuation.unconsidered(held)
-            if appeared:
-                # The portfolio moved while it was being valued, so the figure
-                # SENTINEL would judge covers only part of it.
-                return _refused(
-                    position_id,
-                    ExitRefusal.PORTFOLIO_CHANGED_DURING_VALUATION,
-                    trade_case_id=trade_case.id,
-                    readiness=readiness,
+            if self.exit_read is not None:
+                basis = await self._fresh_basis(
+                    feed, position_id, trade_case, fresh, request_key, valuation, held
                 )
-
-            # The last clock read, after the last input read. Everything from
-            # here to the verdict is synchronous, so one instant governs every
-            # source age, the UTC loss day and SENTINEL itself.
-            now = self.clock.now()
-
-            if not readiness.complete:
-                return _refused(
-                    position_id,
-                    ExitRefusal.RISK_DATA_INCOMPLETE,
-                    trade_case_id=trade_case.id,
-                    readiness=readiness,
+            else:
+                basis = await self._entry_basis(
+                    feed, position_id, trade_case, request_key, valuation, held
                 )
-            if not readiness.is_current_at(now):
-                return _refused(
-                    position_id,
-                    ExitRefusal.DECISION_BASIS_EXPIRED,
-                    trade_case_id=trade_case.id,
-                    readiness=readiness,
-                )
-            onchain = current.get(EvidenceType.ONCHAIN)
-            anchor = current.get(EvidenceType.LIQUIDITY_EXECUTION)
-            if snapshot is None or onchain is None or anchor is None:
-                raise PaperExitUnavailable("CANONICAL_INPUTS_INCONSISTENT")
-            price = reference_price(snapshot)
-            metadata = base_asset_metadata(snapshot)
-            if (
-                price is None
-                or metadata is None
-                or not isinstance(self.costs, PaperCostAssumptions)
-            ):
-                raise PaperExitUnavailable("CANONICAL_INPUTS_INCONSISTENT")
-            market = risk_market(
-                base_asset_id=trade_case.market.base_asset_id,
-                price=price,
-                base_asset=metadata,
-                snapshot=snapshot,
-                onchain=onchain,
-                anchor=anchor,
-                costs=self.costs,
-                correlation_id=trade_case.correlation_id,
-                # Bound to this exit: a different reading at a different instant
-                # from the entry's, and giving it the entry's identity would
-                # make two snapshots look like one.
-                identity_key=f"{request_key}:exit",
-                side=Side.SELL,
-            )
+            if isinstance(basis, ExitRefused):
+                return basis
+            market, readiness, now = basis
             stale = too_old_for(market, now, self.limits)
             if stale is not None:
                 # Present, provable and still older than SENTINEL's own bound.
@@ -324,6 +313,8 @@ class PaperExitService:
             # the order now. A later different holding does not become a
             # different order: the intent identity is the key's, so a changed
             # quantity is a conflicting reuse rather than a second sale.
+            if not isinstance(self.costs, PaperCostAssumptions):  # pragma: no cover
+                raise PaperExitUnavailable("CANONICAL_INPUTS_INCONSISTENT")  # guarded by the basis
             intent = _exit_intent(position, trade_case, market, self.costs, request_key, now)
 
             def still_authorised(at: datetime) -> str | None:
@@ -332,7 +323,7 @@ class PaperExitService:
                 Synchronous and over inputs already loaded under the locks, so
                 nothing between this answer and the fill touches the database.
                 """
-                if not readiness.is_current_at(at):
+                if readiness is not None and not readiness.is_current_at(at):
                     return "DECISION_BASIS_EXPIRED"
                 if valuation.stale_at(at, self.limits.max_snapshot_age_seconds):
                     return "POSITION_VALUATION_STALE"
@@ -372,8 +363,217 @@ class PaperExitService:
                     outcome=outcome.decision,
                 )
             return self._record(
-                session, position, trade_case, entry, outcome, market, now, request_key
+                session,
+                position,
+                trade_case,
+                entry,
+                outcome,
+                market,
+                now,
+                request_key,
+                trigger,
+                fresh if isinstance(fresh, ExitOnchainRead) else None,
             )
+
+    # ------------------------------------------------------------ the basis
+
+    async def _entry_basis(
+        self,
+        feed: OneSnapshot,
+        position_id: UUID,
+        trade_case: TradeCase,
+        request_key: str,
+        valuation: PortfolioValuation,
+        held: set[str],
+    ) -> "tuple[MarketSnapshot, RiskDataReadiness | None, datetime] | ExitRefused":
+        """The sale judged on the entry's own evidence, while it is current.
+
+        Only for a service composed without a fresh exit read. The entry's
+        on-chain evidence ages past SENTINEL's bound within seconds of the fill,
+        so this basis refuses almost every later exit, fail closed.
+        """
+        readiness = await RiskDataReader(
+            cases=self.cases,
+            markets=feed,
+            costs=self.costs,
+            clock=self.clock,
+            pause=self.pause,
+            include_fixtures=self.include_fixtures,
+        ).readiness(trade_case.id)
+        snapshot = await feed.latest(trade_case.market.pair_id)
+        current = active_evidence(await self.cases.evidence(trade_case.id))
+        appeared = valuation.unconsidered(held)
+        if appeared:
+            # The portfolio moved while it was being valued, so the figure
+            # SENTINEL would judge covers only part of it.
+            return _refused(
+                position_id,
+                ExitRefusal.PORTFOLIO_CHANGED_DURING_VALUATION,
+                trade_case_id=trade_case.id,
+                readiness=readiness,
+            )
+
+        # The last clock read, after the last input read. Everything from
+        # here to the verdict is synchronous, so one instant governs every
+        # source age, the UTC loss day and SENTINEL itself.
+        now = self.clock.now()
+
+        if not readiness.complete:
+            return _refused(
+                position_id,
+                ExitRefusal.RISK_DATA_INCOMPLETE,
+                trade_case_id=trade_case.id,
+                readiness=readiness,
+            )
+        if not readiness.is_current_at(now):
+            return _refused(
+                position_id,
+                ExitRefusal.DECISION_BASIS_EXPIRED,
+                trade_case_id=trade_case.id,
+                readiness=readiness,
+            )
+        onchain = current.get(EvidenceType.ONCHAIN)
+        anchor = current.get(EvidenceType.LIQUIDITY_EXECUTION)
+        if snapshot is None or onchain is None or anchor is None:
+            raise PaperExitUnavailable("CANONICAL_INPUTS_INCONSISTENT")
+        price = reference_price(snapshot)
+        metadata = base_asset_metadata(snapshot)
+        if price is None or metadata is None or not isinstance(self.costs, PaperCostAssumptions):
+            raise PaperExitUnavailable("CANONICAL_INPUTS_INCONSISTENT")
+        market = risk_market(
+            base_asset_id=trade_case.market.base_asset_id,
+            price=price,
+            base_asset=metadata,
+            snapshot=snapshot,
+            onchain=onchain,
+            anchor=anchor,
+            costs=self.costs,
+            correlation_id=trade_case.correlation_id,
+            # Bound to this exit: a different reading at a different instant
+            # from the entry's, and giving it the entry's identity would
+            # make two snapshots look like one.
+            identity_key=f"{request_key}:exit",
+            side=Side.SELL,
+        )
+        return market, readiness, now
+
+    async def _fresh_read(
+        self, position_id: UUID, request_key: str
+    ) -> ExitOnchainRead | str | None:
+        """The exit's own on-chain read of the held token, or why none exists.
+
+        `None` means the position cannot be placed in a case here; the locked
+        path answers that with its own, authoritative refusal.
+        """
+        if self.exit_read is None:  # pragma: no cover - only called when configured
+            return None
+        async with self.sessions() as session:
+            row = await session.get(PositionRow, position_id)
+            if row is None:
+                return None
+            position = read_position(row)
+            if position.quantity <= 0:
+                return None
+            entry = await self._entry(session, position)
+        if isinstance(entry, ExitRefusal):
+            return None
+        try:
+            trade_case = await self.cases.get_trade_case(entry.trade_case_id)
+        except WorkflowFailure:
+            return None
+        try:
+            return await self.exit_read.read(trade_case.id, trade_case.market, request_key)
+        except ExitReadUnavailable as error:
+            return error.reason_code
+
+    async def _fresh_basis(
+        self,
+        feed: OneSnapshot,
+        position_id: UUID,
+        trade_case: TradeCase,
+        fresh: ExitOnchainRead | str | None,
+        request_key: str,
+        valuation: PortfolioValuation,
+        held: set[str],
+    ) -> "tuple[MarketSnapshot, RiskDataReadiness | None, datetime] | ExitRefused":
+        """The sale judged on a fresh read: the held market now, the chain now.
+
+        Every input is this exit's own. Anything missing is a refusal, never a
+        default: no market, no price, no metadata, no cost basis, no read or no
+        holder measurement means no sale. What remains is SENTINEL's to judge,
+        with the SELL semantics it owns.
+        """
+        snapshot = await feed.latest(trade_case.market.pair_id)
+        appeared = valuation.unconsidered(held)
+        if appeared:
+            return _refused(
+                position_id,
+                ExitRefusal.PORTFOLIO_CHANGED_DURING_VALUATION,
+                trade_case_id=trade_case.id,
+            )
+        now = self.clock.now()
+
+        def incomplete(detail: str) -> ExitRefused:
+            return _refused(
+                position_id,
+                ExitRefusal.EXIT_DATA_INCOMPLETE,
+                trade_case_id=trade_case.id,
+                detail=detail,
+            )
+
+        if not isinstance(fresh, ExitOnchainRead):
+            return _refused(
+                position_id,
+                ExitRefusal.EXIT_READ_UNAVAILABLE,
+                trade_case_id=trade_case.id,
+                detail=fresh if isinstance(fresh, str) else "EXIT_READ_NOT_TAKEN",
+            )
+        if fresh.trade_case_id != trade_case.id:
+            # Read for a different case than the one now locked.
+            return _refused(
+                position_id,
+                ExitRefusal.EXIT_READ_UNAVAILABLE,
+                trade_case_id=trade_case.id,
+                detail="EXIT_READ_CASE_MISMATCH",
+            )
+        if snapshot is None:
+            return incomplete("MARKET_UNAVAILABLE")
+        price = reference_price(snapshot)
+        if price is None:
+            return incomplete("REFERENCE_PRICE_UNAVAILABLE")
+        metadata = base_asset_metadata(snapshot)
+        if metadata is None:
+            return incomplete("TOKEN_METADATA_UNAVAILABLE")
+        if not isinstance(self.costs, PaperCostAssumptions):
+            return incomplete("COST_BASIS_UNAVAILABLE")
+        intelligence = fresh.payload.intelligence
+        holders = None if intelligence is None else intelligence.holders
+        if holders is None:
+            return incomplete("HOLDER_FACTS_UNAVAILABLE")
+        liquidity = snapshot.liquidity
+        # The route a sale needs is the pool the holding was bought in, observed
+        # again and still holding liquidity. Unobserved or empty is unknown.
+        routing = (
+            SafetyStatus.PASS
+            if liquidity.status is Availability.AVAILABLE
+            and liquidity.value_usd is not None
+            and liquidity.value_usd > 0
+            else SafetyStatus.UNKNOWN
+        )
+        market = market_view(
+            base_asset_id=trade_case.market.base_asset_id,
+            price=price,
+            base_asset=metadata,
+            snapshot=snapshot,
+            onchain=fresh.payload,
+            holders=holders,
+            routing=routing,
+            costs=self.costs,
+            correlation_id=trade_case.correlation_id,
+            identity_key=f"{request_key}:exit",
+            side=Side.SELL,
+        )
+        return market, None, now
 
     # ------------------------------------------------------------------ reads
 
@@ -506,6 +706,8 @@ class PaperExitService:
         market: Any,
         now: datetime,
         request_key: str,
+        trigger: "ExitTriggerRecord | None" = None,
+        fresh: ExitOnchainRead | None = None,
     ) -> PaperExitRecorded:
         """Bind the sale to the holding, the entry and the decision behind it."""
         fill, order, trade = outcome.fill, outcome.order, outcome.trade
@@ -564,7 +766,14 @@ class PaperExitService:
                 "trade": trade.model_dump(mode="json"),
                 "position_before": state.position.model_dump(mode="json"),
                 "position_after": closed.model_dump(mode="json"),
+                # Which on-chain basis the sale was judged on: its own fresh
+                # read, or the entry's evidence while that was still current.
+                "exit_basis": "ENTRY_EVIDENCE" if fresh is None else "FRESH_EXIT_READ",
+                "exit_onchain": None if fresh is None else fresh.basis(),
             },
+            exit_trigger=None if trigger is None else trigger.trigger,
+            exit_policy_version=None if trigger is None else trigger.policy_version,
+            exit_trigger_basis=None if trigger is None else trigger.basis,
         )
         session.add(row)
         return _recorded(row, replayed=False)
@@ -646,6 +855,8 @@ def _recorded(row: TradeCaseExitRow, *, replayed: bool) -> PaperExitRecorded:
         realized_pnl_usd=row.realized_pnl_usd,
         cost_basis_released_usd=row.cost_basis_released_usd,
         filled_at=aware(row.filled_at),
+        exit_trigger=row.exit_trigger,
+        exit_policy_version=row.exit_policy_version,
         replayed=replayed,
     )
 

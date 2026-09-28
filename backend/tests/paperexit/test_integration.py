@@ -191,13 +191,14 @@ async def test_a_stored_refusal_replays_the_same_way(risk_db, now, trace):
     _, sessions = risk_db
     feed = market_feed(now)
     _, _, position = await entered(sessions, now, trace, feed=feed)
-    # A limit the sale cannot meet, so SENTINEL refuses this SELL on its merits.
-    strict = RiskLimits(min_liquidity_usd=Decimal("999999999"))
+    # A limit the sale cannot meet, so SENTINEL refuses this SELL on its merits:
+    # the assumed 25 bps slippage exceeds a 10 bps ceiling.
+    strict = RiskLimits(max_slippage_bps=Decimal("10"))
     refused = await build_exit_service(
         sessions, now, feed=feed, limits=strict
     ).execute_position_exit(position.id, request_key="exit-no")
     assert refused.reason is ExitRefusal.EXIT_RISK_REFUSED
-    assert "INSUFFICIENT_LIQUIDITY" in refused.reason_codes
+    assert "SLIPPAGE_LIMIT" in refused.reason_codes
 
     offline = Unreachable()
     again = await build_exit_service(sessions, now, feed=offline).execute_position_exit(

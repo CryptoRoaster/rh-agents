@@ -63,6 +63,7 @@ from src.core.models import TradingMode
 from src.data.tables import TradeCaseRow
 from src.orchestration.commander.context import SystemPauseUnavailable
 from src.orchestration.commander.intake import IntakeRefusal
+from src.orchestration.exitpolicy.service import ExitSweep
 from src.orchestration.riskrequest.models import RiskRequestRefusal
 from src.orchestration.riskrequest.service import stale_source
 from src.orchestration.workflow.models import (
@@ -76,6 +77,7 @@ from src.runner.models import (
     AcquisitionStop,
     CaseProgress,
     ConfigurationRefused,
+    ExitReport,
     MarketAcquisition,
     PromotionReading,
     RunLimits,
@@ -168,6 +170,8 @@ class Account:
     # them would have this process alternating between the two gaps, which is
     # retry-until-pass wearing a second name.
     refreshed: dict[UUID, set[str]] = field(default_factory=dict)
+    # What the automatic exit sweep did, when one is configured.
+    exits: ExitSweep | None = None
 
     def admits(self, trade_case_id: UUID) -> bool:
         """Whether this run may work on that case, counting it if it may."""
@@ -241,6 +245,9 @@ class BoundedPaperRun:
                 # observation may or may not have been recorded. Both end the
                 # pass before a single mutating trading stage runs.
                 return self._summary(started, account)
+            # Exits first: closing what the policy says to close reduces risk
+            # before any new case is opened, and needs nothing intake produces.
+            await self._exit(account, deadline)
             await self._promote(account, deadline)
             await self._intake(account, deadline)
             if account.intake_unknown:
@@ -329,6 +336,17 @@ class BoundedPaperRun:
         make the runtime bound a suggestion.
         """
         return await asyncio.wait_for(work, timeout=max(0.001, deadline.remaining))
+
+    async def _exit(self, account: Account, deadline: Deadline) -> None:
+        """One bounded sweep of automatic PAPER exits, when configured.
+
+        Every exit goes through PaperExitService with its own SENTINEL SELL
+        check; the sweep only decides when to ask, by PAPER_EXIT_V1.
+        """
+        stage = self.stack.exits
+        if stage is None:
+            return
+        account.exits = await self._bounded(stage.sweep(), deadline)
 
     async def _intake(self, account: Account, deadline: Deadline) -> None:
         """One bounded intake cycle, through the existing control plane.
@@ -923,6 +941,16 @@ class BoundedPaperRun:
             risk_requests=len([item for item in cases if item.risk_outcome is not None]),
             fills=len([item for item in cases if item.execution_id is not None]),
             replays=len([item for item in cases if item.replayed]),
+            exits=None
+            if account.exits is None
+            else ExitReport(
+                evaluated=account.exits.evaluated,
+                triggered=account.exits.triggered,
+                executed=account.exits.executed,
+                held=account.exits.held,
+                triggers=tuple(sorted(account.exits.triggers)),
+                refusals=tuple(sorted(account.exits.refusals)),
+            ),
             errors=tuple(account.errors),
         )
 

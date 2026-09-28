@@ -22,6 +22,7 @@ from src.agents.atlas.context import (
 from src.agents.atlas.models import (
     AtlasAssessment,
     AtlasDomain,
+    AtlasOnchainSnapshot,
     AtlasReasonCode,
     AtlasSafetyDecision,
     AtlasVerdict,
@@ -133,6 +134,57 @@ def holder_distribution(facts: HolderFacts) -> HolderDistributionFacts | None:
     )
 
 
+def onchain_payload(
+    snapshot: AtlasOnchainSnapshot,
+    decision: AtlasSafetyDecision,
+    assessment: AtlasAssessment | None = None,
+) -> OnchainPayload:
+    """The ONCHAIN payload a deterministic decision implies, commentary optional.
+
+    One derivation for every reader: the worker's evidence and a PAPER exit's
+    own fresh read describe a snapshot identically. Nothing here consults a
+    model; `assessment` is only carried when one was already validated.
+    """
+    verdicts = domain_verdicts(decision)
+    digest = atlas_snapshot_digest(snapshot)
+    return OnchainPayload(
+        holder_integrity=verdicts[AtlasDomain.HOLDERS],  # type: ignore[arg-type]
+        dev_wallet_integrity=verdicts[AtlasDomain.ORIGIN],  # type: ignore[arg-type]
+        contract_integrity=verdicts[AtlasDomain.CONTRACT],  # type: ignore[arg-type]
+        intelligence=OnchainIntelligence(
+            verdict=decision.verdict.value,
+            policy_version=decision.policy_version,
+            blockers=tuple(code.value for code in decision.blockers),
+            data_gaps=tuple(code.value for code in decision.data_gaps),
+            domain_status=decision.domain_status,
+            chain_id=snapshot.chain.chain_id,
+            block_number=snapshot.chain.block_number,
+            snapshot_digest=digest,
+            advisory_summary=None if assessment is None else assessment.summary,
+            advisory_findings=(
+                ()
+                if assessment is None
+                else tuple(
+                    OnchainAdvisoryFinding(
+                        kind=finding.kind,
+                        code=finding.code,
+                        statement=finding.statement,
+                        referenced_addresses=finding.referenced_addresses,
+                    )
+                    for finding in assessment.findings
+                )
+            ),
+            prompt_version=None if assessment is None else ATLAS_PROMPT_VERSION,
+            prompt_hash=None if assessment is None else ATLAS_PROMPT_HASH,
+            # Always passed, `None` included. An explicitly recorded
+            # absence says "this run looked and found nothing", which is
+            # a different fact from a row written before the block
+            # existed — and the two must not serialise alike.
+            holders=holder_distribution(snapshot.holders),
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class AtlasWorkerHandler:
     provider: ReasoningProvider | None = None
@@ -212,7 +264,6 @@ class AtlasWorkerHandler:
         assessment: AtlasAssessment | None,
     ) -> EvidenceSubmission:
         snapshot = task_input.snapshot
-        verdicts = domain_verdicts(decision)
         digest = atlas_snapshot_digest(snapshot)
         # A known violation is an available fact. Only an unestablished domain
         # makes the envelope itself unknown.
@@ -242,42 +293,7 @@ class AtlasWorkerHandler:
             valid_until=snapshot.collected_at + self.policy.snapshot_validity,
             status=status,
             reason_codes=reasons,
-            payload=OnchainPayload(
-                holder_integrity=verdicts[AtlasDomain.HOLDERS],  # type: ignore[arg-type]
-                dev_wallet_integrity=verdicts[AtlasDomain.ORIGIN],  # type: ignore[arg-type]
-                contract_integrity=verdicts[AtlasDomain.CONTRACT],  # type: ignore[arg-type]
-                intelligence=OnchainIntelligence(
-                    verdict=decision.verdict.value,
-                    policy_version=decision.policy_version,
-                    blockers=tuple(code.value for code in decision.blockers),
-                    data_gaps=tuple(code.value for code in decision.data_gaps),
-                    domain_status=decision.domain_status,
-                    chain_id=snapshot.chain.chain_id,
-                    block_number=snapshot.chain.block_number,
-                    snapshot_digest=digest,
-                    advisory_summary=None if assessment is None else assessment.summary,
-                    advisory_findings=(
-                        ()
-                        if assessment is None
-                        else tuple(
-                            OnchainAdvisoryFinding(
-                                kind=finding.kind,
-                                code=finding.code,
-                                statement=finding.statement,
-                                referenced_addresses=finding.referenced_addresses,
-                            )
-                            for finding in assessment.findings
-                        )
-                    ),
-                    prompt_version=None if assessment is None else ATLAS_PROMPT_VERSION,
-                    prompt_hash=None if assessment is None else ATLAS_PROMPT_HASH,
-                    # Always passed, `None` included. An explicitly recorded
-                    # absence says "this run looked and found nothing", which is
-                    # a different fact from a row written before the block
-                    # existed — and the two must not serialise alike.
-                    holders=holder_distribution(snapshot.holders),
-                ),
-            ),
+            payload=onchain_payload(snapshot, decision, assessment),
             correlation_id=lease.correlation_id,
             supersedes_id=task_input.supersedes_evidence_id,
         )
