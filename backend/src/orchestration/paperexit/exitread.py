@@ -18,7 +18,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from src.agents.atlas.context import (
     AtlasContextUnavailable,
-    AtlasSnapshotBuilder,
+    SnapshotBuilderPort,
     atlas_snapshot_digest,
 )
 from src.agents.atlas.handler import onchain_payload
@@ -68,7 +68,7 @@ class ExitOnchainReadPort(Protocol):
 class AtlasExitRead:
     """ATLAS's collector and policy, run for a sale instead of for a case."""
 
-    builder: AtlasSnapshotBuilder
+    builder: SnapshotBuilderPort
     policy: AtlasPolicy = ATLAS_POLICY_V1
     clock: Clock = SystemClock()
 

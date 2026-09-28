@@ -26,6 +26,8 @@ Three distinctions are load-bearing:
   the market. It is counted and reported, never filled in.
 """
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -36,6 +38,7 @@ from pydantic import AfterValidator, AwareDatetime, BeforeValidator, Field, mode
 from src.core.models import Contract
 from src.markets.models import (
     Amount,
+    MarketIdentity,
     Name,
     Namespace,
     PairId,
@@ -329,3 +332,27 @@ class UnconfiguredHistorySource:
         self, identity: object, *, timeframe: str, aggregate: int, bars: int
     ) -> MarketHistory:
         raise MarketHistoryUnavailable("MARKET_HISTORY_SOURCE_NOT_CONFIGURED")
+
+
+@dataclass(frozen=True)
+class ChainRoutedHistory:
+    """One history source per configured chain, chosen by the market's own chain.
+
+    A provider's OHLCV source is bound to one chain at construction. With
+    several chains enabled the read goes to the source keyed by the market's
+    own chain and network — never to whichever chain was configured first. A
+    market on a chain without a source is refused, and the chosen source still
+    refuses an identity from another chain on its own.
+    """
+
+    sources: Mapping[tuple[str, str], MarketHistorySource]
+
+    async def history(
+        self, identity: object, *, timeframe: str, aggregate: int, bars: int
+    ) -> MarketHistory:
+        if not isinstance(identity, MarketIdentity):
+            raise MarketHistoryUnavailable("MARKET_HISTORY_IDENTITY_INVALID")
+        source = self.sources.get((identity.chain, identity.network))
+        if source is None:
+            raise MarketHistoryUnavailable("MARKET_HISTORY_CHAIN_NOT_CONFIGURED")
+        return await source.history(identity, timeframe=timeframe, aggregate=aggregate, bars=bars)

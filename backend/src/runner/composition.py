@@ -21,7 +21,7 @@ that is what the operator configured; nothing here quietly substitutes one for a
 provider that failed to build.
 """
 
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.agents.anchor.context import AnchorContextReader
 from src.agents.anchor.handler import AnchorWorkerHandler
-from src.agents.atlas.context import AtlasContextReader
+from src.agents.atlas.context import AtlasContextReader, SnapshotBuilderPort
 from src.agents.fuse.context import FuseContextReader
 from src.agents.fuse.handler import FuseWorkerHandler
 from src.agents.orbit.context import OrbitContextReader
@@ -47,7 +47,11 @@ from src.agents.vector.handler import VectorWorkerHandler
 from src.core.clock import Clock, SystemClock
 from src.core.config import Settings
 from src.core.models import AgentRole, RiskLimits
-from src.markets.history import MarketHistorySource, UnconfiguredHistorySource
+from src.markets.history import (
+    ChainRoutedHistory,
+    MarketHistorySource,
+    UnconfiguredHistorySource,
+)
 from src.markets.quotes import ExecutionQuoteSource, UnconfiguredQuoteSource
 from src.markets.reader import MarketReader
 from src.orchestration.casefill.service import CaseFillService
@@ -147,17 +151,15 @@ def acquisition_limits_from_settings(settings: Settings) -> AcquisitionLimits:
     )
 
 
-def _single_chain(names: tuple[str, ...]) -> str | None:
-    """The one chain a chain-bound port can serve, or nothing when it is ambiguous.
+@dataclass(frozen=True)
+class ChainContractSources:
+    """ATLAS's contract source for every configured chain, keyed by chain and network.
 
-    `TokenContractReadPort.chain_snapshot()` and `GeckoTerminalOhlcvSource` are
-    both fixed to one chain at construction — the first because the port takes
-    no chain argument, the second because the adapter is built per chain. A run
-    handles whatever chains its cases are on, so with more than one enabled
-    there is no single correct source to build and the role says so instead of
-    serving one chain and silently refusing the others.
+    A contract source reads "the" chain head and takes no chain argument, so
+    one is built per chain and the case's own market chooses among them.
     """
-    return names[0] if len(names) == 1 else None
+
+    sources: Mapping[tuple[str, str], object]
 
 
 def ports_from_settings(
@@ -201,41 +203,46 @@ def ports_from_settings(
     history: MarketHistorySource | None = None
     history_unavailable = "MARKET_HISTORY_NOT_CONFIGURED"
     if settings.vector_history_provider == "geckoterminal":
-        chain = _single_chain(tuple(settings.market_chains.split(",")))
-        if chain is None:
-            history_unavailable = "MARKET_HISTORY_CHAIN_AMBIGUOUS"
-        else:
-            from src.markets.geckoterminal.networks import CHAINS, NetworkDirectory
-            from src.markets.geckoterminal.ohlcv import GeckoTerminalOhlcvSource
-            from src.markets.geckoterminal.transport import GeckoTerminalTransport
+        from src.markets.geckoterminal.networks import CHAINS, NetworkDirectory
+        from src.markets.geckoterminal.ohlcv import GeckoTerminalOhlcvSource
+        from src.markets.geckoterminal.transport import GeckoTerminalTransport
 
+        names = tuple(name.strip() for name in settings.market_chains.split(",") if name.strip())
+        if not names or any(name not in CHAINS for name in names):
+            history_unavailable = "MARKET_HISTORY_CHAIN_NOT_SUPPORTED"
+        else:
+            # One transport and one network directory, a source per chain — the
+            # scout's arrangement — routed by each case's own market.
             transport = GeckoTerminalTransport(settings, clock=tick)
             closers.append(_exit(transport))
-            history = GeckoTerminalOhlcvSource(
-                transport,
-                NetworkDirectory(transport, settings),
-                CHAINS[chain],
-                settings,
-                clock=tick,
+            directory = NetworkDirectory(transport, settings)
+            history = ChainRoutedHistory(
+                {
+                    (name, "mainnet"): GeckoTerminalOhlcvSource(
+                        transport, directory, CHAINS[name], settings, clock=tick
+                    )
+                    for name in names
+                }
             )
 
     onchain: object | None = None
     onchain_unavailable = "ONCHAIN_SOURCE_NOT_CONFIGURED"
     configs = chain_configs(settings)
     if configs:
-        config = configs[0] if len(configs) == 1 else None
-        if config is None:
-            onchain_unavailable = "ONCHAIN_SOURCE_CHAIN_AMBIGUOUS"
-        else:
-            from src.agents.atlas.rpc_source import RpcTokenContractSource
-            from src.runtime.rpc import EvmRpcClient
+        from src.agents.atlas.rpc_source import RpcTokenContractSource
+        from src.runtime.rpc import EvmRpcClient
 
-            # The request/response RPC client the ATLAS source already uses. No
-            # websocket, no recovery loop and no ingestion: this reads a block
-            # and two contract slots when a handler asks for them.
+        # The request/response RPC client the ATLAS source already uses, one per
+        # enabled chain. No websocket, no recovery loop and no ingestion: each
+        # reads a block and two contract slots when a handler asks for them.
+        sources: dict[tuple[str, str], object] = {}
+        for config in configs:
             client = EvmRpcClient(config, settings)
             closers.append(client.close)
-            onchain = RpcTokenContractSource(client=client, config=config, clock=tick)
+            sources[(config.chain, config.network)] = RpcTokenContractSource(
+                client=client, config=config, clock=tick
+            )
+        onchain = ChainContractSources(sources)
 
     quotes: ExecutionQuoteSource | None = None
     if settings.execution_quote_provider == "kyberswap":
@@ -319,22 +326,36 @@ def _exit_read(settings: Settings, ports: RunnerPorts, clock: Clock) -> ExitOnch
     """
     if ports.onchain is None:
         return UnavailableExitRead(ports.onchain_unavailable)
-    from src.agents.atlas.context import AtlasSnapshotBuilder
+    return AtlasExitRead(builder=atlas_builder(settings, ports, clock), clock=clock)
+
+
+def atlas_builder(settings: Settings, ports: RunnerPorts, clock: Clock) -> SnapshotBuilderPort:
+    """ATLAS's snapshot builder: one per chain when several are configured.
+
+    The holder and origin sources take a chain argument and are shared; only
+    the contract source is bound to one chain. Used by the ATLAS worker and by
+    a PAPER exit's fresh read alike, so both route a case the same way.
+    """
+    from src.agents.atlas.context import AtlasSnapshotBuilder, ChainRoutedSnapshotBuilder
     from src.agents.atlas.sources.factory import holder_sources, origin_sources
 
-    return AtlasExitRead(
-        builder=AtlasSnapshotBuilder(
-            contracts=ports.onchain,  # type: ignore[arg-type]
-            holders=ports.holders  # type: ignore[arg-type]
-            if ports.holders is not None
-            else holder_sources(settings, clock=clock),
-            origins=ports.origins  # type: ignore[arg-type]
-            if ports.origins is not None
-            else origin_sources(settings),
+    holders = ports.holders if ports.holders is not None else holder_sources(settings, clock=clock)
+    origins = ports.origins if ports.origins is not None else origin_sources(settings)
+
+    def one(contracts: object) -> AtlasSnapshotBuilder:
+        return AtlasSnapshotBuilder(
+            contracts=contracts,  # type: ignore[arg-type]
+            holders=holders,  # type: ignore[arg-type]
+            origins=origins,  # type: ignore[arg-type]
             clock=clock,
-        ),
-        clock=clock,
-    )
+        )
+
+    if isinstance(ports.onchain, ChainContractSources):
+        return ChainRoutedSnapshotBuilder(
+            {key: one(source) for key, source in ports.onchain.sources.items()}
+        )
+    # A single source supplied at the outside edge (a test, or one chain).
+    return one(ports.onchain)
 
 
 def build_stack(
@@ -557,9 +578,7 @@ def _runners(
     elif ports.onchain is None:
         note(AgentRole.ATLAS, ports.onchain_unavailable)
     else:
-        from src.agents.atlas.context import AtlasSnapshotBuilder
         from src.agents.atlas.handler import AtlasWorkerHandler
-        from src.agents.atlas.sources.factory import holder_sources, origin_sources
 
         add(
             AgentRole.ATLAS,
@@ -567,17 +586,7 @@ def _runners(
             CapabilityProvider(
                 service=runtime,
                 onchain=AtlasContextReader(
-                    cases=cases,
-                    builder=AtlasSnapshotBuilder(
-                        contracts=ports.onchain,  # type: ignore[arg-type]
-                        holders=ports.holders  # type: ignore[arg-type]
-                        if ports.holders is not None
-                        else holder_sources(settings, clock=clock),
-                        origins=ports.origins  # type: ignore[arg-type]
-                        if ports.origins is not None
-                        else origin_sources(settings),
-                        clock=clock,
-                    ),
+                    cases=cases, builder=atlas_builder(settings, ports, clock)
                 ),
             ),
         )

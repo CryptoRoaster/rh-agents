@@ -7,6 +7,7 @@ A worker never holds a port, a session or a client — only the assembled view.
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from hashlib import sha256
@@ -80,6 +81,14 @@ def token_address_of(market: MarketIdentity) -> str:
     if int(candidate[2:], 16) == 0:
         raise AtlasContextUnavailable("TOKEN_ADDRESS_ZERO")
     return candidate.lower()
+
+
+class SnapshotBuilderPort(Protocol):
+    """What assembles one on-chain snapshot for a market. Routing or building."""
+
+    async def build(
+        self, trade_case_id: UUID, task_id: UUID, market: MarketIdentity
+    ) -> AtlasOnchainSnapshot: ...
 
 
 @dataclass(frozen=True)
@@ -260,9 +269,32 @@ class AtlasSnapshotBuilder:
 
 
 @dataclass(frozen=True)
+class ChainRoutedSnapshotBuilder:
+    """One builder per configured chain, chosen by the case's own market.
+
+    Each builder's contract source is fixed to one chain, because the port reads
+    "the" chain head and takes no chain argument. With several chains enabled
+    the right builder is therefore the one keyed by the market's own chain and
+    network — never whichever was configured first. A market on a chain without
+    a builder is refused, and the chosen builder still refuses a source that
+    answers for a different chain (`SOURCE_CHAIN_MISMATCH`).
+    """
+
+    builders: Mapping[tuple[str, str], AtlasSnapshotBuilder]
+
+    async def build(
+        self, trade_case_id: UUID, task_id: UUID, market: MarketIdentity
+    ) -> AtlasOnchainSnapshot:
+        builder = self.builders.get((market.chain, market.network))
+        if builder is None:
+            raise AtlasContextUnavailable("ONCHAIN_SOURCE_CHAIN_NOT_CONFIGURED")
+        return await builder.build(trade_case_id, task_id, market)
+
+
+@dataclass(frozen=True)
 class AtlasContextReader:
     cases: TradeCaseIdentitySource
-    builder: AtlasSnapshotBuilder
+    builder: "SnapshotBuilderPort"
 
     async def onchain_context(self, trade_case_id: UUID, task_id: UUID) -> AtlasTaskInput:
         trade_case = await self.cases.get_trade_case(trade_case_id)
