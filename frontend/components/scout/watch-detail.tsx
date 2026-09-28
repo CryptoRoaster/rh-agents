@@ -8,6 +8,7 @@ import {
   formatUsd,
   pairLabel,
   statusTone,
+  type WatchAssessment,
   type WatchDetail,
 } from "@/lib/scout";
 
@@ -152,7 +153,7 @@ export function WatchDetailView({
                       </p>
                       <small className="scout-muted">
                         {assessment.reasoning_provider}/
-                        {assessment.reasoning_model} ·{" "}
+                        {assessment.reasoning_model} · {effortLabel(assessment)}
                         {assessment.input_tokens ?? "—"} in /{" "}
                         {assessment.output_tokens ?? "—"} out ·{" "}
                         {assessment.latency_ms ?? "—"} ms ·{" "}
@@ -176,4 +177,15 @@ export function WatchDetailView({
       </ol>
     </div>
   );
+}
+
+// Requested and reported effort, only as stored. Codex reports none, so its
+// reviews show what was asked for and say that nothing was reported.
+function effortLabel(assessment: WatchAssessment): string {
+  const { reasoning_effort: requested, reported_effort: reported } = assessment;
+  if (!requested && !reported) return "";
+  if (reported && reported !== requested)
+    return `effort ${reported} (requested ${requested ?? "—"}) · `;
+  if (reported) return `effort ${reported} · `;
+  return `effort ${requested} (requested, not reported) · `;
 }

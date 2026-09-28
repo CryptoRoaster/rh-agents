@@ -200,7 +200,7 @@ async def test_an_unknown_watch_is_not_found(client):
 async def test_the_timeline_is_chronological_and_shows_failures_and_coalescing(client):
     http, sessions, _ = client
     provider = MarketProvider(discovery=[young(0)], targeted=[young(0)])
-    await scout(sessions, T0, provider=provider, orbit=EchoOrbit())
+    await scout(sessions, T0, provider=provider, orbit=EchoOrbit(effort="high"))
     provider.discovery = []
     await scout(
         sessions,
@@ -218,6 +218,9 @@ async def test_the_timeline_is_chronological_and_shows_failures_and_coalescing(c
     assert timeline[1]["failure_reason"] == "PROVIDER_TIMEOUT"
     assert timeline[1]["failure_reason_code"] == "SCRIPTED_FAILURE"
     assert timeline[0]["failure_reason_code"] is None
+    assert timeline[0]["reasoning_effort"] == "high"
+    assert timeline[0]["reported_effort"] is None
+    assert timeline[1]["reasoning_effort"] is None
     assert timeline[1]["classification"] is None
     runs = (await http.get("/api/scout/runs")).json()["items"]
     assert runs[0]["run"]["model_failure_reasons"] == [

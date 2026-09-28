@@ -101,6 +101,8 @@ def _assessment(row: DiscoveryWatchAssessmentRow) -> WatchAssessment:
         output_schema_version=row.output_schema_version,
         reasoning_provider=row.reasoning_provider,
         reasoning_model=row.reasoning_model,
+        reasoning_effort=row.reasoning_effort,
+        reported_effort=row.reported_effort,
         input_tokens=row.input_tokens,
         output_tokens=row.output_tokens,
         latency_ms=row.latency_ms,

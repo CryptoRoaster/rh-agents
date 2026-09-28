@@ -776,6 +776,9 @@ class DiscoveryWatchAssessmentRow(Base):
     output_schema_version: Mapped[int] = mapped_column(Integer)
     reasoning_provider: Mapped[str | None] = mapped_column(String(200))
     reasoning_model: Mapped[str | None] = mapped_column(String(200))
+    # Requested effort, and the effort the provider reported (NULL when silent).
+    reasoning_effort: Mapped[str | None] = mapped_column(String(40))
+    reported_effort: Mapped[str | None] = mapped_column(String(40))
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     latency_ms: Mapped[int | None] = mapped_column(Integer)

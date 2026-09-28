@@ -6,7 +6,7 @@ durably recorded. The model and the provider are fakes; everything between them
 is production code.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
@@ -302,6 +302,36 @@ async def test_a_failure_keeps_its_exact_reason_beside_its_category(db):
     }
     (run,) = await ScoutRunRepository(sessions).recent(1)
     assert run.model_failure_reasons == summary.model_failure_reasons
+
+
+async def test_the_requested_and_the_reported_effort_are_stored_apart(db):
+    _, sessions = db
+    await scout(
+        sessions,
+        T0,
+        provider=MarketProvider(discovery=[young(0), young(1)]),
+        orbit=EchoOrbit(effort="high"),
+    )
+    (silent,) = await assessments(sessions, await watch_for(sessions, 0))
+    # The provider reported nothing: the requested value is not passed off as reported.
+    assert (silent.reasoning_effort, silent.reported_effort) == ("high", None)
+
+    await scout(
+        sessions,
+        T0 + timedelta(hours=1),
+        provider=MarketProvider(discovery=[young(2)]),
+        orbit=EchoOrbit(effort="high", reported_effort="medium"),
+    )
+    (reported,) = await assessments(sessions, await watch_for(sessions, 2))
+    assert (reported.reasoning_effort, reported.reported_effort) == ("high", "medium")
+
+
+async def test_an_assessment_without_effort_reads_back_as_none(db):
+    """Rows from before 0015, and providers that name no effort, stay NULL."""
+    _, sessions = db
+    await scout(sessions, T0, provider=MarketProvider(discovery=[young(0)]), orbit=EchoOrbit())
+    (row,) = await assessments(sessions, await watch_for(sessions, 0))
+    assert row.reasoning_effort is None and row.reported_effort is None
 
 
 async def test_an_unsafe_reason_is_stored_as_unclassified(db):

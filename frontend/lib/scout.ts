@@ -85,6 +85,8 @@ export type WatchAssessment = {
   output_schema_version: number;
   reasoning_provider: string | null;
   reasoning_model: string | null;
+  reasoning_effort: string | null;
+  reported_effort: string | null;
   input_tokens: number | null;
   output_tokens: number | null;
   latency_ms: number | null;

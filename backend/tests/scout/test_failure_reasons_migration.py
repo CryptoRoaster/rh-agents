@@ -13,7 +13,6 @@ from alembic.operations import Operations
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from src.data.schema import expected_revision
 from tests.reentry.test_migration import load
 from tests.scout.test_runs_migration import ROW, THROUGH_0012
 
@@ -69,8 +68,7 @@ async def columns(engine, table):
         )
 
 
-def test_the_chain_ends_at_0014():
-    assert expected_revision() == "0014"
+def test_0014_follows_0013():
     assert load(MODULE).down_revision == "0013"
 
 

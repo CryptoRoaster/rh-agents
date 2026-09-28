@@ -122,6 +122,12 @@ ops/scout/uninstall.sh           # unload and remove it (logs stay)
   (`model_failure_reasons`), which the run history shows beside the failure
   count. Codes only: a reason that is not a plain code is stored as
   `UNCLASSIFIED`, so no path, message, stderr or login detail is kept.
+- **Effort.** A review records the effort it asked for (`reasoning_effort`)
+  and, separately, the effort the provider reported (`reported_effort`). Codex
+  0.153.4 reports none, so its reviews show `high (requested, not reported)`.
+  A requested value is never shown as a reported one. Rows from before
+  migration 0015 have neither.
+- **Capacity.** See [the ORBIT capacity analysis](architecture/scout-orbit-capacity.md).
 - **Logs.** `~/Library/Logs/rh-agents/scout.log` holds the run summary JSON
   plus start and exit lines. It rotates at 5 MB and keeps 3 generations.
   launchd's own output goes to `scout.launchd.log`. A failed run keeps its exit

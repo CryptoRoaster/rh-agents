@@ -702,6 +702,8 @@ class EarlyScoutCycle:
                 input_digest=result.input_digest,
                 reasoning_provider=result.model.provider,
                 reasoning_model=result.model.model,
+                reasoning_effort=result.model.effort,
+                reported_effort=result.model.reported_effort,
                 input_tokens=result.usage.input_tokens,
                 output_tokens=result.usage.output_tokens,
                 latency_ms=result.usage.latency_ms,
