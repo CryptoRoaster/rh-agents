@@ -17,6 +17,7 @@ from src.data.database import connect
 from src.scout.models import WatchAssessment
 from src.scout.policy import WatchStatus
 from src.scout.read import RunPage, ScoutOverview, ScoutReadService, WatchDetail, WatchPage
+from src.scout.shadow_read import ShadowReadService, ShadowSummary
 
 router = APIRouter(prefix="/api/scout")
 
@@ -107,5 +108,25 @@ async def runs(
 ) -> RunPage:
     try:
         return await reader.runs(limit, offset)
+    except (SQLAlchemyError, OSError) as error:
+        raise unavailable() from error
+
+
+async def shadow_reader(request: Request) -> AsyncIterator[ShadowReadService]:
+    engine, sessions = connect(request.app.state.settings.database_url)
+    try:
+        yield ShadowReadService(sessions)
+    finally:
+        await engine.dispose()
+
+
+ShadowReader = Annotated[ShadowReadService, Depends(shadow_reader)]
+
+
+@router.get("/shadow/summary")
+async def shadow_summary(reader: ShadowReader) -> ShadowSummary:
+    """Descriptive statistics of the JEV shadow assessments. Decides nothing."""
+    try:
+        return await reader.summary()
     except (SQLAlchemyError, OSError) as error:
         raise unavailable() from error

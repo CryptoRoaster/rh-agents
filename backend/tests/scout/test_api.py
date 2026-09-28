@@ -9,7 +9,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
 from src.api.paper import paper_reader
-from src.api.scout import scout_reader
+from src.api.scout import scout_reader, shadow_reader
 from src.core.config import Settings
 from src.data.tables import DiscoveryWatchAssessmentRow, PnLRow, PositionRow, TradeCaseRow
 from src.ledger.read import PaperReadService
@@ -17,6 +17,7 @@ from src.reasoning.models import ReasoningErrorCategory
 from src.scout.policy import WatchStatus
 from src.scout.read import ScoutReadService
 from src.scout.repository import WatchRepository
+from src.scout.shadow_read import ShadowReadService
 from tests.scout.conftest import (
     POOLS,
     EchoOrbit,
@@ -44,8 +45,12 @@ async def client(db, monkeypatch):
     async def paper_override():
         yield PaperReadService(sessions)
 
+    async def shadow_override():
+        yield ShadowReadService(sessions)
+
     app.dependency_overrides[scout_reader] = scout_override
     app.dependency_overrides[paper_reader] = paper_override
+    app.dependency_overrides[shadow_reader] = shadow_override
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
         yield http, sessions, app
 
@@ -346,3 +351,46 @@ async def test_booked_paper_state_is_shown_as_recorded(client):
     assert Decimal(position["quantity"]) == Decimal("12.5")
     (pnl,) = body["pnl"]
     assert Decimal(pnl["snapshot"]["unrealized_pnl_usd"]) == Decimal("1")
+
+
+async def test_the_shadow_view_is_shown_and_summarised_but_decides_nothing(client):
+    from tests.scout.test_shadow import ScriptedFast
+
+    http, sessions, _ = client
+    provider = MarketProvider(discovery=[young(0)], targeted=[young(0)])
+    await scout(sessions, T0, provider=provider, orbit=EchoOrbit(), fast=ScriptedFast())
+    watch = await watch_id(sessions, 0)
+
+    detail = (await http.get(f"/api/scout/watches/{watch}")).json()
+    (fast,) = detail["fast_assessments"]
+    assert fast["status"] == "COMPLETED"
+    assert (fast["provider"], fast["model"], fast["model_version"]) == (
+        "jev",
+        "jev-1.13.0",
+        "jev-1.13.0",
+    )
+    assert fast["question_version"] == "jev-scout-v1"
+    assert set(fast["answers"]) >= {"data_quality", "suspicious_activity"}
+
+    summary = (await http.get("/api/scout/shadow/summary")).json()
+    assert summary["notice"] == "SHADOW - NO TRADING EFFECT"
+    assert summary["total"] == 1
+    assert summary["by_status"] == {"COMPLETED": 1}
+    assert summary["by_model_version"] == {"jev-1.13.0": 1}
+    assert summary["signals"]["suspicious_activity"]["mean"] == 0.2
+    assert summary["by_chain"] == {"robinhood": 1}
+    assert summary["outcomes"] == "NOT_YET_LABELLED"
+    # JEV runs last in a run, so only an ORBIT review after it is "later".
+    assert summary["versus_codex"] == []
+    provider.discovery = []
+    await scout(sessions, T0 + timedelta(hours=1), provider=provider, orbit=EchoOrbit())
+    later = (await http.get("/api/scout/shadow/summary")).json()
+    (comparison,) = later["versus_codex"]
+    assert comparison["classification"] == "NOT_INTERESTING"
+    assert comparison["mean_by_question"]["suspicious_activity"] == 0.2
+
+
+async def test_an_empty_shadow_summary_is_empty_not_an_error(client):
+    http, _, _ = client
+    summary = (await http.get("/api/scout/shadow/summary")).json()
+    assert summary["total"] == 0 and summary["signals"] == {} and summary["versus_codex"] == []

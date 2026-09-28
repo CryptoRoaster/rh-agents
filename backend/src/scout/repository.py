@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.data.repository import aware
 from src.data.tables import (
+    DiscoveryStreamDeclineRow,
     DiscoveryWatchAssessmentRow,
     DiscoveryWatchRow,
     MarketObservationRow,
@@ -330,6 +331,31 @@ class WatchRepository:
             row.updated_at = now
             return SyncResult.UPDATED
 
+    async def decline(self, snapshot: MarketSnapshot, *, now: datetime, reason: str) -> bool:
+        """Mark a stream the watch limit turned away. Idempotent; True if new."""
+        identity = snapshot.pair.market_identity
+        values = dict(
+            id=uuid4(),
+            provider=identity.provider,
+            chain=identity.chain,
+            network=identity.network,
+            pair_id=identity.pair_id,
+            is_fixture=identity.is_fixture,
+            reason=reason,
+            declined_at=now,
+        )
+        async with self.sessions.begin() as session:
+            dialect = session.get_bind().dialect.name
+            insert = pg_insert if dialect == "postgresql" else sqlite_insert
+            result = await session.execute(
+                insert(DiscoveryStreamDeclineRow)
+                .values(**values)
+                .on_conflict_do_nothing(
+                    index_elements=["provider", "chain", "network", "pair_id", "is_fixture"]
+                )
+            )
+            return bool(getattr(result, "rowcount", 0) == 1)
+
     @staticmethod
     def _stream(identity: MarketIdentity) -> tuple[Any, ...]:
         return (
@@ -506,6 +532,10 @@ class WatchRepository:
     async def bootstrap(self, now: datetime, limit: int) -> int:
         """Adopt recorded market streams that have no watch yet. Bounded, idempotent.
 
+        Recovery only: streams recorded outside a scout run, or left without a
+        watch by a run that stopped between recording and syncing. A stream the
+        per-run watch limit declined is never adopted here.
+
         Oldest stream first. `first_seen_at` is the stream's own oldest
         observation, and the watch points at its newest one. No model and no
         provider is involved: an adopted watch is reviewed later under the same
@@ -524,11 +554,22 @@ class WatchRepository:
                 DiscoveryWatchRow.is_fixture.is_(False),
             )
         )
+        # A stream the watch limit turned away is not a recovery case. Adopting
+        # it one run later would open more watches than the limit allows.
+        declined = exists(
+            select(DiscoveryStreamDeclineRow.id).where(
+                DiscoveryStreamDeclineRow.provider == row.provider,
+                DiscoveryStreamDeclineRow.chain == row.chain,
+                DiscoveryStreamDeclineRow.network == row.network,
+                DiscoveryStreamDeclineRow.pair_id == row.pair_id,
+                DiscoveryStreamDeclineRow.is_fixture.is_(False),
+            )
+        )
         async with self.sessions() as session:
             streams = (
                 await session.execute(
                     select(row.provider, row.chain, row.network, row.pair_id, first)
-                    .where(row.is_fixture.is_(False), ~watched)
+                    .where(row.is_fixture.is_(False), ~watched, ~declined)
                     .group_by(row.provider, row.chain, row.network, row.pair_id)
                     .order_by(first, row.pair_id)
                     .limit(limit)

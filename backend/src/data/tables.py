@@ -873,3 +873,96 @@ class ScoutOrbitReservationRow(Base):
     assessment_id: Mapped[UUID | None] = mapped_column(Uuid)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failure_reason: Mapped[str | None] = mapped_column(String(80))
+
+
+class DiscoveryStreamDeclineRow(Base):
+    """A discovered market stream that deliberately received no watch.
+
+    Discovery records every valid pool, but a run may open only
+    `EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN` watches. A stream turned away by that
+    limit is marked here so the recovery bootstrap cannot adopt it one run
+    later and quietly double the limit. The observations themselves are kept;
+    nothing is deleted. A later discovery run may still open a watch for the
+    same stream within its own limit.
+    """
+
+    __tablename__ = "discovery_stream_declines"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "chain",
+            "network",
+            "pair_id",
+            "is_fixture",
+            name="uq_discovery_stream_decline",
+        ),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(200))
+    chain: Mapped[str] = mapped_column(String(60))
+    network: Mapped[str] = mapped_column(String(60))
+    pair_id: Mapped[str] = mapped_column(String(512))
+    is_fixture: Mapped[bool] = mapped_column(Boolean)
+    reason: Mapped[str] = mapped_column(String(80))
+    declined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class DiscoveryWatchFastAssessmentRow(Base):
+    """One shadow fast assessment (JEV) of a new watch. Never trading evidence.
+
+    Reserved before the provider is called and settled exactly once, so the
+    daily budget counts a call that died half-way and a watch is never asked
+    twice for the same question set. Provenance, status and failures are
+    columns; the typed input and the typed answers are versioned JSONB
+    documents, because the question set is expected to evolve by version.
+    """
+
+    __tablename__ = "discovery_watch_fast_assessments"
+    __table_args__ = (
+        UniqueConstraint("watch_id", "question_version", name="uq_fast_assessment_watch_questions"),
+        CheckConstraint(
+            "status IN ('PENDING', 'COMPLETED', 'FAILED')", name="fast_assessment_status"
+        ),
+        CheckConstraint(
+            "(status = 'COMPLETED') = (answers IS NOT NULL)", name="fast_assessment_answered"
+        ),
+        CheckConstraint(
+            "(status = 'FAILED') = (failure_category IS NOT NULL)",
+            name="fast_assessment_failure_named",
+        ),
+        CheckConstraint(
+            "failure_reason_code IS NULL OR status = 'FAILED'",
+            name="fast_assessment_failure_code",
+        ),
+        CheckConstraint(
+            "(status = 'PENDING') = (assessed_at IS NULL)", name="fast_assessment_settled"
+        ),
+        Index("ix_fast_assessments_day", "utc_day"),
+        Index("ix_fast_assessments_watch_time", "watch_id", "reserved_at"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    watch_id: Mapped[UUID] = mapped_column(ForeignKey("discovery_watches.id", ondelete="RESTRICT"))
+    snapshot_id: Mapped[UUID] = mapped_column(
+        ForeignKey("market_observations.id", ondelete="RESTRICT")
+    )
+    utc_day: Mapped[date] = mapped_column(Date)
+    reserved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    assessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20))
+    provider: Mapped[str] = mapped_column(String(40))
+    # The model asked for (a pinned version) and the version that answered.
+    model: Mapped[str] = mapped_column(String(80))
+    model_version: Mapped[str | None] = mapped_column(String(80))
+    question_version: Mapped[str] = mapped_column(String(40))
+    input_schema_version: Mapped[int] = mapped_column(Integer)
+    input_digest: Mapped[str] = mapped_column(String(64))
+    input_payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
+    # SQL NULL, never JSON null: the "answered" check depends on it.
+    answers: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
+    )
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    failure_category: Mapped[str | None] = mapped_column(String(80))
+    failure_reason_code: Mapped[str | None] = mapped_column(String(80))

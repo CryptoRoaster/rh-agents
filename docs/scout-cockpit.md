@@ -78,6 +78,27 @@ ops/scout/install.sh             # install and load the per-user agent
 ops/scout/uninstall.sh           # unload and remove it (logs stay)
 ```
 
+- **Runtime worktree, never the development checkout.** The agent runs the
+  code of the worktree it was installed from. Install it from a dedicated
+  worktree that tracks `main`, for example:
+
+  ```bash
+  git worktree add /Volumes/Coding/rh-agents.worktrees/runtime-main main
+  cp -p .env /Volumes/Coding/rh-agents.worktrees/runtime-main/.env
+  cd /Volumes/Coding/rh-agents.worktrees/runtime-main/backend
+  uv sync --locked --python 3.13 && uv run alembic upgrade head
+  ../ops/scout/install.sh
+  ```
+
+  The development worktree may then switch branches freely; git keeps `main`
+  checked out in the runtime worktree only, so develop from `origin/main`.
+  Two guards make this hold: `install.sh` refuses to install from any branch
+  but `main`, and the plist sets `RH_AGENTS_SCOUT_REQUIRE_BRANCH=main`, so
+  `run-scout.sh` refuses (exit 78, `RUNTIME_NOT_ON_MAIN` or
+  `RUNTIME_WORKTREE_MODIFIED`) to run a worktree on another branch or with
+  tracked changes. To update the runtime: `git pull --ff-only`, `uv sync
+  --locked`, then `alembic upgrade head` — migrate before a release that adds
+  columns reaches the scheduler.
 - The agent runs only `python -m src.runner.main --scout-once` from `backend/`,
   every 900 seconds. It never runs the full PAPER run.
 - **No overlap.** launchd never starts a job again while the previous run is
@@ -128,6 +149,16 @@ ops/scout/uninstall.sh           # unload and remove it (logs stay)
   A requested value is never shown as a reported one. Rows from before
   migration 0015 have neither.
 - **Capacity.** See [the ORBIT capacity analysis](architecture/scout-orbit-capacity.md).
+- **Watch limit.** Discovery records every valid pool, but opens at most
+  `EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN` watches, taking chains in turn
+  (robinhood, bsc, robinhood, …) in provider order within a chain; nothing is
+  ranked by market size. A stream the limit turns away is recorded in
+  `discovery_stream_declines` (`watches_declined` in the summary) and is not
+  adopted by the recovery bootstrap on the next run. It can still become a
+  watch if a later discovery run sees it again within that run's limit.
+- **JEV shadow triage.** Optional, off by default. See
+  [JEV-0](architecture/jev-shadow-triage.md). The watch detail shows it under
+  "Fast shadow assessment", marked SHADOW — NO TRADING EFFECT.
 - **Logs.** `~/Library/Logs/rh-agents/scout.log` holds the run summary JSON
   plus start and exit lines. It rotates at 5 MB and keeps 3 generations.
   launchd's own output goes to `scout.launchd.log`. A failed run keeps its exit

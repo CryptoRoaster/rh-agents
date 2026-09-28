@@ -213,6 +213,44 @@ const detail = {
       latency_ms: null,
     },
   ],
+  fast_assessments: [
+    {
+      id: "f0",
+      watch_id: WATCH_ID,
+      snapshot_id: "1",
+      reserved_at: "2026-09-26T20:00:05Z",
+      assessed_at: "2026-09-26T20:00:06Z",
+      status: "COMPLETED",
+      provider: "jev",
+      model: "jev-1.13.0",
+      model_version: "jev-1.13.0",
+      question_version: "jev-scout-v1",
+      input_schema_version: 1,
+      input_digest: "d",
+      input_payload: { schema_version: 1 },
+      answers: {
+        suspicious_activity: { type: "noul", noul: 0.12 },
+        data_quality: {
+          type: "choice",
+          choice: "partial",
+          probabilities: { complete: 0.2, partial: 0.7, insufficient: 0.1 },
+          confidence: 0.6,
+        },
+        organic_activity: {
+          type: "score",
+          score: 1.4,
+          legend: { "0": "none", "1": "thin", "2": "plausible", "3": "strong" },
+          probabilities: { "0": 0.1, "1": 0.5, "2": 0.3, "3": 0.1 },
+          confidence: 0.4,
+        },
+      },
+      latency_ms: 620,
+      input_tokens: 400,
+      output_tokens: 20,
+      failure_category: null,
+      failure_reason_code: null,
+    },
+  ],
   trade_case: null,
 };
 
@@ -345,6 +383,28 @@ describe("early discovery cockpit", () => {
     ).toBeTruthy();
     expect(screen.getByText(/no assessment yet/)).toBeTruthy();
     expect(screen.getByText(/never TradeCase evidence/)).toBeTruthy();
+  });
+
+  it("shows the JEV shadow assessment as shadow, with no controls", async () => {
+    vi.stubGlobal("fetch", respond(routes));
+    render(<ScoutCockpit />);
+    const table = await screen.findByRole("table", {
+      name: /Discovery watches/,
+    });
+    fireEvent.click(within(table).getAllByRole("button")[0]);
+    const shadow = await screen.findByRole("region", {
+      name: "Fast shadow assessment",
+    });
+    expect(within(shadow).getByText("SHADOW — NO TRADING EFFECT")).toBeTruthy();
+    expect(within(shadow).getByText("jev · jev-1.13.0")).toBeTruthy();
+    expect(within(shadow).getByText(/questions jev-scout-v1/)).toBeTruthy();
+    expect(within(shadow).getByText("yes 12%")).toBeTruthy();
+    expect(
+      within(shadow).getByText("partial (70%, confidence 60%)"),
+    ).toBeTruthy();
+    expect(within(shadow).getByText("1.40 of 3 (confidence 40%)")).toBeTruthy();
+    expect(within(shadow).queryAllByRole("button")).toHaveLength(0);
+    expect(shadow.textContent).not.toMatch(/\b(buy|sell|execute|promote)\b/i);
   });
 
   it("shows an empty paper ledger as empty", async () => {

@@ -35,6 +35,7 @@ from src.scout.models import DiscoveryWatch, ScoutRun, WatchAssessment
 from src.scout.policy import EARLY_SCOUT_V1, REVIEWABLE, EarlyScoutPolicy, WatchStatus
 from src.scout.repository import Backlog, WatchRepository, _watch
 from src.scout.runs import ScoutRunRepository
+from src.scout.shadow import FastAssessment, FastAssessmentStore
 
 Availability = Literal["AVAILABLE", "UNKNOWN", "UNAVAILABLE"]
 
@@ -125,6 +126,8 @@ class WatchDetail(Immutable):
     checkpoints: tuple[CheckpointView, ...]
     assessments: tuple[WatchAssessment, ...]
     trade_case: LinkedCase | None = None
+    # JEV shadow assessments of this watch. Shadow only: no trading effect.
+    fast_assessments: tuple[FastAssessment, ...] = ()
 
 
 class RunView(Immutable):
@@ -381,6 +384,7 @@ class ScoutReadService:
             checkpoints=checkpoint_plan(watch, assessments, now, self.policy),
             assessments=assessments,
             trade_case=linked,
+            fast_assessments=await FastAssessmentStore(self.sessions).for_watch(watch_id),
         )
 
     async def assessments(self, watch_id: UUID) -> tuple[WatchAssessment, ...] | None:

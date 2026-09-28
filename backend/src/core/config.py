@@ -1,3 +1,4 @@
+import re
 from decimal import Decimal
 from typing import Annotated, Literal
 from urllib.parse import unquote, urlsplit
@@ -109,6 +110,20 @@ class Settings(BaseSettings):
     # `~/.codex` respectively.
     codex_executable: str = Field(default="", max_length=1024)
     codex_home: str = Field(default="", max_length=1024)
+    # Shadow fast assessments (TypeSafe Jev) for new scout watches. "disabled"
+    # by default: a key alone selects nothing. Shadow only — no decision reads
+    # it. The model is a pinned version; moving aliases are refused, so the
+    # answers never change underneath a calibration without a config change.
+    fast_reasoning_provider: Literal["disabled", "jev"] = "disabled"
+    typesafe_api_key: SecretStr = SecretStr("")
+    jev_model: str = Field(default="jev-1.13.0", min_length=1, max_length=80)
+    jev_base_url: str = Field(default="https://api.typesafe.ai", min_length=1, max_length=200)
+    jev_timeout_seconds: int = Field(default=10, ge=1, le=60)
+    # At most one assessment per new watch; the per-run bound matches the
+    # per-run watch limit and the daily bound is the most that limit can ever
+    # open in a day (10 x 96 runs).
+    jev_max_assessments_per_run: int = Field(default=10, ge=0, le=50)
+    jev_max_assessments_per_day: int = Field(default=960, ge=0, le=5000)
     orbit_worker_enabled: bool = False
     orbit_input_max_age_seconds: int = Field(default=900, ge=30, le=86400)
     orbit_discovery_liquidity_floor_usd: Decimal = Field(
@@ -350,6 +365,12 @@ class Settings(BaseSettings):
         # worker without credentials must fail loudly rather than at call time.
         if self.reasoning_provider == "anthropic" and not self.anthropic_api_key.get_secret_value():
             raise ValueError("The anthropic reasoning provider requires ANTHROPIC_API_KEY")
+        if self.fast_reasoning_provider == "jev":
+            if not self.typesafe_api_key.get_secret_value():
+                raise ValueError("The jev fast provider requires TYPESAFE_API_KEY")
+            if re.fullmatch(r"jev-\d+\.\d+\.\d+", self.jev_model) is None:
+                # `jev-latest` and `jev-preview` move when a release ships.
+                raise ValueError("JEV_MODEL must be a pinned version such as jev-1.13.0")
         if self.reasoning_provider == "codex" and self.reasoning_effort == "max":
             # The Codex CLI knows no "max"; refusing here beats a refused call.
             raise ValueError("The codex reasoning provider does not support REASONING_EFFORT=max")

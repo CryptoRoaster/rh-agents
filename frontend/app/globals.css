@@ -2245,3 +2245,23 @@ main {
   flex-wrap: wrap;
   padding-block: 6px;
 }
+
+.scout-shadow {
+  margin-top: 12px;
+  border-top: 1px dashed var(--border, #d4d4d8);
+  padding-top: 8px;
+}
+.scout-shadow-notice {
+  display: inline-block;
+  margin: 2px 0 6px;
+  padding: 1px 6px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+.scout-shadow-signal {
+  display: contents;
+}

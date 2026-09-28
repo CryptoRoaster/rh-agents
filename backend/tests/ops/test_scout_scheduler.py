@@ -118,7 +118,13 @@ def test_the_rendered_plist_runs_the_wrapper_every_fifteen_minutes(tmp_path):
     assert plist["RunAtLoad"] is False
     # Background throttles the Codex subprocess past its own deadlines.
     assert plist["ProcessType"] == "Standard"
-    assert set(plist["EnvironmentVariables"]) == {"PATH", "RH_AGENTS_SCOUT_LOG_DIR"}
+    assert set(plist["EnvironmentVariables"]) == {
+        "PATH",
+        "RH_AGENTS_SCOUT_LOG_DIR",
+        "RH_AGENTS_SCOUT_REQUIRE_BRANCH",
+    }
+    # The agent runs only a worktree on main.
+    assert plist["EnvironmentVariables"]["RH_AGENTS_SCOUT_REQUIRE_BRANCH"] == "main"
     # A dry run installs nothing.
     assert not (tmp_path / "agents").exists()
 
@@ -160,3 +166,85 @@ def test_the_scout_env_reaches_the_scout_process(tmp_path):
         check=True,
     )
     assert (tmp_path / "seen").read_text().split() == ["120", "codex"]
+
+
+def scratch_repo(tmp_path: Path, branch: str) -> Path:
+    """A throwaway git repository carrying the scheduler scripts, on `branch`."""
+    repo = tmp_path / "repo"
+    (repo / "ops" / "scout").mkdir(parents=True)
+    (repo / "backend").mkdir()
+    for name in FILES:
+        (repo / "ops" / "scout" / name).write_text((SCOUT / name).read_text())
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    for command in (
+        ["git", "init", "-q", "-b", "main"],
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"],
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init"],
+    ):
+        subprocess.run(command, cwd=repo, env=env, check=True)
+    if branch != "main":
+        subprocess.run(["git", "switch", "-q", "-c", branch], cwd=repo, env=env, check=True)
+    return repo
+
+
+def run_guarded(tmp_path: Path, repo: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/bin/bash", str(repo / "ops" / "scout" / "run-scout.sh")],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "RH_AGENTS_UV": str(fake_uv(tmp_path, 0)),
+            "RH_AGENTS_SCOUT_LOG_DIR": str(tmp_path / "logs"),
+            "RH_AGENTS_SCOUT_ENV": str(tmp_path / "absent.env"),
+            "RH_AGENTS_SCOUT_REQUIRE_BRANCH": "main",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_the_scheduler_refuses_a_worktree_on_a_feature_branch(tmp_path):
+    repo = scratch_repo(tmp_path, "feat/newer-orm")
+    result = run_guarded(tmp_path, repo)
+    assert result.returncode == 78
+    assert "refused RUNTIME_NOT_ON_MAIN" in (tmp_path / "logs" / "scout.log").read_text()
+    # The scout itself was never started.
+    assert not (tmp_path / "args").exists()
+
+
+def test_the_scheduler_refuses_a_modified_runtime_worktree(tmp_path):
+    repo = scratch_repo(tmp_path, "main")
+    (repo / "ops" / "scout" / "install.sh").write_text("# edited\n")
+    result = run_guarded(tmp_path, repo)
+    assert result.returncode == 78
+    assert "refused RUNTIME_WORKTREE_MODIFIED" in (tmp_path / "logs" / "scout.log").read_text()
+
+
+def test_the_scheduler_runs_a_clean_worktree_on_main(tmp_path):
+    repo = scratch_repo(tmp_path, "main")
+    # Untracked runtime files (.env, .venv) do not count as modifications.
+    (repo / ".env").write_text("X=1\n")
+    result = run_guarded(tmp_path, repo)
+    assert result.returncode == 0
+    assert (tmp_path / "args").read_text().split()[-1] == "--scout-once"
+
+
+def test_the_agent_is_never_installed_from_a_feature_branch(tmp_path):
+    repo = scratch_repo(tmp_path, "feat/anything")
+    result = subprocess.run(
+        ["/bin/bash", str(repo / "ops" / "scout" / "install.sh")],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "RH_AGENTS_UV": str(fake_uv(tmp_path, 0)),
+            "RH_AGENTS_LAUNCH_AGENTS": str(tmp_path / "agents"),
+            "RH_AGENTS_SCOUT_LOG_DIR": str(tmp_path / "logs"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 1
+    assert "refusing to install from branch feat/anything" in result.stderr
+    assert not (tmp_path / "agents").exists()

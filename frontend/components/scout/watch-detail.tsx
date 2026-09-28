@@ -1,4 +1,5 @@
 import { StatusBadge } from "@/components/console/ui";
+import { FastShadowSection } from "@/components/scout/fast-shadow";
 import {
   CHECKPOINT_LABELS,
   checkpointTone,
@@ -175,6 +176,7 @@ export function WatchDetailView({
           );
         })}
       </ol>
+      <FastShadowSection assessments={detail.fast_assessments ?? []} />
     </div>
   );
 }
