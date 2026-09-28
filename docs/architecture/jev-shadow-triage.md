@@ -187,7 +187,8 @@ reproducible, chain-stratified, and blind to JEV (it is only given ids and
 chains). It is a design helper; using it to choose Codex reviews would be a
 queue-policy change and is a separate decision.
 
-**Outcome labels (designed, not created).** A later table
+**Outcome labels (built in 0017, see
+[discovery outcomes](discovery-outcomes.md)).** The table
 `discovery_stream_outcomes` with one row per stream key and horizon — not
 per watch, so declined candidates are labelled too:
 `horizon` ∈ {15m, 1h, 3h, 6h, 24h, 72h}; `computed_at`; `return_pct`,

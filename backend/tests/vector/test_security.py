@@ -337,20 +337,32 @@ def test_nothing_wires_a_market_history_source_at_startup():
         )
 
 
-def test_no_candle_archive_is_persisted():
-    """Bars are read into bounded context; they never become a table.
+def test_vector_itself_persists_no_candle_archive():
+    """VECTOR reads bars into bounded context; it never writes them anywhere.
 
-    Auditability comes from the input digest plus the window's own coordinates,
-    which is enough to answer what a setup was drawn from without accumulating
-    market data this system has no mandate to store.
+    Revised with migration 0017: closed OHLCV bars may now be stored, but only
+    by the discovery outcome labeller (`src/scout/outcomes.py`), under the
+    explicit mandate to measure what candidates' markets did (see
+    docs/architecture/discovery-outcomes.md). VECTOR, the trade workflow and
+    every other runtime package still hold no bar table and write none, and
+    VECTOR's own audit trail stays the input digest plus the window's
+    coordinates.
     """
     from pathlib import Path
 
-    tables = Path("src/data/tables.py").read_text().lower()
-    for forbidden in ("marketbar", "ohlcv", "candle", "market_history"):
-        assert forbidden not in tables
+    writers = []
+    for path in sorted(Path("src").rglob("*.py")):
+        text = path.read_text()
+        if "MarketOhlcvBarRow" in text or "market_ohlcv_bars" in text:
+            writers.append(path.as_posix())
+    assert sorted(writers) == ["src/data/tables.py", "src/scout/outcomes.py"]
+    for package in ("src/agents/vector", "src/orchestration", "src/risk", "src/execution"):
+        for path in Path(package).rglob("*.py"):
+            text = path.read_text().lower()
+            assert "ohlcv_bar" not in text and "barstore" not in text, path
     migrations = sorted(Path("../backend/migrations/versions").glob("*.py"))
-    assert migrations and all("ohlcv" not in path.read_text().lower() for path in migrations)
+    holding = [path.name for path in migrations if "market_ohlcv_bars" in path.read_text()]
+    assert holding == ["0017_discovery_outcomes.py"]
 
 
 def test_an_accepted_setup_can_be_audited_back_to_its_inputs():

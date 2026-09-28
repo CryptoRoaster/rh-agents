@@ -70,7 +70,8 @@
 | ORBIT budget by day | `ix_scout_orbit_reservations_day` | sufficient |
 | JEV assessments by stream, by day, by time | `uq_fast_assessment_stream_questions` (stream key + question version), `ix_fast_assessments_day`, `ix_fast_assessments_reserved` (0016) | added with the table |
 | Decline lookup (bootstrap) | `uq_discovery_stream_decline` | added with the table |
-| Outcome labels by stream/horizon | – | table not created yet (see the JEV document); index to be designed with it |
+| Outcome labels by stream/horizon | `uq_stream_outcome_horizon`, `ix_stream_outcomes_horizon` (0017) | added with the table |
+| OHLCV bars / reads by stream | `uq_ohlcv_bar`, `ix_ohlcv_fetches_stream` (0017) | added with the table |
 
 Watch item: the recovery bootstrap groups `market_observations` by stream
 each run. At today's volume that is trivial; at tens of millions of rows it

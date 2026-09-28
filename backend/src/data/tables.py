@@ -986,3 +986,172 @@ class DiscoveryFastAssessmentRow(Base):
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     failure_category: Mapped[str | None] = mapped_column(String(80))
     failure_reason_code: Mapped[str | None] = mapped_column(String(80))
+
+
+class MarketOhlcvFetchRow(Base):
+    """One OHLCV read of one stream: which window it covered, and who asked.
+
+    The window is what the request could see, not only where bars came back:
+    the provider omits intervals in which nobody traded, so a covered window
+    with no bar in it is a fact (no trades), and a window never fetched is not.
+    Reused across consumers: the scout's VECTOR history check records its
+    hourly read here, and the outcome sampler labels from it before asking the
+    provider again.
+    """
+
+    __tablename__ = "market_ohlcv_fetches"
+    __table_args__ = (
+        CheckConstraint("window_end > window_start", name="ohlcv_fetch_window"),
+        Index("ix_ohlcv_fetches_stream", "provider", "chain", "network", "pair_id", "is_fixture"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(200))
+    chain: Mapped[str] = mapped_column(String(60))
+    network: Mapped[str] = mapped_column(String(60))
+    pair_id: Mapped[str] = mapped_column(String(512))
+    is_fixture: Mapped[bool] = mapped_column(Boolean)
+    timeframe: Mapped[str] = mapped_column(String(10))
+    aggregate: Mapped[int] = mapped_column(Integer)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(40))
+    bars_returned: Mapped[int] = mapped_column(Integer)
+
+
+class MarketOhlcvBarRow(Base):
+    """One closed OHLCV bar of one stream, USD per base unit. Written once."""
+
+    __tablename__ = "market_ohlcv_bars"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "chain",
+            "network",
+            "pair_id",
+            "is_fixture",
+            "timeframe",
+            "aggregate",
+            "opened_at",
+            name="uq_ohlcv_bar",
+        ),
+        CheckConstraint("low <= high AND volume >= 0", name="ohlcv_bar_shape"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    fetch_id: Mapped[UUID] = mapped_column(
+        ForeignKey("market_ohlcv_fetches.id", ondelete="RESTRICT")
+    )
+    provider: Mapped[str] = mapped_column(String(200))
+    chain: Mapped[str] = mapped_column(String(60))
+    network: Mapped[str] = mapped_column(String(60))
+    pair_id: Mapped[str] = mapped_column(String(512))
+    is_fixture: Mapped[bool] = mapped_column(Boolean)
+    timeframe: Mapped[str] = mapped_column(String(10))
+    aggregate: Mapped[int] = mapped_column(Integer)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    open: Mapped[Decimal] = mapped_column(Numeric())
+    high: Mapped[Decimal] = mapped_column(Numeric())
+    low: Mapped[Decimal] = mapped_column(Numeric())
+    close: Mapped[Decimal] = mapped_column(Numeric())
+    volume: Mapped[Decimal] = mapped_column(Numeric())
+
+
+class DiscoveryOutcomeSampleRow(Base):
+    """That one discovery stream was labelled, how, and at what cost. One per stream.
+
+    Covers candidates with and without a watch: the stream key is the same one
+    watches, declines and fast assessments use.
+    """
+
+    __tablename__ = "discovery_outcome_samples"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "chain",
+            "network",
+            "pair_id",
+            "is_fixture",
+            "schema_version",
+            name="uq_outcome_sample_stream",
+        ),
+        CheckConstraint(
+            "status IN ('COMPLETE', 'PARTIAL', 'UNAVAILABLE')", name="outcome_sample_status"
+        ),
+        CheckConstraint(
+            "history_source IN ('REUSED', 'FETCHED', 'NONE')", name="outcome_sample_source"
+        ),
+        Index("ix_outcome_samples_sampled", "sampled_at"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(200))
+    chain: Mapped[str] = mapped_column(String(60))
+    network: Mapped[str] = mapped_column(String(60))
+    pair_id: Mapped[str] = mapped_column(String(512))
+    is_fixture: Mapped[bool] = mapped_column(Boolean)
+    schema_version: Mapped[int] = mapped_column(Integer)
+    reference_observation_id: Mapped[UUID] = mapped_column(
+        ForeignKey("market_observations.id", ondelete="RESTRICT")
+    )
+    reference_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    reference_price_usd: Mapped[Decimal | None] = mapped_column(Numeric())
+    sampled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20))
+    reason_code: Mapped[str | None] = mapped_column(String(80))
+    history_source: Mapped[str] = mapped_column(String(10))
+    provider_requests: Mapped[int] = mapped_column(Integer)
+    # Liquidity persistence: at the reference observation, and re-observed at
+    # sampling time (NULL when no re-observation was affordable or possible).
+    liquidity_at_reference_usd: Mapped[Decimal | None] = mapped_column(Numeric())
+    liquidity_at_sample_usd: Mapped[Decimal | None] = mapped_column(Numeric())
+
+
+class DiscoveryStreamOutcomeRow(Base):
+    """What one discovery stream's market did over one horizon after first seen.
+
+    Objective labels for calibrating JEV, ORBIT and later strategies against
+    reality — never an input to any decision. Measured from closed OHLCV bars
+    against the price of the stream's first recorded observation.
+    """
+
+    __tablename__ = "discovery_stream_outcomes"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "chain",
+            "network",
+            "pair_id",
+            "is_fixture",
+            "horizon_minutes",
+            "schema_version",
+            name="uq_stream_outcome_horizon",
+        ),
+        CheckConstraint("status IN ('LABELLED', 'MISSING')", name="stream_outcome_status"),
+        CheckConstraint(
+            "(status = 'MISSING') = (missing_reason IS NOT NULL)", name="stream_outcome_missing"
+        ),
+        CheckConstraint("horizon_minutes > 0", name="stream_outcome_horizon"),
+        Index("ix_stream_outcomes_horizon", "horizon_minutes", "computed_at"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    sample_id: Mapped[UUID] = mapped_column(
+        ForeignKey("discovery_outcome_samples.id", ondelete="RESTRICT")
+    )
+    provider: Mapped[str] = mapped_column(String(200))
+    chain: Mapped[str] = mapped_column(String(60))
+    network: Mapped[str] = mapped_column(String(60))
+    pair_id: Mapped[str] = mapped_column(String(512))
+    is_fixture: Mapped[bool] = mapped_column(Boolean)
+    horizon_minutes: Mapped[int] = mapped_column(Integer)
+    schema_version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20))
+    missing_reason: Mapped[str | None] = mapped_column(String(80))
+    timeframe: Mapped[str | None] = mapped_column(String(10))
+    aggregate: Mapped[int | None] = mapped_column(Integer)
+    bars_used: Mapped[int] = mapped_column(Integer)
+    return_pct: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))
+    max_return_pct: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))
+    max_drawdown_pct: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))
+    survived: Mapped[bool | None] = mapped_column(Boolean)
+    volume_usd: Mapped[Decimal | None] = mapped_column(Numeric())
+    second_half_volume_share: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
