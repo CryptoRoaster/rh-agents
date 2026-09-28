@@ -6,7 +6,7 @@
 
 1. **PostgreSQL is the one durable source of truth.** It stores market
    observations and streams, discovery watches and stream declines, scout runs,
-   ORBIT assessments, JEV/fast shadow assessments, budget reservations,
+   ORBIT assessments, JEV/fast shadow assessments of discovery candidates, budget reservations,
    TradeCases and their evidence, risk requests, orders, fills (`trades`),
    positions, and later outcome labels, model provenance and calibration data.
 2. **SQLite is a test backend only.** Runtime `Settings` refuse any URL that
@@ -68,9 +68,9 @@
 | Observations by stream/time | `ix_observation_pair_time (provider, pair_id, observed_at, id)` (pair_id carries chain:network) | sufficient |
 | Scout runs by start | `ix_scout_runs_started` | sufficient |
 | ORBIT budget by day | `ix_scout_orbit_reservations_day` | sufficient |
-| JEV assessments by watch/time, by day | `uq_fast_assessment_watch_questions`, `ix_fast_assessments_watch_time`, `ix_fast_assessments_day` (0016) | added with the table |
+| JEV assessments by stream, by day, by time | `uq_fast_assessment_stream_questions` (stream key + question version), `ix_fast_assessments_day`, `ix_fast_assessments_reserved` (0016) | added with the table |
 | Decline lookup (bootstrap) | `uq_discovery_stream_decline` | added with the table |
-| Outcome labels by watch/horizon | – | table not created yet (see the JEV document); index to be designed with it |
+| Outcome labels by stream/horizon | – | table not created yet (see the JEV document); index to be designed with it |
 
 Watch item: the recovery bootstrap groups `market_observations` by stream
 each run. At today's volume that is trivial; at tens of millions of rows it
@@ -89,7 +89,7 @@ run); `market_observations` is 2.1 MB for 1,026 rows including indexes
 | per month | ≈ 70,000 | ≈ 150 MB |
 | per year | ≈ 840,000 | ≈ 1.8 GB |
 
-JEV shadow assessments add at most 960 rows/day (≈ 3–4 KB each, ≈ 1.3 GB/year).
+JEV shadow assessments add at most 1,920 rows/day (≈ 3–4 KB each, ≈ 2.5 GB/year).
 
 **`PLAIN_POSTGRESQL_SUFFICIENT = YES`**, **`TIMESCALEDB_NOW = NO`.** Range
 queries are per stream and short; there is no retention or compression

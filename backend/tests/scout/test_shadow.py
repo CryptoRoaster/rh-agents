@@ -1,8 +1,9 @@
-"""JEV-0 shadow triage in the scout: one assessment per new watch, and no effect.
+"""JEV-0 shadow triage at the discovery-candidate level, and its lack of any effect.
 
-The shadow invariant is tested the only honest way: the same runs with the
-fast provider switched off and on, compared field by field on everything a
-decision could read.
+Every new valid stream a run discovers is assessed — the ones the watch limit
+turns away included — and the assessment decides nothing. The invariant is
+tested the only honest way: the same runs with the fast provider off, on and
+failing, compared field by field on everything a decision could read.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -14,8 +15,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.data.tables import (
     Base,
-    DiscoveryWatchFastAssessmentRow,
+    DiscoveryFastAssessmentRow,
+    DiscoveryStreamDeclineRow,
     DiscoveryWatchRow,
+    MarketObservationRow,
     OrderRow,
     PositionRow,
     TradeCaseEvidenceRow,
@@ -32,7 +35,9 @@ from src.fast_reasoning.models import (
 )
 from src.reasoning.models import ReasoningErrorCategory, ReasoningFailure
 from src.scout.shadow import QUESTION_VERSION, QUESTIONS, build_input, input_digest
+from tests.atlas.conftest import QUOTE
 from tests.riskrequest.conftest import seed_account
+from tests.runner.provider import pool
 from tests.scout.conftest import (
     HOUR,
     EchoOrbit,
@@ -71,13 +76,16 @@ class ScriptedFast:
     name = "jev"
     model = "jev-1.13.0"
 
-    def __init__(self, failure: ReasoningFailure | Exception | None = None) -> None:
+    def __init__(
+        self, failure: ReasoningFailure | Exception | None = None, *, fail_after: int = 0
+    ) -> None:
         self.failure = failure
+        self.fail_after = fail_after
         self.requests: list[FastRequest] = []
 
     async def assess(self, request: FastRequest) -> FastResult:
         self.requests.append(request)
-        if self.failure is not None:
+        if self.failure is not None and len(self.requests) > self.fail_after:
             raise self.failure
         return FastResult(
             answers=answers_for(request),
@@ -90,64 +98,111 @@ class ScriptedFast:
         )
 
 
-async def fast_rows(sessions) -> list[DiscoveryWatchFastAssessmentRow]:
+def bsc_pool(index: int):
+    return pool(
+        "0x" + f"d{index}" * 20,
+        base="0x" + f"e{index}" * 20,
+        quote=QUOTE,
+        price="0.001",
+        liquidity="5000",
+        volume="100",
+        network="bsc",
+    )
+
+
+def both_chains(count: int = 10) -> MarketProvider:
+    return MarketProvider(
+        discovery_by_network={
+            "robinhood": [young(index) for index in range(count)],
+            "bsc": [bsc_pool(index) for index in range(count)],
+        }
+    )
+
+
+BOTH = {"market_chains": "robinhood,bsc", "early_scout_max_new_watches_per_run": 10}
+
+
+async def fast_rows(sessions) -> list[DiscoveryFastAssessmentRow]:
     async with sessions() as session:
         return list(
             (
                 await session.scalars(
-                    select(DiscoveryWatchFastAssessmentRow).order_by(
-                        DiscoveryWatchFastAssessmentRow.reserved_at,
-                        DiscoveryWatchFastAssessmentRow.id,
+                    select(DiscoveryFastAssessmentRow).order_by(
+                        DiscoveryFastAssessmentRow.reserved_at, DiscoveryFastAssessmentRow.id
                     )
                 )
             ).all()
         )
 
 
-async def test_each_new_watch_gets_exactly_one_shadow_assessment(db):
+async def count(sessions, table) -> int:
+    async with sessions() as session:
+        return int(await session.scalar(select(func.count()).select_from(table)) or 0)
+
+
+async def test_every_new_candidate_is_assessed_not_only_the_watches(db):
+    """20 discovered, 10 watch slots: 20 observed, 10 watches, 10 declined, 20 JEV."""
     _, sessions = db
     fast = ScriptedFast()
     summary = await scout(
-        sessions, T0, provider=MarketProvider(discovery=[young(0), young(1)]), fast=fast
+        sessions, T0, provider=both_chains(), fast=fast, settings=scout_settings(**BOTH)
     )
 
+    assert (summary.discovered, summary.valid_markets) == (20, 20)
+    assert (summary.watches_created, summary.watches_declined) == (10, 10)
+    assert summary.shadow_candidates == 20
+    assert (summary.shadow_assessments_started, summary.shadow_assessments_completed) == (20, 20)
+    assert await count(sessions, MarketObservationRow) == 20
     rows = await fast_rows(sessions)
-    assert summary.watches_created == 2
-    assert (summary.shadow_assessments_started, summary.shadow_assessments_completed) == (2, 2)
-    assert len(rows) == 2 and len(fast.requests) == 2
+    assert len(rows) == 20 and len(fast.requests) == 20
+    # Both chains fully covered, and the watch slots split without starvation.
+    assert sorted(row.chain for row in rows).count("bsc") == 10
+    async with sessions() as session:
+        watch_chains = (await session.scalars(select(DiscoveryWatchRow.chain))).all()
+        declined = set((await session.scalars(select(DiscoveryStreamDeclineRow.pair_id))).all())
+    assert (watch_chains.count("robinhood"), watch_chains.count("bsc")) == (5, 5)
+    # The streams the limit turned away got their assessment all the same.
+    assert len(declined) == 10
+    assert declined <= {row.pair_id for row in rows}
     for row in rows:
         assert row.status == "COMPLETED"
         assert (row.provider, row.model, row.model_version) == ("jev", "jev-1.13.0", "jev-1.13.0")
         assert row.question_version == QUESTION_VERSION
-        assert row.input_schema_version == 1
         assert row.input_digest == input_digest(row.input_payload)
         assert set(row.answers) == set(QUESTIONS)
-        assert row.failure_category is None and row.failure_reason_code is None
-    # The questions are the versioned set, and none asks what to do with a market.
-    assert set(fast.requests[0].questions) == set(QUESTIONS)
-    for question in QUESTIONS.values():
-        text = question.instructions.lower()
-        assert not any(word in text for word in ("buy", "sell", "trade this", "invest"))
 
 
-async def test_no_duplicate_next_run_and_no_backfill_of_older_watches(db):
+async def test_the_next_run_asks_no_one_twice_and_opens_no_declined_watch(db):
+    _, sessions = db
+    fast = ScriptedFast()
+    settings = scout_settings(**BOTH)
+    await scout(sessions, T0, provider=both_chains(), fast=fast, settings=settings)
+    again = await scout(
+        sessions, T0 + timedelta(minutes=15), provider=both_chains(), fast=fast, settings=settings
+    )
+    assert (again.watches_created, again.watches_declined, again.bootstrapped) == (0, 0, 0)
+    assert again.shadow_candidates == 0
+    assert again.shadow_assessments_started == 0
+    assert len(fast.requests) == 20
+    assert len(await fast_rows(sessions)) == 20
+    assert await count(sessions, DiscoveryWatchRow) == 10
+
+
+async def test_no_backfill_of_streams_known_before_jev(db):
     _, sessions = db
     fast = ScriptedFast()
     provider = MarketProvider(discovery=[young(0)], targeted=[young(0)])
     await scout(sessions, T0, provider=provider, fast=None)  # a watch from before JEV
     provider.discovery = [young(0), young(1)]
     await scout(sessions, T0 + HOUR, provider=provider, fast=fast)
-    await scout(sessions, T0 + 2 * HOUR, provider=provider, fast=fast)
-
     rows = await fast_rows(sessions)
-    # Only the watch opened while JEV was on, and only once.
-    assert len(rows) == 1
-    async with sessions() as session:
-        opened_later = await session.scalar(
-            select(DiscoveryWatchRow.id).where(DiscoveryWatchRow.pair_id.like("%c2c2%"))
-        )
-    assert rows[0].watch_id == opened_later
-    assert len(fast.requests) == 1
+    assert [row.pair_id for row in rows] == [young_pair(1)]
+
+
+def young_pair(index: int) -> str:
+    from tests.scout.conftest import POOLS, pair_id
+
+    return pair_id(POOLS[index])
 
 
 async def test_the_shadow_budget_is_bounded_per_run_and_per_day(db):
@@ -168,7 +223,7 @@ async def test_the_shadow_budget_is_bounded_per_run_and_per_day(db):
         fast=fast,
         settings=tight,
     )
-    assert first.shadow_assessments_started == 2
+    assert (first.shadow_candidates, first.shadow_assessments_started) == (4, 2)
     assert (second.shadow_assessments_started, second.shadow_skipped_budget) == (1, 1)
     assert len(await fast_rows(sessions)) == 3
 
@@ -206,7 +261,7 @@ async def test_a_shadow_failure_is_recorded_and_blocks_nothing(db, failure, cate
         fast=fast,
     )
 
-    (first, second) = await fast_rows(sessions)
+    first, second = await fast_rows(sessions)
     assert first.status == second.status == "FAILED"
     assert (first.failure_category, first.failure_reason_code) == (category, code)
     assert first.answers is None
@@ -220,12 +275,8 @@ async def test_a_shadow_failure_is_recorded_and_blocks_nothing(db, failure, cate
     assert summary.shadow_failure_codes == (code,)
 
 
-def test_the_input_is_deterministic_and_uses_no_names():
-    from datetime import UTC, datetime
-    from uuid import uuid4
-
+def test_the_input_needs_no_watch_is_deterministic_and_uses_no_names():
     from src.markets.models import MarketSnapshot
-    from src.scout.models import DiscoveryWatch
     from tests.riskdata.conftest import recorded_snapshot
 
     now = datetime(2026, 9, 28, 6, tzinfo=UTC)
@@ -236,17 +287,16 @@ def test_the_input_is_deterministic_and_uses_no_names():
         base_asset_id="robinhood:mainnet:0x" + "9e" * 20,
         label="SUPERMOON",
     )
-    watch = DiscoveryWatch.model_construct(
-        id=uuid4(), chain="robinhood", first_seen_at=now - timedelta(minutes=5)
-    )
-    one = build_input(watch, snapshot, None, now)
-    two = build_input(watch, snapshot, None, now)
+    one = build_input(snapshot, None, now - timedelta(minutes=5), now)
+    two = build_input(snapshot, None, now - timedelta(minutes=5), now)
     assert one == two and input_digest(one) == input_digest(two)
     shown = repr(one)
-    # No symbol, name or address is shown to the fast model.
+    # No symbol, name or address is shown to the fast model; no watch state either.
     assert "SUPERMOON" not in shown and "0x" not in shown
+    assert not any("watch" in key or "orbit" in key for key in one)
     assert one["prior_observation"] == {"available": False}
-    assert one["watch_age_minutes"] == 5
+    assert one["stream_age_minutes"] == 5
+    assert one["chain"] == "robinhood"
 
 
 # ------------------------------------------------------------ the invariant
@@ -278,6 +328,7 @@ async def decision_state(sessions) -> dict[str, Any]:
                 ).order_by(DiscoveryWatchRow.pair_id)
             )
         ).all()
+        declined = sorted((await session.scalars(select(DiscoveryStreamDeclineRow.pair_id))).all())
         counts = {
             table.__tablename__: await session.scalar(select(func.count()).select_from(table))
             for table in (
@@ -289,31 +340,33 @@ async def decision_state(sessions) -> dict[str, Any]:
                 TradeCaseEvidenceRow,
             )
         }
-    return {"watches": [tuple(row) for row in watches], "counts": counts}
+    return {"watches": [tuple(row) for row in watches], "declined": declined, "counts": counts}
 
 
-async def test_jev_on_or_off_changes_no_decision_input():
-    """Same runs, fast provider off and on: watches, ORBIT and trading state identical."""
+async def test_jev_off_on_or_failing_changes_no_decision_input():
+    """Same runs with JEV off, on, and failing from the 11th call: identical decisions."""
     results = []
-    for fast in (None, ScriptedFast()):
+    variants = (
+        None,
+        ScriptedFast(),
+        ScriptedFast(
+            ReasoningFailure(ReasoningErrorCategory.PROVIDER_UNAVAILABLE, "JEV_OVERLOADED"),
+            fail_after=10,
+        ),
+    )
+    for fast in variants:
         engine, sessions = await fresh_db()
         try:
             orbit = EchoOrbit()
-            provider = MarketProvider(
-                discovery=[young(index) for index in range(6)],
-                targeted=[young(index) for index in range(6)],
-            )
-            limited = scout_settings(
-                early_scout_max_new_watches_per_run=4, early_scout_max_orbit_reviews_per_run=2
-            )
+            settings = scout_settings(**BOTH, early_scout_max_orbit_reviews_per_run=2)
             for step in range(3):
                 await scout(
                     sessions,
                     T0 + step * HOUR,
-                    provider=provider,
+                    provider=both_chains(),
                     orbit=orbit,
                     fast=fast,
-                    settings=limited,
+                    settings=settings,
                 )
             results.append(
                 {
@@ -321,8 +374,12 @@ async def test_jev_on_or_off_changes_no_decision_input():
                     "orbit": [call.data["market_observation"]["pair_id"] for call in orbit.calls],
                 }
             )
+            if fast is not None:
+                rows = await fast_rows(sessions)
+                assert len(rows) == 20
         finally:
             await engine.dispose()
-    off, on = results
+    off, on, failing = results
     assert on == off
+    assert failing == off
     assert all(value == 0 for value in on["state"]["counts"].values())

@@ -216,7 +216,11 @@ const detail = {
   fast_assessments: [
     {
       id: "f0",
-      watch_id: WATCH_ID,
+      market_provider: "geckoterminal",
+      chain: "robinhood",
+      network: "mainnet",
+      pair_id: "robinhood:mainnet:contract_address:0xpool",
+      is_fixture: false,
       snapshot_id: "1",
       reserved_at: "2026-09-26T20:00:05Z",
       assessed_at: "2026-09-26T20:00:06Z",

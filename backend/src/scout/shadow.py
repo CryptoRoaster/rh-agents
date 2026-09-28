@@ -1,21 +1,27 @@
-"""JEV-0: one shadow fast assessment for each watch a scout run opens.
+"""JEV-0: one shadow fast assessment for every new discovery candidate.
 
-**Shadow only.** Nothing in the scout, ORBIT, VECTOR, promotion, risk or
-execution reads what is written here. The assessment runs after the run's
-ORBIT reviews and history checks, over watches this run already opened, and
-its outcome — answers, failure or skipped budget — changes no watch, no
-schedule and no queue. It exists to be compared later against Codex ORBIT
-classifications and market outcomes.
+A candidate is a valid, newly discovered market stream: no watch existed for
+it and it had never been observed before this run. The candidate set is fixed
+from discovery alone, *before* watch allocation, so a stream the watch limit
+turns away is assessed exactly like one that becomes a watch. Assessments are
+evidence about the stream (the existing provider/chain/network/pair identity)
+and the observation it was shown, never about a watch.
+
+**Shadow only.** Nothing in the scout, the watch allocation, ORBIT, VECTOR,
+promotion, risk or execution reads what is written here. The calls run last
+in a scout run, after every review and check, and their outcome — answers,
+failure or a spent budget — changes no watch, no schedule and no queue. The
+purpose is calibration: against the watch decision, against Codex ORBIT
+classifications, and later against objective market outcomes.
 
 The input is deterministic and uses only what was observed by the assessment
-instant: the recorded snapshot the watch opened on, the stream's previous
-observation if there is one, and arithmetic done here in code (Jev is not a
-calculator). No symbol, name or address is shown. Magnitude bands describe a
-value; they are not a gate.
+instant, with all arithmetic done here in code (Jev is not a calculator). No
+symbol, name or address is shown. Magnitude bands describe a value; they are
+not a gate.
 
 Budget: its own, separate from ORBIT. A row is reserved (PENDING) and committed
 before the call and settled exactly once, so a crashed call still counts
-toward the UTC day and a watch is never asked twice for one question set.
+toward the UTC day and a stream is never asked twice for one question set.
 """
 
 import asyncio
@@ -34,7 +40,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.numbers import canonical_decimal
 from src.data.repository import aware
-from src.data.tables import DiscoveryWatchFastAssessmentRow, MarketObservationRow
+from src.data.tables import (
+    DiscoveryFastAssessmentRow,
+    DiscoveryWatchRow,
+    MarketObservationRow,
+)
 from src.fast_reasoning.models import (
     ChoiceQuestion,
     FastRequest,
@@ -44,10 +54,9 @@ from src.fast_reasoning.models import (
     ScoreQuestion,
 )
 from src.fast_reasoning.provider import FastAssessmentProvider
-from src.markets.models import Availability, MarketSnapshot, Measurement
+from src.markets.models import Availability, MarketIdentity, MarketSnapshot, Measurement
 from src.reasoning.models import Identifier, ReasoningErrorCategory, ReasoningFailure
 from src.runner.models import Code, Immutable
-from src.scout.models import DiscoveryWatch
 
 QUESTION_VERSION = "jev-scout-v1"
 INPUT_SCHEMA_VERSION = 1
@@ -127,7 +136,11 @@ class FastAssessment(Immutable):
     """One persisted shadow assessment, as the cockpit reads it."""
 
     id: UUID
-    watch_id: UUID
+    market_provider: Identifier
+    chain: Identifier
+    network: Identifier
+    pair_id: str
+    is_fixture: bool
     snapshot_id: UUID
     reserved_at: AwareDatetime
     assessed_at: AwareDatetime | None = None
@@ -147,10 +160,14 @@ class FastAssessment(Immutable):
     failure_reason_code: Code | None = None
 
 
-def _fast(row: DiscoveryWatchFastAssessmentRow) -> FastAssessment:
+def _fast(row: DiscoveryFastAssessmentRow) -> FastAssessment:
     return FastAssessment(
         id=row.id,
-        watch_id=row.watch_id,
+        market_provider=row.market_provider,
+        chain=row.chain,
+        network=row.network,
+        pair_id=row.pair_id,
+        is_fixture=row.is_fixture,
         snapshot_id=row.snapshot_id,
         reserved_at=aware(row.reserved_at),
         assessed_at=None if row.assessed_at is None else aware(row.assessed_at),
@@ -214,12 +231,18 @@ def _value(item: Measurement) -> Decimal | None:
 
 
 def build_input(
-    watch: DiscoveryWatch,
     snapshot: MarketSnapshot,
     prior: MarketSnapshot | None,
+    first_seen_at: datetime,
     now: datetime,
 ) -> dict[str, object]:
-    """The deterministic state shown to the fast model. Nothing after `now`."""
+    """The deterministic state shown to the fast model. Nothing after `now`.
+
+    Built from the stream's observations alone — no watch, ORBIT or case
+    state — so a candidate the watch limit turned away is described exactly
+    like one that became a watch. `first_seen_at` is the stream's first
+    observation instant.
+    """
     liquidity = _value(snapshot.liquidity)
     volume = _value(snapshot.volume)
     ratio = (
@@ -247,9 +270,9 @@ def build_input(
         }
     return {
         "schema_version": INPUT_SCHEMA_VERSION,
-        "chain": watch.chain,
+        "chain": snapshot.chain,
         "venue": snapshot.pair.venue,
-        "watch_age_minutes": max(0, int((now - watch.first_seen_at).total_seconds() // 60)),
+        "stream_age_minutes": max(0, int((now - first_seen_at).total_seconds() // 60)),
         "observation_age_seconds": max(0, int((now - snapshot.freshness_at).total_seconds())),
         "price_usd": _measure(snapshot.price),
         "liquidity_usd": {**_measure(snapshot.liquidity), "magnitude": magnitude(liquidity)},
@@ -272,6 +295,17 @@ def input_digest(payload: dict[str, object]) -> str:
 # ------------------------------------------------------------------ store
 
 
+def stream_key(identity: MarketIdentity) -> tuple[Any, ...]:
+    row = DiscoveryFastAssessmentRow
+    return (
+        row.market_provider == identity.provider,
+        row.chain == identity.chain,
+        row.network == identity.network,
+        row.pair_id == identity.pair_id,
+        row.is_fixture.is_(identity.is_fixture),
+    )
+
+
 def utc_day(instant: datetime) -> date:
     return instant.astimezone(UTC).date()
 
@@ -290,43 +324,51 @@ class FastAssessmentStore:
     async def _count(session: AsyncSession, day: date) -> int:
         count = await session.scalar(
             select(func.count())
-            .select_from(DiscoveryWatchFastAssessmentRow)
-            .where(DiscoveryWatchFastAssessmentRow.utc_day == day)
+            .select_from(DiscoveryFastAssessmentRow)
+            .where(DiscoveryFastAssessmentRow.utc_day == day)
         )
         return int(count or 0)
 
     async def reserve(
         self,
         *,
-        watch_id: UUID,
-        snapshot_id: UUID,
+        snapshot: MarketSnapshot,
         provider: str,
         model: str,
         payload: dict[str, object],
         now: datetime,
         cap: int,
     ) -> UUID | None:
-        """A PENDING row, committed before any call; None when spent or already asked."""
+        """A PENDING row, committed before any call; None when spent or already asked.
+
+        One per stream and question set: a pool seen again in a later run,
+        with or without a watch, is never asked a second time.
+        """
         day = utc_day(now)
+        identity = snapshot.pair.market_identity
         async with self.sessions.begin() as session:
             if session.get_bind().dialect.name == "postgresql":
                 await session.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": BUDGET_LOCK}
                 )
             asked = await session.scalar(
-                select(DiscoveryWatchFastAssessmentRow.id).where(
-                    DiscoveryWatchFastAssessmentRow.watch_id == watch_id,
-                    DiscoveryWatchFastAssessmentRow.question_version == QUESTION_VERSION,
+                select(DiscoveryFastAssessmentRow.id).where(
+                    *stream_key(identity),
+                    DiscoveryFastAssessmentRow.question_version == QUESTION_VERSION,
                 )
             )
             if asked is not None or await self._count(session, day) >= cap:
                 return None
             reservation = uuid4()
             session.add(
-                DiscoveryWatchFastAssessmentRow(
+                DiscoveryFastAssessmentRow(
                     id=reservation,
-                    watch_id=watch_id,
-                    snapshot_id=snapshot_id,
+                    market_provider=identity.provider,
+                    chain=identity.chain,
+                    network=identity.network,
+                    pair_id=identity.pair_id,
+                    is_fixture=identity.is_fixture,
+                    snapshot_id=snapshot.id,
                     utc_day=day,
                     reserved_at=now,
                     assessed_at=None,
@@ -378,27 +420,62 @@ class FastAssessmentStore:
         # Only a PENDING row moves, and only once: a settled assessment is history.
         async with self.sessions.begin() as session:
             await session.execute(
-                update(DiscoveryWatchFastAssessmentRow)
+                update(DiscoveryFastAssessmentRow)
                 .where(
-                    DiscoveryWatchFastAssessmentRow.id == reservation,
-                    DiscoveryWatchFastAssessmentRow.status == "PENDING",
+                    DiscoveryFastAssessmentRow.id == reservation,
+                    DiscoveryFastAssessmentRow.status == "PENDING",
                 )
                 .values(**values)
             )
 
-    async def for_watch(self, watch_id: UUID) -> tuple[FastAssessment, ...]:
+    async def for_stream(
+        self, provider: str, chain: str, network: str, pair_id: str, is_fixture: bool
+    ) -> tuple[FastAssessment, ...]:
+        """The stream's shadow assessments, oldest first. A watch finds its own by its key."""
+        row = DiscoveryFastAssessmentRow
         async with self.sessions() as session:
             rows = (
                 await session.scalars(
-                    select(DiscoveryWatchFastAssessmentRow)
-                    .where(DiscoveryWatchFastAssessmentRow.watch_id == watch_id)
-                    .order_by(
-                        DiscoveryWatchFastAssessmentRow.reserved_at,
-                        DiscoveryWatchFastAssessmentRow.id,
+                    select(row)
+                    .where(
+                        row.market_provider == provider,
+                        row.chain == chain,
+                        row.network == network,
+                        row.pair_id == pair_id,
+                        row.is_fixture.is_(is_fixture),
                     )
+                    .order_by(row.reserved_at, row.id)
                 )
             ).all()
-            return tuple(_fast(row) for row in rows)
+            return tuple(_fast(item) for item in rows)
+
+    async def is_new_candidate(self, snapshot: MarketSnapshot) -> bool:
+        """Never observed before this snapshot and without a watch: a new candidate."""
+        identity = snapshot.pair.market_identity
+        observation = MarketObservationRow
+        async with self.sessions() as session:
+            earlier = await session.scalar(
+                select(observation.id)
+                .where(
+                    observation.provider == identity.provider,
+                    observation.chain == identity.chain,
+                    observation.network == identity.network,
+                    observation.pair_id == identity.pair_id,
+                    observation.is_fixture.is_(identity.is_fixture),
+                    observation.observed_at < snapshot.observed_at,
+                )
+                .limit(1)
+            )
+            watched = await session.scalar(
+                select(DiscoveryWatchRow.id).where(
+                    DiscoveryWatchRow.provider == identity.provider,
+                    DiscoveryWatchRow.chain == identity.chain,
+                    DiscoveryWatchRow.network == identity.network,
+                    DiscoveryWatchRow.pair_id == identity.pair_id,
+                    DiscoveryWatchRow.is_fixture.is_(identity.is_fixture),
+                )
+            )
+        return earlier is None and watched is None
 
     async def prior(self, snapshot: MarketSnapshot) -> MarketSnapshot | None:
         """The stream's newest observation strictly before this one, if any."""
@@ -448,17 +525,17 @@ class ShadowTriage:
 
     async def run(
         self,
-        opened: list[tuple[DiscoveryWatch, MarketSnapshot]],
+        candidates: list[MarketSnapshot],
         now_fn: Callable[[], datetime],
         safe: Callable[[str], str],
     ) -> ShadowTally:
+        """Assess the candidates fixed from discovery, in discovery order, within budget."""
         tally = ShadowTally()
-        for watch, snapshot in opened[: max(0, self.per_run)]:
+        for snapshot in candidates[: max(0, self.per_run)]:
             now = now_fn()
-            payload = build_input(watch, snapshot, await self.store.prior(snapshot), now)
+            payload = build_input(snapshot, None, snapshot.observed_at, now)
             reservation = await self.store.reserve(
-                watch_id=watch.id,
-                snapshot_id=snapshot.id,
+                snapshot=snapshot,
                 provider=self.provider.name,
                 model=self.provider.model,
                 payload=payload,

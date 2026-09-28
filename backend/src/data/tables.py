@@ -876,14 +876,13 @@ class ScoutOrbitReservationRow(Base):
 
 
 class DiscoveryStreamDeclineRow(Base):
-    """A discovered market stream that deliberately received no watch.
+    """A discovered stream NOT OPENED AS A WATCH DUE TO THE WATCH LIMIT.
 
-    Discovery records every valid pool, but a run may open only
-    `EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN` watches. A stream turned away by that
-    limit is marked here so the recovery bootstrap cannot adopt it one run
-    later and quietly double the limit. The observations themselves are kept;
-    nothing is deleted. A later discovery run may still open a watch for the
-    same stream within its own limit.
+    Only that. It is not "ignore this market" and not "do not assess": the
+    stream keeps its observations and still gets its JEV-0 shadow assessment.
+    The one thing the mark does is keep the recovery bootstrap from adopting
+    the stream one run later, which would quietly double the per-run limit. A
+    later discovery run may still open a watch for it within its own limit.
     """
 
     __tablename__ = "discovery_stream_declines"
@@ -907,19 +906,34 @@ class DiscoveryStreamDeclineRow(Base):
     declined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
-class DiscoveryWatchFastAssessmentRow(Base):
-    """One shadow fast assessment (JEV) of a new watch. Never trading evidence.
+class DiscoveryFastAssessmentRow(Base):
+    """One shadow fast assessment (JEV-0) of a discovered market stream.
+
+    Evidence about a discovery candidate, not about a watch: every new valid
+    stream a scout run discovers is assessed, whether or not the watch limit
+    let it become a watch. The candidate is the existing stream identity
+    (provider, chain, network, pair, fixture flag) — the same key a watch and a
+    decline use — and the exact observation it was shown. A watch, when there
+    is one, is found by that same key; there is no second identity to drift.
 
     Reserved before the provider is called and settled exactly once, so the
-    daily budget counts a call that died half-way and a watch is never asked
+    daily budget counts a call that died half-way and a stream is never asked
     twice for the same question set. Provenance, status and failures are
-    columns; the typed input and the typed answers are versioned JSONB
-    documents, because the question set is expected to evolve by version.
+    columns; the typed input and answers are versioned JSONB documents.
+    Never trading evidence.
     """
 
-    __tablename__ = "discovery_watch_fast_assessments"
+    __tablename__ = "discovery_fast_assessments"
     __table_args__ = (
-        UniqueConstraint("watch_id", "question_version", name="uq_fast_assessment_watch_questions"),
+        UniqueConstraint(
+            "market_provider",
+            "chain",
+            "network",
+            "pair_id",
+            "is_fixture",
+            "question_version",
+            name="uq_fast_assessment_stream_questions",
+        ),
         CheckConstraint(
             "status IN ('PENDING', 'COMPLETED', 'FAILED')", name="fast_assessment_status"
         ),
@@ -938,10 +952,16 @@ class DiscoveryWatchFastAssessmentRow(Base):
             "(status = 'PENDING') = (assessed_at IS NULL)", name="fast_assessment_settled"
         ),
         Index("ix_fast_assessments_day", "utc_day"),
-        Index("ix_fast_assessments_watch_time", "watch_id", "reserved_at"),
+        Index("ix_fast_assessments_reserved", "reserved_at"),
     )
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
-    watch_id: Mapped[UUID] = mapped_column(ForeignKey("discovery_watches.id", ondelete="RESTRICT"))
+    # The discovered stream: the same identity as a watch or a decline.
+    market_provider: Mapped[str] = mapped_column(String(200))
+    chain: Mapped[str] = mapped_column(String(60))
+    network: Mapped[str] = mapped_column(String(60))
+    pair_id: Mapped[str] = mapped_column(String(512))
+    is_fixture: Mapped[bool] = mapped_column(Boolean)
+    # The exact observation shown to the model.
     snapshot_id: Mapped[UUID] = mapped_column(
         ForeignKey("market_observations.id", ondelete="RESTRICT")
     )

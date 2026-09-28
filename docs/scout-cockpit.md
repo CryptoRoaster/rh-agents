@@ -151,14 +151,17 @@ ops/scout/uninstall.sh           # unload and remove it (logs stay)
 - **Capacity.** See [the ORBIT capacity analysis](architecture/scout-orbit-capacity.md).
 - **Watch limit.** Discovery records every valid pool, but opens at most
   `EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN` watches, taking chains in turn
-  (robinhood, bsc, robinhood, …) in provider order within a chain; nothing is
-  ranked by market size. A stream the limit turns away is recorded in
-  `discovery_stream_declines` (`watches_declined` in the summary) and is not
-  adopted by the recovery bootstrap on the next run. It can still become a
-  watch if a later discovery run sees it again within that run's limit.
-- **JEV shadow triage.** Optional, off by default. See
-  [JEV-0](architecture/jev-shadow-triage.md). The watch detail shows it under
-  "Fast shadow assessment", marked SHADOW — NO TRADING EFFECT.
+  (robinhood, bsc, robinhood, …) in provider order within a chain — a
+  TEMPORARY NEUTRAL WATCH ALLOCATION; nothing is ranked by market size or by
+  JEV. A stream the limit turns away is recorded in `discovery_stream_declines`
+  (`watches_declined` in the summary) as NOT_OPENED_AS_WATCH_DUE_TO_WATCH_LIMIT:
+  it is never adopted by the recovery bootstrap and never opened by a later
+  discovery run, but it is still observed and still gets its JEV-0 assessment.
+- **JEV shadow triage.** Optional, off by default. Every new discovery
+  candidate is assessed, declined ones included; see
+  [JEV-0](architecture/jev-shadow-triage.md). The watch detail shows the
+  assessment of its stream under "Fast shadow assessment", marked SHADOW — NO
+  TRADING EFFECT; `GET /api/scout/shadow/summary` counts all of them.
 - **Logs.** `~/Library/Logs/rh-agents/scout.log` holds the run summary JSON
   plus start and exit lines. It rotates at 5 MB and keeps 3 generations.
   launchd's own output goes to `scout.launchd.log`. A failed run keeps its exit

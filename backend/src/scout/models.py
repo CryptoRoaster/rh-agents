@@ -164,6 +164,8 @@ class ScoutSummary(Immutable):
     model_failure_reasons: tuple[ModelFailureCount, ...] = Field(default=(), max_length=32)
     # Shadow fast assessments (JEV) of the watches this run opened. Shadow only:
     # none of these counts feeds any decision, and none is a run error.
+    # New discovery candidates, fixed before watch allocation (declined included).
+    shadow_candidates: int = Field(default=0, ge=0)
     shadow_assessments_started: int = Field(default=0, ge=0)
     shadow_assessments_completed: int = Field(default=0, ge=0)
     shadow_assessments_failed: int = Field(default=0, ge=0)

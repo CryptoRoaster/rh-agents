@@ -32,7 +32,7 @@ def test_another_seed_draws_another_sample():
 def test_the_sample_cannot_see_any_signal():
     # Only ids, chains, a seed and a size go in: no JEV score, classification or market value.
     assert list(inspect.signature(calibration_sample).parameters) == [
-        "watches",
+        "candidates",
         "seed",
         "per_chain",
     ]

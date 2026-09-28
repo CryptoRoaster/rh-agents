@@ -681,8 +681,8 @@ async def test_the_watch_limit_is_not_doubled_by_the_next_runs_bootstrap(db):
     assert await observations_count(sessions) == 10
 
 
-async def test_a_declined_pool_can_still_open_a_watch_through_discovery_later(db):
-    """The decline only closes the bootstrap path, never discovery within its own limit."""
+async def test_a_declined_pool_never_becomes_a_watch_later(db):
+    """Seen again by discovery, a declined stream still gets no watch: new pools get the slot."""
     _, sessions = db
     limited = scout_settings(early_scout_max_new_watches_per_run=1)
     await scout(
@@ -691,11 +691,17 @@ async def test_a_declined_pool_can_still_open_a_watch_through_discovery_later(db
     later = await scout(
         sessions,
         T0 + timedelta(minutes=15),
-        provider=MarketProvider(discovery=[young(1)]),
+        provider=MarketProvider(discovery=[young(0), young(1), young(2)]),
         settings=limited,
     )
-    assert later.watches_created == 1
-    assert await watch_count(sessions) == 2
+    # young(1) was declined; the one slot goes to the genuinely new young(2).
+    assert (later.watches_created, later.watches_declined) == (1, 0)
+    async with sessions() as session:
+        from src.data.tables import DiscoveryWatchRow
+
+        pairs = set((await session.scalars(select(DiscoveryWatchRow.pair_id))).all())
+    assert pair_id(POOLS[1]) not in pairs
+    assert {pair_id(POOLS[0]), pair_id(POOLS[2])} <= pairs
 
 
 async def test_recovery_bootstrap_still_adopts_streams_nobody_declined(db):

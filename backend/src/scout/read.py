@@ -384,7 +384,9 @@ class ScoutReadService:
             checkpoints=checkpoint_plan(watch, assessments, now, self.policy),
             assessments=assessments,
             trade_case=linked,
-            fast_assessments=await FastAssessmentStore(self.sessions).for_watch(watch_id),
+            fast_assessments=await FastAssessmentStore(self.sessions).for_stream(
+                watch.provider, watch.chain, watch.network, watch.pair_id, watch.is_fixture
+            ),
         )
 
     async def assessments(self, watch_id: UUID) -> tuple[WatchAssessment, ...] | None:

@@ -70,8 +70,8 @@ async def tables(engine):
         return await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
 
 
-async def a_watch_and_observation(engine):
-    """One observation and one watch on it, the rows an assessment points at."""
+async def an_observation(engine, *, with_watch: bool = False):
+    """One recorded observation, and optionally a watch on its stream."""
     watch, observation = uuid4(), uuid4()
     pair = "robinhood:mainnet:contract_address:0x" + "0f" * 20
     async with engine.begin() as connection:
@@ -90,36 +90,38 @@ async def a_watch_and_observation(engine):
                 "trace": uuid4(),
             },
         )
-        await connection.execute(
-            text(
-                "INSERT INTO discovery_watches (id, schema_version, policy_version, provider,"
-                " chain, network, pair_id, is_fixture, market_payload, first_seen_at,"
-                " last_seen_at, latest_snapshot_id, created_at, updated_at, status,"
-                " next_orbit_review_at, next_history_review_at, reason_code)"
-                " VALUES (:id, 1, 'early-scout-v1', 'geckoterminal', 'robinhood', 'mainnet',"
-                " :pair, false, '{}'::jsonb, now(), now(), :obs, now(), now(), 'WATCHING',"
-                " now(), now(), 'WATCH_OPENED')"
-            ),
-            {"id": watch, "pair": pair, "obs": observation},
-        )
-    return watch, observation
+        if with_watch:
+            await connection.execute(
+                text(
+                    "INSERT INTO discovery_watches (id, schema_version, policy_version, provider,"
+                    " chain, network, pair_id, is_fixture, market_payload, first_seen_at,"
+                    " last_seen_at, latest_snapshot_id, created_at, updated_at, status,"
+                    " next_orbit_review_at, next_history_review_at, reason_code)"
+                    " VALUES (:id, 1, 'early-scout-v1', 'geckoterminal', 'robinhood', 'mainnet',"
+                    " :pair, false, '{}'::jsonb, now(), now(), :obs, now(), now(), 'WATCHING',"
+                    " now(), now(), 'WATCH_OPENED')"
+                ),
+                {"id": watch, "pair": pair, "obs": observation},
+            )
+    return pair, observation
 
 
 SETTLED = datetime(2026, 9, 28, 6, tzinfo=UTC)
 
 ROW = (
-    "INSERT INTO discovery_watch_fast_assessments (id, watch_id, snapshot_id, utc_day,"
-    " reserved_at, assessed_at, status, provider, model, question_version,"
-    " input_schema_version, input_digest, input_payload, answers, failure_category)"
-    " VALUES (:id, :watch, :obs, current_date, now(), :assessed, :status, 'jev', 'jev-1.13.0',"
-    " :version, 1, 'd', '{\"schema_version\": 1}'::jsonb, CAST(:answers AS jsonb), :failure)"
+    "INSERT INTO discovery_fast_assessments (id, market_provider, chain, network, pair_id,"
+    " is_fixture, snapshot_id, utc_day, reserved_at, assessed_at, status, provider, model,"
+    " question_version, input_schema_version, input_digest, input_payload, answers,"
+    " failure_category) VALUES (:id, 'geckoterminal', 'robinhood', 'mainnet', :pair, false,"
+    " :obs, current_date, now(), :assessed, :status, 'jev', 'jev-1.13.0', :version, 1, 'd',"
+    " '{\"schema_version\": 1}'::jsonb, CAST(:answers AS jsonb), :failure)"
 )
 
 
-def row(watch, obs, **overrides):
+def row(pair, obs, **overrides):
     values = {
         "id": uuid4(),
-        "watch": watch,
+        "pair": pair,
         "obs": obs,
         "assessed": None,
         "status": "PENDING",
@@ -138,33 +140,31 @@ def test_the_chain_ends_at_0016():
 
 async def test_upgrade_creates_both_tables_empty(at_0015):
     await apply(at_0015)
-    assert {"discovery_stream_declines", "discovery_watch_fast_assessments"} <= await tables(
-        at_0015
-    )
+    assert {"discovery_stream_declines", "discovery_fast_assessments"} <= await tables(at_0015)
     async with at_0015.connect() as connection:
-        for table in ("discovery_stream_declines", "discovery_watch_fast_assessments"):
+        for table in ("discovery_stream_declines", "discovery_fast_assessments"):
             assert await connection.scalar(text(f"SELECT count(*) FROM {table}")) == 0
 
 
-async def test_an_assessment_must_point_at_a_real_watch(at_0015):
+async def test_an_assessment_must_point_at_a_real_observation(at_0015):
     await apply(at_0015)
-    _, obs = await a_watch_and_observation(at_0015)
+    pair, obs = await an_observation(at_0015)
     with pytest.raises(IntegrityError):
         async with at_0015.begin() as connection:
-            await connection.execute(text(ROW), row(uuid4(), obs))
+            await connection.execute(text(ROW), row(pair, uuid4()))
 
 
-async def test_one_assessment_per_watch_and_question_set(at_0015):
+async def test_one_assessment_per_stream_and_question_set(at_0015):
     await apply(at_0015)
-    watch, obs = await a_watch_and_observation(at_0015)
+    pair, obs = await an_observation(at_0015)
     async with at_0015.begin() as connection:
-        await connection.execute(text(ROW), row(watch, obs))
+        await connection.execute(text(ROW), row(pair, obs))
     with pytest.raises(IntegrityError):
         async with at_0015.begin() as connection:
-            await connection.execute(text(ROW), row(watch, obs))
+            await connection.execute(text(ROW), row(pair, obs))
     # A later question set is a different assessment.
     async with at_0015.begin() as connection:
-        await connection.execute(text(ROW), row(watch, obs, version="jev-scout-v2"))
+        await connection.execute(text(ROW), row(pair, obs, version="jev-scout-v2"))
 
 
 @pytest.mark.parametrize(
@@ -179,21 +179,21 @@ async def test_one_assessment_per_watch_and_question_set(at_0015):
 )
 async def test_the_database_refuses_an_inconsistent_assessment(at_0015, overrides):
     await apply(at_0015)
-    watch, obs = await a_watch_and_observation(at_0015)
+    pair, obs = await an_observation(at_0015)
     with pytest.raises(IntegrityError):
         async with at_0015.begin() as connection:
-            await connection.execute(text(ROW), row(watch, obs, **overrides))
+            await connection.execute(text(ROW), row(pair, obs, **overrides))
 
 
 async def test_answers_round_trip_as_jsonb(at_0015):
     await apply(at_0015)
-    watch, obs = await a_watch_and_observation(at_0015)
+    pair, obs = await an_observation(at_0015)
     answers = {"anomaly_signal": {"type": "noul", "noul": 0.2}}
     async with at_0015.begin() as connection:
         await connection.execute(
             text(ROW),
             row(
-                watch,
+                pair,
                 obs,
                 status="COMPLETED",
                 assessed=SETTLED,
@@ -201,10 +201,7 @@ async def test_answers_round_trip_as_jsonb(at_0015):
             ),
         )
         stored = await connection.scalar(
-            text(
-                "SELECT answers -> 'anomaly_signal' ->> 'noul'"
-                " FROM discovery_watch_fast_assessments"
-            )
+            text("SELECT answers -> 'anomaly_signal' ->> 'noul' FROM discovery_fast_assessments")
         )
     assert stored == "0.2"
 
@@ -228,5 +225,21 @@ async def test_downgrade_removes_only_what_0016_added(at_0015):
     await apply(at_0015, "downgrade")
     remaining = await tables(at_0015)
     assert "discovery_stream_declines" not in remaining
-    assert "discovery_watch_fast_assessments" not in remaining
+    assert "discovery_fast_assessments" not in remaining
     assert {"discovery_watches", "discovery_watch_assessments", "scout_runs"} <= remaining
+
+
+@pytest.mark.parametrize("with_watch", [False, True], ids=["declined", "watched"])
+async def test_no_watch_is_needed_and_a_watch_is_found_by_the_stream_key(at_0015, with_watch):
+    await apply(at_0015)
+    pair, obs = await an_observation(at_0015, with_watch=with_watch)
+    async with at_0015.begin() as connection:
+        await connection.execute(text(ROW), row(pair, obs))
+        linked = await connection.scalar(
+            text(
+                "SELECT count(*) FROM discovery_fast_assessments f JOIN discovery_watches w"
+                " ON (w.provider, w.chain, w.network, w.pair_id, w.is_fixture)"
+                " = (f.market_provider, f.chain, f.network, f.pair_id, f.is_fixture)"
+            )
+        )
+    assert linked == (1 if with_watch else 0)

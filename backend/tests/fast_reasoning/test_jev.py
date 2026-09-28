@@ -212,8 +212,8 @@ def test_jev_is_disabled_by_default_and_a_key_alone_selects_nothing(monkeypatch)
     assert configured.fast_reasoning_provider == "disabled"
     assert configured.jev_model == "jev-1.13.0"
     assert (configured.jev_max_assessments_per_run, configured.jev_max_assessments_per_day) == (
-        10,
-        960,
+        20,
+        1920,
     )
 
 

@@ -331,6 +331,33 @@ class WatchRepository:
             row.updated_at = now
             return SyncResult.UPDATED
 
+    async def declined(self, identities: list[MarketIdentity]) -> set[str]:
+        """Pair ids among these streams that the watch limit already turned away."""
+        if not identities:
+            return set()
+        row = DiscoveryStreamDeclineRow
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(row.provider, row.chain, row.network, row.pair_id, row.is_fixture).where(
+                        row.pair_id.in_({identity.pair_id for identity in identities})
+                    )
+                )
+            ).all()
+        keys = {tuple(item) for item in rows}
+        return {
+            identity.pair_id
+            for identity in identities
+            if (
+                identity.provider,
+                identity.chain,
+                identity.network,
+                identity.pair_id,
+                identity.is_fixture,
+            )
+            in keys
+        }
+
     async def decline(self, snapshot: MarketSnapshot, *, now: datetime, reason: str) -> bool:
         """Mark a stream the watch limit turned away. Idempotent; True if new."""
         identity = snapshot.pair.market_identity

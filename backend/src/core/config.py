@@ -119,11 +119,12 @@ class Settings(BaseSettings):
     jev_model: str = Field(default="jev-1.13.0", min_length=1, max_length=80)
     jev_base_url: str = Field(default="https://api.typesafe.ai", min_length=1, max_length=200)
     jev_timeout_seconds: int = Field(default=10, ge=1, le=60)
-    # At most one assessment per new watch; the per-run bound matches the
-    # per-run watch limit and the daily bound is the most that limit can ever
-    # open in a day (10 x 96 runs).
-    jev_max_assessments_per_run: int = Field(default=10, ge=0, le=50)
-    jev_max_assessments_per_day: int = Field(default=960, ge=0, le=5000)
+    # One assessment per new discovery candidate, declined ones included. The
+    # per-run bound covers a full discovery (10 pools x 2 chains); the daily
+    # bound is that for every 15-minute run (20 x 96). Rate limits are 1,200
+    # requests/min, so neither bound is set by the provider.
+    jev_max_assessments_per_run: int = Field(default=20, ge=0, le=50)
+    jev_max_assessments_per_day: int = Field(default=1920, ge=0, le=5000)
     orbit_worker_enabled: bool = False
     orbit_input_max_age_seconds: int = Field(default=900, ge=30, le=86400)
     orbit_discovery_liquidity_floor_usd: Decimal = Field(

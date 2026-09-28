@@ -210,9 +210,10 @@ class Tally:
     rejections: dict[str, int] = field(default_factory=dict)
     watches_created: int = 0
     watches_updated: int = 0
-    # Streams the per-run watch limit turned away, and the pairs this run opened.
+    # Streams the per-run watch limit turned away (still observed and assessed).
     watches_declined: int = 0
-    created_pairs: list[str] = field(default_factory=list)
+    # New discovery candidates for JEV-0, fixed before watch allocation.
+    shadow_candidates: list[MarketSnapshot] = field(default_factory=list)
     refreshed: int = 0
     watches_due_orbit: int = 0
     orbit_reviews_started: int = 0
@@ -346,7 +347,7 @@ class EarlyScoutCycle:
                 await self._scheduled(transport, directory, recorder, fresh, tally)
                 # Last, after every review and check: shadow work cannot change
                 # what the run already decided, nor delay it.
-                await self._shadow(fresh, tally)
+                await self._shadow(tally)
         except SystemPauseUnavailable:
             tally.stop = "SYSTEM_STOPPED"
             tally.fail("SYSTEM_STOP_UNREADABLE")
@@ -369,29 +370,46 @@ class EarlyScoutCycle:
             )
         return summary.model_copy(update={"run_id": run_id})
 
-    async def _shadow(self, fresh: dict[str, MarketSnapshot], tally: Tally) -> None:
-        """One JEV shadow assessment per watch this run opened. Never raises.
+    async def _freeze_candidates(self, ordered: list[MarketSnapshot], tally: Tally) -> None:
+        """Every new valid stream of this discovery, in the neutral chain order.
 
-        Only watches this run created are asked — no backfill of older ones —
-        and every outcome, including a store that cannot be written, stays in
-        the shadow tally instead of the run's errors.
+        New means never observed before this run and without a watch. Only
+        looked up when a fast provider is configured; the lookup reads and
+        never writes, and a failure empties the shadow set instead of the run.
         """
-        if self._ports.fast is None or not tally.created_pairs:
+        if self._ports.fast is None:
+            return
+        store = FastAssessmentStore(self._sessions)
+        try:
+            for snapshot in ordered:
+                if await store.is_new_candidate(snapshot):
+                    tally.shadow_candidates.append(snapshot)
+        except (SQLAlchemyError, OSError):
+            tally.shadow_candidates.clear()
+            tally.shadow.failure("SHADOW_STORE_UNAVAILABLE")
+
+    async def _shadow(self, tally: Tally) -> None:
+        """One JEV-0 shadow assessment per new discovery candidate. Never raises.
+
+        Runs after every review and check. The candidates were fixed before
+        watch allocation, so declined streams are assessed as well; nothing
+        older is backfilled; every outcome, including a store that cannot be
+        written, stays in the shadow tally instead of the run's errors.
+        """
+        if self._ports.fast is None or not tally.shadow_candidates:
             return
         try:
-            opened: list[tuple[DiscoveryWatch, MarketSnapshot]] = []
-            for pair in tally.created_pairs:
-                watch = await self._watches.by_pair(pair)
-                snapshot = fresh.get(pair)
-                if watch is not None and snapshot is not None:
-                    opened.append((watch, snapshot))
             triage = ShadowTriage(
                 store=FastAssessmentStore(self._sessions),
                 provider=self._ports.fast,
                 per_run=self._settings.jev_max_assessments_per_run,
                 per_day=self._settings.jev_max_assessments_per_day,
             )
-            tally.shadow = await triage.run(opened, self._clock.now, safe_code)
+            result = await triage.run(tally.shadow_candidates, self._clock.now, safe_code)
+            result.failed += tally.shadow.failed
+            for code, count in tally.shadow.failure_codes.items():
+                result.failure_codes[code] = result.failure_codes.get(code, 0) + count
+            tally.shadow = result
         except (SQLAlchemyError, OSError):
             tally.shadow.failure("SHADOW_STORE_UNAVAILABLE")
 
@@ -457,20 +475,35 @@ class EarlyScoutCycle:
                 recorded[snapshot.pair.pair_id] = snapshot
                 batch.append(snapshot)
             by_chain.append(batch)
+        ordered = round_robin(by_chain)
+        # The JEV-0 candidate set is fixed here, from discovery alone and before
+        # any watch is allocated: a stream the limit turns away is a candidate
+        # exactly like one that becomes a watch.
+        await self._freeze_candidates(ordered, tally)
         limit = self._settings.early_scout_max_new_watches_per_run
-        for snapshot in round_robin(by_chain):
+        # A stream the limit turned away once never becomes a watch later, not by
+        # bootstrap and not by being discovered again: the slots of later runs go
+        # to genuinely new pools.
+        declined = await self._watches.declined(
+            [snapshot.pair.market_identity for snapshot in ordered]
+        )
+        for snapshot in ordered:
             now = self._clock.now()
             result = await self._watches.sync(
-                snapshot, now=now, allow_create=tally.watches_created < limit
+                snapshot,
+                now=now,
+                allow_create=tally.watches_created < limit
+                and snapshot.pair.pair_id not in declined,
             )
             if result is SyncResult.CREATED:
                 tally.watches_created += 1
-                tally.created_pairs.append(snapshot.pair.pair_id)
             elif result is SyncResult.UPDATED:
                 tally.watches_updated += 1
-            elif result is SyncResult.SKIPPED:
-                await self._watches.decline(snapshot, now=now, reason="WATCH_LIMIT_REACHED")
-                tally.watches_declined += 1
+            elif result is SyncResult.SKIPPED and snapshot.pair.pair_id not in declined:
+                if await self._watches.decline(
+                    snapshot, now=now, reason="NOT_OPENED_AS_WATCH_DUE_TO_WATCH_LIMIT"
+                ):
+                    tally.watches_declined += 1
         return recorded
 
     async def _record(
@@ -968,6 +1001,7 @@ class EarlyScoutCycle:
                 ModelFailureCount(provider=provider, category=category, reason_code=code, count=n)
                 for (provider, category, code), n in sorted(tally.model_failure_reasons.items())
             )[:32],
+            shadow_candidates=len(tally.shadow_candidates),
             shadow_assessments_started=tally.shadow.started,
             shadow_assessments_completed=tally.shadow.completed,
             shadow_assessments_failed=tally.shadow.failed,

@@ -120,9 +120,15 @@ export type FastAnswer =
       confidence: number;
     };
 
+// Evidence about a discovered stream, not a watch: candidates the watch limit
+// declined have these too. A watch shows the ones for its own stream.
 export type FastAssessment = {
   id: string;
-  watch_id: string;
+  market_provider: string;
+  chain: string;
+  network: string;
+  pair_id: string;
+  is_fixture: boolean;
   snapshot_id: string;
   reserved_at: string;
   assessed_at: string | null;

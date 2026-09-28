@@ -21,8 +21,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.data.repository import aware
 from src.data.tables import (
+    DiscoveryFastAssessmentRow,
     DiscoveryWatchAssessmentRow,
-    DiscoveryWatchFastAssessmentRow,
     DiscoveryWatchRow,
 )
 from src.runner.models import Immutable
@@ -60,6 +60,10 @@ class ShadowSummary(Immutable):
     sample: int
     signals: dict[str, QuestionSignal]
     by_chain: dict[str, int]
+    # Settled assessments in the sample whose stream became a watch, and those
+    # that did not (declined by the watch limit, or not opened yet).
+    with_watch: int
+    without_watch: int
     versus_codex: tuple[CodexComparison, ...]
     outcomes: Literal["NOT_YET_LABELLED"] = "NOT_YET_LABELLED"
 
@@ -96,7 +100,7 @@ class ShadowReadService:
     sessions: async_sessionmaker[AsyncSession]
 
     async def summary(self) -> ShadowSummary:
-        row = DiscoveryWatchFastAssessmentRow
+        row = DiscoveryFastAssessmentRow
         async with self.sessions() as session:
             total = int(await session.scalar(select(func.count()).select_from(row)) or 0)
             by_status = await self._group(session, row.status)
@@ -104,22 +108,47 @@ class ShadowReadService:
             failures = await self._group(session, row.failure_reason_code, row.status == "FAILED")
             recent = (
                 await session.execute(
-                    select(row.watch_id, row.reserved_at, row.answers, row.latency_ms, row.status)
+                    select(
+                        row.market_provider,
+                        row.chain,
+                        row.network,
+                        row.pair_id,
+                        row.is_fixture,
+                        row.reserved_at,
+                        row.answers,
+                        row.latency_ms,
+                        row.status,
+                    )
                     .where(row.status != "PENDING")
                     .order_by(row.reserved_at.desc(), row.id.desc())
                     .limit(SAMPLE)
                 )
             ).all()
-            watch_ids = [item.watch_id for item in recent]
-            chain_rows = (
+            # A watch, where one exists, by the same stream key. Assessed streams
+            # without a watch stay in every count; they just have no Codex view.
+            watch_rows = (
                 await session.execute(
-                    select(DiscoveryWatchRow.id, DiscoveryWatchRow.chain).where(
-                        DiscoveryWatchRow.id.in_(watch_ids)
-                    )
+                    select(
+                        DiscoveryWatchRow.id,
+                        DiscoveryWatchRow.provider,
+                        DiscoveryWatchRow.chain,
+                        DiscoveryWatchRow.network,
+                        DiscoveryWatchRow.pair_id,
+                        DiscoveryWatchRow.is_fixture,
+                    ).where(DiscoveryWatchRow.pair_id.in_({item.pair_id for item in recent}))
                 )
             ).all()
-            chains: dict[UUID, str] = {watch_id: chain for watch_id, chain in chain_rows}
-            codex = await self._codex_reviews(session, watch_ids)
+            watches: dict[tuple[str, str, str, str, bool], UUID] = {
+                (item.provider, item.chain, item.network, item.pair_id, item.is_fixture): item.id
+                for item in watch_rows
+            }
+            codex = await self._codex_reviews(session, list(watches.values()))
+
+        def watch_of(item: Any) -> UUID | None:
+            return watches.get(
+                (item.market_provider, item.chain, item.network, item.pair_id, item.is_fixture)
+            )
+
         latencies = [item.latency_ms for item in recent if item.latency_ms is not None]
         values: dict[str, list[float]] = defaultdict(list)
         buckets: dict[str, Counter[str]] = defaultdict(Counter)
@@ -130,8 +159,14 @@ class ShadowReadService:
                 continue
             # The first ORBIT classification strictly after this shadow assessment.
             reserved = aware(item.reserved_at)
+            watch_id = watch_of(item)
             later = next(
-                (review for review in codex.get(item.watch_id, ()) if review[0] > reserved), None
+                (
+                    review
+                    for review in (codex.get(watch_id, ()) if watch_id is not None else ())
+                    if review[0] > reserved
+                ),
+                None,
             )
             for name, answer in item.answers.items():
                 kinds[name] = str(answer.get("type"))
@@ -170,7 +205,9 @@ class ShadowReadService:
             latency_ms_p95=_percentile(latencies, 0.95),
             sample=len(recent),
             signals=signals,
-            by_chain=dict(Counter(chains.get(item.watch_id, "unknown") for item in recent)),
+            by_chain=dict(Counter(item.chain for item in recent)),
+            with_watch=sum(1 for item in recent if watch_of(item) is not None),
+            without_watch=sum(1 for item in recent if watch_of(item) is None),
             versus_codex=versus,
         )
 
@@ -178,7 +215,7 @@ class ShadowReadService:
     async def _group(
         session: AsyncSession, column: Any, *where: ColumnElement[bool]
     ) -> dict[str, int]:
-        query = select(column, func.count()).select_from(DiscoveryWatchFastAssessmentRow)
+        query = select(column, func.count()).select_from(DiscoveryFastAssessmentRow)
         for condition in where:
             query = query.where(condition)
         rows = (await session.execute(query.group_by(column))).all()

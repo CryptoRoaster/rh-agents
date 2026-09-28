@@ -394,3 +394,22 @@ async def test_an_empty_shadow_summary_is_empty_not_an_error(client):
     http, _, _ = client
     summary = (await http.get("/api/scout/shadow/summary")).json()
     assert summary["total"] == 0 and summary["signals"] == {} and summary["versus_codex"] == []
+
+
+async def test_the_summary_counts_candidates_that_never_became_watches(client):
+    """A declined candidate is assessed and summarised; it only lacks a Codex view."""
+    from tests.scout.test_shadow import ScriptedFast
+
+    http, sessions, _ = client
+    await scout(
+        sessions,
+        T0,
+        provider=MarketProvider(discovery=[young(0), young(1)]),
+        orbit=EchoOrbit(),
+        fast=ScriptedFast(),
+        settings=scout_settings(early_scout_max_new_watches_per_run=1),
+    )
+    summary = (await http.get("/api/scout/shadow/summary")).json()
+    assert summary["total"] == 2
+    assert (summary["with_watch"], summary["without_watch"]) == (1, 1)
+    assert summary["by_chain"] == {"robinhood": 2}
