@@ -1,6 +1,7 @@
 """The sweep inside a full PAPER run: composed only when configured, reported always."""
 
 from src.orchestration.exitpolicy.service import AutoExitService
+from src.orchestration.paperexit.exitread import UnavailableExitRead
 from src.runner.service import BoundedPaperRun
 from tests.runner.conftest import record_market, runner_settings, stack_for
 
@@ -27,6 +28,9 @@ async def test_enabled_sweeps_before_intake_and_reports_counts(risk_db, now):
     stack = stack_for(sessions, runner_settings(**FIXTURE_POLICY), now)
     assert isinstance(stack.exits, AutoExitService)
     assert stack.exits.policy.max_holding_seconds == 360 * 60
+    # No chain source configured here: exits are refused by name, never judged
+    # on the entry's evidence.
+    assert isinstance(stack.exits.exits.exit_read, UnavailableExitRead)
     summary = await BoundedPaperRun(stack).execute()
     assert summary.exits is not None
     assert (summary.exits.evaluated, summary.exits.executed) == (0, 0)

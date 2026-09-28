@@ -304,3 +304,94 @@ def test_new_risk_payload_requires_nonnegative_capacity(intent, market, context,
     del data["max_additional_notional_usd"]
     with pytest.raises(ValidationError):
         RiskDecision.model_validate(data)
+
+
+# ------------------------------------------------------- BUY and SELL semantics
+
+
+def _thin(market, liquidity="50000"):
+    return market.model_copy(
+        update={
+            "liquidity": market.liquidity.model_copy(update={"liquidity_usd": Decimal(liquidity)})
+        }
+    )
+
+
+def _concentrated(market):
+    holders = market.holders.model_copy(
+        update={"top_ten_fraction": Decimal("0.9"), "concentration_check": SafetyStatus.FAIL}
+    )
+    return market.model_copy(update={"holders": holders})
+
+
+def _holding(intent, context):
+    sell = intent.model_copy(update={"side": Side.SELL})
+    return sell, context.model_copy(update={"position_quantity": intent.quantity})
+
+
+def test_a_buy_keeps_every_entry_bar(intent, market, context, now):
+    """The entry is judged exactly as before: thin and concentrated both reject."""
+    thin = evaluate(intent, _thin(market), context, RiskLimits(), now=now)
+    assert thin.outcome == RiskOutcome.REJECT
+    assert thin.reason_codes == ("INSUFFICIENT_LIQUIDITY",)
+    held = evaluate(intent, _concentrated(market), context, RiskLimits(), now=now)
+    assert held.outcome == RiskOutcome.REJECT
+    assert held.reason_codes == ("HOLDERS_FAIL", "HOLDER_CONCENTRATION_LIMIT")
+
+
+def test_a_sale_is_not_held_to_the_entry_bars(intent, market, context, now):
+    sell, context = _holding(intent, context)
+    thin = evaluate(sell, _thin(market), context, RiskLimits(), now=now)
+    assert thin.outcome == RiskOutcome.APPROVE
+    concentrated = evaluate(sell, _concentrated(market), context, RiskLimits(), now=now)
+    assert concentrated.outcome == RiskOutcome.APPROVE
+
+
+@pytest.mark.parametrize(
+    "change,code",
+    [
+        ("empty_pool", "INSUFFICIENT_LIQUIDITY"),
+        ("unknown_liquidity", "LIQUIDITY_UNKNOWN"),
+        ("unknown_holders", "HOLDERS_UNKNOWN"),
+        ("unmeasured_holders", "HOLDER_METRICS_UNKNOWN"),
+        ("token_fail", "TOKEN_FAIL"),
+        ("routing_unknown", "ROUTING_UNKNOWN"),
+        ("stale_holders", "STALE_OR_FUTURE_SAFETY_DATA"),
+    ],
+)
+def test_a_sale_still_fails_closed(intent, market, context, now, change, code):
+    sell, context = _holding(intent, context)
+    liquidity, holders, token = market.liquidity, market.holders, market.token
+    if change == "empty_pool":
+        market = _thin(market, "0")
+    elif change == "unknown_liquidity":
+        market = market.model_copy(
+            update={"liquidity": liquidity.model_copy(update={"liquidity_usd": None})}
+        )
+    elif change == "unknown_holders":
+        market = market.model_copy(
+            update={
+                "holders": holders.model_copy(update={"concentration_check": SafetyStatus.UNKNOWN})
+            }
+        )
+    elif change == "unmeasured_holders":
+        market = market.model_copy(
+            update={"holders": holders.model_copy(update={"top_ten_fraction": None})}
+        )
+    elif change == "token_fail":
+        market = market.model_copy(
+            update={"token": token.model_copy(update={"tradable": SafetyStatus.FAIL})}
+        )
+    elif change == "routing_unknown":
+        market = market.model_copy(
+            update={"liquidity": liquidity.model_copy(update={"routing": SafetyStatus.UNKNOWN})}
+        )
+    else:
+        market = market.model_copy(
+            update={
+                "holders": holders.model_copy(update={"created_at": now - timedelta(minutes=1)})
+            }
+        )
+    risk = evaluate(sell, market, context, RiskLimits(), now=now)
+    assert risk.outcome == RiskOutcome.REJECT
+    assert code in risk.reason_codes

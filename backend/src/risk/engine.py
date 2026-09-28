@@ -18,6 +18,8 @@ from src.core.models import (
 from src.core.numbers import quantize
 
 BPS = Decimal("10000")
+# The order safety checks report in, unchanged from when they were one mapping.
+ORDER = {"TOKEN": 0, "ROUTING": 1, "HOLDERS": 2, "ACCOUNTING": 3}
 
 
 def _additional_buy_notional(
@@ -97,27 +99,38 @@ def evaluate(
         or any((timing.tx_signed_at, timing.tx_sent_at, timing.tx_confirmed_at))
     ):
         reasons.append("INVALID_OR_STALE_INTENT_TIMING")
+    # A purchase is judged on whether the market is good enough to enter; a sale
+    # only on whether the holding can safely be sold there. The entry-quality
+    # bars — holder concentration and minimum pool liquidity — therefore bind
+    # BUY alone: a concentrated or thinning market is a reason to leave it, not
+    # a reason to stay. Everything that says whether a sale is possible and
+    # correctly valued binds both, and every UNKNOWN still fails closed.
+    buying = intent.side == Side.BUY
     checks = {
         "TOKEN": market.token.tradable,
         "ROUTING": market.liquidity.routing,
-        "HOLDERS": market.holders.concentration_check,
         "ACCOUNTING": context.accounting,
     }
-    for name, status in checks.items():
+    if buying or market.holders.concentration_check == SafetyStatus.UNKNOWN:
+        # For a sale only an unestablished holder domain vetoes; a measured
+        # concentration FAIL is an entry verdict.
+        checks = {**checks, "HOLDERS": market.holders.concentration_check}
+    for name, status in sorted(checks.items(), key=lambda item: ORDER[item[0]]):
         if status != SafetyStatus.PASS:
             reasons.append(f"{name}_{status.value}")
     liquidity = market.liquidity.liquidity_usd
     slippage = market.liquidity.estimated_slippage_bps
     if market.holders.holder_count is None or market.holders.top_ten_fraction is None:
         reasons.append("HOLDER_METRICS_UNKNOWN")
-    elif (
+    elif buying and (
         market.holders.holder_count == 0
         or market.holders.top_ten_fraction > limits.max_top_ten_holder_fraction
     ):
         reasons.append("HOLDER_CONCENTRATION_LIMIT")
     if liquidity is None:
         reasons.append("LIQUIDITY_UNKNOWN")
-    elif liquidity < limits.min_liquidity_usd:
+    elif (liquidity < limits.min_liquidity_usd) if buying else (liquidity <= 0):
+        # A sale needs a pool that exists, not one deep enough to enter.
         reasons.append("INSUFFICIENT_LIQUIDITY")
     if slippage is None:
         reasons.append("SLIPPAGE_UNKNOWN")

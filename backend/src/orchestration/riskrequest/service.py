@@ -72,6 +72,7 @@ from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
     EvidenceEnvelope,
     EvidenceType,
+    HolderDistributionFacts,
     LiquidityExecutionPayload,
     OnchainPayload,
     TradeCase,
@@ -619,6 +620,47 @@ def risk_market(
         or liquidity.value_usd is None
     ):  # pragma: no cover - guarded by the completeness check
         raise RiskRequestUnavailable("CANONICAL_INPUTS_INCONSISTENT")
+    return market_view(
+        base_asset_id=base_asset_id,
+        price=price,
+        base_asset=base_asset,
+        snapshot=snapshot,
+        onchain=payload,
+        holders=holders,
+        # ANCHOR established an executable route at a tested size, which is
+        # what this field asks. It is not a claim about the price.
+        routing=SafetyStatus.PASS,
+        costs=costs,
+        correlation_id=correlation_id,
+        identity_key=identity_key,
+        side=side,
+    )
+
+
+def market_view(
+    *,
+    base_asset_id: str,
+    price: ReferencePrice,
+    base_asset: BaseAssetMetadata,
+    snapshot: RecordedMarket,
+    onchain: OnchainPayload,
+    holders: HolderDistributionFacts,
+    routing: SafetyStatus,
+    costs: PaperCostAssumptions,
+    correlation_id: UUID,
+    identity_key: str,
+    side: Side,
+) -> MarketSnapshot:
+    """SENTINEL's market view from established facts, whoever established them.
+
+    `risk_market` supplies the entry's evidence; a PAPER exit supplies its own
+    fresh read. Either way each nested observation keeps its source's instant.
+    An unavailable liquidity reading is carried as unknown, for SENTINEL to
+    refuse, never replaced.
+    """
+    payload = onchain
+    liquidity = snapshot.liquidity
+    available = liquidity.status is Availability.AVAILABLE and liquidity.value_usd is not None
 
     def identity(label: str) -> UUID:
         return uuid5(NAMESPACE_URL, f"rh-agents:risk-market:{identity_key}:{label}")
@@ -649,9 +691,11 @@ def risk_market(
     # `min_liquidity_usd` cannot be lifted over it. A sub-precision reading
     # becomes zero, which the engine rejects as insufficient liquidity. A
     # reading too large for the ledger is refused rather than capped.
-    if not fits_ledger(liquidity.value_usd):
-        raise RiskRequestUnavailable("LIQUIDITY_OUTSIDE_ACCOUNTING_PRECISION")
-    liquidity_usd = quantize_down(liquidity.value_usd)
+    liquidity_usd: Decimal | None = None
+    if available and liquidity.value_usd is not None:
+        if not fits_ledger(liquidity.value_usd):
+            raise RiskRequestUnavailable("LIQUIDITY_OUTSIDE_ACCOUNTING_PRECISION")
+        liquidity_usd = quantize_down(liquidity.value_usd)
 
     price_at = price.observed_at
     return MarketSnapshot(
@@ -685,9 +729,7 @@ def risk_market(
             correlation_id=correlation_id,
             asset_id=base_asset_id,
             liquidity_usd=liquidity_usd,
-            # ANCHOR established an executable route at a tested size, which is
-            # what this field asks. It is not a claim about the price.
-            routing=SafetyStatus.PASS,
+            routing=routing,
             # A configured simulation assumption, never a measured fill cost and
             # never ANCHOR's execution deviation.
             estimated_slippage_bps=costs.slippage_bps,

@@ -32,8 +32,8 @@ Unknown data never triggers the exit it cannot prove: no fresh mark, no price
 exit; no fresh liquidity, no invalidation. Protective triggers come first.
 
 **SENTINEL mapping.** Only the liquidity floor maps cleanly onto a held
-position. The holder-concentration bound needs fresh ATLAS evidence, which a
-filled case does not receive, so it is not re-evaluated here.
+position as a trigger; the holder-concentration bound is an entry verdict and
+not a trigger (see "BUY vs. SELL" below).
 
 ## What is stored
 
@@ -50,18 +50,49 @@ Key `auto-exit:PAPER_EXIT_V1:<cycle>:<UTC minute>`: a retry inside the minute
 finds its own order. The database allows one exit per cycle, so no later run can
 sell a holding twice; a closed position is no longer swept.
 
-## Known limits of the existing exit path (not relaxed)
+## The exit's own risk read
 
-- **Entry-evidence freshness.** The SELL check judges the case's ATLAS evidence
-  against `max_snapshot_age_seconds` (30 s by default), and a filled case is
-  terminal and cannot take new evidence. After that window every triggered exit
-  is refused with `SOURCE_OLDER_THAN_RISK_LIMIT` (later `RISK_DATA_INCOMPLETE`)
-  and the position stays open. Making auto exits executable hours after entry
-  needs a separate decision on how a held position's risk data is refreshed for
-  the exit; loosening the bound is not an option.
-- **Invalidation vs. SENTINEL.** SENTINEL's liquidity floor binds sales too, so
-  a `SENTINEL_INVALIDATION` exit is rejected by the SELL check
-  (`EXIT_RISK_REFUSED`). The trigger is reported; nothing is sold.
+A sale is never judged on the entry's evidence: that belongs to a terminal case,
+ages past SENTINEL's 30 s bound within seconds and must not be reopened. Each
+exit takes its own read, before the account lock:
+
+- **On-chain:** `AtlasExitRead` — ATLAS's deterministic half only: the same
+  chain, holder and origin ports, `AtlasSnapshotBuilder`, the versioned ATLAS
+  policy and the same payload derivation the worker submits. No model, nothing
+  written to the case. Stored on the exit as `basis.exit_onchain` (policy
+  version, snapshot digest, payload) with `basis.exit_basis = FRESH_EXIT_READ`.
+- **Market:** the held pair's latest recorded snapshot (the PAPER run's
+  acquisition re-observes markets of open positions before the sweep).
+- **Routing:** the pool the holding was bought in, observed again with
+  liquidity > 0; otherwise `UNKNOWN`.
+
+Missing inputs refuse the sale: `EXIT_READ_UNAVAILABLE` (no chain source, read
+failed, or read for another case) and `EXIT_DATA_INCOMPLETE` (no market,
+price, token metadata, cost basis or holder measurement). Stale inputs refuse
+with `SOURCE_OLDER_THAN_RISK_LIMIT`. With auto exits enabled the service is
+always composed with a fresh read; without a chain source it is
+`UnavailableExitRead`, never a fallback to entry evidence. A service composed
+without any exit read (manual exits, as before) still judges on the entry's
+evidence and refuses once that is older than the bound.
+
+## BUY vs. SELL in SENTINEL
+
+`src/risk/engine.py` judges a BUY exactly as before. For a SELL the two
+entry-quality bars no longer apply:
+
+| Check | BUY | SELL |
+|---|---|---|
+| minimum pool liquidity (`min_liquidity_usd`) | reject below | reject only if unknown or ≤ 0 |
+| holder concentration limit / holder `FAIL` | reject | not applied |
+| holder domain `UNKNOWN`, holder metrics unknown | reject | reject |
+| token contract integrity, routing, accounting | reject unless PASS | reject unless PASS |
+| stale/future market or safety data, intent timing | reject | reject |
+| slippage, fees, portfolio data, kill switch, mode, daily loss | reject | reject |
+| insufficient position | – | reject |
+
+A concentrated or thinning market is a reason to leave, not to stay.
+Everything that decides whether a sale is possible and correctly valued still
+binds, and every UNKNOWN still fails closed.
 
 Refusals are counted per code in the run summary (`exits.refusals`).
 

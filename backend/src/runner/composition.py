@@ -58,6 +58,11 @@ from src.orchestration.costs.models import PaperCostReading, paper_cost_assumpti
 from src.orchestration.exitpolicy.policy import PaperExitPolicy
 from src.orchestration.exitpolicy.service import AutoExitService
 from src.orchestration.paper import PaperTradingService
+from src.orchestration.paperexit.exitread import (
+    AtlasExitRead,
+    ExitOnchainReadPort,
+    UnavailableExitRead,
+)
 from src.orchestration.paperexit.service import PaperExitService
 from src.orchestration.riskrequest.service import RiskRequestService
 from src.orchestration.worker.runner import CapabilityProvider, WorkerHandler, WorkerRunner
@@ -306,6 +311,32 @@ class RunnerStack:
         )
 
 
+def _exit_read(settings: Settings, ports: RunnerPorts, clock: Clock) -> ExitOnchainReadPort:
+    """ATLAS's deterministic collector and policy, composed for a sale.
+
+    The same chain, holder and origin sources the ATLAS worker is built on, and
+    no model: an exit's on-chain basis is facts and policy only.
+    """
+    if ports.onchain is None:
+        return UnavailableExitRead(ports.onchain_unavailable)
+    from src.agents.atlas.context import AtlasSnapshotBuilder
+    from src.agents.atlas.sources.factory import holder_sources, origin_sources
+
+    return AtlasExitRead(
+        builder=AtlasSnapshotBuilder(
+            contracts=ports.onchain,  # type: ignore[arg-type]
+            holders=ports.holders  # type: ignore[arg-type]
+            if ports.holders is not None
+            else holder_sources(settings, clock=clock),
+            origins=ports.origins  # type: ignore[arg-type]
+            if ports.origins is not None
+            else origin_sources(settings),
+            clock=clock,
+        ),
+        clock=clock,
+    )
+
+
 def build_stack(
     settings: Settings,
     sessions: async_sessionmaker[AsyncSession],
@@ -408,6 +439,10 @@ def build_stack(
                 kill_switch=settings.commander_kill_switch,
                 pause=supplied.pause,
                 clock=tick,
+                # Always a fresh read for an automatic exit: the entry's evidence
+                # is never the basis of a sale hours later. Without a chain
+                # source every exit is refused by name, never judged on less.
+                exit_read=_exit_read(settings, supplied, tick),
             ),
             markets=markets,
             policy=PaperExitPolicy(
