@@ -16,7 +16,7 @@ from src.data.schema import expected_revision
 from src.runner.main import main
 from src.runner.models import ExitCode
 from src.runner.preflight import CheckStatus
-from tests.runner.test_preflight import check, named, preflight_settings
+from tests.runner.test_preflight import bare_settings, check, named, preflight_settings
 
 OTHER = "0006"
 
@@ -263,7 +263,9 @@ async def test_no_fact_source_means_nothing_to_report(risk_db, now, monkeypatch)
     _, sessions = risk_db
     await record_revisions(sessions, expected_revision())
 
-    reading = await check(sessions, preflight_settings(), now)
+    reading = await check(sessions, bare_settings(), now)
 
     assert "FACT_SOURCE_REACHABLE" not in {item.name for item in reading.checks}
-    assert reading.ready is True, reading
+    # Not ready, and only because the workflow's roles are off — nothing about
+    # an external source is claimed either way.
+    assert {item.reason for item in reading.blocked} == {"REQUIRED_ROLE_DISABLED"}

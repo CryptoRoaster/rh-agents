@@ -78,6 +78,11 @@ from src.runner.service import refuse
 Note = Annotated[str, Field(max_length=200, pattern=r"^[ -~]*$")]
 
 
+# A role the executed workflow requires evidence from, switched off while a PAPER
+# run is requested. Stable: operators and tests match on it.
+REQUIRED_ROLE_DISABLED = "REQUIRED_ROLE_DISABLED"
+
+
 class CheckStatus(StrEnum):
     """What this process actually established about one precondition."""
 
@@ -287,15 +292,29 @@ class Preflight:
         return found
 
     def _roles(self, stack: RunnerStack) -> list[Check]:
-        """Every specialist, as the composition itself reports it.
+        """Every specialist, as the composition itself reports it, against the workflow.
 
-        Three outcomes and they are not the same. A role that composed is ready.
-        A role somebody switched off is a decision, and reporting it as a
-        problem would teach an operator to ignore the list. A role that is on
-        and could not be built is the mistake this whole mode exists to surface,
-        and it is the same set `RunnerStack.misconfigured` refuses a run over.
+        Four outcomes and they are not the same. A role that composed is ready.
+        A role that is on and could not be built is the mistake this whole mode
+        exists to surface — the same set `RunnerStack.misconfigured` refuses a
+        run over — and keeps its own source reason. A role somebody switched off
+        is a decision *unless the workflow the run executes requires its
+        evidence*: then no case can ever reach risk, and the run this preflight
+        is about could not do what it is for. That is `REQUIRED_ROLE_DISABLED`.
+
+        The requirement is read from the workflow the stack's case service
+        executes, not restated here, and applies only when a PAPER run is
+        actually requested. A configuration that runs the scout alone asks for
+        no case at all, and its switched-off roles stay decisions.
         """
         broken = {item.role for item in stack.misconfigured}
+        requested = self._settings.paper_runner_enabled
+        workflow = stack.cases.policy
+        required = {
+            item.role.value: item.evidence_type.name
+            for item in workflow.requirements
+            if item.required
+        }
         found: list[Check] = []
         for role in stack.roles:
             name = f"ROLE_{role.role}"
@@ -307,6 +326,15 @@ class Preflight:
                         name,
                         role.reason or "ROLE_NOT_CONFIGURED",
                         "Enabled, and this configuration cannot build what it needs.",
+                    )
+                )
+            elif requested and role.role in required:
+                found.append(
+                    _blocked(
+                        name,
+                        REQUIRED_ROLE_DISABLED,
+                        f"Not enabled, and {workflow.version} requires its "
+                        f"{required[role.role]} evidence before any case can reach risk.",
                     )
                 )
             else:
