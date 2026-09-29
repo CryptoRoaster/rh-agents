@@ -13,7 +13,7 @@ import pytest
 from src.orchestration.riskdata.models import RiskDataGapCode, RiskFactKind
 from src.orchestration.riskdata.policy import RISK_DATA_V1
 from src.orchestration.workflow.models import EvidenceType
-from src.orchestration.workflow.policy import TRADE_CASE_V1
+from src.orchestration.workflow.policy import TRADE_CASE_V1, TRADE_CASE_V2
 from tests.riskdata.conftest import (
     RecordedMarkets,
     build_reader,
@@ -98,7 +98,10 @@ def test_the_blocker_scope_is_the_workflow_s_own_safety_table():
     """
     from src.orchestration.riskdata.context import RiskDataReader
 
-    assert RiskDataReader.workflow is TRADE_CASE_V1
+    # None: each case is read under the workflow it was opened with, whose own
+    # safety table is the only one consulted.
+    assert RiskDataReader.workflow is None
+    assert TRADE_CASE_V2.safety_types == TRADE_CASE_V1.safety_types
     safety = TRADE_CASE_V1.safety_types
     assert EvidenceType.SYNTHESIS not in safety
     assert EvidenceType.SENTIMENT not in safety

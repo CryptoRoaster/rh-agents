@@ -20,7 +20,7 @@ from src.orchestration.workflow.models import (
     WorkflowErrorCode,
     WorkflowFailure,
 )
-from src.orchestration.workflow.policy import TRADE_CASE_V1, WorkflowPolicy
+from src.orchestration.workflow.policy import TRADE_CASE_V1, WorkflowPolicy, policy_for
 from src.risk.authorization import RiskAuthorization, classify_risk_authorization
 
 # evidence_type, producer_role, evidence_id, schema_version, submission_fingerprint
@@ -151,6 +151,14 @@ def aged_out(item: EvidenceEnvelope, now: datetime) -> bool:
 
 
 class TradeCaseEvaluator:
+    """The one evaluator. Each case is judged under the workflow it was opened with.
+
+    `policy` is what a caller composed the service with (and what new cases are
+    opened under); it never decides how an existing case is read. A case's own
+    `workflow_version` does, so no default can re-judge an old case under new
+    rules, and a version this code does not implement fails closed.
+    """
+
     def __init__(self, policy: WorkflowPolicy = TRADE_CASE_V1) -> None:
         self.policy = policy
 
@@ -171,10 +179,11 @@ class TradeCaseEvaluator:
         if trade_case.expires_at is not None and now >= trade_case.expires_at:
             return Evaluation(TradeCaseStatus.EXPIRED, "TRADE_CASE_EXPIRED")
 
+        policy = policy_for(trade_case.workflow_version)
         current = active_evidence(evidence)
         pre_blockers: list[Blocker] = []
         pre_missing: list[Blocker] = []
-        for requirement in self.policy.requirements:
+        for requirement in policy.requirements:
             if not requirement.before_trigger or not requirement.required:
                 continue
             item = current.get(requirement.evidence_type)
@@ -220,7 +229,7 @@ class TradeCaseEvaluator:
                 (
                     Blocker(
                         code=f"PULSE_{trigger_reason}",
-                        role=self.policy.requirement(EvidenceType.TRIGGER).role,
+                        role=policy.requirement(EvidenceType.TRIGGER).role,
                         evidence_type=EvidenceType.TRIGGER,
                         evidence_id=trigger.evidence_id,
                     ),
@@ -234,7 +243,7 @@ class TradeCaseEvaluator:
                 (
                     Blocker(
                         code="PULSE_TRIGGER_SETUP_MISMATCH",
-                        role=self.policy.requirement(EvidenceType.TRIGGER).role,
+                        role=policy.requirement(EvidenceType.TRIGGER).role,
                         evidence_type=EvidenceType.TRIGGER,
                         evidence_id=trigger.evidence_id,
                     ),
@@ -256,7 +265,7 @@ class TradeCaseEvaluator:
                 (
                     Blocker(
                         code=f"ANCHOR_{anchor_reason}_EXECUTION_EVIDENCE",
-                        role=self.policy.requirement(EvidenceType.LIQUIDITY_EXECUTION).role,
+                        role=policy.requirement(EvidenceType.LIQUIDITY_EXECUTION).role,
                         evidence_type=EvidenceType.LIQUIDITY_EXECUTION,
                         evidence_id=anchor.evidence_id,
                     ),
@@ -273,7 +282,7 @@ class TradeCaseEvaluator:
                 "EXECUTION_EVIDENCE_NOT_CURRENT",
             )
 
-        digest = risk_input_digest(trade_case, current, self.policy)
+        digest = risk_input_digest(trade_case, current, policy)
         if (
             risk_binding is None
             or risk_binding.risk_input_digest != digest

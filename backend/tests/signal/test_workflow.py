@@ -52,7 +52,9 @@ def _lease_for(task_input, instant, trace):
 
 def build_stack(sessions, instant, observations=(), *, source=None):
     clock = FixedClock(instant)
-    cases = TradeCaseService(sessions, clock=clock)
+    # The SIGNAL gating these tests describe is TRADE_CASE_V1's; V2 makes
+    # SENTIMENT advisory and is covered in tests/workflow/test_trade_case_v2.py.
+    cases = TradeCaseService(sessions, clock=clock, policy=TRADE_CASE_V1)
     runtime = WorkerRuntimeService(sessions, cases, clock=clock)
     reader = SignalContextReader(
         cases=cases, source=source or source_for(observations), clock=clock

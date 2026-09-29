@@ -1,11 +1,11 @@
 """One versioned location for TradeCase requirements and role capabilities."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from src.core.models import AgentRole
-from src.orchestration.workflow.models import EvidenceType
+from src.orchestration.workflow.models import EvidenceType, WorkflowErrorCode, WorkflowFailure
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Imported for annotations alone. The risk-data package reads this policy at
@@ -330,3 +330,46 @@ TRADE_CASE_V1 = WorkflowPolicy(
         RefreshableSource("ANCHOR_EXECUTION_EVIDENCE", EvidenceType.LIQUIDITY_EXECUTION),
     ),
 )
+
+
+# TRADE_CASE_V2: identical to V1 except that SENTIMENT is advisory.
+#
+# SIGNAL's task is still created and claimable, and whatever it records is kept
+# and audited exactly as before — UNKNOWN stays UNKNOWN, a failed source stays a
+# failure, nothing is re-labelled. What changes is only that a case no longer
+# waits for SENTIMENT to move toward its trigger: under V1 a young token without
+# enough Farcaster activity could never leave EVIDENCE_PENDING, which made social
+# popularity a hidden entry condition. SENTIMENT was never safety-critical and
+# still is not, so it stays outside the risk digest and holds no risk authority.
+TRADE_CASE_V2 = replace(
+    TRADE_CASE_V1,
+    version="trade-case-v2",
+    requirements=tuple(
+        replace(item, required=False, safety_critical=False)
+        if item.evidence_type is EvidenceType.SENTIMENT
+        else item
+        for item in TRADE_CASE_V1.requirements
+    ),
+    # The SIGNAL task is still created and claimable; its slot is only marked
+    # optional so every view of the case says what the workflow means.
+    tasks=tuple(
+        replace(item, required=False) if item.role is AgentRole.SIGNAL else item
+        for item in TRADE_CASE_V1.tasks
+    ),
+)
+
+# Every workflow a stored case may carry, by the version it was opened under.
+WORKFLOW_POLICIES: dict[str, WorkflowPolicy] = {
+    policy.version: policy for policy in (TRADE_CASE_V1, TRADE_CASE_V2)
+}
+
+# The workflow new cases are opened under.
+CURRENT_WORKFLOW = TRADE_CASE_V2
+
+
+def policy_for(version: str) -> WorkflowPolicy:
+    """The rules a case was opened under. An unknown version fails closed."""
+    policy = WORKFLOW_POLICIES.get(version)
+    if policy is None:
+        raise WorkflowFailure(WorkflowErrorCode.UNSUPPORTED_WORKFLOW_VERSION)
+    return policy

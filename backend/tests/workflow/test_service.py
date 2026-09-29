@@ -36,6 +36,7 @@ from src.orchestration.workflow.models import (
     WorkflowErrorCode,
     WorkflowFailure,
 )
+from src.orchestration.workflow.policy import TRADE_CASE_V1
 from src.orchestration.workflow.service import TradeCaseService, risk_from_row
 from src.risk.authorization import RiskAuthorization
 
@@ -1220,9 +1221,9 @@ async def test_parallel_evaluation_after_limit_adds_no_transition(workflow_db, n
 
 
 async def test_scenario_g_resizable_sentinel_limit(workflow_db, now, trace):
-    """Scenario G: discovery to a resizable SENTINEL cap, then revocation."""
+    """Scenario G: discovery to a resizable SENTINEL cap, then revocation (V1 rules)."""
     _, sessions = workflow_db
-    service = TradeCaseService(sessions, clock=FixedClock(now))
+    service = TradeCaseService(sessions, clock=FixedClock(now), policy=TRADE_CASE_V1)
 
     # Opening records ORBIT discovery evidence, so the case settles straight
     # onto the outstanding ATLAS, SIGNAL and VECTOR requirements.
