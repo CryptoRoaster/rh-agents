@@ -15,7 +15,7 @@ from src.data.tables import DiscoveryWatchAssessmentRow, PnLRow, PositionRow, Tr
 from src.ledger.read import PaperReadService
 from src.reasoning.models import ReasoningErrorCategory
 from src.scout.outcome_read import OutcomeReadService
-from src.scout.policy import WatchStatus
+from src.scout.policy import EARLY_SCOUT_V1, WatchStatus
 from src.scout.read import ScoutReadService
 from src.scout.repository import WatchRepository
 from src.scout.shadow_read import ShadowReadService
@@ -41,7 +41,7 @@ async def client(db, monkeypatch):
     app = create_app(Settings(_env_file=None))
 
     async def scout_override():
-        yield ScoutReadService(sessions, daily_budget=96)
+        yield ScoutReadService(sessions, daily_budget=96, policy=EARLY_SCOUT_V1)
 
     async def paper_override():
         yield PaperReadService(sessions)

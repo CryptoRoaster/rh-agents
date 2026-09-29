@@ -100,6 +100,7 @@ async def risk_db():
                 "0016_scout_shadow_triage",
                 "0017_discovery_outcomes",
                 "0018_paper_exit_triggers",
+                "0019_scout_fresh_first_orbit",
             ):
                 spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
                 module = importlib.util.module_from_spec(spec)

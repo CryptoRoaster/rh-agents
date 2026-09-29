@@ -238,6 +238,10 @@ export type ScoutOverview = {
   orbit_daily_budget: number;
   orbit_daily_used: number;
   orbit_daily_remaining: number;
+  // EARLY_SCOUT_V2: review debt closed without a model call, kept apart from "due".
+  orbit_first_reviews_skipped_stale?: number;
+  orbit_follow_ups_deferred?: number;
+  orbit_reviewed?: number;
 };
 
 export type PositionView = {

@@ -1,4 +1,4 @@
-"""Migration 0018: the exit trigger columns on `trade_case_exits`, on PostgreSQL."""
+"""Migration 0019: the ORBIT review-debt state and the V2 run counters, on PostgreSQL."""
 
 import os
 from uuid import uuid4
@@ -9,27 +9,33 @@ from alembic.operations import Operations
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from src.data.schema import expected_revision
+from tests.exitpolicy.test_migration import THROUGH_0017
 from tests.reentry.test_migration import load
-from tests.scout.test_outcome_migration import THROUGH_0016
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("TEST_DATABASE_URL"), reason="migrating a real schema needs one"
 )
 
-THROUGH_0017 = (*THROUGH_0016, "0017_discovery_outcomes")
-MODULE = "0018_paper_exit_triggers"
-COLUMNS = {"exit_trigger", "exit_policy_version", "exit_trigger_basis"}
+THROUGH_0018 = (*THROUGH_0017, "0018_paper_exit_triggers")
+MODULE = "0019_scout_fresh_first_orbit"
+COUNTERS = {
+    "orbit_fresh_first_reviews_due",
+    "orbit_first_reviews_skipped_stale",
+    "orbit_follow_ups_deferred",
+    "orbit_slots_released",
+}
 
 
 @pytest.fixture
-async def at_0017():
+async def at_0018():
     url = os.environ["TEST_DATABASE_URL"]
-    name = "exit_trigger_migration_" + uuid4().hex
+    name = "fresh_first_migration_" + uuid4().hex
     admin = create_async_engine(url)
     async with admin.begin() as connection:
         await connection.execute(text(f'CREATE SCHEMA "{name}"'))
     engine = create_async_engine(url, connect_args={"server_settings": {"search_path": name}})
-    modules = [load(item) for item in THROUGH_0017]
+    modules = [load(item) for item in THROUGH_0018]
 
     def migrate(sync_connection):
         with Operations.context(MigrationContext.configure(sync_connection)):
@@ -61,34 +67,31 @@ async def apply(engine, direction="upgrade"):
 async def shape(engine):
     def read(sync):
         inspector = inspect(sync)
-        columns = {item["name"]: item for item in inspector.get_columns("trade_case_exits")}
-        checks = {item["name"] for item in inspector.get_check_constraints("trade_case_exits")}
-        return columns, checks
+        watches = {item["name"] for item in inspector.get_columns("discovery_watches")}
+        runs = {item["name"] for item in inspector.get_columns("scout_runs")}
+        checks = {item["name"] for item in inspector.get_check_constraints("discovery_watches")}
+        return watches, runs, checks
 
     async with engine.connect() as connection:
         return await connection.run_sync(read)
 
 
-def test_0018_follows_0017():
-    assert load(MODULE).down_revision == "0017"
+def test_the_chain_ends_at_0019():
+    assert expected_revision() == "0019"
+    assert load(MODULE).down_revision == "0018"
 
 
-async def test_the_columns_arrive_nullable_with_their_pairing_check(at_0017):
-    before, _ = await shape(at_0017)
-    assert not COLUMNS & set(before)
+async def test_upgrade_adds_the_state_and_counters_and_downgrade_removes_them(at_0018):
+    watches, runs, checks = await shape(at_0018)
+    assert "orbit_state" not in watches and not COUNTERS & runs
 
-    await apply(at_0017)
-    columns, checks = await shape(at_0017)
-    assert COLUMNS <= set(columns)
-    assert all(columns[name]["nullable"] for name in COLUMNS)
-    assert "JSONB" in str(columns["exit_trigger_basis"]["type"]).upper()
-    assert "trade_case_exit_trigger_versioned" in checks
+    await apply(at_0018)
+    watches, runs, checks = await shape(at_0018)
+    assert {"orbit_state", "orbit_state_at"} <= watches
+    assert COUNTERS <= runs
+    assert {"discovery_watch_orbit_state", "discovery_watch_orbit_state_dated"} <= checks
 
-
-async def test_the_downgrade_removes_exactly_what_it_added(at_0017):
-    before, checks_before = await shape(at_0017)
-    await apply(at_0017)
-    await apply(at_0017, "downgrade")
-    after, checks_after = await shape(at_0017)
-    assert set(after) == set(before)
-    assert checks_after == checks_before
+    await apply(at_0018, "downgrade")
+    after, runs_after, checks_after = await shape(at_0018)
+    assert "orbit_state" not in after and not COUNTERS & runs_after
+    assert "discovery_watch_orbit_state" not in checks_after

@@ -44,6 +44,10 @@ COUNTERS = (
     "orbit_daily_remaining_before",
     "orbit_daily_used_after",
     "orbit_daily_remaining_after",
+    "orbit_fresh_first_reviews_due",
+    "orbit_first_reviews_skipped_stale",
+    "orbit_follow_ups_deferred",
+    "orbit_slots_released",
 )
 
 

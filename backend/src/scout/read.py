@@ -32,7 +32,7 @@ from src.markets.models import MarketSnapshot
 from src.runner.models import Code, Identifier, Immutable
 from src.scout.budget import OrbitBudget, utc_day
 from src.scout.models import DiscoveryWatch, ScoutRun, WatchAssessment
-from src.scout.policy import EARLY_SCOUT_V1, REVIEWABLE, EarlyScoutPolicy, WatchStatus
+from src.scout.policy import EARLY_SCOUT_V2, REVIEWABLE, EarlyScoutPolicy, WatchStatus
 from src.scout.repository import Backlog, WatchRepository, _watch
 from src.scout.runs import ScoutRunRepository
 from src.scout.shadow import FastAssessment, FastAssessmentStore
@@ -160,6 +160,10 @@ class ScoutOverview(Immutable):
     orbit_daily_budget: int
     orbit_daily_used: int
     orbit_daily_remaining: int
+    # EARLY_SCOUT_V2: what became of review debt, kept apart from "due".
+    orbit_first_reviews_skipped_stale: int = 0
+    orbit_follow_ups_deferred: int = 0
+    orbit_reviewed: int = 0
 
 
 def snapshot_view(snapshot: MarketSnapshot) -> SnapshotView:
@@ -191,7 +195,7 @@ def checkpoint_plan(
     watch: DiscoveryWatch,
     assessments: tuple[WatchAssessment, ...],
     now: datetime,
-    policy: EarlyScoutPolicy = EARLY_SCOUT_V1,
+    policy: EarlyScoutPolicy = EARLY_SCOUT_V2,
 ) -> tuple[CheckpointView, ...]:
     """What happened at every ORBIT checkpoint, derived from the stored facts."""
     taken = {item.checkpoint_index: item for item in assessments}
@@ -225,7 +229,7 @@ def checkpoint_plan(
 @dataclass(frozen=True)
 class ScoutReadService:
     sessions: async_sessionmaker[AsyncSession]
-    policy: EarlyScoutPolicy = EARLY_SCOUT_V1
+    policy: EarlyScoutPolicy = EARLY_SCOUT_V2
     # The configured daily cap, shown beside what was used. Read-only.
     daily_budget: int = 0
 
@@ -433,4 +437,7 @@ class ScoutReadService:
             orbit_daily_budget=self.daily_budget,
             orbit_daily_used=used,
             orbit_daily_remaining=max(0, self.daily_budget - used),
+            orbit_first_reviews_skipped_stale=backlog.skipped_stale,
+            orbit_follow_ups_deferred=backlog.follow_ups_deferred,
+            orbit_reviewed=backlog.reviewed,
         )
