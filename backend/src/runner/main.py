@@ -49,7 +49,7 @@ import json
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
-from src.core.config import Settings
+from src.core.config import Settings, settings_refusal
 from src.data.database import connect
 from src.runner.composition import RunnerPorts, RunnerStack, runner_stack
 from src.runner.models import (
@@ -140,13 +140,15 @@ def main() -> int:
     arguments = parser.parse_args()
     try:
         settings = Settings()
-    except ValidationError:
-        # Before anything could write, and without echoing what was misconfigured.
+    except ValidationError as error:
+        # Before anything could write, and without echoing what was misconfigured:
+        # only a stable code naming the requirement, never a value.
+        reason = settings_refusal([str(item.get("msg", "")) for item in error.errors()])
         if arguments.preflight:
-            invalid = preflight_refused("SETTINGS_INVALID")
+            invalid = preflight_refused(reason)
             print(render(invalid))
             return int(invalid.exit_code)
-        refused = ConfigurationRefused(reason="SETTINGS_INVALID")
+        refused = ConfigurationRefused(reason=reason)
         print(render(refused))
         return int(refused.exit_code)
     if arguments.preflight:

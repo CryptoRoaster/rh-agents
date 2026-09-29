@@ -44,6 +44,24 @@ ConfiguredBps = Annotated[
 ]
 
 
+# Stable configuration refusal codes. A refused configuration never echoes a
+# value, but an operator must be able to tell which requirement failed.
+SETTINGS_INVALID = "SETTINGS_INVALID"
+ATLAS_PROVIDER_KEY_MISSING = "ATLAS_PROVIDER_KEY_MISSING"
+REFUSAL_CODES = (ATLAS_PROVIDER_KEY_MISSING,)
+# NodeReal serves each chain on its own host; the BSC holder source must reach
+# the BSC one and nothing else.
+NODEREAL_BSC_HOST = "bsc-mainnet.nodereal.io"
+
+
+def settings_refusal(messages: "list[str]") -> str:
+    """The stable code a refused configuration names, never its values."""
+    for code in REFUSAL_CODES:
+        if any(code in message for message in messages):
+            return code
+    return SETTINGS_INVALID
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="../.env", extra="ignore", hide_input_in_errors=True)
     database_url: str = Field(min_length=1)
@@ -147,7 +165,7 @@ class Settings(BaseSettings):
     # defaults to "disabled": a key sitting in the environment is not consent to
     # spend, and selecting a provider still starts no worker.
     atlas_rh_holder_provider: Literal["disabled", "blockscout"] = "disabled"
-    atlas_bsc_holder_provider: Literal["disabled", "moralis"] = "disabled"
+    atlas_bsc_holder_provider: Literal["disabled", "moralis", "nodereal"] = "disabled"
     atlas_rh_origin_provider: Literal["disabled", "blockscout"] = "disabled"
     atlas_bsc_origin_provider: Literal["disabled", "etherscan"] = "disabled"
     blockscout_base_url: str = "https://api.blockscout.com"
@@ -156,6 +174,10 @@ class Settings(BaseSettings):
     moralis_api_key: SecretStr = SecretStr("")
     etherscan_base_url: str = "https://api.etherscan.io"
     etherscan_api_key: SecretStr = SecretStr("")
+    # NodeReal's BSC mainnet JSON-RPC origin. The key is appended to the path
+    # inside the adapter's transport, never stored in this URL.
+    nodereal_base_url: str = "https://bsc-mainnet.nodereal.io/v1"
+    nodereal_api_key: SecretStr = SecretStr("")
     atlas_source_timeout_seconds: int = Field(default=10, ge=1, le=60)
     atlas_holder_page_size: int = Field(default=50, ge=10, le=200)
     atlas_holder_max_pages: int = Field(default=1, ge=1, le=5)
@@ -422,6 +444,7 @@ class Settings(BaseSettings):
             "blockscout": self.blockscout_api_key,
             "moralis": self.moralis_api_key,
             "etherscan": self.etherscan_api_key,
+            "nodereal": self.nodereal_api_key,
         }
         selected = {
             self.atlas_rh_holder_provider,
@@ -431,7 +454,10 @@ class Settings(BaseSettings):
         } - {"disabled"}
         for provider in sorted(selected):
             if not credentials[provider].get_secret_value():
-                raise ValueError("A selected ATLAS fact provider requires its API key")
+                raise ValueError(
+                    f"{ATLAS_PROVIDER_KEY_MISSING}: a selected ATLAS fact provider "
+                    "requires its API key"
+                )
         return self
 
     @model_validator(mode="after")
@@ -536,7 +562,17 @@ class Settings(BaseSettings):
             raise ValueError("The Neynar base URL must be the documented HTTPS origin")
         return value.rstrip("/")
 
-    @field_validator("blockscout_base_url", "moralis_base_url", "etherscan_base_url")
+    @field_validator("nodereal_base_url")
+    @classmethod
+    def require_nodereal_bsc(cls, value: str) -> str:
+        """The documented BSC mainnet host, so a holder read cannot cross chains."""
+        if urlsplit(value).hostname != NODEREAL_BSC_HOST:
+            raise ValueError("The NodeReal base URL must be the BSC mainnet host")
+        return value
+
+    @field_validator(
+        "blockscout_base_url", "moralis_base_url", "etherscan_base_url", "nodereal_base_url"
+    )
     @classmethod
     def require_provider_origin(cls, value: str) -> str:
         """An allowlisted HTTPS origin with no embedded credentials.

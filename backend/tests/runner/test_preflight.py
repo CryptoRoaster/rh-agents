@@ -55,6 +55,9 @@ REQUIRED_ROLES = {
     "rh_chain_enabled": True,
     "rh_rpc_http_url": "https://rh.invalid",
     "rh_rpc_ws_url": "wss://rh.invalid",
+    # ATLAS needs a holder source for every chain it reads.
+    "atlas_rh_holder_provider": "blockscout",
+    "blockscout_api_key": "unused-no-call-is-made",
     "signal_social_provider": "neynar",
     "neynar_api_key": "unused-no-call-is-made",
 }
