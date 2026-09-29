@@ -100,20 +100,27 @@ class SourceTransport:
 
     async def get_json(self, path: str, params: Mapping[str, str | int]) -> object:
         """One bounded GET returning parsed JSON, or a typed failure."""
+        return await self._bounded("GET", path, params=dict(params))
+
+    async def post_json(self, path: str, body: Mapping[str, object]) -> object:
+        """One bounded POST of a JSON body (a JSON-RPC call), same bounds as a GET."""
+        return await self._bounded("POST", path, json=dict(body))
+
+    async def _bounded(self, method: str, path: str, **request: object) -> object:
         if self.requests_made >= self._max_requests:
             # A single ATLAS assessment must never become an unbounded crawl.
             raise SourceRequestError(AtlasSourceFailure.INCOMPLETE_RESULT)
         self.requests_made += 1
         try:
             async with asyncio.timeout(self._timeout_seconds):
-                return await self._get(path, params)
+                return await self._send(method, path, request)
         except TimeoutError:
             raise SourceRequestError(AtlasSourceFailure.TIMEOUT) from None
 
-    async def _get(self, path: str, params: Mapping[str, str | int]) -> object:
+    async def _send(self, method: str, path: str, request: Mapping[str, object]) -> object:
         try:
-            request = self._client.stream("GET", path.lstrip("/"), params=dict(params))
-            async with request as response:
+            stream = self._client.stream(method, path.lstrip("/"), **request)  # type: ignore[arg-type]
+            async with stream as response:
                 status = response.status_code
                 if status != 200:
                     raise SourceRequestError(

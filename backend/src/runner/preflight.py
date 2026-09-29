@@ -71,6 +71,7 @@ from src.runner.composition import (
 )
 from src.runner.models import Code, ExitCode, Immutable, RoleAvailability
 from src.runner.service import refuse
+from src.runtime.models import chain_configs
 
 # A short human sentence beside the code. Printable ASCII only and authored
 # here: the values that reach it are counts, role names, chain names and
@@ -81,6 +82,8 @@ Note = Annotated[str, Field(max_length=200, pattern=r"^[ -~]*$")]
 # A role the executed workflow requires evidence from, switched off while a PAPER
 # run is requested. Stable: operators and tests match on it.
 REQUIRED_ROLE_DISABLED = "REQUIRED_ROLE_DISABLED"
+# ATLAS is on for a PAPER run, and a chain it reads has no holder source.
+ATLAS_HOLDER_SOURCE_NOT_CONFIGURED = "ATLAS_HOLDER_SOURCE_NOT_CONFIGURED"
 
 
 class CheckStatus(StrEnum):
@@ -196,6 +199,7 @@ class Preflight:
         checks.append(self._chains())
         checks.extend(self._budgets(stack))
         checks.extend(self._roles(stack))
+        checks.extend(self._holder_sources(stack))
         checks.extend(self._scout(stack))
         checks.append(await self._schema(errors))
         checks.append(await self._pause(errors))
@@ -340,6 +344,46 @@ class Preflight:
             else:
                 found.append(_satisfied(name, "Deliberately not enabled."))
         return found
+
+    def _holder_sources(self, stack: RunnerStack) -> list[Check]:
+        """ATLAS's holder source for every chain it reads, built as a run builds it.
+
+        ATLAS composes without any holder provider and would then answer every
+        case with `HOLDER_SOURCE_NOT_CONFIGURED`, which leaves HOLDERS unknown
+        and no case able to reach risk. So when a PAPER run is requested and
+        ATLAS is on, each chain ATLAS has an on-chain source for must also have
+        a holder source the configuration can build. Building one contacts
+        nobody; a missing credential already refused the configuration.
+        """
+        settings = self._settings
+        atlas = next((item for item in stack.roles if item.role == "ATLAS"), None)
+        if not settings.paper_runner_enabled or atlas is None or not atlas.available:
+            return []
+        from src.agents.atlas.sources.factory import holder_sources
+
+        chains = [config.chain for config in chain_configs(settings)]
+        routed = holder_sources(settings)
+        missing = [chain for chain in chains if chain not in routed.sources]
+        if missing:
+            return [
+                _blocked(
+                    "ATLAS_HOLDER_SOURCES",
+                    ATLAS_HOLDER_SOURCE_NOT_CONFIGURED,
+                    f"No holder source is selected for: {', '.join(missing)}.",
+                )
+            ]
+        selected = {
+            "robinhood": settings.atlas_rh_holder_provider,
+            "bsc": settings.atlas_bsc_holder_provider,
+        }
+        return [
+            _satisfied(
+                "ATLAS_HOLDER_SOURCES",
+                "Holder sources: "
+                + ", ".join(f"{chain} via {selected[chain]}" for chain in chains)
+                + ".",
+            )
+        ]
 
     def _scout(self, stack: RunnerStack) -> list[Check]:
         """The early-discovery scout, only when it is switched on.
