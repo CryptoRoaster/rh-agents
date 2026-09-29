@@ -705,6 +705,10 @@ class DiscoveryWatchRow(Base):
             "(orbit_state IS NULL) = (orbit_state_at IS NULL)",
             name="discovery_watch_orbit_state_dated",
         ),
+        CheckConstraint(
+            "history_failure_count >= 0 AND history_failure_count <= 10",
+            name="discovery_watch_history_failure_count",
+        ),
         Index("ix_discovery_watches_orbit_due", "status", "next_orbit_review_at"),
         Index("ix_discovery_watches_history_due", "status", "next_history_review_at"),
         Index("ix_discovery_watches_first_seen", "first_seen_at", "pair_id"),
@@ -733,6 +737,12 @@ class DiscoveryWatchRow(Base):
     # it is still pending, and for rows no V2 run has settled yet.
     orbit_state: Mapped[str | None] = mapped_column(String(40))
     orbit_state_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # History read retry state (migration 0020), kept apart from the checkpoint:
+    # `next_history_review_at` stays the 24/48/72h schedule, this only says a
+    # failed read may not be retried before a bounded backoff has passed.
+    history_retry_not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    history_failure_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    history_last_failure: Mapped[str | None] = mapped_column(String(80))
     next_history_review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     latest_vector_sufficiency: Mapped[str | None] = mapped_column(String(60))
     vector_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -869,6 +879,14 @@ class ScoutRunRow(Base):
     )
     orbit_follow_ups_deferred: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     orbit_slots_released: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    # Scout VECTOR history on its own transport (migration 0020).
+    history_eligible_now: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    history_current_selected: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    history_catchup_selected: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    history_provider_requests: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    history_backoff_set: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    history_rate_limited: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    oldest_history_due_age_seconds: Mapped[int | None] = mapped_column(Integer)
     # Model failures by provider, category and reason code: a list of
     # {"provider", "category", "reason_code", "count"}. Codes only.
     model_failure_reasons: Mapped[list[dict[str, Any]]] = mapped_column(

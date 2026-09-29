@@ -166,6 +166,14 @@ class ScoutSummary(Immutable):
     orbit_first_reviews_skipped_stale: int = Field(default=0, ge=0)
     orbit_follow_ups_deferred: int = Field(default=0, ge=0)
     orbit_slots_released: int = Field(default=0, ge=0)
+    # Scout VECTOR history on its own paced transport and fair queue.
+    history_eligible_now: int = Field(default=0, ge=0)
+    history_current_selected: int = Field(default=0, ge=0)
+    history_catchup_selected: int = Field(default=0, ge=0)
+    history_provider_requests: int = Field(default=0, ge=0)
+    history_backoff_set: int = Field(default=0, ge=0)
+    history_rate_limited: int = Field(default=0, ge=0)
+    oldest_history_due_age_seconds: int | None = Field(default=None, ge=0)
     reviews: tuple[ScoutReview, ...] = Field(default=(), max_length=16)
     # Every model failure of this run, counted by provider, category and code.
     model_failure_reasons: tuple[ModelFailureCount, ...] = Field(default=(), max_length=32)
@@ -240,6 +248,13 @@ class ScoutRun(Immutable):
     orbit_first_reviews_skipped_stale: int = 0
     orbit_follow_ups_deferred: int = 0
     orbit_slots_released: int = 0
+    history_eligible_now: int = 0
+    history_current_selected: int = 0
+    history_catchup_selected: int = 0
+    history_provider_requests: int = 0
+    history_backoff_set: int = 0
+    history_rate_limited: int = 0
+    oldest_history_due_age_seconds: int | None = None
     model_failure_reasons: tuple[ModelFailureCount, ...] = ()
 
     @property

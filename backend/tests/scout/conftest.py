@@ -82,7 +82,7 @@ def scout_settings(**overrides: Any) -> Settings:
         "early_scout_max_discovery_pools": 10,
         "early_scout_max_new_watches_per_run": 10,
         "early_scout_max_orbit_reviews_per_run": 5,
-        "early_scout_max_history_checks_per_run": 5,
+        "early_scout_history_max_requests_per_run": 5,
         "early_scout_max_refresh_markets_per_run": 5,
     }
     return Settings(_env_file=None, **{**base, **overrides})
@@ -160,6 +160,16 @@ class EchoOrbit:
         )
 
 
+class RecordingSleep:
+    """Records every pause a paced transport asks for; waits for none of them."""
+
+    def __init__(self) -> None:
+        self.pauses: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.pauses.append(seconds)
+
+
 class ScriptedHistory:
     """Prepared series by pair, and a count of every read."""
 
@@ -196,6 +206,7 @@ async def scout(
     settings: Settings | None = None,
     fast=None,
     policy=None,
+    sleep=None,
 ):
     """One real scout cycle at `now`, with the outside edges replaced.
 
@@ -204,16 +215,21 @@ async def scout(
     """
     from src.scout.policy import EARLY_SCOUT_V1
 
-    history = history if history is not None else ScriptedHistory()
-    history.now = now
+    # `history=False` means no scripted series: the real GeckoTerminal OHLCV
+    # source runs against `provider`.
+    scripted = None if history is False else history if history is not None else ScriptedHistory()
+    if scripted is not None:
+        scripted.now = now
     cycle = EarlyScoutCycle(
         settings if settings is not None else scout_settings(),
         sessions,
         ports=ScoutPorts(
             reasoning=orbit if orbit is not None else EchoOrbit(),
             market_http=provider.transport(),
-            history=history,
+            history=scripted,
             fast=fast,
+            # Paced history requests wait on this, never on the wall clock.
+            sleep=sleep if sleep is not None else RecordingSleep(),
         ),
         clock=FixedClock(now),
         policy=policy if policy is not None else EARLY_SCOUT_V1,

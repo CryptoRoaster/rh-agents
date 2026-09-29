@@ -22,7 +22,7 @@ from src.markets.geckoterminal.errors import (
     UnavailableError,
 )
 
-Sleep = Callable[[int], Awaitable[None]]
+Sleep = Callable[[float], Awaitable[None]]
 
 
 def invalid_constant(value: str) -> object:
@@ -46,9 +46,14 @@ class GeckoTerminalTransport:
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Clock | None = None,
         sleep: Sleep = asyncio.sleep,
+        spacing_seconds: float = 0.0,
     ) -> None:
         self._clock = clock if clock is not None else SystemClock()
         self._sleep = sleep
+        # A minimum pause before every logical request after the first, so a
+        # budget is spent as a paced sequence and never as a burst. Zero keeps
+        # the historic behaviour for every existing caller.
+        self._spacing = spacing_seconds
         self._retries = settings.geckoterminal_retries
         self._delay = settings.geckoterminal_retry_delay_seconds
         self._delay_cap = settings.geckoterminal_max_retry_after_seconds
@@ -102,6 +107,8 @@ class GeckoTerminalTransport:
     async def get(self, path: str, params: dict[str, str | int]) -> object:
         if self.logical_requests >= self._max_requests:
             raise BudgetError()
+        if self._spacing > 0 and self.logical_requests > 0:
+            await self._sleep(self._spacing)
         self.logical_requests += 1
         try:
             async with asyncio.timeout(self._timeout), self._slots:

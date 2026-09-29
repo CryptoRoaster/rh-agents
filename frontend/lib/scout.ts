@@ -242,6 +242,11 @@ export type ScoutOverview = {
   orbit_first_reviews_skipped_stale?: number;
   orbit_follow_ups_deferred?: number;
   orbit_reviewed?: number;
+  // VECTOR history fair queue.
+  history_due?: number;
+  history_eligible_now?: number;
+  history_in_backoff?: number;
+  oldest_history_due_age_seconds?: number | null;
 };
 
 export type PositionView = {

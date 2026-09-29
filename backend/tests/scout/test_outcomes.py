@@ -177,7 +177,9 @@ async def test_a_recorded_read_keeps_its_window_and_each_bar_once(db):
 # ---------------------------------------------------------------- sampling
 
 
-SAMPLER = {"outcome_sampler_enabled": True}
+# The sampler, measured alone: scout history reads (their own transport since
+# the fair queue) would share the scripted series and blur the read counts.
+SAMPLER = {"outcome_sampler_enabled": True, "early_scout_history_max_requests_per_run": 0}
 
 
 async def discovered(sessions, *, limit: int = 2, pools: int = 3):

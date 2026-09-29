@@ -10,14 +10,15 @@ Nothing here calls a provider or a model, and no provider call is ever made
 while a transaction opened here is still open.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, exists, func, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -650,6 +651,10 @@ class WatchRepository:
             if status is WatchStatus.WATCHING
             else status.value,
             updated_at=now,
+            # A read that succeeded ends any retry state a failure had set.
+            history_retry_not_before=None,
+            history_failure_count=0,
+            history_last_failure=None,
         )
         if status is WatchStatus.DORMANT:
             # Dormant causes no further traffic of any kind.
@@ -665,6 +670,122 @@ class WatchRepository:
                 .values(**values)
             )
             return bool(getattr(result, "rowcount", 0) == 1)
+
+    # ------------------------------------------------------------ history queue
+
+    def _history_eligible(self, now: datetime) -> Any:
+        """Due at a checkpoint, still watched, and not inside a retry backoff."""
+        return and_(
+            self._due(
+                DiscoveryWatchRow.next_history_review_at, frozenset({WatchStatus.WATCHING}), now
+            ),
+            or_(
+                DiscoveryWatchRow.history_retry_not_before.is_(None),
+                DiscoveryWatchRow.history_retry_not_before <= now,
+            ),
+        )
+
+    async def history_lanes(
+        self, now: datetime, window: timedelta, limit: int
+    ) -> tuple[dict[str, list[DiscoveryWatch]], dict[str, list[DiscoveryWatch]]]:
+        """Eligible history checks per chain: CURRENT newest-due first, CATCH-UP oldest first.
+
+        Ordered by due time, then pair identity, and nothing else: no market
+        figure, JEV answer or classification can move a watch in either lane.
+        """
+        if limit <= 0:
+            return {}, {}
+        eligible = self._history_eligible(now)
+        recent = DiscoveryWatchRow.next_history_review_at >= now - window
+        due = DiscoveryWatchRow.next_history_review_at
+        current: dict[str, list[DiscoveryWatch]] = {}
+        catch_up: dict[str, list[DiscoveryWatch]] = {}
+        async with self.sessions() as session:
+            chains = (
+                await session.scalars(select(DiscoveryWatchRow.chain).where(eligible).distinct())
+            ).all()
+            for chain in chains:
+                in_chain = and_(eligible, DiscoveryWatchRow.chain == chain)
+                current[chain] = [
+                    _watch(row)
+                    for row in (
+                        await session.scalars(
+                            select(DiscoveryWatchRow)
+                            .where(in_chain, recent)
+                            .order_by(due.desc(), DiscoveryWatchRow.pair_id)
+                            .limit(limit)
+                        )
+                    ).all()
+                ]
+                catch_up[chain] = [
+                    _watch(row)
+                    for row in (
+                        await session.scalars(
+                            select(DiscoveryWatchRow)
+                            .where(in_chain, ~recent)
+                            .order_by(due, DiscoveryWatchRow.pair_id)
+                            .limit(limit)
+                        )
+                    ).all()
+                ]
+        return current, catch_up
+
+    async def history_eligible_count(self, now: datetime) -> tuple[int, int | None]:
+        """Eligible history checks now, and the age of the oldest due checkpoint."""
+        async with self.sessions() as session:
+            eligible = await session.scalar(
+                select(func.count())
+                .select_from(DiscoveryWatchRow)
+                .where(self._history_eligible(now))
+            )
+            oldest = await session.scalar(
+                select(func.min(DiscoveryWatchRow.next_history_review_at)).where(
+                    self._due(
+                        DiscoveryWatchRow.next_history_review_at,
+                        frozenset({WatchStatus.WATCHING}),
+                        now,
+                    )
+                )
+            )
+        return int(eligible or 0), (
+            None if oldest is None else max(0, int((now - aware(oldest)).total_seconds()))
+        )
+
+    async def history_failed(
+        self,
+        watch_id: UUID,
+        *,
+        expected_next: datetime | None,
+        failure: str,
+        now: datetime,
+        backoff: "Callable[[int], timedelta]",
+        max_failures: int,
+    ) -> timedelta | None:
+        """Set a bounded retry-not-before after a failed read. The checkpoint stays.
+
+        Returns the backoff applied, or None when the watch moved on meanwhile
+        (another run settled it), in which case nothing is changed.
+        """
+        async with self.sessions.begin() as session:
+            row = await session.scalar(
+                select(DiscoveryWatchRow)
+                .where(
+                    DiscoveryWatchRow.id == watch_id,
+                    DiscoveryWatchRow.status == WatchStatus.WATCHING.value,
+                    DiscoveryWatchRow.next_history_review_at == expected_next,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                return None
+            failures = min(int(row.history_failure_count or 0) + 1, max_failures)
+            pause = backoff(failures)
+            row.history_failure_count = failures
+            row.history_retry_not_before = now + pause
+            row.history_last_failure = failure[:80]
+            row.reason_code = failure[:80]
+            row.updated_at = now
+        return pause
 
     async def note(self, watch_id: UUID, reason: str, now: datetime) -> None:
         """Record why a due step did not happen. Changes no schedule."""

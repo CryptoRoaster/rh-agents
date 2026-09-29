@@ -48,6 +48,13 @@ COUNTERS = (
     "orbit_first_reviews_skipped_stale",
     "orbit_follow_ups_deferred",
     "orbit_slots_released",
+    "history_eligible_now",
+    "history_current_selected",
+    "history_catchup_selected",
+    "history_provider_requests",
+    "history_backoff_set",
+    "history_rate_limited",
+    "oldest_history_due_age_seconds",
 )
 
 

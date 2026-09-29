@@ -53,6 +53,15 @@ export function OverviewStrip({ overview }: { overview: ScoutOverview }) {
           } follow-ups deferred`}
         />
         <Kpi
+          label="History due"
+          value={String(overview.history_due ?? 0)}
+          detail={`${overview.history_eligible_now ?? 0} eligible · ${
+            overview.history_in_backoff ?? 0
+          } backing off · oldest ${formatAge(
+            overview.oldest_history_due_age_seconds ?? null,
+          )}`}
+        />
+        <Kpi
           label="Oldest due"
           value={formatAge(overview.oldest_orbit_due_age_seconds)}
         />

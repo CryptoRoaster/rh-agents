@@ -354,7 +354,11 @@ class Settings(BaseSettings):
     # bound while the day still has budget.
     early_scout_max_orbit_reviews_per_day: int = Field(default=96, ge=0, le=2000)
     # History reads for the structural VECTOR check. No model call is involved.
-    early_scout_max_history_checks_per_run: int = Field(default=1, ge=0, le=10)
+    # Scout VECTOR history reads: their own GeckoTerminal transport and request
+    # budget, separate from discovery/refresh and from the outcome sampler, and
+    # spaced so they never arrive as a burst.
+    early_scout_history_max_requests_per_run: int = Field(default=6, ge=0, le=10)
+    early_scout_history_request_spacing_seconds: float = Field(default=6.0, ge=0, le=60)
     # Watches re-observed by exact pool locator in one run, batched into one
     # request per chain. Only due watches whose reading is stale are refreshed;
     # one that is already fresh costs nothing. Matches the review budget.
