@@ -12,6 +12,7 @@ commentary. System safety does not depend on model uptime.
 
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Any
 
 from src.agents.atlas.context import (
     AtlasContextUnavailable,
@@ -51,6 +52,7 @@ from src.orchestration.workflow.models import (
     OnchainAdvisoryFinding,
     OnchainIntelligence,
     OnchainPayload,
+    ReconciledExclusion,
 )
 from src.reasoning.models import ReasoningFailure, ReasoningRequest, ReasoningResult
 from src.reasoning.provider import ReasoningProvider
@@ -116,22 +118,38 @@ def holder_distribution(facts: HolderFacts) -> HolderDistributionFacts | None:
         return None
     if facts.observation_basis is None:
         return None
-    return HolderDistributionFacts(
-        source=facts.source,
-        observed_at=facts.observed_at,
-        observation_basis=facts.observation_basis.value,
-        completeness=facts.completeness.value,
-        snapshot_block=facts.snapshot_block,
-        holder_block_delta=facts.holder_block_delta,
-        holder_count=facts.holder_count,
-        total_supply_raw=(None if facts.total_supply_raw is None else str(facts.total_supply_raw)),
-        top_one_fraction=facts.top1_share,
-        top_five_fraction=facts.top5_share,
-        top_ten_fraction=facts.top10_share,
-        top_ten_fraction_excluding_burn=facts.top10_share_excluding_burn,
-        burned_fraction=facts.burned_share,
-        provider_excluded_addresses=facts.excluded_addresses,
-    )
+    fields: dict[str, Any] = {
+        "source": facts.source,
+        "observed_at": facts.observed_at,
+        "observation_basis": facts.observation_basis.value,
+        "completeness": facts.completeness.value,
+        "snapshot_block": facts.snapshot_block,
+        "holder_block_delta": facts.holder_block_delta,
+        "holder_count": facts.holder_count,
+        "total_supply_raw": (
+            None if facts.total_supply_raw is None else str(facts.total_supply_raw)
+        ),
+        "top_one_fraction": facts.top1_share,
+        "top_five_fraction": facts.top5_share,
+        "top_ten_fraction": facts.top10_share,
+        "top_ten_fraction_excluding_burn": facts.top10_share_excluding_burn,
+        "burned_fraction": facts.burned_share,
+        "provider_excluded_addresses": facts.excluded_addresses,
+    }
+    if facts.reconciled_exclusions:
+        # Carried only when something was reconciled, so evidence without a
+        # reconciliation keeps exactly the shape it always had — and, like
+        # legacy evidence, leaves every exclusion unresolved.
+        fields["reconciled_exclusions"] = tuple(
+            ReconciledExclusion(
+                address=item.address,
+                balance_raw=str(item.balance_raw),
+                block=item.block,
+                method=item.method,
+            )
+            for item in facts.reconciled_exclusions
+        )
+    return HolderDistributionFacts(**fields)
 
 
 def onchain_payload(

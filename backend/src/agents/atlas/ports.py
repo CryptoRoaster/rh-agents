@@ -23,6 +23,10 @@ class TokenContractReadPort(Protocol):
 
     async def contract_facts(self, token_address: str, block: int) -> ContractFacts: ...
 
+    async def balance_of(self, token_address: str, holder: str, block: int) -> int | None:
+        """ERC-20 balance of one address at an explicit block, or None if unread."""
+        ...
+
 
 class HolderIntelligenceReadPort(Protocol):
     """Holder distribution from a source that can genuinely provide it.

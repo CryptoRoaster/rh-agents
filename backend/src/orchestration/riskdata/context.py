@@ -464,10 +464,13 @@ def _holder_facts(
     kind = RiskFactKind.HOLDER_CONCENTRATION
     if holders.completeness not in PROVEN_COVERAGE:
         _gap(gaps, kind, RiskDataGapCode.HOLDER_COVERAGE_UNPROVEN, origin)
-    elif holders.provider_excluded_addresses:
+    elif holders.unresolved_exclusions:
         # The numerator is missing rows the provider filtered while the
         # denominator stays full on-chain supply, so the figure can only
-        # understate. Usable as context and not as an input to a limit.
+        # understate. Usable as context and not as an input to a limit. An
+        # exclusion read back on-chain at the snapshot block is in the rows and
+        # understates nothing; every other one — legacy evidence included —
+        # still does.
         _gap(gaps, kind, RiskDataGapCode.HOLDER_METRIC_UNDERSTATED, origin)
     elif holders.top_ten_fraction is None:
         _gap(gaps, kind, RiskDataGapCode.NOT_ESTABLISHED, origin)

@@ -175,16 +175,16 @@ def _data_gaps(
     if (
         policy.max_top10_concentration is not None
         and snapshot.holders.status == Availability.AVAILABLE
-        and snapshot.holders.excluded_addresses
+        and snapshot.holders.unresolved_exclusions
     ):
         # A threshold judges a distribution, so it may only judge one that
         # actually covers it. Every exclusion a provider applies removes supply
         # from the numerator while the denominator stays full on-chain supply,
         # so the metric can only ever *understate* concentration — and an
         # understated metric silently passing a limit is the one failure mode a
-        # limit exists to prevent. Nothing reconciles an exclusion today, so any
-        # exclusion is an unreconciled one and the case becomes insufficient
-        # rather than clear. A blocker still fires on the same metric, because
+        # limit exists to prevent. Only an exclusion read back on-chain at the
+        # holder block is covered; every unresolved one makes the case
+        # insufficient rather than clear. A blocker still fires on the same metric, because
         # exceeding a limit on an understated figure means the true figure
         # exceeds it too.
         gaps.append(AtlasReasonCode.HOLDER_FACTS_UNAVAILABLE)

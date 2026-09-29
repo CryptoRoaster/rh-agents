@@ -24,6 +24,10 @@ from src.runtime.models import (
 Sleep = Callable[[int], Awaitable[None]]
 
 
+# ERC-20 `balanceOf(address)`.
+BALANCE_OF_SELECTOR = "0x70a08231"
+
+
 class RedactTransport(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.msg = "HTTP transport diagnostic [redacted]"
@@ -213,6 +217,22 @@ class EvmRpcClient:
         if not isinstance(result, str) or not result.startswith("0x"):
             raise RuntimeFailure(ErrorCode.CONTRACT)
         return result
+
+    async def balance_of(self, token: str, holder: str, block: int) -> int:
+        """ERC-20 `balanceOf(holder)` on `token` at an explicit block.
+
+        The one call here that takes an argument, and the argument is fixed to
+        a single 20-byte address under the standard selector — so this reads a
+        balance and can be made to do nothing else. The answer must be exactly
+        one 32-byte word; anything else is a contract failure, never a zero.
+        """
+        self._require_address(token, block)
+        self._require_address(holder, block)
+        data = BALANCE_OF_SELECTOR + holder[2:].rjust(64, "0")
+        result = await self._request("eth_call", [{"to": token, "data": data}, hex(block)])
+        if not isinstance(result, str) or re.fullmatch(r"0x[0-9a-fA-F]{64}", result) is None:
+            raise RuntimeFailure(ErrorCode.CONTRACT)
+        return int(result, 16)
 
     async def storage_at(self, address: str, slot: str, block: int) -> str:
         """One storage slot at an explicit block, for documented standard slots."""
