@@ -40,8 +40,33 @@ TABLES = (
 )
 
 
+# Every role TRADE_CASE_V1 requires evidence from, switched on and composable
+# without contacting anybody: building a model client, an RPC client or a social
+# client opens no connection. The values are placeholders a check never uses.
+REQUIRED_ROLES = {
+    "reasoning_provider": "anthropic",
+    "orbit_worker_enabled": True,
+    "atlas_worker_enabled": True,
+    "signal_worker_enabled": True,
+    "vector_worker_enabled": True,
+    "pulse_worker_enabled": True,
+    "anchor_worker_enabled": True,
+    "evm_runtime_enabled": True,
+    "rh_chain_enabled": True,
+    "rh_rpc_http_url": "https://rh.invalid",
+    "rh_rpc_ws_url": "wss://rh.invalid",
+    "signal_social_provider": "neynar",
+    "neynar_api_key": "unused-no-call-is-made",
+}
+
+
 def preflight_settings(**overrides) -> Settings:
-    """A configuration a run would be permitted to start from."""
+    """A configuration a complete PAPER run would be permitted to start from."""
+    return runner_settings(**{**REQUIRED_ROLES, **overrides})
+
+
+def bare_settings(**overrides) -> Settings:
+    """The runner baseline alone: a PAPER run requested, no specialist enabled."""
     return runner_settings(**overrides)
 
 
@@ -188,18 +213,19 @@ async def test_an_enabled_role_that_cannot_be_composed_blocks(risk_db, now):
     await migrate_marker(sessions)
     # ORBIT is on, and the deterministic provider is deliberately not something
     # a configuration can build.
-    settings = preflight_settings(orbit_worker_enabled=True, reasoning_provider="fake")
+    settings = preflight_settings(reasoning_provider="fake", fuse_worker_enabled=False)
 
     reading = await check(sessions, settings, now)
 
     orbit = named(reading, "ROLE_ORBIT")
     assert orbit.status == CheckStatus.BLOCKED.value
+    # The source reason, not the required-role one: the role is on.
     assert orbit.reason == "REASONING_PROVIDER_NOT_COMPOSABLE"
     assert reading.ready is False
     assert reading.exit_code is ExitCode.CONFIGURATION_REFUSED
-    # A role somebody switched off is a decision, not a problem.
-    assert named(reading, "ROLE_ATLAS").status == CheckStatus.SATISFIED.value
-    assert "not enabled" in named(reading, "ROLE_ATLAS").note.lower()
+    # An optional role somebody switched off is a decision, not a problem.
+    assert named(reading, "ROLE_FUSE").status == CheckStatus.SATISFIED.value
+    assert "not enabled" in named(reading, "ROLE_FUSE").note.lower()
 
 
 async def test_two_chains_no_longer_block_the_role_that_needs_history(risk_db, now):
