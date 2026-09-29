@@ -33,7 +33,7 @@ unchanged rules.
 
 import asyncio
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -80,6 +80,16 @@ from src.reasoning.models import ReasoningErrorCategory, ReasoningFailure
 from src.reasoning.provider import ReasoningProvider
 from src.runner.models import ConfigurationRefused
 from src.scout.budget import OrbitBudget, SlotPacing, utc_day
+from src.scout.history_queue import (
+    BUDGET_EXHAUSTED,
+    CURRENT_WINDOW,
+    MAX_FAILURE_COUNT,
+    RATE_LIMITED,
+    Lane,
+    backoff_after,
+    interleave,
+    pick,
+)
 from src.scout.models import (
     DiscoveryWatch,
     ModelFailureCount,
@@ -129,6 +139,9 @@ class ScoutPorts:
     # Shadow fast assessments of new watches (JEV). None means none are asked;
     # nothing else in the run depends on it either way.
     fast: FastAssessmentProvider | None = None
+    # How the history transport waits between paced requests. Tests replace it
+    # so a paced run needs no real time.
+    sleep: Callable[[float], Awaitable[None]] | None = None
 
 
 def scout_ports_from_settings(settings: Settings) -> ScoutPorts:
@@ -256,6 +269,13 @@ class Tally:
     orbit_first_reviews_skipped_stale: int = 0
     orbit_follow_ups_deferred: int = 0
     orbit_slots_released: int = 0
+    history_eligible_now: int = 0
+    history_current_selected: int = 0
+    history_catchup_selected: int = 0
+    history_provider_requests: int = 0
+    history_backoff_set: int = 0
+    history_rate_limited: int = 0
+    oldest_history_due_age_seconds: int | None = None
     reviews: list[ScoutReview] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     shadow: ShadowTally = field(default_factory=ShadowTally)
@@ -687,21 +707,14 @@ class EarlyScoutCycle:
             readings,
             stale,
         )
-        checks = await self._select(
-            await self._watches.due_for_history(now, DUE_SCAN),
-            self._settings.early_scout_max_history_checks_per_run,
-            readings,
-            stale,
-        )
+        # History no longer passes through here: it needs no fresh reading and
+        # spends none of the refresh budget (see `_history`).
         await self._refresh(stale, readings, transport, directory, recorder, tally)
         for watch in reviews:
             reading = readings.by_pair.get(watch.pair_id)
             if reading is not None:
                 await self._review(watch, reading, tally)
-        for watch in checks:
-            reading = readings.by_pair.get(watch.pair_id)
-            if reading is not None:
-                await self._check_history(watch, reading, transport, directory, tally)
+        await self._history(directory, tally)
         after = await self._watches.backlog(now)
         tally.orbit_backlog_after = after.due
         tally.new_watches_without_orbit_assessment = after.unreviewed
@@ -1031,22 +1044,63 @@ class EarlyScoutCycle:
             transport, directory, chain, self._settings, clock=self._clock
         )
 
+    async def _history(self, directory: NetworkDirectory, tally: Tally) -> None:
+        """Due VECTOR history checks through the fair queue, on their own paced transport.
+
+        A check needs only the stored watch identity and a due checkpoint — no
+        fresh market reading and no refresh — because the verdict is formed on
+        the OHLCV series alone. Reads go through a transport of their own, with
+        its own request budget and a pause between requests, so discovery,
+        ORBIT refresh and the outcome sampler keep exactly the budgets they had.
+        """
+        settings = self._settings
+        now = self._clock.now()
+        (
+            tally.history_eligible_now,
+            tally.oldest_history_due_age_seconds,
+        ) = await self._watches.history_eligible_count(now)
+        slots = settings.early_scout_history_max_requests_per_run
+        if slots <= 0:
+            return
+        current, catch_up = await self._watches.history_lanes(now, CURRENT_WINDOW, slots)
+        chosen = pick(interleave(current), interleave(catch_up), slots)
+        tally.history_current_selected = sum(1 for _, lane in chosen if lane is Lane.CURRENT)
+        tally.history_catchup_selected = sum(1 for _, lane in chosen if lane is Lane.CATCH_UP)
+        if not chosen:
+            return
+        budget = settings.model_copy(update={"geckoterminal_max_requests": slots})
+        transport = GeckoTerminalTransport(
+            budget,
+            transport=self._ports.market_http,
+            clock=self._clock,
+            sleep=self._ports.sleep if self._ports.sleep is not None else asyncio.sleep,
+            spacing_seconds=settings.early_scout_history_request_spacing_seconds,
+        )
+        async with transport:
+            try:
+                for watch, _ in chosen:
+                    if not await self._check_history(watch, transport, directory, tally):
+                        break
+            finally:
+                tally.history_provider_requests = transport.logical_requests
+
     async def _check_history(
         self,
         watch: DiscoveryWatch,
-        snapshot: MarketSnapshot | None,
         transport: GeckoTerminalTransport,
         directory: NetworkDirectory,
         tally: Tally,
-    ) -> None:
-        """One structural VECTOR check under the unchanged VECTOR policy."""
+    ) -> bool:
+        """One structural VECTOR check under the unchanged VECTOR policy.
+
+        Returns False when the run should stop reading history: the provider
+        rate-limited us, or our own request budget is spent.
+        """
         now = self._clock.now()
-        if snapshot is None:
-            return  # promotion needs a current reading; the check stays due
         chain = CHAINS.get(watch.chain)
-        if chain is None:
+        if chain is None or chain not in selected_chains(self._settings):
             await self._watches.note(watch.id, "CHAIN_NOT_CONFIGURED", now)
-            return
+            return True
         vector = self._policy.vector
         source = self._history_source(chain, transport, directory)
         try:
@@ -1057,9 +1111,24 @@ class EarlyScoutCycle:
                 bars=vector.history_bars,
             )
         except MarketHistoryUnavailable as error:
+            if error.reason_code == BUDGET_EXHAUSTED:
+                # Our own limit, not the watch's failure: no backoff, just stop.
+                return False
             tally.provider_failures += 1
-            await self._watches.note(watch.id, error.reason_code, now)
-            return
+            pause = await self._watches.history_failed(
+                watch.id,
+                expected_next=watch.next_history_review_at,
+                failure=error.reason_code,
+                now=now,
+                backoff=backoff_after,
+                max_failures=MAX_FAILURE_COUNT,
+            )
+            if pause is not None:
+                tally.history_backoff_set += 1
+            if error.reason_code == RATE_LIMITED:
+                tally.history_rate_limited += 1
+                return False
+            return True
         tally.history_checks += 1
         verdict = assess(history, watch.market, now, vector)
         # The same read labels outcomes later: keep its bars. Recording never
@@ -1086,6 +1155,7 @@ class EarlyScoutCycle:
             tally.promotable_new += 1
         if settled and outcome.status is WatchStatus.DORMANT:
             tally.dormant_new += 1
+        return True
 
     # ---------------------------------------------------------------- summary
 
@@ -1136,6 +1206,13 @@ class EarlyScoutCycle:
             orbit_first_reviews_skipped_stale=tally.orbit_first_reviews_skipped_stale,
             orbit_follow_ups_deferred=tally.orbit_follow_ups_deferred,
             orbit_slots_released=tally.orbit_slots_released,
+            history_eligible_now=tally.history_eligible_now,
+            history_current_selected=tally.history_current_selected,
+            history_catchup_selected=tally.history_catchup_selected,
+            history_provider_requests=tally.history_provider_requests,
+            history_backoff_set=tally.history_backoff_set,
+            history_rate_limited=tally.history_rate_limited,
+            oldest_history_due_age_seconds=tally.oldest_history_due_age_seconds,
             reviews=tuple(tally.reviews[:16]),
             model_failure_reasons=tuple(
                 ModelFailureCount(provider=provider, category=category, reason_code=code, count=n)

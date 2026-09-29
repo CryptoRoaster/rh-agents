@@ -1,4 +1,4 @@
-"""Migration 0019: the ORBIT review-debt state and the V2 run counters, on PostgreSQL."""
+"""Migration 0020: history retry state and fair-queue run counters, on PostgreSQL."""
 
 import os
 from uuid import uuid4
@@ -9,6 +9,7 @@ from alembic.operations import Operations
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from src.data.schema import expected_revision
 from tests.exitpolicy.test_migration import THROUGH_0017
 from tests.reentry.test_migration import load
 
@@ -16,25 +17,29 @@ pytestmark = pytest.mark.skipif(
     not os.environ.get("TEST_DATABASE_URL"), reason="migrating a real schema needs one"
 )
 
-THROUGH_0018 = (*THROUGH_0017, "0018_paper_exit_triggers")
-MODULE = "0019_scout_fresh_first_orbit"
+THROUGH_0019 = (*THROUGH_0017, "0018_paper_exit_triggers", "0019_scout_fresh_first_orbit")
+MODULE = "0020_scout_history_fair_queue"
 COUNTERS = {
-    "orbit_fresh_first_reviews_due",
-    "orbit_first_reviews_skipped_stale",
-    "orbit_follow_ups_deferred",
-    "orbit_slots_released",
+    "history_eligible_now",
+    "history_current_selected",
+    "history_catchup_selected",
+    "history_provider_requests",
+    "history_backoff_set",
+    "history_rate_limited",
+    "oldest_history_due_age_seconds",
 }
+COLUMNS = {"history_retry_not_before", "history_failure_count", "history_last_failure"}
 
 
 @pytest.fixture
-async def at_0018():
+async def at_0019():
     url = os.environ["TEST_DATABASE_URL"]
-    name = "fresh_first_migration_" + uuid4().hex
+    name = "history_queue_migration_" + uuid4().hex
     admin = create_async_engine(url)
     async with admin.begin() as connection:
         await connection.execute(text(f'CREATE SCHEMA "{name}"'))
     engine = create_async_engine(url, connect_args={"server_settings": {"search_path": name}})
-    modules = [load(item) for item in THROUGH_0018]
+    modules = [load(item) for item in THROUGH_0019]
 
     def migrate(sync_connection):
         with Operations.context(MigrationContext.configure(sync_connection)):
@@ -75,21 +80,21 @@ async def shape(engine):
         return await connection.run_sync(read)
 
 
-def test_0019_follows_0018():
-    assert load(MODULE).down_revision == "0018"
+def test_the_chain_ends_at_0020():
+    assert expected_revision() == "0020"
+    assert load(MODULE).down_revision == "0019"
 
 
-async def test_upgrade_adds_the_state_and_counters_and_downgrade_removes_them(at_0018):
-    watches, runs, checks = await shape(at_0018)
-    assert "orbit_state" not in watches and not COUNTERS & runs
+async def test_upgrade_adds_retry_state_and_counters_and_downgrade_removes_them(at_0019):
+    watches, runs, checks = await shape(at_0019)
+    assert not COLUMNS & watches and not COUNTERS & runs
 
-    await apply(at_0018)
-    watches, runs, checks = await shape(at_0018)
-    assert {"orbit_state", "orbit_state_at"} <= watches
-    assert COUNTERS <= runs
-    assert {"discovery_watch_orbit_state", "discovery_watch_orbit_state_dated"} <= checks
+    await apply(at_0019)
+    watches, runs, checks = await shape(at_0019)
+    assert COLUMNS <= watches and COUNTERS <= runs
+    assert "discovery_watch_history_failure_count" in checks
 
-    await apply(at_0018, "downgrade")
-    after, runs_after, checks_after = await shape(at_0018)
-    assert "orbit_state" not in after and not COUNTERS & runs_after
-    assert "discovery_watch_orbit_state" not in checks_after
+    await apply(at_0019, "downgrade")
+    watches, runs, checks = await shape(at_0019)
+    assert not COLUMNS & watches and not COUNTERS & runs
+    assert "discovery_watch_history_failure_count" not in checks

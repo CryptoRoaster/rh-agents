@@ -51,7 +51,8 @@ def test_scout_settings_are_bounded_and_off_by_default():
     assert settings.early_scout_max_orbit_reviews_per_run == 4
     assert settings.early_scout_max_orbit_reviews_per_day == 96
     assert settings.early_scout_max_refresh_markets_per_run == 4
-    assert settings.early_scout_max_history_checks_per_run == 1
+    assert settings.early_scout_history_max_requests_per_run == 6
+    assert settings.early_scout_history_request_spacing_seconds == 6.0
     assert settings.early_scout_max_bootstrap_streams <= 100
 
 

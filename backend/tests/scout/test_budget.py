@@ -459,7 +459,9 @@ async def test_reviews_and_history_checks_share_one_refresh_request(db):
         T0 + timedelta(hours=24),
         provider=provider,
         history=ScriptedHistory(3),
-        settings=budget(per_run=1).model_copy(update={"early_scout_max_history_checks_per_run": 1}),
+        settings=budget(per_run=1).model_copy(
+            update={"early_scout_history_max_requests_per_run": 1}
+        ),
     )
     assert summary.orbit_reviews_started == 1 and summary.history_checks == 1
     assert len(provider.multi_requests) == 1

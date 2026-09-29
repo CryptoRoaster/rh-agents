@@ -427,9 +427,10 @@ class Preflight:
                 "EARLY_SCOUT_BUDGETS",
                 f"discovery pools {settings.early_scout_max_discovery_pools}, new watches "
                 f"{settings.early_scout_max_new_watches_per_run}, reviews "
-                f"{settings.early_scout_max_orbit_reviews_per_run}, history checks "
-                f"{settings.early_scout_max_history_checks_per_run}, refreshes "
-                f"{settings.early_scout_max_refresh_markets_per_run}.",
+                f"{settings.early_scout_max_orbit_reviews_per_run}, history reads "
+                f"{settings.early_scout_history_max_requests_per_run} "
+                f"(own transport, {settings.early_scout_history_request_spacing_seconds:g}s "
+                f"apart), refreshes {settings.early_scout_max_refresh_markets_per_run}.",
             )
         )
         return found

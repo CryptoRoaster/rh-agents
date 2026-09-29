@@ -164,6 +164,12 @@ class ScoutOverview(Immutable):
     orbit_first_reviews_skipped_stale: int = 0
     orbit_follow_ups_deferred: int = 0
     orbit_reviewed: int = 0
+    # VECTOR history queue: due checkpoints, those eligible now (not in a retry
+    # backoff), those backing off, and the oldest due checkpoint's age.
+    history_due: int = 0
+    history_eligible_now: int = 0
+    history_in_backoff: int = 0
+    oldest_history_due_age_seconds: int | None = None
 
 
 def snapshot_view(snapshot: MarketSnapshot) -> SnapshotView:
@@ -412,6 +418,8 @@ class ScoutReadService:
     async def overview(self, now: datetime) -> ScoutOverview:
         repository = WatchRepository(self.sessions, policy=self.policy)
         backlog: Backlog = await repository.backlog(now)
+        _, history_due = await repository.count_due(now)
+        history_eligible, oldest_history = await repository.history_eligible_count(now)
         used = await OrbitBudget(self.sessions).used(utc_day(now))
         async with self.sessions() as session:
             grouped = (
@@ -440,4 +448,8 @@ class ScoutReadService:
             orbit_first_reviews_skipped_stale=backlog.skipped_stale,
             orbit_follow_ups_deferred=backlog.follow_ups_deferred,
             orbit_reviewed=backlog.reviewed,
+            history_due=history_due,
+            history_eligible_now=history_eligible,
+            history_in_backoff=max(0, history_due - history_eligible),
+            oldest_history_due_age_seconds=oldest_history,
         )
