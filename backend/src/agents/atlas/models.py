@@ -307,6 +307,22 @@ class HolderFactsSourceResult(Immutable):
         return self
 
 
+# Provider exclusions that can be reconciled at all: the zero address, whose
+# holding the standard ERC-20 `balanceOf` answers like any other address's.
+# Every other excluded address stays unresolved; there is no general release.
+RECONCILABLE_EXCLUSIONS = frozenset({ZERO_ADDRESS})
+RECONCILIATION_METHOD = "ERC20_BALANCE_OF_AT_SNAPSHOT_BLOCK"
+
+
+class ExclusionReconciliation(Immutable):
+    """A provider-excluded address's balance, read on-chain at the holder block."""
+
+    address: EvmAddress
+    balance_raw: int = Field(ge=0)
+    block: int = Field(ge=0)
+    method: Literal["ERC20_BALANCE_OF_AT_SNAPSHOT_BLOCK"] = "ERC20_BALANCE_OF_AT_SNAPSHOT_BLOCK"
+
+
 class HolderFacts(Immutable):
     """Holder distribution, only ever from a source that can actually provide it.
 
@@ -323,6 +339,9 @@ class HolderFacts(Immutable):
     # Carried through from the source so a reader can see that the holder list
     # was filtered upstream, and why an adjustment may be absent.
     excluded_addresses: tuple[EvmAddress, ...] = Field(default=(), max_length=8)
+    # Of those, the ones read back on-chain at `snapshot_block` and included in
+    # the rows every share below was computed from.
+    reconciled_exclusions: tuple[ExclusionReconciliation, ...] = Field(default=(), max_length=8)
     snapshot_block: int | None = Field(default=None, ge=0)
     # Pinned contract block minus holder snapshot block, when both are known.
     # Positive means the holder data is older than the block the contract facts
@@ -358,9 +377,19 @@ class HolderFacts(Immutable):
                 raise ValueError("Available holder facts require an observation basis")
             if self.total_supply_raw is None:
                 raise ValueError("Available holder facts require the denominator they used")
-        elif self.top_holders or self.top1_share is not None:
+        elif self.top_holders or self.top1_share is not None or self.reconciled_exclusions:
             raise ValueError("Unavailable holder facts must not carry observations")
+        for item in self.reconciled_exclusions:
+            if item.address not in self.excluded_addresses or item.block != self.snapshot_block:
+                raise ValueError(
+                    "A reconciliation must name a provider exclusion at the holder block"
+                )
         return self
+
+    @property
+    def unresolved_exclusions(self) -> tuple[str, ...]:
+        resolved = {item.address for item in self.reconciled_exclusions}
+        return tuple(item for item in self.excluded_addresses if item not in resolved)
 
 
 class OriginFacts(Immutable):

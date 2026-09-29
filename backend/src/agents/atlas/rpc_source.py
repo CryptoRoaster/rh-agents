@@ -107,6 +107,17 @@ class RpcTokenContractSource:
             admin_address=admin,
         )
 
+    async def balance_of(self, token_address: str, holder: str, block: int) -> int | None:
+        """One ERC-20 balance at exactly `block`, or None when it could not be read.
+
+        None is not zero: a failed or malformed read leaves whatever depended on
+        it unresolved rather than supplying a convenient default.
+        """
+        try:
+            return await self.client.balance_of(token_address, holder, block)
+        except RuntimeFailure:
+            return None
+
     async def creation_receipt_contract(self, tx_hash: str) -> str | None:
         """Chain-side confirmation of a creation claim, or None when unobtainable.
 

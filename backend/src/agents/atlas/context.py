@@ -15,12 +15,16 @@ from typing import Protocol
 from uuid import UUID
 
 from src.agents.atlas.models import (
+    RECONCILABLE_EXCLUSIONS,
     AtlasOnchainSnapshot,
     AtlasSourceFailure,
     ChainSnapshot,
     ContractFacts,
+    ExclusionReconciliation,
     HolderFacts,
     HolderFactsSourceResult,
+    HolderObservationBasis,
+    HolderSourceRow,
     Immutable,
     OriginFacts,
     OriginVerification,
@@ -153,7 +157,41 @@ class AtlasSnapshotBuilder:
             )
         if result.status != Availability.AVAILABLE:
             return HolderFacts(status=result.status, failure=result.failure, source=result.source)
-        return self._holder_measurement(result, chain, token_address, contract)
+        reconciled = await self._reconcile(result, token_address)
+        return self._holder_measurement(result, chain, token_address, contract, reconciled)
+
+    async def _reconcile(
+        self, result: HolderFactsSourceResult, token_address: str
+    ) -> tuple[ExclusionReconciliation, ...]:
+        """Read back what the provider excluded, where that can be proven.
+
+        Only an explicitly reconcilable address (the zero address), only for a
+        block-anchored holder state, and only at exactly the provider's own
+        snapshot block — never the latest block as a stand-in. A missing block,
+        a failed or malformed read, a result for another token, or any other
+        excluded address leaves that exclusion unresolved; nothing is defaulted.
+        """
+        if (
+            result.token_address != token_address
+            or result.observation_basis != HolderObservationBasis.SOURCE_BLOCK
+            or result.snapshot_block is None
+        ):
+            return ()
+        block = result.snapshot_block
+        reconciled: list[ExclusionReconciliation] = []
+        for excluded in result.excluded_addresses:
+            if excluded not in RECONCILABLE_EXCLUSIONS:
+                continue
+            try:
+                balance = await self.contracts.balance_of(token_address, excluded, block)
+            except Exception:
+                balance = None
+            if balance is None or type(balance) is not int or balance < 0:
+                continue
+            reconciled.append(
+                ExclusionReconciliation(address=excluded, balance_raw=balance, block=block)
+            )
+        return tuple(reconciled)
 
     def _holder_measurement(
         self,
@@ -161,8 +199,14 @@ class AtlasSnapshotBuilder:
         chain: ChainSnapshot,
         token_address: str,
         contract: ContractFacts,
+        reconciled: tuple[ExclusionReconciliation, ...] = (),
     ) -> HolderFacts:
         """Turn provider rows into the measured fact, or into an honest failure.
+
+        A reconciled exclusion's on-chain balance joins the rows before anything
+        is computed, so a large holding the provider filtered out counts in the
+        raw top-N exactly like any other holder. Only exclusions still
+        unresolved are passed on as exclusions.
 
         Every concentration is computed here from raw balances and the on-chain
         supply. A provider's own percentage is never used, so a vendor cannot
@@ -184,10 +228,16 @@ class AtlasSnapshotBuilder:
             # The two views of the same contract are not merely skewed, they are
             # incompatible. Reconciliation is exact: no tolerance is guessed.
             return unusable(AtlasSourceFailure.SUPPLY_INCONSISTENT)
+        resolved = {item.address for item in reconciled}
+        unresolved = tuple(item for item in result.excluded_addresses if item not in resolved)
+        rows = result.rows + tuple(
+            HolderSourceRow(address=item.address, balance_raw=item.balance_raw)
+            for item in reconciled
+            # A zero balance holds nothing and takes no rank.
+            if item.balance_raw > 0
+        )
         try:
-            measured = concentration(
-                result.rows, supply, result.completeness, result.excluded_addresses
-            )
+            measured = concentration(rows, supply, result.completeness, unresolved)
         except HolderNormalizationError as error:
             return unusable(error.failure)
         return HolderFacts(
@@ -198,6 +248,7 @@ class AtlasSnapshotBuilder:
             observation_basis=result.observation_basis,
             completeness=result.completeness,
             excluded_addresses=result.excluded_addresses,
+            reconciled_exclusions=reconciled,
             snapshot_block=result.snapshot_block,
             holder_block_delta=(
                 None
@@ -354,6 +405,23 @@ def snapshot_document(snapshot: AtlasOnchainSnapshot) -> dict[str, object]:
             # digest, so a provider silently changing its filtering changes the
             # fact fingerprint instead of passing unnoticed.
             "excluded_addresses": list(holders.excluded_addresses),
+            # What was read back on-chain for those, and at which block. Only
+            # present when something was, so every earlier digest is unchanged.
+            **(
+                {
+                    "reconciled_exclusions": [
+                        {
+                            "address": item.address,
+                            "balance_raw": str(item.balance_raw),
+                            "block": item.block,
+                            "method": item.method,
+                        }
+                        for item in holders.reconciled_exclusions
+                    ]
+                }
+                if holders.reconciled_exclusions
+                else {}
+            ),
             "snapshot_block": holders.snapshot_block,
             "holder_block_delta": holders.holder_block_delta,
             "total_supply_raw": (

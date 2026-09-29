@@ -42,6 +42,27 @@ marketplace, which lists both methods for every plan including Free).
   `ATLAS_HOLDER_SOURCES`: every chain with an on-chain source needs a holder
   source, else `ATLAS_HOLDER_SOURCE_NOT_CONFIGURED`.
 
-Robinhood's Blockscout source is unchanged here, including its declared
-zero-address exclusion, which risk readiness still treats as understating the
-concentration metric.
+## Provider exclusions and their reconciliation (Robinhood / Blockscout)
+
+Blockscout removes the zero address from its holder list server-side and the
+adapter declares that (`excluded_addresses=(0x0…0,)`); the declaration is never
+dropped. ATLAS reconciles it:
+
+- only an explicitly reconcilable address (`RECONCILABLE_EXCLUSIONS`: the zero
+  address), only for a block-anchored holder state (`SOURCE_BLOCK`), and only
+  at **exactly the provider's `snapshot_block`** — never latest;
+- the read is ERC-20 `balanceOf(0x0)` over our RPC (`EvmRpcClient.balance_of`,
+  fixed selector, one 32-byte answer or a contract failure);
+- a successful read joins the rows before any share is computed, so a large
+  zero-address holding counts in the raw top-1/5/10 like any holder; the
+  burn-adjusted figure stays a separate measure and is only claimed from a
+  complete set;
+- recorded as `reconciled_exclusions` (address, balance, block, method
+  `ERC20_BALANCE_OF_AT_SNAPSHOT_BLOCK`) beside `provider_excluded_addresses`.
+
+Unresolved — and still `HOLDER_METRIC_UNDERSTATED` in risk readiness — is every
+exclusion without such a reconciliation: no snapshot block, a failed or
+malformed read, any other excluded address, a reconciliation at another block,
+and all legacy evidence (which never carries the field; its stored bytes and
+fingerprints are unchanged). Evidence and snapshot digests only change when a
+reconciliation is present.

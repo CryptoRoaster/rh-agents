@@ -241,6 +241,12 @@ class OnchainAdvisoryFinding(Immutable):
 # `SynthesisDetail` use for their legacy timestamp, applied once more rather
 # than generalised into a serialisation layer nobody could reason about.
 HOLDER_FACTS_KEY = "holders"
+# The same, for holder evidence written before exclusions could be reconciled.
+RECONCILED_EXCLUSIONS_KEY = "reconciled_exclusions"
+# How a provider-side exclusion may be reconciled: the standard ERC-20
+# `balanceOf` of that address, read over our own RPC at exactly the block the
+# provider's holder state belongs to. Nothing else resolves an exclusion.
+RECONCILIATION_METHOD = "ERC20_BALANCE_OF_AT_SNAPSHOT_BLOCK"
 
 
 def _holder_facts_present(data: Any) -> bool:
@@ -248,6 +254,26 @@ def _holder_facts_present(data: Any) -> bool:
     if isinstance(data, Mapping):
         return HOLDER_FACTS_KEY in data
     return bool(getattr(data, "_holder_facts_key_present", False))
+
+
+class ReconciledExclusion(Immutable):
+    """One provider-excluded address whose holding was read back on-chain.
+
+    Its balance is part of the rows the figures above were computed from, so the
+    exclusion no longer understates them. The provider's exclusion itself stays
+    recorded in `provider_excluded_addresses`; this says what was done about it.
+    """
+
+    address: Identifier
+    balance_raw: Annotated[str, Field(pattern=r"^[0-9]{1,78}$")]
+    block: int = Field(strict=True, ge=0)
+    method: Literal["ERC20_BALANCE_OF_AT_SNAPSHOT_BLOCK"] = "ERC20_BALANCE_OF_AT_SNAPSHOT_BLOCK"
+
+
+def _reconciled_exclusions_present(data: Any) -> bool:
+    if isinstance(data, Mapping):
+        return RECONCILED_EXCLUSIONS_KEY in data
+    return bool(getattr(data, "_reconciled_exclusions_key_present", False))
 
 
 class HolderDistributionFacts(Immutable):
@@ -300,6 +326,48 @@ class HolderDistributionFacts(Immutable):
     top_ten_fraction_excluding_burn: Share | None = None
     burned_fraction: Share | None = None
     provider_excluded_addresses: tuple[Identifier, ...] = Field(default=(), max_length=8)
+    # Exclusions reconciled on-chain at the holder snapshot block. Absent on
+    # evidence written before reconciliation existed, and omitted for exactly
+    # those rows so their stored bytes and fingerprints replay unchanged. Absent
+    # means nothing was reconciled: every exclusion stays unresolved.
+    reconciled_exclusions: tuple[ReconciledExclusion, ...] = Field(default=(), max_length=8)
+
+    _reconciled_exclusions_key_present: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _remember_reconciliation_shape(cls, data: Any, handler: Any) -> Any:
+        present = _reconciled_exclusions_present(data)
+        model = handler(data)
+        object.__setattr__(model, "_reconciled_exclusions_key_present", present)
+        return model
+
+    @model_serializer(mode="wrap")
+    def _historical_reconciliation_shape(self, handler: Any) -> dict[str, Any]:
+        emitted: dict[str, Any] = handler(self)
+        if self._reconciled_exclusions_key_present:
+            return emitted
+        return {key: value for key, value in emitted.items() if key != RECONCILED_EXCLUSIONS_KEY}
+
+    @property
+    def unresolved_exclusions(self) -> tuple[str, ...]:
+        """Provider exclusions not proven on-chain at this holder snapshot's block.
+
+        A reconciliation counts only if it names an address the provider actually
+        excluded, was read at exactly `snapshot_block`, and used the one
+        supported method. Anything else — including legacy evidence carrying no
+        reconciliation at all — leaves the exclusion unresolved.
+        """
+        resolved = {
+            item.address
+            for item in self.reconciled_exclusions
+            if self.snapshot_block is not None
+            and item.block == self.snapshot_block
+            and item.method == RECONCILIATION_METHOD
+        }
+        return tuple(
+            address for address in self.provider_excluded_addresses if address not in resolved
+        )
 
 
 class OnchainIntelligence(Immutable):
