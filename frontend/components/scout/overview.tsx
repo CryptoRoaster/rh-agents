@@ -41,9 +41,16 @@ export function OverviewStrip({ overview }: { overview: ScoutOverview }) {
         <Kpi label="Dormant" value={String(overview.by_status.DORMANT)} />
         <Kpi label="Retired" value={String(overview.by_status.RETIRED)} />
         <Kpi
-          label="ORBIT backlog"
+          label="ORBIT fresh due"
           value={String(overview.orbit_backlog)}
-          detail={`${overview.unreviewed_watches} never reviewed`}
+          detail={`${overview.unreviewed_watches} pending first review`}
+        />
+        <Kpi
+          label="ORBIT closed"
+          value={String(overview.orbit_reviewed ?? 0)}
+          detail={`${overview.orbit_first_reviews_skipped_stale ?? 0} skipped stale · ${
+            overview.orbit_follow_ups_deferred ?? 0
+          } follow-ups deferred`}
         />
         <Kpi
           label="Oldest due"

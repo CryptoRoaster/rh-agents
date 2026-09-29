@@ -195,8 +195,15 @@ async def scout(
     history: ScriptedHistory | None = None,
     settings: Settings | None = None,
     fast=None,
+    policy=None,
 ):
-    """One real scout cycle at `now`, with the outside edges replaced."""
+    """One real scout cycle at `now`, with the outside edges replaced.
+
+    The suite written against EARLY_SCOUT_V1's timeline pins that policy here;
+    tests of the production default (EARLY_SCOUT_V2) pass it explicitly.
+    """
+    from src.scout.policy import EARLY_SCOUT_V1
+
     history = history if history is not None else ScriptedHistory()
     history.now = now
     cycle = EarlyScoutCycle(
@@ -209,6 +216,7 @@ async def scout(
             fast=fast,
         ),
         clock=FixedClock(now),
+        policy=policy if policy is not None else EARLY_SCOUT_V1,
     )
     return await cycle.execute()
 

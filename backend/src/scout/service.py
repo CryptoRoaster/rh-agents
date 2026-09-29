@@ -79,7 +79,7 @@ from src.orchestration.commander.context import (
 from src.reasoning.models import ReasoningErrorCategory, ReasoningFailure
 from src.reasoning.provider import ReasoningProvider
 from src.runner.models import ConfigurationRefused
-from src.scout.budget import OrbitBudget, utc_day
+from src.scout.budget import OrbitBudget, SlotPacing, utc_day
 from src.scout.models import (
     DiscoveryWatch,
     ModelFailureCount,
@@ -100,7 +100,7 @@ from src.scout.outcomes import (
     SamplerStop,
     classify_history_failure,
 )
-from src.scout.policy import EARLY_SCOUT_V1, EarlyScoutPolicy, WatchStatus
+from src.scout.policy import EARLY_SCOUT_V2, EarlyScoutPolicy, WatchStatus
 from src.scout.repository import SyncResult, WatchRepository, refreshed_identity_contradicts
 from src.scout.runs import ScoutRunRepository
 from src.scout.shadow import FastAssessmentStore, ShadowTally, ShadowTriage
@@ -252,6 +252,10 @@ class Tally:
     orbit_daily_remaining_before: int = 0
     orbit_daily_used_after: int = 0
     orbit_daily_remaining_after: int = 0
+    orbit_fresh_first_reviews_due: int = 0
+    orbit_first_reviews_skipped_stale: int = 0
+    orbit_follow_ups_deferred: int = 0
+    orbit_slots_released: int = 0
     reviews: list[ScoutReview] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     shadow: ShadowTally = field(default_factory=ShadowTally)
@@ -287,7 +291,7 @@ class EarlyScoutCycle:
         *,
         ports: ScoutPorts | None = None,
         clock: Clock | None = None,
-        policy: EarlyScoutPolicy = EARLY_SCOUT_V1,
+        policy: EarlyScoutPolicy = EARLY_SCOUT_V2,
     ) -> None:
         self._settings = settings
         self._sessions = sessions
@@ -296,6 +300,8 @@ class EarlyScoutCycle:
         self._policy = policy
         self._watches = WatchRepository(sessions, policy=policy)
         self._budget = OrbitBudget(sessions)
+        # V2 spreads the day's paid ORBIT slots evenly; V1 keeps its daily cap only.
+        self._pacing = SlotPacing() if policy.fresh_first_only else None
         # Discovery and refresh freshness is ORBIT's own discovery freshness.
         self._max_input_age = timedelta(seconds=settings.orbit_input_max_age_seconds)
 
@@ -645,7 +651,14 @@ class EarlyScoutCycle:
         than one request per watch.
         """
         now = self._clock.now()
+        # V2 closes review debt it will not serve before counting anything, so
+        # "due" only ever means work this run could actually do.
+        settled = await self._watches.settle_orbit_debts(now)
+        tally.orbit_first_reviews_skipped_stale = settled.skipped_stale
+        tally.orbit_follow_ups_deferred = settled.follow_ups_deferred
         tally.watches_due_orbit, tally.watches_due_history = await self._watches.count_due(now)
+        if self._policy.fresh_first_only:
+            tally.orbit_fresh_first_reviews_due = tally.watches_due_orbit
         before = await self._watches.backlog(now)
         tally.orbit_backlog_before = before.due
         tally.oldest_orbit_due_age_seconds = before.oldest_due_age_seconds
@@ -660,16 +673,17 @@ class EarlyScoutCycle:
         tally.orbit_daily_budget = cap
         tally.orbit_daily_used_before = used
         tally.orbit_daily_remaining_before = max(0, cap - used)
+        available = await self._budget.available(now, cap, self._pacing)
+        if self._pacing is not None:
+            tally.orbit_slots_released = min(cap, self._pacing.released(now, cap))
         # Choose the workable reviews and history checks first, then re-observe
         # every stale one in a single batch per chain: one refresh request for
         # the whole run instead of one per stage.
         stale: list[DiscoveryWatch] = []
         reviews = await self._select(
             await self._watches.due_for_orbit(now, DUE_SCAN),
-            min(
-                self._settings.early_scout_max_orbit_reviews_per_run,
-                tally.orbit_daily_remaining_before,
-            ),
+            # The per-run cap stays as a safety bound; pacing decides the rest.
+            min(self._settings.early_scout_max_orbit_reviews_per_run, available),
             readings,
             stale,
         )
@@ -832,9 +846,16 @@ class EarlyScoutCycle:
             review.checkpoint_index,
             now,
             self._settings.early_scout_max_orbit_reviews_per_day,
+            self._pacing,
         )
         if reservation is None:
-            await self._watches.note(watch.id, "ORBIT_DAILY_BUDGET_REACHED", now)
+            await self._watches.note(
+                watch.id,
+                "ORBIT_SLOT_NOT_RELEASED"
+                if self._pacing is not None
+                else "ORBIT_DAILY_BUDGET_REACHED",
+                now,
+            )
             return
         if not await self._watches.claim_orbit(
             watch.id,
@@ -1111,6 +1132,10 @@ class EarlyScoutCycle:
             orbit_daily_remaining_before=tally.orbit_daily_remaining_before,
             orbit_daily_used_after=tally.orbit_daily_used_after,
             orbit_daily_remaining_after=tally.orbit_daily_remaining_after,
+            orbit_fresh_first_reviews_due=tally.orbit_fresh_first_reviews_due,
+            orbit_first_reviews_skipped_stale=tally.orbit_first_reviews_skipped_stale,
+            orbit_follow_ups_deferred=tally.orbit_follow_ups_deferred,
+            orbit_slots_released=tally.orbit_slots_released,
             reviews=tuple(tally.reviews[:16]),
             model_failure_reasons=tuple(
                 ModelFailureCount(provider=provider, category=category, reason_code=code, count=n)

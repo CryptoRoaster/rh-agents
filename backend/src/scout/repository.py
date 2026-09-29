@@ -13,6 +13,7 @@ while a transaction opened here is still open.
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from hashlib import sha256
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -30,7 +31,13 @@ from src.data.tables import (
 )
 from src.markets.models import MarketIdentity, MarketSnapshot
 from src.scout.models import DiscoveryWatch, WatchAssessment
-from src.scout.policy import EARLY_SCOUT_V1, REVIEWABLE, EarlyScoutPolicy, WatchStatus
+from src.scout.policy import (
+    EARLY_SCOUT_V2,
+    REVIEWABLE,
+    EarlyScoutPolicy,
+    OrbitState,
+    WatchStatus,
+)
 
 WATCH_SCHEMA_VERSION = 1
 
@@ -144,14 +151,53 @@ class Backlog:
 
     due: int
     oldest_due_age_seconds: int | None
-    # Reviewable watches that have never had an ORBIT review.
+    # Reviewable watches that have never had an ORBIT review and still may.
     unreviewed: int
+    # What became of review debt that will not be served (EARLY_SCOUT_V2).
+    skipped_stale: int = 0
+    follow_ups_deferred: int = 0
+    reviewed: int = 0
+
+
+@dataclass(frozen=True)
+class OrbitSettlement:
+    """Review debt one run closed without a model call."""
+
+    skipped_stale: int = 0
+    follow_ups_deferred: int = 0
+
+
+# The upper bound on fresh first reviews read to choose among. A freshness
+# window of an hour holds a few dozen at the measured intake; this only keeps a
+# pathological burst from becoming an unbounded read.
+FRESH_SCAN = 2000
+
+
+def selection_key(policy_version: str, watch: DiscoveryWatch) -> str:
+    """The signal-blind order fresh first reviews are chosen in.
+
+    A hash of the policy version and the stable market identity and nothing
+    else: no price, liquidity, volume, momentum, JEV answer or model opinion
+    can move a watch up or down. The same watch always sorts the same way under
+    the same policy, on both chains alike.
+    """
+    identity = "|".join(
+        (
+            policy_version,
+            watch.provider,
+            watch.chain,
+            watch.network,
+            watch.pair_id,
+            str(watch.is_fixture),
+        )
+    )
+    return sha256(identity.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
 class WatchRepository:
     sessions: async_sessionmaker[AsyncSession]
-    policy: EarlyScoutPolicy = EARLY_SCOUT_V1
+    policy: EarlyScoutPolicy = EARLY_SCOUT_V2
 
     # ------------------------------------------------------------------ reads
 
@@ -201,13 +247,89 @@ class WatchRepository:
         )
 
     async def due_for_orbit(self, now: datetime, limit: int) -> tuple[DiscoveryWatch, ...]:
-        """Due reviews in schedule order, then discovery order, then identity.
+        """Due reviews, in an order no market figure or opinion can influence.
 
-        Never by liquidity, volume, price or any earlier classification: the
-        order a budget cuts at must not become a hidden strategy.
+        V1: schedule order, then discovery order, then identity. V2 (fresh first
+        only): first reviews still inside the freshness window, ordered by the
+        signal-blind `selection_key` — never by liquidity, volume, price, JEV or
+        any earlier classification: the order a budget cuts at must not become
+        a hidden strategy.
         """
-        return await self._select_due(
-            DiscoveryWatchRow.next_orbit_review_at, REVIEWABLE, now, limit
+        if not self.policy.fresh_first_only:
+            return await self._select_due(
+                DiscoveryWatchRow.next_orbit_review_at, REVIEWABLE, now, limit
+            )
+        if limit <= 0:
+            return ()
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(DiscoveryWatchRow)
+                    .where(self._fresh_first(now))
+                    .order_by(DiscoveryWatchRow.first_seen_at, DiscoveryWatchRow.pair_id)
+                    .limit(FRESH_SCAN)
+                )
+            ).all()
+        fresh = [_watch(row) for row in rows]
+        fresh.sort(key=lambda watch: selection_key(self.policy.version, watch))
+        return tuple(fresh[:limit])
+
+    def _fresh_first(self, now: datetime) -> Any:
+        """A pending first review, due, and still inside the freshness window."""
+        window = self.policy.first_review_window
+        assert window is not None  # only called under a fresh-first policy
+        return and_(
+            self._due(DiscoveryWatchRow.next_orbit_review_at, REVIEWABLE, now),
+            DiscoveryWatchRow.orbit_checkpoint_index.is_(None),
+            DiscoveryWatchRow.orbit_state.is_(None),
+            DiscoveryWatchRow.first_seen_at >= now - window,
+        )
+
+    async def settle_orbit_debts(self, now: datetime) -> OrbitSettlement:
+        """Close review debt V2 will not serve, deterministically and without a call.
+
+        Two bulk updates, each idempotent because it only touches rows that
+        still owe a review: a first review not taken within the freshness
+        window is `ORBIT_FIRST_REVIEW_SKIPPED_STALE`; a watch already reviewed
+        whose V1 follow-ups are still scheduled is `ORBIT_FOLLOW_UPS_DEFERRED`.
+        Nothing else changes — status, history schedule, assessments and the
+        watch itself stay exactly as they were.
+        """
+        window = self.policy.first_review_window
+        if window is None:
+            return OrbitSettlement()
+        owing = and_(
+            DiscoveryWatchRow.status.in_([item.value for item in REVIEWABLE]),
+            DiscoveryWatchRow.next_orbit_review_at.is_not(None),
+        )
+        async with self.sessions.begin() as session:
+            stale = await session.execute(
+                update(DiscoveryWatchRow)
+                .where(
+                    owing,
+                    DiscoveryWatchRow.orbit_checkpoint_index.is_(None),
+                    DiscoveryWatchRow.first_seen_at < now - window,
+                )
+                .values(
+                    next_orbit_review_at=None,
+                    orbit_state=OrbitState.FIRST_REVIEW_SKIPPED_STALE.value,
+                    orbit_state_at=now,
+                    updated_at=now,
+                )
+            )
+            deferred = await session.execute(
+                update(DiscoveryWatchRow)
+                .where(owing, DiscoveryWatchRow.orbit_checkpoint_index.is_not(None))
+                .values(
+                    next_orbit_review_at=None,
+                    orbit_state=OrbitState.FOLLOW_UPS_DEFERRED.value,
+                    orbit_state_at=now,
+                    updated_at=now,
+                )
+            )
+        return OrbitSettlement(
+            skipped_stale=int(getattr(stale, "rowcount", 0) or 0),
+            follow_ups_deferred=int(getattr(deferred, "rowcount", 0) or 0),
         )
 
     async def due_for_history(self, now: datetime, limit: int) -> tuple[DiscoveryWatch, ...]:
@@ -273,14 +395,29 @@ class WatchRepository:
             unreviewed = await session.scalar(
                 select(func.count())
                 .select_from(DiscoveryWatchRow)
-                .where(reviewable, DiscoveryWatchRow.orbit_checkpoint_index.is_(None))
+                .where(
+                    reviewable,
+                    DiscoveryWatchRow.orbit_checkpoint_index.is_(None),
+                    DiscoveryWatchRow.orbit_state.is_(None),
+                )
             )
+            grouped = (
+                await session.execute(
+                    select(DiscoveryWatchRow.orbit_state, func.count())
+                    .where(DiscoveryWatchRow.orbit_state.is_not(None))
+                    .group_by(DiscoveryWatchRow.orbit_state)
+                )
+            ).all()
+            states: dict[str, int] = {str(state): int(total) for state, total in grouped}
         return Backlog(
             due=int(count or 0),
             oldest_due_age_seconds=None
             if oldest is None
             else max(0, int((now - aware(oldest)).total_seconds())),
             unreviewed=int(unreviewed or 0),
+            skipped_stale=int(states.get(OrbitState.FIRST_REVIEW_SKIPPED_STALE.value, 0)),
+            follow_ups_deferred=int(states.get(OrbitState.FOLLOW_UPS_DEFERRED.value, 0)),
+            reviewed=int(states.get(OrbitState.REVIEWED.value, 0)),
         )
 
     async def promotable(self, limit: int) -> tuple[DiscoveryWatch, ...]:
@@ -462,11 +599,20 @@ class WatchRepository:
                     DiscoveryWatchRow.id == watch_id,
                     DiscoveryWatchRow.next_orbit_review_at == expected,
                     DiscoveryWatchRow.status.in_([item.value for item in REVIEWABLE]),
+                    *(
+                        # V2: only a pending first review still inside the window.
+                        (self._fresh_first(now),) if self.policy.fresh_first_only else ()
+                    ),
                 )
                 .values(
                     next_orbit_review_at=next_at,
                     orbit_checkpoint_index=checkpoint_index,
                     updated_at=now,
+                    **(
+                        {"orbit_state": OrbitState.REVIEWED.value, "orbit_state_at": now}
+                        if self.policy.fresh_first_only
+                        else {}
+                    ),
                 )
             )
             return bool(getattr(result, "rowcount", 0) == 1)

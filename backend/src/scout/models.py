@@ -159,6 +159,13 @@ class ScoutSummary(Immutable):
     orbit_daily_remaining_before: int = Field(default=0, ge=0)
     orbit_daily_used_after: int = Field(default=0, ge=0)
     orbit_daily_remaining_after: int = Field(default=0, ge=0)
+    # EARLY_SCOUT_V2: fresh first reviews due at the start of the ORBIT stage,
+    # review debt this run closed without a model call, and the day's slots the
+    # pacing had released by then.
+    orbit_fresh_first_reviews_due: int = Field(default=0, ge=0)
+    orbit_first_reviews_skipped_stale: int = Field(default=0, ge=0)
+    orbit_follow_ups_deferred: int = Field(default=0, ge=0)
+    orbit_slots_released: int = Field(default=0, ge=0)
     reviews: tuple[ScoutReview, ...] = Field(default=(), max_length=16)
     # Every model failure of this run, counted by provider, category and code.
     model_failure_reasons: tuple[ModelFailureCount, ...] = Field(default=(), max_length=32)
@@ -229,6 +236,10 @@ class ScoutRun(Immutable):
     orbit_daily_remaining_before: int
     orbit_daily_used_after: int
     orbit_daily_remaining_after: int
+    orbit_fresh_first_reviews_due: int = 0
+    orbit_first_reviews_skipped_stale: int = 0
+    orbit_follow_ups_deferred: int = 0
+    orbit_slots_released: int = 0
     model_failure_reasons: tuple[ModelFailureCount, ...] = ()
 
     @property

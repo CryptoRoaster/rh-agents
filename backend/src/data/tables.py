@@ -696,6 +696,15 @@ class DiscoveryWatchRow(Base):
             "orbit_checkpoint_index IS NULL OR orbit_checkpoint_index >= 0",
             name="discovery_watch_checkpoint_index",
         ),
+        CheckConstraint(
+            "orbit_state IS NULL OR orbit_state IN ('REVIEWED', "
+            "'ORBIT_FIRST_REVIEW_SKIPPED_STALE', 'ORBIT_FOLLOW_UPS_DEFERRED')",
+            name="discovery_watch_orbit_state",
+        ),
+        CheckConstraint(
+            "(orbit_state IS NULL) = (orbit_state_at IS NULL)",
+            name="discovery_watch_orbit_state_dated",
+        ),
         Index("ix_discovery_watches_orbit_due", "status", "next_orbit_review_at"),
         Index("ix_discovery_watches_history_due", "status", "next_history_review_at"),
         Index("ix_discovery_watches_first_seen", "first_seen_at", "pair_id"),
@@ -720,6 +729,10 @@ class DiscoveryWatchRow(Base):
     next_orbit_review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # The last checkpoint an ORBIT review was taken for. NULL before the first.
     orbit_checkpoint_index: Mapped[int | None] = mapped_column(Integer)
+    # What became of the ORBIT review debt (EARLY_SCOUT_V2), and when. NULL while
+    # it is still pending, and for rows no V2 run has settled yet.
+    orbit_state: Mapped[str | None] = mapped_column(String(40))
+    orbit_state_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_history_review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     latest_vector_sufficiency: Mapped[str | None] = mapped_column(String(60))
     vector_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -849,6 +862,13 @@ class ScoutRunRow(Base):
     orbit_daily_remaining_before: Mapped[int] = mapped_column(Integer)
     orbit_daily_used_after: Mapped[int] = mapped_column(Integer)
     orbit_daily_remaining_after: Mapped[int] = mapped_column(Integer)
+    # EARLY_SCOUT_V2 review-debt settlement and budget pacing (migration 0019).
+    orbit_fresh_first_reviews_due: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    orbit_first_reviews_skipped_stale: Mapped[int] = mapped_column(
+        Integer, server_default=text("0")
+    )
+    orbit_follow_ups_deferred: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    orbit_slots_released: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     # Model failures by provider, category and reason code: a list of
     # {"provider", "category", "reason_code", "count"}. Codes only.
     model_failure_reasons: Mapped[list[dict[str, Any]]] = mapped_column(
