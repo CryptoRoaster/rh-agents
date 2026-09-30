@@ -359,6 +359,9 @@ def test_the_summary_carries_no_secret_and_no_payload(risk_db):
         "risk_requests",
         "fills",
         "replays",
+        # Counts only; the per-case detail is each case's `market_refreshes`.
+        "pre_risk_market_refreshes",
+        "pre_risk_refusals",
         # Counts and codes only; absent unless automatic PAPER exits are configured.
         "exits",
         "errors",

@@ -75,6 +75,7 @@ from src.orchestration.workflow.service import TradeCaseService
 from src.reasoning.provider import ReasoningProvider
 from src.runner.acquisition import BoundedMarketAcquisition
 from src.runner.models import AcquisitionLimits, RoleAvailability, RunLimits
+from src.runner.pre_risk import PreRiskLimits, PreRiskMarketRefresh
 from src.runtime.models import chain_configs
 from src.scout.candidates import PromotedWatchCandidates, PromotionRefresh
 from src.scout.repository import WatchRepository
@@ -290,6 +291,10 @@ class RunnerStack:
     # the ordinary case and means exactly what it did before this contract: the
     # run trades whatever was already recorded and asks nobody for anything.
     acquisition: BoundedMarketAcquisition | None = None
+    # Composed under the same consent as acquisition, with a budget of its own.
+    # Absent, a risk request is asked exactly as it was before: over whatever
+    # was already recorded, with SENTINEL's own bound refusing what is stale.
+    pre_risk: PreRiskMarketRefresh | None = None
     # Present only with the early scout enabled: intake then reads PROMOTABLE
     # watches instead of every fresh new pool, and this re-observes them by
     # exact locator first. Absent means intake is exactly what it always was.
@@ -478,6 +483,7 @@ def build_stack(
         )
     runners, roles = _runners(settings, sessions, runtime, markets, supplied, tick)
     acquisition = None
+    pre_risk = None
     if settings.paper_runner_market_acquisition_enabled:
         # Composed from settings and nothing else, like every other port here.
         # Its own transport is built when it runs and closed when it finishes,
@@ -488,6 +494,18 @@ def build_stack(
             markets,
             acquisition_limits_from_settings(settings),
             pause=supplied.pause,
+            clock=tick,
+            http=supplied.market_http,
+        )
+        pre_risk = PreRiskMarketRefresh(
+            settings,
+            sessions,
+            markets,
+            paper.limits,
+            PreRiskLimits(
+                max_requests=settings.paper_runner_pre_risk_market_max_requests,
+                max_seconds=settings.paper_runner_pre_risk_market_max_seconds,
+            ),
             clock=tick,
             http=supplied.market_http,
         )
@@ -507,6 +525,7 @@ def build_stack(
         clock=tick,
         pause=supplied.pause,
         acquisition=acquisition,
+        pre_risk=pre_risk,
         promotion=promotion,
         watches=watches,
         exits=exits,

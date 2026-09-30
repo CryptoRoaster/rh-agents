@@ -83,6 +83,58 @@ fixed codes. A read that did not return says `completed=false` with a reason and
 reports no counters, because it never finished counting. How many pools the
 provider's document carried is not counted anywhere and is not inferred.
 
+### Pre-risk market refresh (with acquisition)
+
+Composed whenever acquisition is enabled, and never otherwise. SENTINEL refuses
+market observations older than its own 30-second bound, and the run-start
+acquisition has aged past that by the time a case has waited on its handlers.
+So immediately before a **new** risk request the run observes again, by exact
+pool locator only, the markets that request will read:
+
+- the case's own market, and
+- the market of every open position SENTINEL values,
+
+each once. Not the payment-asset reference ANCHOR uses, no discovery, no other
+case. Each market must come back as exactly the stored identity (provider,
+chain, network, venue, both assets, pool locator); nothing is searched by
+symbol, name or address and no pool is substituted. Observations are recorded
+through the ordinary recorder and committed before the request.
+
+**Pair-agnostic.** Any pair the market path supports is refreshed alike —
+MEME/MEME, MEME/TOKEN, TOKEN/WETH, TOKEN/stable, native/token, token/native.
+Base and quote are taken unchanged from the stored identity; no quote asset is
+required, preferred, ranked or excluded, and nothing here names WETH, WBNB or a
+stablecoin.
+
+| Setting | Meaning |
+| --- | --- |
+| `PAPER_RUNNER_PRE_RISK_MARKET_MAX_REQUESTS=3` | Provider requests per refresh, network resolution included. Its own budget, never the acquisition's. |
+| `PAPER_RUNNER_PRE_RISK_MARKET_MAX_SECONDS=15` | Time per refresh, additionally bounded by the run's remaining time. |
+
+The order is: market refresh → risk request; and when that request is refused
+for a stale ATLAS/ANCHOR source, source refresh → market refresh again → the
+same request re-asked. The existing source-refresh bound applies; no source
+refresh means no second market refresh. A `RISK_APPROVED` replay is never
+refreshed — its verdict already exists.
+
+**Fail closed.** If any needed market cannot be shown fresh, no risk request is
+sent and the case's progress says why in `pre_risk_refusal`:
+`MARKET_IDENTITY_UNKNOWN`, `POOL_LOCATOR_UNKNOWN`, `CHAIN_NOT_CONFIGURED`,
+`MARKET_NOT_RETURNED`, `MARKET_IDENTITY_MISMATCH`, `PROVIDER_FAILED`,
+`TIME_BUDGET_REACHED`, `REQUEST_BUDGET_REACHED`, `RECORD_OUTCOME_UNKNOWN`,
+`MARKET_STILL_STALE` or `DATABASE_UNAVAILABLE`. An older observation is never
+used in place of a failed read, and a replayed provider event is judged on the
+source time actually stored — nothing is re-dated. A liquidity the provider
+could not state stays unknown, and the request's own readiness check refuses it.
+
+**Reading it.** Three things are reported apart: the run-start `acquisition`
+block, each case's `refreshes` (workflow source refreshes of ATLAS/ANCHOR), and
+each case's `market_refreshes` — one entry per pre-risk refresh, marked
+`stage=PRE_RISK_MARKET_REFRESH`, with `ready`, `reason`, `required_markets`,
+`attempted`, `recorded`, `unchanged`, `refused`, `failed`, `provider_requests`
+and the canonical pair ids. The run summary adds `pre_risk_market_refreshes`
+and `pre_risk_refusals`. Counts and codes only, never a provider payload.
+
 ## 3. The preflight
 
 ```sh

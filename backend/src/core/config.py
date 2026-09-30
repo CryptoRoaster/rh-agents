@@ -326,6 +326,15 @@ class Settings(BaseSettings):
     # The whole acquisition stage, measured monotonically and additionally
     # bounded by whatever is left of the run's own runtime.
     paper_runner_acquisition_max_seconds: int = Field(default=60, ge=1, le=600)
+    # The pre-risk market refresh: immediately before a risk request, the case's
+    # market and every open position's market are observed again by exact pool
+    # locator, so SENTINEL reads observations younger than its own bound. It
+    # rides on the same consent as acquisition (it is composed only when
+    # `paper_runner_market_acquisition_enabled` is set) and has a budget of its
+    # own, applied per refresh: it never spends the run-start acquisition's
+    # requests or time, and it never discovers anything.
+    paper_runner_pre_risk_market_max_requests: int = Field(default=3, ge=1, le=10)
+    paper_runner_pre_risk_market_max_seconds: int = Field(default=15, ge=1, le=120)
     # Early discovery scout. Disabled by default, and it grants no trading
     # authority of any kind: `python -m src.runner.main --scout-once` discovers
     # new pools, keeps a persistent watch on each, asks ORBIT about them at fixed
@@ -402,6 +411,8 @@ class Settings(BaseSettings):
                 raise ValueError("Market acquisition requires a real market provider")
             if self.paper_runner_acquisition_max_seconds > self.paper_runner_max_seconds:
                 raise ValueError("Acquisition may not be allowed to outlast the run")
+            if self.paper_runner_pre_risk_market_max_seconds > self.paper_runner_max_seconds:
+                raise ValueError("A pre-risk market refresh may not outlast the run")
         return self
 
     @model_validator(mode="after")

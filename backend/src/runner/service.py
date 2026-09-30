@@ -79,6 +79,7 @@ from src.runner.models import (
     ConfigurationRefused,
     ExitReport,
     MarketAcquisition,
+    PreRiskRefresh,
     PromotionReading,
     RunLimits,
     RunReading,
@@ -603,6 +604,7 @@ class BoundedPaperRun:
         stack = self.stack
         case = await self._bounded(stack.cases.get_trade_case(trade_case_id), deadline)
         refreshes: list[SourceRefresh] = []
+        markets: list[PreRiskRefresh] = []
         if case.status is TradeCaseStatus.BLOCKED:
             # A case can be blocked on evidence that is merely old — an execution
             # assessment outlives its quotes long before the setup it serves runs
@@ -626,6 +628,7 @@ class BoundedPaperRun:
                     status=case.status.value,
                     reason_code=_code(case.reason_code),
                     refreshes=tuple(refreshes),
+                    market_refreshes=tuple(markets),
                 )
             )
             return
@@ -648,6 +651,24 @@ class BoundedPaperRun:
                     status=case.status.value,
                     reason_code=_code(case.reason_code),
                     refreshes=tuple(refreshes),
+                    market_refreshes=tuple(markets),
+                )
+            )
+            return
+        # A new request is about to be made, so the markets it will read are
+        # observed first. Not on `RISK_APPROVED`: that request was already made
+        # and answered, and asking again replays the stored verdict — a new
+        # observation could change nothing about it.
+        fresh = case.status is TradeCaseStatus.READY_FOR_RISK
+        if fresh and not await self._markets_fresh(case, account, deadline, markets):
+            account.record(
+                CaseProgress(
+                    trade_case_id=trade_case_id,
+                    status=case.status.value,
+                    reason_code=_code(case.reason_code),
+                    refreshes=tuple(refreshes),
+                    market_refreshes=tuple(markets),
+                    pre_risk_refusal=None if not markets else markets[-1].reason,
                 )
             )
             return
@@ -667,7 +688,7 @@ class BoundedPaperRun:
             # before the case's one request is spent on readings nobody would
             # accept.
             verdict = await self._refresh(
-                trade_case_id, verdict, key, account, deadline, refreshes, case.status.value
+                case, verdict, key, account, deadline, refreshes, markets, fresh=fresh
             )
             if verdict is None:
                 return
@@ -677,7 +698,11 @@ class BoundedPaperRun:
                     trade_case_id=trade_case_id,
                     status=case.status.value,
                     risk_refusal=verdict.reason.value,
+                    pre_risk_refusal=None
+                    if not markets or markets[-1].ready
+                    else markets[-1].reason,
                     refreshes=tuple(refreshes),
+                    market_refreshes=tuple(markets),
                 )
             )
             return
@@ -692,6 +717,7 @@ class BoundedPaperRun:
                 risk_outcome=outcome,
                 replayed=verdict.replayed,
                 refreshes=tuple(refreshes),
+                market_refreshes=tuple(markets),
             )
         )
         if verdict.authorization.value != "APPROVED":
@@ -709,6 +735,7 @@ class BoundedPaperRun:
                     risk_outcome=outcome,
                     replayed=verdict.replayed,
                     refreshes=tuple(refreshes),
+                    market_refreshes=tuple(markets),
                 )
             )
             return
@@ -732,6 +759,7 @@ class BoundedPaperRun:
                     fill_refusal=fill.reason.value,
                     replayed=fill.replayed,
                     refreshes=tuple(refreshes),
+                    market_refreshes=tuple(markets),
                 )
             )
             return
@@ -743,6 +771,7 @@ class BoundedPaperRun:
                 execution_id=fill.execution_id,
                 replayed=fill.replayed,
                 refreshes=tuple(refreshes),
+                market_refreshes=tuple(markets),
             )
         )
 
@@ -831,15 +860,50 @@ class BoundedPaperRun:
         await self._drain(frozenset({trade_case_id}), account, deadline)
         return placed
 
+    async def _markets_fresh(
+        self,
+        case: Any,
+        account: Account,
+        deadline: Deadline,
+        markets: list[PreRiskRefresh],
+    ) -> bool:
+        """Observe the markets a new risk request will read, and say whether to ask.
+
+        Absent unless market acquisition was switched on, and then the run asks
+        exactly as it did before this stage existed: SENTINEL's own bound still
+        refuses a stale reading, it just cannot be helped. Present, it observes
+        the case's market and every open position's by exact locator and records
+        them — each recording committed on its own — before the request is
+        made. Anything short of every one of them being fresh means no request:
+        a request asked over a market nobody could re-observe would be spent on
+        a reading SENTINEL must refuse.
+
+        Reported as its own thing, apart from the run-start acquisition and the
+        workflow's source refreshes. Not a step: a step is a call into the
+        trading contracts, and none is made here. It is still bounded by the
+        run's deadline, and a pass whose time or steps ran out while it was
+        observing does not then start a request.
+        """
+        stage = self.stack.pre_risk
+        if stage is None:
+            return True
+        reading = await stage.refresh(case, deadline)
+        markets.append(reading)
+        if not reading.ready:
+            return False
+        return account.may_step(deadline)
+
     async def _refresh(
         self,
-        trade_case_id: UUID,
+        case: Any,
         refusal: Any,
         key: str,
         account: Account,
         deadline: Deadline,
         refreshes: list[SourceRefresh],
-        status: str,
+        markets: list[PreRiskRefresh],
+        *,
+        fresh: bool,
     ) -> Any:
         """Establish the preconditions this case is missing, then ask again.
 
@@ -859,7 +923,15 @@ class BoundedPaperRun:
         Everything it does is an ordinary step against the same step and time
         budgets, and when a new observation does not arrive the refusal that was
         already there is what gets reported, unchanged.
+
+        The markets are observed again between the source refresh and the
+        second question, and only then: a source refresh takes the time of a
+        handler, and the markets observed before the first question have aged
+        by that much. No source refresh ordered means no second question and no
+        second market observation either.
         """
+        trade_case_id = case.id
+        status = case.status.value
         while refusal is not None and refusal.kind == "risk_request_refused":
             wanted = tuple(
                 origin
@@ -873,6 +945,8 @@ class BoundedPaperRun:
             if not any(item.outcome == SourceRefreshOutcome.ORDERED.value for item in placed):
                 return refusal
             if not account.may_step(deadline):
+                return refusal
+            if fresh and not await self._markets_fresh(case, account, deadline, markets):
                 return refusal
             account.steps += 1
             answer = await self._attempt(
@@ -941,6 +1015,8 @@ class BoundedPaperRun:
             risk_requests=len([item for item in cases if item.risk_outcome is not None]),
             fills=len([item for item in cases if item.execution_id is not None]),
             replays=len([item for item in cases if item.replayed]),
+            pre_risk_market_refreshes=sum(len(item.market_refreshes) for item in cases),
+            pre_risk_refusals=len([item for item in cases if item.pre_risk_refusal is not None]),
             exits=None
             if account.exits is None
             else ExitReport(
