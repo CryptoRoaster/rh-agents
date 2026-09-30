@@ -251,3 +251,62 @@ async def test_a_legacy_observation_is_never_valued_from_another_pool(now, marke
     assert error.value.reason_code == "QUOTE_ASSET_USD_VALUE_UNAVAILABLE"
     assert markets.asked == [legacy.pair.pair_id]
     assert quotes.requests == []
+
+
+# ------------------------------------------ the stored 0xeeee… native alias
+
+EEEE = "0x" + "e" * 40
+
+
+async def test_an_eeee_quoted_robinhood_pool_is_quoted_through_kyber(now, market_sessions):
+    """MEME/0xeeee…: the recorded alias is paid in, and comes back as itself.
+
+    The real KyberSwap adapter over scripted HTTP: the request carries
+    KyberSwap's sentinel, the answer uses it, and the quote ANCHOR receives is
+    bound to the stored alias — first hop included — so the ladder is built.
+    """
+    import json
+
+    import httpx
+
+    from src.markets.kyberswap import KyberSwapQuoteSource
+    from src.markets.kyberswap.source import KYBER_NATIVE
+    from tests.anchor.test_kyber_native import answer
+    from tests.anchor.test_kyberswap import settings
+
+    (snapshot,) = await observe(
+        now, [pool("0x" + "58" * 20, base=MEME_A, quote=EEEE, price="0.004", quote_price="2600")]
+    )
+    await MarketRecorder(market_sessions, clock=FixedClock(now)).record(snapshot)
+    sent: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        params = request.url.params
+        payload = json.loads(answer(params["tokenIn"], params["tokenOut"]))
+        summary = payload["data"]["routeSummary"]
+        summary["amountIn"] = params["amountIn"]
+        summary["route"][0][0]["swapAmount"] = params["amountIn"]
+        summary["timestamp"] = int(now.timestamp())
+        return httpx.Response(200, text=json.dumps(payload))
+
+    async with KyberSwapQuoteSource(
+        settings(), transport=httpx.MockTransport(handle), clock=FixedClock(now)
+    ) as quotes:
+        reader = AnchorContextReader(
+            cases=StubCases(StubTradeCase(snapshot.pair.market_identity), triggered_pair(now)),
+            markets=WatchedMarkets(MarketReader(market_sessions, clock=FixedClock(now))),
+            quotes=quotes,
+            clock=FixedClock(now),
+        )
+        context = await reader.execution_context(uuid4(), uuid4())
+
+    assert context.quote_asset_valuation is not None
+    assert context.quote_asset_valuation.asset_id == f"robinhood:mainnet:{EEEE}"
+    assert sent and sent[0].url.params["tokenIn"] == KYBER_NATIVE
+    assert sent[0].url.params["tokenOut"] == MEME_A
+    first = context.ladder[0]
+    assert first.failure is None and first.quote is not None, first
+    assert first.quote.token_in == EEEE
+    assert first.quote.route.hops[0].token_in == EEEE
+    assert first.quote.token_out == MEME_A

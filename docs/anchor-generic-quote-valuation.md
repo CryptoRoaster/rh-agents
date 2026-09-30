@@ -53,11 +53,27 @@ prices, liquidity and volume.
 
 ## Native asset at the KyberSwap boundary
 
-The native asset stays the zero address everywhere inside this system. Only the
-KyberSwap adapter translates it to KyberSwap's `0xEeee…EEeE` in the request,
-validates the answer against exactly what was sent, and translates route hops
-back to the zero address. Nothing is recognised by symbol or name. Any two
-tokens are asked about; a pair without a route is `NO_ROUTE`.
+The canonical internal form of a chain's native asset is the zero address. In
+some Robinhood pools GeckoTerminal names it `0xeeee…eeee` instead, and market
+identities recorded from those pools keep that form exactly — nothing is
+rewritten, because watches and cases compare identities strictly.
+
+Only the KyberSwap adapter treats both as the native asset (`NATIVE_ALIASES`):
+
+- **Request:** either alias becomes KyberSwap's `0xEeee…EEeE`; any other
+  address is sent unchanged.
+- **Validation:** the answer's endpoints must equal exactly what was sent (the
+  sentinel), and the amount in must match, before anything is translated.
+- **Answer:** caller-preserving. The sentinel becomes the alias the caller
+  used for the trade's native endpoint — a zero-address case gets zero back, an
+  `0xeeee…` case gets `0xeeee…` back — so `route.hops[0].token_in` and
+  `route.hops[-1].token_out` still equal the quote's own tokens. A native hop
+  between two non-native endpoints is the zero address.
+- **Native for native** (zero ↔ `0xeeee…`) is refused before any request with
+  `IDENTITY_MISMATCH`.
+
+Nothing is recognised by symbol or name. Any two tokens are asked about; a pair
+without a route is `NO_ROUTE`.
 
 ## Unchanged
 
