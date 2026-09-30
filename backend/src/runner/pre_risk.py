@@ -45,7 +45,12 @@ from src.data.repository import aware
 from src.data.tables import MarketObservationRow as Row
 from src.markets.geckoterminal.adapter import MAX_POOLS_PER_REQUEST, GeckoTerminalAdapter
 from src.markets.geckoterminal.errors import BudgetError, ProviderError
-from src.markets.geckoterminal.networks import Chain, NetworkDirectory, selected_chains
+from src.markets.geckoterminal.networks import (
+    Chain,
+    NetworkDirectory,
+    VerifiedNetworkRegistry,
+    selected_chains,
+)
 from src.markets.geckoterminal.transport import GeckoTerminalTransport
 from src.markets.models import MarketIdentity
 from src.markets.reader import MarketReader
@@ -105,6 +110,10 @@ class _Tally:
     unchanged: int = 0
     refused: int = 0
     failed: int = 0
+    # How each chain's provider network was resolved: by the provider in this
+    # refresh, or from the run's registry of bindings already validated.
+    networks_by_provider: int = 0
+    networks_from_cache: int = 0
     reason: PreRiskReason | None = None
 
     def fail(self, reason: PreRiskReason) -> None:
@@ -148,7 +157,21 @@ class PreRiskMarketRefresh:
             }
         )
 
-    async def refresh(self, trade_case: TradeCase, deadline: RunDeadline) -> PreRiskRefresh:
+    async def refresh(
+        self,
+        trade_case: TradeCase,
+        deadline: RunDeadline,
+        *,
+        networks: VerifiedNetworkRegistry | None = None,
+    ) -> PreRiskRefresh:
+        """Observe the request's markets, record them, and judge their freshness.
+
+        `networks` is the run's registry of chain bindings validated earlier in
+        the same pass — normally by the run-start acquisition. A chain found
+        there costs no `/networks` request; a chain that is not is validated
+        here the ordinary way, under this stage's own budget, and fails closed
+        when that budget ends. Nothing is ever assumed into it.
+        """
         tally = _Tally()
         window = Window(self._limits.max_seconds, deadline)
         transport: GeckoTerminalTransport | None = None
@@ -174,7 +197,7 @@ class PreRiskMarketRefresh:
                 transport = GeckoTerminalTransport(
                     self._settings, transport=self._http, clock=self._clock
                 )
-                await self._observe(needed, chains, transport, tally, window)
+                await self._observe(needed, chains, transport, tally, window, networks)
             if tally.reason is None:
                 await self._fresh_enough(needed, tally)
         except ProviderError:
@@ -202,6 +225,8 @@ class PreRiskMarketRefresh:
             refused=tally.refused,
             failed=tally.failed,
             provider_requests=0 if transport is None else transport.logical_requests,
+            network_resolution_provider=tally.networks_by_provider,
+            network_resolution_cache=tally.networks_from_cache,
             markets=tuple(pairs[:8]),
         )
 
@@ -230,9 +255,25 @@ class PreRiskMarketRefresh:
         transport: GeckoTerminalTransport,
         tally: _Tally,
         window: Window,
+        networks: VerifiedNetworkRegistry | None,
+    ) -> None:
+        directory = NetworkDirectory(transport, self._settings, registry=networks)
+        try:
+            await self._batches(needed, chains, transport, directory, tally, window)
+        finally:
+            tally.networks_by_provider = directory.resolved_by_provider
+            tally.networks_from_cache = directory.resolved_from_cache
+
+    async def _batches(
+        self,
+        needed: list[MarketIdentity],
+        chains: dict[str, Chain],
+        transport: GeckoTerminalTransport,
+        directory: NetworkDirectory,
+        tally: _Tally,
+        window: Window,
     ) -> None:
         """One exact-locator read per chain, then one recording per market."""
-        directory = NetworkDirectory(transport, self._settings)
         recorder = MarketRecorder(self._sessions, clock=self._clock)
         for name in sorted({identity.chain for identity in needed}):
             batch = [identity for identity in needed if identity.chain == name]
