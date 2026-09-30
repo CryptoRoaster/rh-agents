@@ -57,13 +57,12 @@ from src.markets.quotes import (
     UnconfiguredQuoteSource,
     to_base_units,
 )
-from src.orchestration.workflow.engine import active_evidence, unusable_reason
+from src.orchestration.workflow.engine import active_evidence, untriggered_reason
 from src.orchestration.workflow.models import (
     EvidenceEnvelope,
     EvidenceType,
     TradeCase,
     TradeSetupPayload,
-    TriggerPayload,
 )
 
 
@@ -204,20 +203,20 @@ class AnchorContextReader:
         now = self.clock.now()
         current = active_evidence(await self.cases.evidence(trade_case_id))
 
-        setup = current.get(EvidenceType.TRADE_SETUP)
-        trigger = current.get(EvidenceType.TRIGGER)
-        if setup is None or trigger is None:
-            # ANCHOR runs after a trigger, never instead of one.
-            raise AnchorContextUnavailable("NO_TRIGGERED_SETUP")
-        if unusable_reason(setup, now) is not None or unusable_reason(trigger, now) is not None:
-            raise AnchorContextUnavailable("NO_TRIGGERED_SETUP")
+        # ANCHOR runs after a trigger, never instead of one. The worker runtime
+        # does not lease this task before one exists (the same test, applied at
+        # claim time); this stays as the defensive check for direct calls and
+        # for a trigger superseded between the claim and this read.
+        missing = untriggered_reason(current, now)
+        if missing is not None:
+            raise AnchorContextUnavailable(missing)
+        setup = current[EvidenceType.TRADE_SETUP]
+        trigger = current[EvidenceType.TRIGGER]
+        # ANCHOR binds to the setup's own detail (its fingerprint), which a
+        # triggered setup may still lack; that is ANCHOR's refusal, not the
+        # claim gate's.
         if not isinstance(setup.payload, TradeSetupPayload) or setup.payload.setup is None:
             raise AnchorContextUnavailable("NO_TRIGGERED_SETUP")
-        if not isinstance(trigger.payload, TriggerPayload):
-            raise AnchorContextUnavailable("NO_TRIGGERED_SETUP")
-        if trigger.payload.setup_evidence_id != setup.evidence_id:
-            # The trigger belongs to a setup that is no longer current.
-            raise AnchorContextUnavailable("TRIGGER_NOT_FOR_CURRENT_SETUP")
 
         snapshot = await self.markets.latest(
             trade_case.market.pair_id, include_fixtures=self.include_fixtures
