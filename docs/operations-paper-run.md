@@ -100,6 +100,12 @@ chain, network, venue, both assets, pool locator); nothing is searched by
 symbol, name or address and no pool is substituted. Observations are recorded
 through the ordinary recorder and committed before the request.
 
+**Pair-agnostic.** Any pair the market path supports is refreshed alike —
+MEME/MEME, MEME/TOKEN, TOKEN/WETH, TOKEN/stable, native/token, token/native.
+Base and quote are taken unchanged from the stored identity; no quote asset is
+required, preferred, ranked or excluded, and nothing here names WETH, WBNB or a
+stablecoin.
+
 | Setting | Meaning |
 | --- | --- |
 | `PAPER_RUNNER_PRE_RISK_MARKET_MAX_REQUESTS=3` | Provider requests per refresh, network resolution included. Its own budget, never the acquisition's. |
@@ -123,9 +129,11 @@ could not state stays unknown, and the request's own readiness check refuses it.
 
 **Reading it.** Three things are reported apart: the run-start `acquisition`
 block, each case's `refreshes` (workflow source refreshes of ATLAS/ANCHOR), and
-each case's `market_refreshes` — one entry per pre-risk refresh with `ready`,
-`reason`, `attempted`, `recorded`, `unchanged`, `refused`, `failed`,
-`provider_requests` and the canonical pair ids. Counts and codes only.
+each case's `market_refreshes` — one entry per pre-risk refresh, marked
+`stage=PRE_RISK_MARKET_REFRESH`, with `ready`, `reason`, `required_markets`,
+`attempted`, `recorded`, `unchanged`, `refused`, `failed`, `provider_requests`
+and the canonical pair ids. The run summary adds `pre_risk_market_refreshes`
+and `pre_risk_refusals`. Counts and codes only, never a provider payload.
 
 ## 3. The preflight
 

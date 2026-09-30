@@ -1015,6 +1015,8 @@ class BoundedPaperRun:
             risk_requests=len([item for item in cases if item.risk_outcome is not None]),
             fills=len([item for item in cases if item.execution_id is not None]),
             replays=len([item for item in cases if item.replayed]),
+            pre_risk_market_refreshes=sum(len(item.market_refreshes) for item in cases),
+            pre_risk_refusals=len([item for item in cases if item.pre_risk_refusal is not None]),
             exits=None
             if account.exits is None
             else ExitReport(

@@ -378,9 +378,15 @@ class PreRiskRefresh(Immutable):
     bound. Counts and codes only: never a payload.
     """
 
+    # Names this block apart from the run-start `acquisition` and from the
+    # workflow's ATLAS/ANCHOR source `refreshes`.
+    stage: Literal["PRE_RISK_MARKET_REFRESH"] = "PRE_RISK_MARKET_REFRESH"
     # Whether every market the request needs was shown fresh. False means the
     # request was not sent.
     ready: bool = Field(strict=True)
+    # Distinct markets the request needs: the case's own, plus every open
+    # position's, each once.
+    required_markets: int = Field(default=0, ge=0)
     # A `PreRiskReason` value: the first thing that stopped it.
     reason: Code | None = None
     attempted: int = Field(default=0, ge=0)
@@ -489,6 +495,10 @@ class RunSummary(Immutable):
     risk_requests: int = Field(default=0, ge=0)
     fills: int = Field(default=0, ge=0)
     replays: int = Field(default=0, ge=0)
+    # Pre-risk market refreshes across all cases, and how many of them stopped
+    # a risk request. Per-case detail is in each case's `market_refreshes`.
+    pre_risk_market_refreshes: int = Field(default=0, ge=0)
+    pre_risk_refusals: int = Field(default=0, ge=0)
     # Absent unless automatic PAPER exits are configured.
     exits: ExitReport | None = None
     # Technical faults, as codes. Never a provider message and never a traceback.

@@ -194,6 +194,7 @@ class PreRiskMarketRefresh:
     ) -> PreRiskRefresh:
         return PreRiskRefresh(
             ready=tally.reason is None,
+            required_markets=len(pairs),
             reason=None if tally.reason is None else tally.reason.value,
             attempted=tally.attempted,
             recorded=tally.recorded,

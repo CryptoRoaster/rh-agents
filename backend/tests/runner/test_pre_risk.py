@@ -509,6 +509,8 @@ async def test_the_market_is_observed_and_committed_before_risk_is_asked(risk_db
     assert progress.risk_outcome == "APPROVE", progress
     # The run-start acquisition is reported apart from it.
     assert summary.acquisition.recorded == 2
+    assert refreshed.stage == "PRE_RISK_MARKET_REFRESH"
+    assert (summary.pre_risk_market_refreshes, summary.pre_risk_refusals) == (1, 0)
 
 
 async def test_a_source_refresh_is_followed_by_another_market_refresh(risk_db, now, trace):
@@ -596,6 +598,7 @@ async def test_a_failed_refresh_sends_no_request_even_over_a_young_reading(risk_
 
     assert risk.seen == [], summary
     assert summary.risk_requests == 0
+    assert (summary.pre_risk_market_refreshes, summary.pre_risk_refusals) == (1, 1)
     progress = next(item for item in summary.cases if item.trade_case_id == case)
     assert progress.pre_risk_refusal in (
         PreRiskReason.PROVIDER_FAILED.value,
@@ -646,3 +649,154 @@ async def test_a_risk_approved_replay_is_not_refreshed(risk_db, now, trace):
     assert len(risk.seen) == 1
     # Only the run-start acquisition asked anything.
     assert len(replay.multi_requests) == 1, replay.paths
+
+
+# ------------------------------------------------------------------ pair agnostic
+
+MEME_A = "0x" + "1a" * 20
+MEME_B = "0x" + "2b" * 20
+WRAPPED = "0x" + "3c" * 20
+STABLE = "0x" + "4d" * 20
+NATIVE = "0x" + "00" * 20
+
+PAIRS = {
+    # name: (pool, base, quote). Symbols are deliberately irrelevant: nothing
+    # here knows which address "is" WETH or a stablecoin, and nothing may.
+    "MEME_A/MEME_B": ("0x" + "51" * 20, MEME_A, MEME_B),
+    "TOKEN/WETH": ("0x" + "52" * 20, TOKEN, WRAPPED),
+    "TOKEN/STABLE": ("0x" + "53" * 20, TOKEN, STABLE),
+    "MEME_A/TOKEN_X": ("0x" + "54" * 20, MEME_A, OTHER_BASE),
+    "NATIVE/TOKEN": ("0x" + "55" * 20, NATIVE, TOKEN),
+    "TOKEN/NATIVE": ("0x" + "56" * 20, TOKEN, NATIVE),
+}
+
+
+def pair_pool(name, price="3"):
+    address, base, quote = PAIRS[name]
+    return pool(address, base=base, quote=quote, price=price)
+
+
+def pair_id(name):
+    return f"{CHAIN}:{NETWORK}:contract_address:{PAIRS[name][0]}"
+
+
+@pytest.mark.parametrize("name", sorted(PAIRS))
+async def test_any_pair_is_refreshed_exactly_as_stored(risk_db, now, trace, name):
+    """The quote asset decides nothing: no allowlist, no wrapped-native demand."""
+    _, sessions = risk_db
+    await seed(sessions, now - STALE, [pair_pool(name)])
+    stored = await identity(sessions, now, pair_id(name))
+    provider = MarketProvider(targeted=[pair_pool(name, price="3.5")])
+
+    reading = await stage(sessions, now, provider).refresh(case_on(stored), Deadline(60))
+
+    assert reading.ready, (name, reading)
+    assert (reading.required_markets, reading.recorded) == (1, 1)
+    newest = MarketSnapshot.model_validate(
+        (await observations(sessions, pair_id(name)))[-1].payload
+    )
+    # Base and quote exactly as they were stored, in the same orientation.
+    assert newest.pair.market_identity == stored
+    assert (stored.base_asset_id, stored.quote_asset_id) == (
+        f"{CHAIN}:{NETWORK}:{PAIRS[name][1]}",
+        f"{CHAIN}:{NETWORK}:{PAIRS[name][2]}",
+    )
+
+
+async def test_a_meme_pair_case_with_mixed_positions_is_refreshed_whole(risk_db, now, trace):
+    """MEME/MEME case, TOKEN/WETH and TOKEN/STABLE holdings: three pair ids, one batch."""
+    _, sessions = risk_db
+    names = ("MEME_A/MEME_B", "TOKEN/WETH", "TOKEN/STABLE")
+    await seed(sessions, now - STALE, [pair_pool(name) for name in names])
+    await hold(sessions, now, trace, pair_id=pair_id("TOKEN/WETH"), asset_id="h:weth")
+    await hold(sessions, now, trace, pair_id=pair_id("TOKEN/STABLE"), asset_id="h:stable")
+    provider = MarketProvider(targeted=[pair_pool(name, price="4") for name in names])
+
+    reading = await stage(sessions, now, provider).refresh(
+        case_on(await identity(sessions, now, pair_id("MEME_A/MEME_B"))), Deadline(60)
+    )
+
+    assert reading.ready, reading
+    # The case's own market first, then the holdings, each once.
+    assert reading.markets[0] == pair_id("MEME_A/MEME_B")
+    assert set(reading.markets) == {pair_id(name) for name in names}
+    assert (reading.required_markets, reading.recorded) == (3, 3)
+    assert len(provider.multi_requests) == 1
+
+
+def test_no_standard_quote_asset_is_named_anywhere_in_the_stage():
+    """No WETH/WBNB/ETH/BNB/USDT/USDC allowlist, preference or ranking."""
+    from pathlib import Path
+
+    import src.runner.acquisition as acquisition
+
+    for module in (pre_risk, acquisition):
+        source = Path(module.__file__).read_text().upper()
+        for word in ("WETH", "WBNB", "USDT", "USDC", "STABLECOIN", "PREFERRED_QUOTE"):
+            assert word not in source, (module.__name__, word)
+
+
+# --------------------------------------------------------------- workflow versions
+
+
+@pytest.mark.parametrize("version", ["TRADE_CASE_V1", "TRADE_CASE_V2"])
+async def test_both_workflow_versions_are_refreshed_alike(risk_db, now, trace, version):
+    from src.orchestration.workflow import policy
+    from src.orchestration.workflow.models import TradeCaseStatus
+    from src.orchestration.workflow.service import TradeCaseService
+    from tests.riskrequest.conftest import ready_case
+
+    _, sessions = risk_db
+    await seed(sessions, now - STALE, [traded(SPOT)])
+    cases = TradeCaseService(sessions, clock=FixedClock(now), policy=getattr(policy, version))
+    case = await ready_case(cases, now, trace, identity=await identity(sessions, now))
+    assert case.status is TradeCaseStatus.READY_FOR_RISK, case
+    provider = MarketProvider(targeted=[traded(SPOT)])
+
+    reading = await stage(sessions, now, provider).refresh(case, Deadline(60))
+
+    assert reading.ready, reading
+    assert reading.markets == (PAIR_ID,)
+
+
+async def test_unknown_liquidity_is_not_blocked_here_and_reaches_risk_as_unknown(
+    risk_db, now, trace
+):
+    """A holding's market comes back fresh with unknown liquidity.
+
+    This stage only proves freshness. It does not guess a liquidity, does not
+    reuse the older known one, and does not stop the request on its behalf:
+    the risk side receives the market as unknown and refuses it by its own
+    code.
+    """
+    _, sessions = risk_db
+    model = ScriptedSpecialists()
+    case = await opened(sessions, now, model)
+    await seed(sessions, now, [other()])
+    await hold(
+        sessions, now, trace, pair_id=OTHER_PAIR_ID, asset_id=f"{CHAIN}:{NETWORK}:{OTHER_BASE}"
+    )
+    later = now + timedelta(seconds=20)
+    unknown = other(liquidity=None)  # type: ignore[arg-type]
+    moved = MarketProvider(targeted=[traded(SPOT * Decimal("1.20")), payment(), unknown])
+
+    summary, risk = await watched_run(
+        sessions,
+        full_acquiring_settings(paper_runner_acquisition_max_discovery_requests=0),
+        later,
+        acquiring_ports(later, model, moved),
+    )
+
+    progress = next(item for item in summary.cases if item.trade_case_id == case)
+    (refreshed,) = progress.market_refreshes
+    assert refreshed.ready and refreshed.required_markets == 2, refreshed
+    assert len(risk.seen) == 1, "the request was made"
+    assert progress.risk_refusal is not None and progress.execution_id is None, progress
+    # The holding cannot be marked without a usable reading, and the risk
+    # request says so by its own code rather than by anything guessed here.
+    assert progress.risk_refusal == "PORTFOLIO_MARKS_UNAVAILABLE", progress
+    newest = MarketSnapshot.model_validate(
+        (await observations(sessions, OTHER_PAIR_ID))[-1].payload
+    )
+    assert newest.liquidity.status is Availability.UNKNOWN
+    assert newest.liquidity.value_usd is None
