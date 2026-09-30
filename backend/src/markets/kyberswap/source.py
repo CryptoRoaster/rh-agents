@@ -103,22 +103,52 @@ class RouteResponse(DTO):
 # answer. Anything else is an absence of evidence.
 NO_ROUTE_CODES = frozenset({4005, 4008, 4011})
 
-# A chain's native asset, as this system names it everywhere: the zero address.
+# A chain's native asset, as this system names it canonically: the zero address.
 NATIVE_ASSET = "0x" + "0" * 40
 # The same asset as KyberSwap names it. Used only at this boundary — in the
 # request, and to validate and translate the answer — and never stored, never
 # passed inward, never matched by symbol or name.
 KYBER_NATIVE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+# Every address that means "the chain's native asset" to this boundary. The
+# zero address is the canonical form; the all-`e` address is how GeckoTerminal
+# names the native asset in some Robinhood pools, and market identities recorded
+# from those pools keep it exactly as recorded. Both mean the same asset here,
+# and nothing is rewritten outside this adapter.
+NATIVE_ALIASES = frozenset({NATIVE_ASSET, KYBER_NATIVE.lower()})
+
+
+def is_native(token: str) -> bool:
+    return token.lower() in NATIVE_ALIASES
 
 
 def to_provider(token: str) -> str:
-    """The canonical address as KyberSwap expects it in a request."""
-    return KYBER_NATIVE if token.lower() == NATIVE_ASSET else token
+    """The address as KyberSwap expects it in a request: its sentinel for native."""
+    return KYBER_NATIVE if is_native(token) else token
 
 
 def from_provider(token: str) -> str:
-    """An address from KyberSwap's answer, back in this system's canonical form."""
-    return NATIVE_ASSET if token.lower() == KYBER_NATIVE.lower() else token.lower()
+    """An intermediate address from KyberSwap's answer, in canonical form.
+
+    Only for a hop that is not one of the trade's own endpoints: there is no
+    caller identity to preserve there, so the native asset is the zero address.
+    """
+    return NATIVE_ASSET if is_native(token) else token.lower()
+
+
+def restore(token: str, *, token_in: str, token_out: str) -> str:
+    """An address from the answer, in the exact form the caller asked with.
+
+    The provider's native sentinel becomes whichever native alias the caller
+    used for this trade's native endpoint, so the quote stays bound to the
+    recorded market identity; with no native endpoint it is the canonical zero
+    address. Every other address is only lowercased.
+    """
+    if not is_native(token):
+        return token.lower()
+    for endpoint in (token_in, token_out):
+        if is_native(endpoint):
+            return endpoint.lower()
+    return NATIVE_ASSET
 
 
 def _usd(raw: Decimal | None) -> Decimal | None:
@@ -193,6 +223,10 @@ class KyberSwapQuoteSource:
         slug = CHAIN_SLUGS.get(chain)
         if slug is None or network != "mainnet":
             raise QuoteUnavailable(QuoteFailure.UNSUPPORTED_CHAIN)
+        if is_native(token_in) and is_native(token_out):
+            # Two spellings of the same native asset: native for native. Never
+            # sent, and never allowed to come back looking like a route.
+            raise QuoteUnavailable(QuoteFailure.IDENTITY_MISMATCH)
         # Any two tokens are asked about as they are: no allowlist of payment
         # assets, and a pair without a route is the provider's NO_ROUTE answer.
         sent_in, sent_out = to_provider(token_in), to_provider(token_out)
@@ -234,8 +268,8 @@ class KyberSwapQuoteSource:
                     RouteHop(
                         venue=hop.exchange,
                         pool=hop.pool.lower(),
-                        token_in=from_provider(hop.tokenIn),
-                        token_out=from_provider(hop.tokenOut),
+                        token_in=restore(hop.tokenIn, token_in=token_in, token_out=token_out),
+                        token_out=restore(hop.tokenOut, token_in=token_in, token_out=token_out),
                         amount_in=_amount(hop.swapAmount),
                         amount_out=_amount(hop.amountOut),
                     )
