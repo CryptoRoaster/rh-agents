@@ -289,6 +289,63 @@ async def test_twelve_waiting_cases_do_not_starve_a_triggered_one(worker_db, now
     assert await anchor_attempts(sessions) == 1
 
 
+async def trigger_for_a_replaced_setup(runtime, now, trace, key):
+    """Setup A, a live trigger for A, then setup B replacing A — and no trigger for B."""
+    case, first = await before_trigger(runtime, now, trace, key)
+    await trigger(runtime, case, now, first.evidence_id, f"{key}-t")
+    await record(
+        runtime,
+        case,
+        now,
+        AgentRole.VECTOR,
+        EvidenceType.TRADE_SETUP,
+        setup_payload(),
+        f"{key}-v2",
+        supersedes_id=first.evidence_id,
+    )
+    return case
+
+
+@pytest.mark.parametrize("waiting", [12, 26])
+async def test_triggers_for_replaced_setups_do_not_starve_a_ready_case(
+    worker_db, now, trace, waiting
+):
+    """More mismatched cases than one claim batch, all older than the ready one.
+
+    Each still holds a live, AVAILABLE, unexpired trigger — only not for its
+    current setup. The candidate query must not take them at all.
+    """
+    _, sessions = worker_db
+    runtime = runtime_for(sessions, now)
+    assert runtime.policy.claim_batch == 10
+    stuck = [
+        await trigger_for_a_replaced_setup(runtime, now, uuid4(), f"stuck-{index}")
+        for index in range(waiting)
+    ]
+    later = now + timedelta(seconds=1)
+    fresh = runtime_for(sessions, later)
+    ready, setup = await before_trigger(fresh, later, trace, "ready-after-stuck")
+    await trigger(fresh, ready, later, setup.evidence_id, "ready-after-stuck-t")
+    anchor = await register(fresh, AgentRole.ANCHOR, f"anchor-stuck-{waiting}")
+
+    lease = await fresh.claim_next_task(anchor.worker_instance_id)
+
+    assert lease is not None and lease.trade_case_id == ready.id
+    assert lease.attempt_number == 1
+    assert await anchor_attempts(sessions) == 1
+    for case in stuck:
+        task = await anchor_task(sessions, case.id)
+        assert (task.status, task.attempt, task.next_eligible_at, task.failure_category) == (
+            "PENDING",
+            1,
+            None,
+            None,
+        )
+    # And, asked again, none of them is ever leased.
+    assert await fresh.claim_next_task(anchor.worker_instance_id) is None
+    assert await anchor_attempts(sessions) == 1
+
+
 async def test_two_concurrent_anchor_workers_take_one_lease(worker_db, now, trace):
     engine, sessions = worker_db
     if engine.dialect.name != "postgresql":

@@ -114,12 +114,17 @@ live and usable `TRIGGER`, a trigger payload, naming exactly the current setup.
 
 Before that there is no work, and none is recorded: no lease, no attempt row, no
 change to the task's attempt counter, schedule or reason, and no failure budget
-spent. The candidate query excludes such tasks with a cheap SQL condition (a
-live, available, unexpired, non-superseded trigger exists), so no number of
-untriggered cases can fill the bounded claim batch ahead of a triggered one; the
-exact test then runs in `_try_claim` under the case lock that every evidence
-write also takes, so a trigger cannot appear or be replaced between the check
-and the lease. Once a trigger is committed, the task that already exists is
+spent. The candidate query excludes such tasks in SQL: it requires a live
+(not superseded), available, unexpired `TRADE_SETUP` and a live, available,
+unexpired `TRIGGER` whose payload names exactly that setup. The setup id is
+compared as lower-cased text without hyphens on both sides, because the id
+column and the JSON payload spell a UUID differently per backend (PostgreSQL
+hyphenated, SQLite 32 hex characters); stored payloads are not changed. So no
+number of cases waiting for a trigger — or holding one for a setup since
+replaced — can fill the bounded claim batch (`claim_batch`, unchanged) ahead of
+a ready one. The exact test then runs in `_try_claim` under the case lock that
+every evidence write also takes, so a trigger cannot appear or be replaced
+between the check and the lease. Once a trigger is committed, the task that already exists is
 claimed as attempt one. A genuine failure after that spends the ordinary budget,
 and a source-refresh re-arm after an assessment claims as before. ANCHOR's own
 `NO_TRIGGERED_SETUP` / `TRIGGER_NOT_FOR_CURRENT_SETUP` refusals stay as the

@@ -16,7 +16,7 @@ from hashlib import sha256
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from sqlalchemy import exists, func, select
+from sqlalchemy import String, cast, exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -84,22 +84,46 @@ def after_trigger_versions(role: AgentRole, task_type: str) -> tuple[str, ...]:
 
 
 def has_current_trigger(trade_case_id: Any, now: datetime) -> Any:
-    """SQL: the case holds a live, available, unexpired TRIGGER envelope.
+    """SQL: the case holds a current trigger naming its current setup.
 
-    A cheap necessary condition for `untriggered_reason(...) is None`, so the
-    bounded candidate batch is never filled by cases that are waiting for one.
-    It does not decide anything: whether that trigger is accepted and names the
-    current setup is checked exactly, under the case lock, before any lease.
+    The candidate-selection form of `untriggered_reason(...) is None`: a live
+    (not superseded), AVAILABLE, unexpired TRADE_SETUP, and a live, AVAILABLE,
+    unexpired TRIGGER whose payload names exactly that setup. Only such cases
+    may take a place in the bounded candidate batch, so no number of cases that
+    are waiting for a trigger — or holding one for a setup since replaced — can
+    starve one that is ready.
+
+    It decides nothing on its own. Acceptance of each payload and the envelope
+    integrity rules are checked exactly, under the case lock, by
+    `_prerequisite_met` before any lease.
+
+    The setup id is compared as text with hyphens removed and lower-cased on
+    both sides, because the id column and the JSON payload spell a UUID
+    differently per backend (PostgreSQL: hyphenated uuid text; SQLite: 32 hex
+    characters; JSON: hyphenated) — the stored payload is never changed.
     """
+    setup = aliased(TradeCaseEvidenceRow)
     trigger = aliased(TradeCaseEvidenceRow)
-    successor = aliased(TradeCaseEvidenceRow)
+    replaced_setup = aliased(TradeCaseEvidenceRow)
+    replaced_trigger = aliased(TradeCaseEvidenceRow)
+
+    def canonical(value: Any) -> Any:
+        return func.lower(func.replace(value, "-", ""))
+
+    named_setup = trigger.payload["payload"]["setup_evidence_id"].as_string()
     return (
         exists()
+        .where(setup.trade_case_id == trade_case_id)
+        .where(setup.evidence_type == EvidenceType.TRADE_SETUP.value)
+        .where(setup.status == EvidenceStatus.AVAILABLE.value)
+        .where(setup.valid_until > now)
+        .where(~exists().where(replaced_setup.supersedes_id == setup.evidence_id))
         .where(trigger.trade_case_id == trade_case_id)
         .where(trigger.evidence_type == EvidenceType.TRIGGER.value)
         .where(trigger.status == EvidenceStatus.AVAILABLE.value)
         .where(trigger.valid_until > now)
-        .where(~exists().where(successor.supersedes_id == trigger.evidence_id))
+        .where(~exists().where(replaced_trigger.supersedes_id == trigger.evidence_id))
+        .where(canonical(cast(setup.evidence_id, String)) == canonical(named_setup))
     )
 
 
@@ -296,10 +320,11 @@ class WorkerRuntimeService:
                 )
             gated = after_trigger_versions(role, task_type)
             if gated:
-                # A post-trigger task of a case without a current trigger is not
-                # a candidate at all, so no number of such cases can fill the
-                # bounded batch ahead of one that is ready. A necessary condition
-                # only; the exact test runs under the case lock in `_try_claim`.
+                # A post-trigger task of a case without a current trigger for its
+                # current setup is not a candidate at all, so no number of such
+                # cases can fill the bounded batch ahead of one that is ready. A
+                # necessary condition only; the exact test runs under the case
+                # lock in `_try_claim`.
                 statement = statement.where(
                     exists()
                     .where(TradeCaseRow.id == TradeCaseTaskRow.trade_case_id)
