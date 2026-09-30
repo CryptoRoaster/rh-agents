@@ -310,15 +310,20 @@ class MarketSnapshot(Observation):
 
     @property
     def freshness_at(self) -> datetime:
-        instants = [
+        """The general market's freshness: the snapshot, base price, liquidity, volume.
+
+        Deliberately not the quote price. This instant is what the recorder
+        stores and every market reader filters on, so including the quote price
+        would let a stale quote-asset price hide an otherwise fresh market from
+        PULSE, SENTINEL and the scout. The quote price's own age is judged only
+        by the one reader that needs it — ANCHOR — against its own bound.
+        """
+        return min(
             self.observed_at,
             self.price.observed_at,
             self.liquidity.observed_at,
             self.volume.observed_at,
-        ]
-        if self.quote_price is not None:
-            instants.append(self.quote_price.observed_at)
-        return min(instants)
+        )
 
     @property
     def available(self) -> bool:

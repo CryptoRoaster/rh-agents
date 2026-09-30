@@ -15,6 +15,8 @@ import pytest
 from pydantic import ValidationError
 
 from src.core.clock import FixedClock
+from src.data.repository import aware
+from src.data.tables import MarketObservationRow
 from src.markets.fake import fixture_snapshot
 from src.markets.geckoterminal.adapter import GeckoTerminalAdapter
 from src.markets.geckoterminal.networks import CHAINS, NetworkDirectory
@@ -150,11 +152,37 @@ async def test_a_quote_price_newer_than_its_snapshot_is_refused(now):
         MarketSnapshot.model_validate(data)
 
 
-async def test_freshness_counts_the_quote_price_source_time(now):
+async def stale_quote(now):
+    """A fresh core market whose quote price was observed two hours earlier."""
     data = await v3(now)
-    data["quote_price"]["observed_at"] = now - timedelta(seconds=40)
-    snapshot = MarketSnapshot.model_validate(data)
-    assert snapshot.freshness_at == now - timedelta(seconds=40)
+    data["quote_price"]["observed_at"] = now - timedelta(hours=2)
+    return MarketSnapshot.model_validate(data)
+
+
+async def test_general_freshness_ignores_the_quote_price(now):
+    """`freshness_at` is the market's: snapshot, base price, liquidity, volume."""
+    snapshot = await stale_quote(now)
+    assert snapshot.freshness_at == now
+    assert snapshot.is_valid_at(now, timedelta(seconds=60))
+
+
+async def test_a_stale_quote_price_does_not_age_the_recorded_market(now, market_sessions):
+    """The central regression: a stale quote price never hides a fresh market."""
+    snapshot = await stale_quote(now)
+    await MarketRecorder(market_sessions, clock=FixedClock(now)).record(snapshot)
+
+    async with market_sessions() as session:
+        row = await session.get(MarketObservationRow, snapshot.id)
+    assert row is not None
+    assert aware(row.freshness_at) == now, "not now - 2h"
+
+    # Every general reader — PULSE, SENTINEL, the scout — still sees the market.
+    read = await MarketReader(
+        market_sessions, clock=FixedClock(now), max_age=timedelta(seconds=60)
+    ).latest(snapshot.pair.pair_id)
+    assert read is not None and read.id == snapshot.id
+    assert read.quote_price is not None
+    assert read.quote_price.observed_at == now - timedelta(hours=2), "nothing re-dated"
 
 
 def test_version_1_and_2_are_unchanged_and_carry_no_quote_price(now, trace):
@@ -184,7 +212,9 @@ async def test_an_unknown_quote_price_does_not_make_the_market_unreadable(now, m
     (snapshot,) = await observe(now, [meme_pool(quote_price=None)])
     await MarketRecorder(market_sessions, clock=FixedClock(now)).record(snapshot)
 
-    read = await MarketReader(market_sessions, clock=FixedClock(now)).latest(snapshot.pair.pair_id)
+    read = await MarketReader(
+        market_sessions, clock=FixedClock(now), max_age=timedelta(seconds=60)
+    ).latest(snapshot.pair.pair_id)
     assert read is not None and read.schema_version == 3
     assert read.quote_price is not None and read.quote_price.status is Availability.UNKNOWN
 

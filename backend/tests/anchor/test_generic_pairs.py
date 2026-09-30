@@ -165,6 +165,36 @@ async def test_an_unknown_quote_price_stops_before_any_request(now, market_sessi
     assert len(markets.asked) == 1, "no other market is tried instead"
 
 
+async def test_a_stale_quote_price_is_refused_while_the_market_stays_readable(now, market_sessions):
+    """Core market fresh, quote price two hours old: readable, and never quoted."""
+    (fresh,) = await observe(
+        now, [pool("0x" + "57" * 20, base=MEME_A, quote=MEME_B, price="0.004", quote_price="0.002")]
+    )
+    data = fresh.model_dump()
+    data["quote_price"]["observed_at"] = now - timedelta(hours=2)
+    from src.markets.models import MarketSnapshot
+
+    snapshot = MarketSnapshot.model_validate(data)
+    await MarketRecorder(market_sessions, clock=FixedClock(now)).record(snapshot)
+    markets = WatchedMarkets(
+        MarketReader(market_sessions, clock=FixedClock(now), max_age=timedelta(seconds=60))
+    )
+    quotes = WatchedQuotes(reference_price=Decimal("0.004"), quoted_at=now)
+    reader = AnchorContextReader(
+        cases=StubCases(StubTradeCase(snapshot.pair.market_identity), triggered_pair(now)),
+        markets=markets,
+        quotes=quotes,
+        clock=FixedClock(now),
+    )
+
+    # The general market reader still returns it: the stale quote hides nothing.
+    assert (await markets.inner.latest(snapshot.pair.pair_id)) is not None
+    with pytest.raises(AnchorContextUnavailable) as error:
+        await reader.execution_context(uuid4(), uuid4())
+    assert error.value.reason_code == "QUOTE_ASSET_USD_VALUE_UNAVAILABLE"
+    assert quotes.requests == [], "no quote provider request"
+
+
 async def test_a_case_whose_payment_asset_is_not_the_pools_quote_is_refused(now, market_sessions):
     """The quote price belongs to the pool's quote asset, and only to it."""
     (snapshot,) = await observe(

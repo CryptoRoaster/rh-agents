@@ -16,7 +16,11 @@ omitted, never estimated from the base price, reserves, market cap, a symbol, a
 peg or a wrapped-native assumption. It must belong to exactly the pair's quote
 asset and share the observation's provider, chain, network, correlation and
 fixture provenance, and its source time may not be newer than the observation.
-`freshness_at` includes its source time.
+Its source time is **not** part of the observation's general `freshness_at`
+(snapshot, base price, liquidity, volume), which the recorder stores and every
+market reader filters on: a stale quote price must never hide an otherwise
+fresh market from PULSE, SENTINEL or the scout. ANCHOR judges the quote price's
+own age separately, against its reference-age bound.
 
 Versions 1 and 2 remain readable and serialize exactly as recorded (no
 `quote_price` key), so stored payloads, digests and replays are unchanged.
