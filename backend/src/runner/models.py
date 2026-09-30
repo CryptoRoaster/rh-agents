@@ -395,6 +395,11 @@ class PreRiskRefresh(Immutable):
     refused: int = Field(default=0, ge=0)
     failed: int = Field(default=0, ge=0)
     provider_requests: int = Field(default=0, ge=0)
+    # Chains whose provider network this refresh validated itself
+    # (NETWORK_RESOLUTION_PROVIDER), and chains it took from the bindings the
+    # same run had already validated (NETWORK_RESOLUTION_CACHE).
+    network_resolution_provider: int = Field(default=0, ge=0)
+    network_resolution_cache: int = Field(default=0, ge=0)
     # Canonical pair ids of the markets in the set: the case's first, then the
     # portfolio's, each once.
     markets: tuple[Identifier, ...] = Field(default=(), max_length=8)

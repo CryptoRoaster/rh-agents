@@ -94,7 +94,12 @@ from src.markets.geckoterminal.errors import (
     ProviderError,
     UnsupportedNetworkError,
 )
-from src.markets.geckoterminal.networks import Chain, NetworkDirectory, selected_chains
+from src.markets.geckoterminal.networks import (
+    Chain,
+    NetworkDirectory,
+    VerifiedNetworkRegistry,
+    selected_chains,
+)
 from src.markets.geckoterminal.transport import GeckoTerminalTransport
 from src.markets.models import MarketIdentity, MarketPair, PoolLocatorIdentity
 from src.markets.reader import MarketReader
@@ -629,8 +634,16 @@ class BoundedMarketAcquisition:
             }
         )
 
-    async def execute(self, deadline: RunDeadline) -> MarketAcquisition:
-        """Acquire what the open work needs, then hand back an honest account."""
+    async def execute(
+        self, deadline: RunDeadline, *, networks: VerifiedNetworkRegistry | None = None
+    ) -> MarketAcquisition:
+        """Acquire what the open work needs, then hand back an honest account.
+
+        `networks` is the run's registry of chain bindings already validated in
+        this pass. Every chain this stage validates is written to it, so the
+        pre-risk refresh later in the same run can reuse the binding instead of
+        paying for the paginated network scan again.
+        """
         ledger = Ledger(limits=self._limits)
         window = Window(self._limits.max_seconds, deadline)
         transport: GeckoTerminalTransport | None = None
@@ -658,7 +671,7 @@ class BoundedMarketAcquisition:
             transport = GeckoTerminalTransport(
                 self._settings, transport=self._http, clock=self._clock
             )
-            directory = NetworkDirectory(transport, self._settings)
+            directory = NetworkDirectory(transport, self._settings, registry=networks)
             recorder = MarketRecorder(self._sessions, clock=self._clock)
             await self._acquire(chains, plan, transport, directory, recorder, ledger, window)
         except ProviderError:

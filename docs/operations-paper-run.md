@@ -111,6 +111,21 @@ stablecoin.
 | `PAPER_RUNNER_PRE_RISK_MARKET_MAX_REQUESTS=3` | Provider requests per refresh, network resolution included. Its own budget, never the acquisition's. |
 | `PAPER_RUNNER_PRE_RISK_MARKET_MAX_SECONDS=15` | Time per refresh, additionally bounded by the run's remaining time. |
 
+**Network resolution is validated once per run.** GeckoTerminal's `/networks`
+list is paginated and Robinhood is on its third page, so validating it costs
+three requests — as much as the whole pre-risk budget. Each PAPER run therefore
+keeps a run-scoped `VerifiedNetworkRegistry` (chain → provider network id, and
+nothing else). The first resolution of a chain in the run goes through the
+ordinary `NetworkDirectory.resolve()` validation — paginated list, configured
+id, platform binding, contract checks — and only a successful validation is
+remembered. The run-start acquisition normally fills it, so each pre-risk
+refresh, including one after a source refresh, costs only its exact pool
+batches: one per chain (Robinhood alone 1 request, Robinhood + BSC 2). A chain
+not yet validated in the run is validated by the refresh itself under its own
+budget and fails closed when that budget ends. Failures are never remembered,
+the registry is not persisted, and the next run starts empty. Each refresh
+reports `network_resolution_cache` and `network_resolution_provider`.
+
 The order is: market refresh → risk request; and when that request is refused
 for a stale ATLAS/ANCHOR source, source refresh → market refresh again → the
 same request re-asked. The existing source-refresh bound applies; no source

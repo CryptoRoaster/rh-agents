@@ -61,6 +61,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from src.core.config import Settings
 from src.core.models import TradingMode
 from src.data.tables import TradeCaseRow
+from src.markets.geckoterminal.networks import VerifiedNetworkRegistry
 from src.orchestration.commander.context import SystemPauseUnavailable
 from src.orchestration.commander.intake import IntakeRefusal
 from src.orchestration.exitpolicy.service import ExitSweep
@@ -173,6 +174,11 @@ class Account:
     refreshed: dict[UUID, set[str]] = field(default_factory=dict)
     # What the automatic exit sweep did, when one is configured.
     exits: ExitSweep | None = None
+    # Chain → provider network bindings validated during this pass. Created
+    # with the account, so it lives exactly as long as one run: the run-start
+    # acquisition fills it, and each pre-risk refresh reads it instead of
+    # scanning the paginated network list again. Never shared between runs.
+    networks: VerifiedNetworkRegistry = field(default_factory=VerifiedNetworkRegistry)
 
     def admits(self, trade_case_id: UUID) -> bool:
         """Whether this run may work on that case, counting it if it may."""
@@ -297,7 +303,7 @@ class BoundedPaperRun:
         if stage is None:
             account.acquisition = no_acquisition()
             return True
-        account.acquisition = await stage.execute(deadline)
+        account.acquisition = await stage.execute(deadline, networks=account.networks)
         stop = account.acquisition.stop
         if stop == AcquisitionStop.SYSTEM_STOP_UNREADABLE.value:
             # A safety question this deployment cannot answer. Unknown is not
@@ -887,7 +893,7 @@ class BoundedPaperRun:
         stage = self.stack.pre_risk
         if stage is None:
             return True
-        reading = await stage.refresh(case, deadline)
+        reading = await stage.refresh(case, deadline, networks=account.networks)
         markets.append(reading)
         if not reading.ready:
             return False
