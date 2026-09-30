@@ -148,8 +148,9 @@ class AcquisitionNeed(StrEnum):
     POSITION_VALUATION = "POSITION_VALUATION"
     # The market an existing, non-terminal case is about.
     CASE_MARKET = "CASE_MARKET"
-    # The market that prices a case's payment asset in dollars. A different
-    # reading from the pair's own, and one ANCHOR refuses to infer.
+    # Formerly: a second market pricing a case's payment asset in dollars. No
+    # longer planned — a version-3 observation of the case's own pool carries
+    # the quote asset's USD price. Kept so earlier run summaries stay readable.
     QUOTE_ASSET = "QUOTE_ASSET"
     # Anything a bounded discovery read returned. Never a recommendation: what
     # it produces is a recorded observation, which intake may or may not open a

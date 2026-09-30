@@ -94,8 +94,9 @@ pool locator only, the markets that request will read:
 - the case's own market, and
 - the market of every open position SENTINEL values,
 
-each once. Not the payment-asset reference ANCHOR uses, no discovery, no other
-case. Each market must come back as exactly the stored identity (provider,
+each once. No discovery, no other case, and no separate payment-asset market:
+a version-3 observation of the case's pool carries the quote asset's USD price
+ANCHOR converts with, so refreshing the pool refreshes that price too. Each market must come back as exactly the stored identity (provider,
 chain, network, venue, both assets, pool locator); nothing is searched by
 symbol, name or address and no pool is substituted. Observations are recorded
 through the ordinary recorder and committed before the request.

@@ -122,7 +122,11 @@ async def test_precise_pool_roundtrip(
         )
         pair = (await provider.discover())[0]
         snapshot = await provider.snapshot(pair)
-        assert snapshot.schema_version == 2
+        # New observations are version 3: the quote asset's USD price is carried
+        # beside the base price, and stays UNKNOWN when the pool did not state it.
+        assert snapshot.schema_version == 3
+        assert snapshot.quote_price is not None
+        assert snapshot.quote_price.asset_id == snapshot.pair.quote.asset_id
         assert snapshot.pair.pool_locator.kind == PoolLocatorKind.BYTES32_POOL_ID
         assert snapshot.price.value_usd == Decimal(value)
         await recorder.record(snapshot)

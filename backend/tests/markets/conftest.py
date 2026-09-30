@@ -44,13 +44,18 @@ async def market_sessions():
                 def migrate(sync_connection):
                     with Operations.context(MigrationContext.configure(sync_connection)):
                         module.upgrade()
-                        next_path = path.with_name("0003_pool_locator.py")
-                        next_spec = importlib.util.spec_from_file_location(
-                            "locator_migration", next_path
-                        )
-                        next_module = importlib.util.module_from_spec(next_spec)
-                        next_spec.loader.exec_module(next_module)
-                        next_module.upgrade()
+                        # Every later revision that touches this table, in order.
+                        for name in (
+                            "0003_pool_locator.py",
+                            "0021_market_snapshot_quote_price.py",
+                        ):
+                            next_path = path.with_name(name)
+                            next_spec = importlib.util.spec_from_file_location(
+                                f"market_migration_{name[:4]}", next_path
+                            )
+                            next_module = importlib.util.module_from_spec(next_spec)
+                            next_spec.loader.exec_module(next_module)
+                            next_module.upgrade()
 
                 await connection.run_sync(migrate)
             else:

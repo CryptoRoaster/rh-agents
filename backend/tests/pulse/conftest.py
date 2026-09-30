@@ -280,6 +280,7 @@ async def pulse_db():
                     "0003_pool_locator",
                     "0005_trade_case_workflow",
                     "0006_worker_runtime",
+                    "0021_market_snapshot_quote_price",
                 ):
                     spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
                     module = importlib.util.module_from_spec(spec)

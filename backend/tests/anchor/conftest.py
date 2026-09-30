@@ -24,7 +24,7 @@ from src.agents.anchor.policy import ANCHOR_EXECUTION_V1
 from src.core.models import AgentRole, Side
 from src.core.numbers import quantize
 from src.markets.fake_quotes import FixtureQuoteSource
-from src.markets.models import Availability, MarketIdentity
+from src.markets.models import Availability, MarketIdentity, MarketSnapshot, PoolLocatorKind
 from src.markets.quotes import QuoteUnavailable
 from src.orchestration.workflow.models import (
     EvidenceEnvelope,
@@ -251,44 +251,79 @@ class StubTradeCase:
 
 
 class StubMarkets:
-    """Recorded markets, keyed by identity.
+    """Recorded markets: the case's own pool, and nothing else.
 
-    The payment asset's price is a *separate* observation from the pair's, and
-    the stub keeps them separate on purpose: one that answered every identity
-    with the same snapshot would hand back the traded asset's price as the
-    payment asset's, and every USD figure derived from it would be wrong by
-    whatever the two happen to differ by.
+    ANCHOR values the payment asset from the case pool's own `quote_price`, so
+    a second market for the payment asset is never needed. The stub answers
+    every question with that one pool — so a reading for another pool is refused
+    by ANCHOR's own identity check — and notes each identity asked in `asked`, so
+    a test can prove no other lookup happened.
+
+    `payment="default"` turns the pair into a version-3 observation whose quote
+    asset is worth one dollar; `payment=None` leaves the pair exactly as given (a
+    legacy snapshot has no quote price); any other snapshot is served as the
+    case's pool instead.
     """
 
     def __init__(self, snapshot=None, *, payment="default") -> None:
-        self._snapshot = snapshot
-        self._payment = payment_snapshot(snapshot) if payment == "default" and snapshot else payment
+        if payment == "default":
+            self._snapshot = payment_snapshot(snapshot) if snapshot is not None else None
+        elif payment is None:
+            self._snapshot = snapshot
+        else:
+            self._snapshot = payment
+        self.asked: list[str] = []
 
     async def latest(self, identity: str, *, include_fixtures: bool = False):
-        if self._snapshot is not None and identity == f"{CHAIN}:{NETWORK}:{QUOTE_TOKEN}":
-            return self._payment
+        self.asked.append(identity)
         return self._snapshot
 
 
-def payment_snapshot(pair_snapshot, usd_per_token=Decimal(1)):
-    """An observation of the payment asset itself, priced in USD."""
+def payment_snapshot(
+    pair_snapshot,
+    usd_per_token=Decimal(1),
+    *,
+    status=Availability.AVAILABLE,
+    observed_at=None,
+    asset_id=None,
+):
+    """The case's own pool as a version-3 observation, with its quote asset priced.
+
+    Built through validation rather than copied around it, so every binding a
+    real observation must satisfy — the pool locator, the quote price's asset and
+    provenance, a source time no newer than the snapshot — holds here too.
+    """
     if pair_snapshot is None:
         return None
-    # Independently priced and independently available. The payment asset is a
-    # different market, so a pair that cannot be priced says nothing about
-    # whether its payment asset can be.
-    return pair_snapshot.model_copy(
-        update={
-            "id": uuid4(),
-            "price": pair_snapshot.price.model_copy(
-                update={
-                    "id": uuid4(),
-                    "value_usd": usd_per_token,
-                    "status": Availability.AVAILABLE,
-                }
-            ),
+    data = pair_snapshot.model_dump()
+    data["schema_version"] = 3
+    # The pool's quote asset is the case's payment asset, as it is in any real
+    # observation of the case's market.
+    data["pair"]["quote"]["asset_id"] = f"{CHAIN}:{NETWORK}:{QUOTE_TOKEN}"
+    if data["pair"].get("pool_locator") is None:
+        # A version-3 observation always carries its pool locator, whose venue
+        # must be a plain slug; the market layer's fixture venue is not one.
+        data["pair"]["venue"] = data["pair"]["venue"].replace(":", "-")
+        data["pair"]["pool_locator"] = {
+            "kind": PoolLocatorKind.CONTRACT_ADDRESS,
+            "value": data["pair"]["pair_id"].rsplit(":", 1)[-1],
+            "venue": data["pair"]["venue"],
         }
-    )
+    available = status == Availability.AVAILABLE
+    data["quote_price"] = {
+        **data["price"],
+        "id": uuid4(),
+        "asset_id": asset_id or data["pair"]["quote"]["asset_id"],
+        "observed_at": observed_at or data["price"]["observed_at"],
+        "status": status,
+        "value_usd": usd_per_token if available else None,
+    }
+    try:
+        return MarketSnapshot.model_validate(data)
+    except ValueError:
+        # A pool this fixture cannot give a locator to (a deliberately foreign
+        # pair id) stays the legacy observation it was.
+        return pair_snapshot
 
 
 def evidence_envelope(now, evidence_type, role, payload, **kw):

@@ -21,7 +21,7 @@ from src.data.tables import (
 )
 from src.runner.models import AcquisitionOutcome, AcquisitionStop, ExitCode, RunStop
 from tests.runner.conftest import run
-from tests.runner.provider import MarketProvider, payment, pool, traded
+from tests.runner.provider import POOL, MarketProvider, payment, pool, traded
 from tests.runner.specialists import ScriptedSpecialists
 from tests.runner.test_acquisition import (
     PAIR_ID,
@@ -328,10 +328,12 @@ async def test_one_market_wanted_twice_still_costs_one(risk_db, now, trace):
         ports=acquiring_ports(later, model, provider),
     )
 
+    # The holding and the case want the same pool: asked once, paid once, and
+    # the second need answered by that reading as the replay it is.
     asked = provider.multi_requests[0].rsplit("/", 1)[-1].split(",")
-    assert len(asked) == 2 and len(set(asked)) == 2, asked
-    assert summary.acquisition.budget_spent == 2, summary.acquisition
-    assert summary.acquisition.recorded == 2
+    assert asked == [POOL], asked
+    assert summary.acquisition.budget_spent == 1, summary.acquisition
+    assert summary.acquisition.recorded == 1
     assert summary.acquisition.unchanged == 1
 
 
@@ -351,10 +353,10 @@ async def test_a_failed_read_does_not_erase_the_markets_it_asked_about(risk_db, 
     )
 
     assert summary.acquisition.stop == AcquisitionStop.PROVIDER_FAILED.value
-    assert summary.acquisition.requested == 2, summary.acquisition
-    assert summary.acquisition.budget_spent == 2, summary.acquisition
+    assert summary.acquisition.requested == 1, summary.acquisition
+    assert summary.acquisition.budget_spent == 1, summary.acquisition
     assert summary.acquisition.recorded == 0
-    assert summary.acquisition.failed == 2
+    assert summary.acquisition.failed == 1
     # HTTP attempts include the retry the transport is configured for, and the
     # market counters are untouched by it: four counters, four questions.
     assert summary.acquisition.http_attempts > summary.acquisition.provider_requests

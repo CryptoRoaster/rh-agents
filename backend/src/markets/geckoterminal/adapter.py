@@ -152,6 +152,12 @@ def normalize(
     if price is not None and price == 0:
         # Existing canonical prices must be positive. Preserve zero reserve/volume below.
         price = None
+    # The quote token's USD price for this same pool, exactly as stated. Absent
+    # or zero is UNKNOWN: never derived from the base price, the reserves, a
+    # symbol or an assumed peg.
+    quote_price = values.quote_token_price_usd
+    if quote_price is not None and quote_price == 0:
+        quote_price = None
     try:
 
         def measurement(value: object) -> dict[str, object]:
@@ -166,7 +172,10 @@ def normalize(
             {
                 **meta,
                 "id": uuid4(),
-                "schema_version": 2,
+                "schema_version": 3,
+                # Bound to the pool's own quote asset, in the pool's own
+                # orientation: base stays base, quote stays quote.
+                "quote_price": {**measurement(quote_price), "asset_id": assets[1]["asset_id"]},
                 "pair": {
                     **meta,
                     "id": uuid4(),

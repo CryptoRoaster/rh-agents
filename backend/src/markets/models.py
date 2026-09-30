@@ -12,7 +12,9 @@ from pydantic import (
     AwareDatetime,
     BeforeValidator,
     Field,
+    SerializerFunctionWrapHandler,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -255,28 +257,68 @@ def same_provenance(parent: Observation, child: Observation, *, same_asset: bool
 
 
 class MarketSnapshot(Observation):
-    schema_version: Literal[1, 2] = 1
+    """One observation of one market.
+
+    Version 3 adds `quote_price`: the pool's own quote asset in USD, as the
+    provider stated it for the same pool at the same instant. It is required in
+    a version-3 snapshot even when the provider did not state it — then it is
+    present and UNKNOWN, never omitted and never estimated — and it is absent
+    from versions 1 and 2, which stay exactly as they were recorded.
+
+    `price` keeps its meaning in every version: the base asset in USD. Market
+    availability is still decided by `price` and `liquidity` alone; an unknown
+    quote price is a problem for whoever needs to convert into the quote asset,
+    not a reason for the market itself to become unreadable.
+    """
+
+    schema_version: Literal[1, 2, 3] = 1
     pair: MarketPair
     price: PriceSnapshot
     liquidity: LiquiditySnapshot
     volume: VolumeSnapshot
+    quote_price: PriceSnapshot | None = None
 
     @model_validator(mode="after")
     def consistent_observation(self) -> Self:
-        if self.schema_version == 2 and self.pair.pool_locator is None:
-            raise ValueError("Version 2 requires an explicit pool locator")
+        if self.schema_version >= 2 and self.pair.pool_locator is None:
+            raise ValueError("Version 2 and later require an explicit pool locator")
         for child in (self.pair, self.price, self.liquidity, self.volume):
             same_provenance(self, child)
+        if self.price.asset_id != self.pair.base.asset_id:
+            raise ValueError("The price must be the base asset's own")
+        if self.schema_version < 3:
+            if self.quote_price is not None:
+                raise ValueError("A quote price exists only from version 3")
+            return self
+        if self.quote_price is None:
+            raise ValueError("Version 3 requires a quote price, even when it is unknown")
+        # The quote asset's own price, bound to the pool's actual quote asset
+        # and to this observation's provenance. Never another token's.
+        same_provenance(self, self.quote_price, same_asset=False)
+        if self.quote_price.asset_id != self.pair.quote.asset_id:
+            raise ValueError("The quote price must be the pair's own quote asset")
         return self
+
+    @model_serializer(mode="wrap")
+    def _versioned(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        # Versions 1 and 2 serialize exactly as they were recorded: no new key,
+        # so stored payloads, digests and replays of them are unchanged.
+        data: dict[str, object] = handler(self)
+        if self.quote_price is None:
+            data.pop("quote_price", None)
+        return data
 
     @property
     def freshness_at(self) -> datetime:
-        return min(
+        instants = [
             self.observed_at,
             self.price.observed_at,
             self.liquidity.observed_at,
             self.volume.observed_at,
-        )
+        ]
+        if self.quote_price is not None:
+            instants.append(self.quote_price.observed_at)
+        return min(instants)
 
     @property
     def available(self) -> bool:

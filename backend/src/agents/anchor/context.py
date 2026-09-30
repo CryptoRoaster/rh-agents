@@ -23,10 +23,14 @@ SENTINEL sizes in USD, so capacity has to arrive in USD or it cannot be used.
 The provider is asked in base units of the payment asset. Those are the same
 number only when that asset happens to trade at a dollar, and nothing here is
 allowed to assume it does: no peg, no symbol matching, no "it looks like a
-stablecoin". The conversion runs through a recorded observation of the payment
-asset's own USD price, and when no such observation exists this refuses — before
-spending a single provider request, because a ladder nobody can denominate is a
-ladder nobody should ask for.
+stablecoin". The conversion runs through the payment asset's own USD price as
+the provider stated it *for the case's own pool* — a version-3 snapshot carries
+it as `quote_price`, bound to the pair's actual quote asset — so any pair works,
+MEME/MEME included, with no second market for the payment asset required or
+consulted. When that price is absent (a version-1/2 snapshot), unknown,
+non-positive, stale or bound to another asset, this refuses before spending a
+single provider request, because a ladder nobody can denominate is a ladder
+nobody should ask for.
 """
 
 from dataclasses import dataclass
@@ -134,26 +138,33 @@ def reference_market(snapshot: MarketSnapshot, now: datetime) -> ReferenceMarket
 def quote_asset_valuation(
     snapshot: MarketSnapshot, asset_id: str, now: datetime
 ) -> QuoteAssetValuation | None:
-    """One unit of the payment asset in USD, from a recorded observation of it.
+    """One unit of the payment asset in USD, from the case's own pool.
 
-    The snapshot must be an observation *of that asset* — a market where it is
-    the thing being priced. A pair's own snapshot prices its base asset, so the
-    payment asset's value is a different reading entirely and is looked up as
-    one. Returning nothing is a real answer here and the caller treats it as
-    fatal rather than filling it in.
+    Read from `quote_price`, which only a version-3 snapshot carries: the
+    provider's own USD price of this pool's quote asset, observed with the rest
+    of the snapshot. Nothing is derived — not from the base price, not from the
+    reserves, not from a symbol — and no other market is consulted. The price
+    must belong to exactly `asset_id`, the payment asset the quote will spend.
+    Returning nothing is a real answer here and the caller treats it as fatal
+    rather than filling it in.
     """
-    if snapshot.price.status != Availability.AVAILABLE or snapshot.price.value_usd is None:
+    observed = snapshot.quote_price
+    if observed is None or observed.asset_id != asset_id:
         return None
-    if snapshot.price.value_usd <= 0:
+    if snapshot.pair.quote.asset_id != asset_id:
+        return None
+    if observed.status != Availability.AVAILABLE or observed.value_usd is None:
+        return None
+    if observed.value_usd <= 0 or observed.observed_at > now:
         return None
     return QuoteAssetValuation(
         asset_id=asset_id,
-        observation_id=snapshot.price.id,
+        observation_id=observed.id,
         snapshot_id=snapshot.id,
         provider=snapshot.provider,
-        usd_per_token=snapshot.price.value_usd,
-        observed_at=snapshot.price.observed_at,
-        age_seconds=max(0, int((now - snapshot.price.observed_at).total_seconds())),
+        usd_per_token=observed.value_usd,
+        observed_at=observed.observed_at,
+        age_seconds=max(0, int((now - observed.observed_at).total_seconds())),
     )
 
 
@@ -219,16 +230,12 @@ class AnchorContextReader:
         market = market_context(snapshot, trade_case)
         reference = reference_market(snapshot, now)
 
-        # The unit bridge, obtained before any provider request. A ladder that
+        # The unit bridge, obtained before any provider request, from the same
+        # pool observation the rest of this context is bound to. A ladder that
         # cannot be denominated in USD is one SENTINEL could not read, so it is
         # never quoted: spending requests to build a number nobody may use is
         # worse than saying plainly that the number cannot be built.
-        payment = await self.markets.latest(
-            market.quote_asset_id, include_fixtures=self.include_fixtures
-        )
-        valuation = (
-            None if payment is None else quote_asset_valuation(payment, market.quote_asset_id, now)
-        )
+        valuation = quote_asset_valuation(snapshot, market.quote_asset_id, now)
         if (
             valuation is None
             or valuation.age_seconds > self.policy.max_reference_age.total_seconds()

@@ -102,6 +102,7 @@ async def risk_db():
                 "0018_paper_exit_triggers",
                 "0019_scout_fresh_first_orbit",
                 "0020_scout_history_fair_queue",
+                "0021_market_snapshot_quote_price",
             ):
                 spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
                 module = importlib.util.module_from_spec(spec)

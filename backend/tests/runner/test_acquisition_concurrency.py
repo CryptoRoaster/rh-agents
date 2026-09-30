@@ -116,11 +116,12 @@ async def test_a_second_run_over_the_same_market_records_its_own_event(risk_db, 
         ),
     )
 
-    assert second.acquisition.recorded == 2, second.acquisition
+    # The case's own pool only: no separate payment-asset market is a target.
+    assert second.acquisition.recorded == 1, second.acquisition
     rows = await observations(sessions, PAIR_ID)
     assert [item.id for item in rows][: len(before)] == before, "the first event is untouched"
     assert len(rows) == 2
-    assert await counted(sessions, MarketObservationRow) == 4
+    assert await counted(sessions, MarketObservationRow) == 3
     async with sessions() as session:
         for_market = await session.scalar(
             select(func.count()).select_from(TradeCaseRow).where(TradeCaseRow.market_key == PAIR_ID)
@@ -187,5 +188,5 @@ async def test_no_provider_request_is_made_while_a_row_is_locked(risk_db, now, t
     )
 
     assert taken, "the targeted request never happened"
-    assert summary.acquisition.recorded == 2, summary.acquisition
+    assert summary.acquisition.recorded == 1, summary.acquisition
     assert not isinstance(summary, DBAPIError)

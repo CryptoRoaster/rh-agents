@@ -103,6 +103,23 @@ class RouteResponse(DTO):
 # answer. Anything else is an absence of evidence.
 NO_ROUTE_CODES = frozenset({4005, 4008, 4011})
 
+# A chain's native asset, as this system names it everywhere: the zero address.
+NATIVE_ASSET = "0x" + "0" * 40
+# The same asset as KyberSwap names it. Used only at this boundary — in the
+# request, and to validate and translate the answer — and never stored, never
+# passed inward, never matched by symbol or name.
+KYBER_NATIVE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+
+
+def to_provider(token: str) -> str:
+    """The canonical address as KyberSwap expects it in a request."""
+    return KYBER_NATIVE if token.lower() == NATIVE_ASSET else token
+
+
+def from_provider(token: str) -> str:
+    """An address from KyberSwap's answer, back in this system's canonical form."""
+    return NATIVE_ASSET if token.lower() == KYBER_NATIVE.lower() else token.lower()
+
 
 def _usd(raw: Decimal | None) -> Decimal | None:
     """The provider's USD valuation, or nothing. Never a reason to fail a quote.
@@ -176,9 +193,12 @@ class KyberSwapQuoteSource:
         slug = CHAIN_SLUGS.get(chain)
         if slug is None or network != "mainnet":
             raise QuoteUnavailable(QuoteFailure.UNSUPPORTED_CHAIN)
+        # Any two tokens are asked about as they are: no allowlist of payment
+        # assets, and a pair without a route is the provider's NO_ROUTE answer.
+        sent_in, sent_out = to_provider(token_in), to_provider(token_out)
         payload = await self._get(
             f"/{slug}/api/v1/routes",
-            {"tokenIn": token_in, "tokenOut": token_out, "amountIn": str(amount_in)},
+            {"tokenIn": sent_in, "tokenOut": sent_out, "amountIn": str(amount_in)},
         )
         # Read after the answer lands, so the name is true. Freshness takes the
         # earlier of this and the provider's own timestamp.
@@ -194,8 +214,10 @@ class KyberSwapQuoteSource:
             raise QuoteUnavailable(QuoteFailure.INVALID_RESPONSE)
 
         summary = response.data.routeSummary
-        if summary.tokenIn.lower() != token_in.lower() or (
-            summary.tokenOut.lower() != token_out.lower()
+        # Validated against exactly what was sent, sentinel included, before
+        # anything is translated back.
+        if summary.tokenIn.lower() != sent_in.lower() or (
+            summary.tokenOut.lower() != sent_out.lower()
         ):
             raise QuoteUnavailable(QuoteFailure.IDENTITY_MISMATCH)
         if _amount(summary.amountIn) != amount_in:
@@ -212,8 +234,8 @@ class KyberSwapQuoteSource:
                     RouteHop(
                         venue=hop.exchange,
                         pool=hop.pool.lower(),
-                        token_in=hop.tokenIn.lower(),
-                        token_out=hop.tokenOut.lower(),
+                        token_in=from_provider(hop.tokenIn),
+                        token_out=from_provider(hop.tokenOut),
                         amount_in=_amount(hop.swapAmount),
                         amount_out=_amount(hop.amountOut),
                     )
