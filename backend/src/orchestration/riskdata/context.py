@@ -48,7 +48,7 @@ from src.orchestration.workflow.models import (
     TradeCaseStatus,
     WorkflowFailure,
 )
-from src.orchestration.workflow.policy import TRADE_CASE_V1, WorkflowPolicy
+from src.orchestration.workflow.policy import WorkflowPolicy, policy_for
 
 MEANINGS: dict[RiskFactKind, str] = {
     RiskFactKind.REFERENCE_PRICE: "USD_PER_BASE_UNIT",
@@ -104,7 +104,9 @@ class RiskDataReader:
     # blocker — restating it here would create a second authority on one
     # question, and the cheapest way for two to disagree is for one to be
     # updated.
-    workflow: WorkflowPolicy = TRADE_CASE_V1
+    # None: every case is read under the workflow it was opened with. A caller
+    # may pin a table explicitly (tests do, to prove it is read, not restated).
+    workflow: WorkflowPolicy | None = None
     clock: Clock = SystemClock()
     # Supplied by a deployment that also runs the accounting subsystem, which is
     # where the durable stop lives. Absent means unreadable, and unreadable is
@@ -140,7 +142,8 @@ class RiskDataReader:
         _cost_facts(self.costs, facts, gaps)
         _routing_fact(current.get(EvidenceType.LIQUIDITY_EXECUTION), now, facts, gaps)
         _onchain_facts(current.get(EvidenceType.ONCHAIN), base_asset_id, now, facts, gaps, blockers)
-        _established_blockers(current, now, self.workflow.safety_types, blockers)
+        workflow = self.workflow or policy_for(trade_case.workflow_version)
+        _established_blockers(current, now, workflow.safety_types, blockers)
         _control_blockers(trade_case, paused, pause_readable, blockers)
 
         horizons = [item.valid_until for item in facts if item.valid_until is not None]

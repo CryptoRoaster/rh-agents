@@ -50,7 +50,7 @@ from src.orchestration.workflow.models import (
     WorkflowErrorCode,
     WorkflowFailure,
 )
-from src.orchestration.workflow.policy import TRADE_CASE_V1, WorkflowPolicy
+from src.orchestration.workflow.policy import WorkflowPolicy, policy_for
 from src.orchestration.workflow.service import TradeCaseService, risk_from_row
 
 
@@ -231,7 +231,8 @@ class CommanderContextReader:
     cases: TradeCaseService
     sessions: async_sessionmaker[AsyncSession]
     policy: CommanderControlPolicy = COMMANDER_CONTROL_V1
-    workflow: WorkflowPolicy = TRADE_CASE_V1
+    # None: every case is read under the workflow it was opened with.
+    workflow: WorkflowPolicy | None = None
     clock: Clock = SystemClock()
     # The authoritative evaluator, reused read-only. Never a second engine.
     evaluator: TradeCaseEvaluator = field(default_factory=TradeCaseEvaluator)
@@ -266,6 +267,7 @@ class CommanderContextReader:
         # second engine: there is one requirement table, one transition matrix
         # and one freshness rule, and this reads them at the present instant
         # instead of trusting a row written at some earlier one.
+        workflow = self.workflow or policy_for(trade_case.workflow_version)
         binding_row = await self._binding_row(trade_case_id)
         effective = self.evaluator.evaluate(
             trade_case,
@@ -284,7 +286,7 @@ class CommanderContextReader:
                 # control plane, granted to the one component that is explicitly
                 # authoritative over nothing.
                 continue
-            requirement = _requirement(self.workflow, evidence_type)
+            requirement = _requirement(workflow, evidence_type)
             states.append(
                 EvidenceState(
                     role=item.producer_role,
@@ -312,7 +314,7 @@ class CommanderContextReader:
             )
         )
 
-        digest = risk_input_digest(trade_case, current, self.workflow)
+        digest = risk_input_digest(trade_case, current, workflow)
         shelf_life = _shelf_life(trade_case, current, binding_row, now)
         risk = None if binding_row is None else _risk_state(risk_from_row(binding_row), digest, now)
         controls = await self._controls()

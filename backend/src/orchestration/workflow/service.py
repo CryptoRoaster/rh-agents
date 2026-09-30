@@ -57,10 +57,11 @@ from src.orchestration.workflow.models import (
     WorkflowFailure,
 )
 from src.orchestration.workflow.policy import (
-    TRADE_CASE_V1,
+    CURRENT_WORKFLOW,
     EvidenceRequirement,
     RefreshableSource,
     WorkflowPolicy,
+    policy_for,
 )
 from src.risk.authorization import RiskAuthorization, classify_decision
 
@@ -159,6 +160,8 @@ def canonical_digest(value: object) -> str:
 
 
 def case_from_row(row: TradeCaseRow) -> TradeCase:
+    # A version this code does not implement is refused, never read as another.
+    policy_for(row.workflow_version)
     return TradeCase.model_validate(
         {
             "id": row.id,
@@ -233,7 +236,7 @@ class TradeCaseService:
         sessions: async_sessionmaker[AsyncSession],
         *,
         clock: Clock | None = None,
-        policy: WorkflowPolicy = TRADE_CASE_V1,
+        policy: WorkflowPolicy = CURRENT_WORKFLOW,
     ) -> None:
         self.sessions = sessions
         self.clock = clock if clock is not None else SystemClock()
@@ -425,7 +428,7 @@ class TradeCaseService:
 
     async def _create_tasks(self, session: AsyncSession, row: TradeCaseRow) -> None:
         now = self.clock.now()
-        for definition in self.policy.tasks:
+        for definition in policy_for(row.workflow_version).tasks:
             task_id = uuid5(
                 NAMESPACE_URL,
                 f"rh-agents:trade-case-task:{row.id}:{definition.role.value}:{definition.task_type}:1",
@@ -570,7 +573,7 @@ class TradeCaseService:
         row: TradeCaseRow,
         submission: EvidenceSubmission,
     ) -> EvidenceEnvelope:
-        requirement = self.policy.requirement(submission.evidence_type)
+        requirement = policy_for(row.workflow_version).requirement(submission.evidence_type)
         if (
             submission.producer_role != requirement.role
             or submission.correlation_id != row.correlation_id
@@ -697,7 +700,7 @@ class TradeCaseService:
     async def _complete_evidence_task(
         self, session: AsyncSession, row: TradeCaseRow, evidence_type: EvidenceType
     ) -> None:
-        requirement = self.policy.requirement(evidence_type)
+        requirement = policy_for(row.workflow_version).requirement(evidence_type)
         # One row per (case, role, task_type) slot; `attempt` is a mutable counter,
         # so completion must not be pinned to the first attempt.
         task = await session.scalar(
@@ -754,7 +757,7 @@ class TradeCaseService:
         Re-arming reuses the task's own row and bumps its attempt counter, so a
         case keeps one slot per role rather than accumulating one per revision.
         """
-        definitions = self.policy.derived_tasks(evidence_type)
+        definitions = policy_for(row.workflow_version).derived_tasks(evidence_type)
         if not definitions:
             return
         if TradeCaseStatus(row.status) in TERMINAL_CASE_STATUSES:
@@ -897,7 +900,8 @@ class TradeCaseService:
         async with self.sessions.begin() as session:
             row = await self._locked_case(session, trade_case_id)
             self._revision(row, expected_revision)
-            refreshable = self.policy.refreshable(origin)
+            policy = policy_for(row.workflow_version)
+            refreshable = policy.refreshable(origin)
             if refreshable is None:
                 return self._refresh_refused(
                     row, origin, SourceRefreshOutcome.SOURCE_NOT_REFRESHABLE
@@ -905,7 +909,7 @@ class TradeCaseService:
             admissible = await self._refresh_admissible(session, row, refreshable)
             if admissible is not None:
                 return self._refresh_refused(row, origin, admissible)
-            requirement = self.policy.requirement(refreshable.evidence_type)
+            requirement = policy.requirement(refreshable.evidence_type)
             task = await session.scalar(
                 select(TradeCaseTaskRow).where(
                     TradeCaseTaskRow.trade_case_id == row.id,

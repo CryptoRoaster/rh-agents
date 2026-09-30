@@ -48,6 +48,9 @@ class WorkflowErrorCode(StrEnum):
     TASK_TRANSITION = "TASK_TRANSITION"
     RISK_BINDING = "RISK_BINDING"
     EVIDENCE_INTEGRITY = "EVIDENCE_INTEGRITY"
+    # A case recorded under a workflow version this code does not implement.
+    # Never evaluated under another version's rules: fail closed.
+    UNSUPPORTED_WORKFLOW_VERSION = "UNSUPPORTED_WORKFLOW_VERSION"
 
 
 class WorkflowFailure(Exception):
@@ -1230,7 +1233,9 @@ class Blocker(Immutable):
 
 class TradeCase(Immutable):
     id: UUID
-    workflow_version: Literal["trade-case-v1"] = "trade-case-v1"
+    # The rules this case is evaluated under, fixed when it was opened. A case
+    # keeps its version for life; no later default re-reads an old case.
+    workflow_version: Literal["trade-case-v1", "trade-case-v2"] = "trade-case-v1"
     market: MarketIdentity
     chain: str
     network: str

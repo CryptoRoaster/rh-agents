@@ -54,7 +54,7 @@ from src.orchestration.workflow.models import (
     TradeCase,
     TradeSetupPayload,
 )
-from src.orchestration.workflow.policy import TRADE_CASE_V1, WorkflowPolicy
+from src.orchestration.workflow.policy import WorkflowPolicy, policy_for
 
 
 class TradeCaseSynthesisSource(Protocol):
@@ -142,7 +142,8 @@ class FuseContextReader:
 
     cases: TradeCaseSynthesisSource
     policy: FuseSynthesisPolicy = FUSE_SYNTHESIS_V1
-    workflow: WorkflowPolicy = TRADE_CASE_V1
+    # None: every case is read under the workflow it was opened with.
+    workflow: WorkflowPolicy | None = None
     clock: Clock = SystemClock()
 
     async def synthesis_context(self, trade_case_id: UUID, task_id: UUID) -> FuseTaskInput:
@@ -158,8 +159,9 @@ class FuseContextReader:
         sources: list[FuseSourceEvidence] = []
         missing: list[MissingSource] = []
 
+        workflow = self.workflow or policy_for(trade_case.workflow_version)
         for evidence_type in self.policy.sources:
-            requirement = self.workflow.requirement(evidence_type)
+            requirement = workflow.requirement(evidence_type)
             role = ROLE_FOR_TYPE[evidence_type]
             item = current.get(evidence_type)
             if item is None:
