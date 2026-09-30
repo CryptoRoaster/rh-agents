@@ -202,6 +202,116 @@ def _provider_code(error: ProviderError) -> str:
     return error.code.upper()
 
 
+def unaddressable(identity: MarketIdentity, chains: "dict[str, Chain]") -> str | None:
+    """Why this market cannot be asked about by exact locator, if it cannot.
+
+    Every answer is a refusal to *substitute*. A market on a chain nobody
+    configured is not served from another chain, one observed by a different
+    provider is not asked of this one, and a market recorded before pool
+    locators existed is not addressed by taking its address out of its own
+    identifier — that string is a derived name, and reading coordinates back
+    out of a name is exactly the guess this system does not make. Shared by the
+    run-start acquisition and the pre-risk refresh, so both refuse alike.
+    """
+    if identity.provider != PROVIDER:
+        return "PROVIDER_NOT_CONFIGURED"
+    if identity.chain not in chains:
+        return "CHAIN_NOT_CONFIGURED"
+    if identity.network != NETWORK:
+        return "NETWORK_NOT_SUPPORTED"
+    if identity.pool_locator is None:
+        return "POOL_LOCATOR_UNKNOWN"
+    if identity.is_fixture:
+        return "FIXTURE_MARKET"
+    return None
+
+
+async def position_markets(
+    sessions: async_sessionmaker[AsyncSession], markets: MarketReader, limit: int
+) -> list[tuple[str, str | None, MarketIdentity | None, str | None]]:
+    """Every open holding's own market, by the identity that was recorded.
+
+    A position names its market by pair, chain, network and provider, and the
+    full canonical identity — venue and pool locator included — lives on the
+    recorded observation. So the observation is what is looked up, and the
+    position's own four fields are then checked against it: two providers
+    observing one pool are two sources, and an address means nothing across
+    chains. Bounded by `limit`; shared by acquisition and the pre-risk refresh.
+    """
+    async with sessions() as session:
+        rows = (
+            await session.scalars(
+                select(PositionRow)
+                .where(PositionRow.quantity != 0)
+                .order_by(PositionRow.asset_id)
+                .limit(limit)
+            )
+        ).all()
+    holdings = [
+        (
+            row.asset_id,
+            row.market_pair_id,
+            row.market_chain,
+            row.market_network,
+            row.market_provider,
+        )
+        for row in rows
+    ]
+    wanted = [item[1] for item in holdings if item[1] is not None]
+    recorded = {
+        identity.pair_id: identity for identity in await markets.identities(wanted, limit=100)
+    }
+    found: list[tuple[str, str | None, MarketIdentity | None, str | None]] = []
+    for asset_id, pair_id, chain, network, provider in holdings:
+        if pair_id is None:
+            # The holding never recorded which market it came from. Choosing
+            # one for it would resolve an ambiguity silently.
+            found.append((asset_id, None, None, "POSITION_MARKET_UNKNOWN"))
+            continue
+        identity = recorded.get(pair_id)
+        if identity is None:
+            found.append((asset_id, pair_id, None, "MARKET_NEVER_RECORDED"))
+            continue
+        if (identity.chain, identity.network, identity.provider) != (chain, network, provider):
+            found.append((asset_id, pair_id, None, "MARKET_IDENTITY_MISMATCH"))
+            continue
+        found.append((asset_id, pair_id, identity, None))
+    return found
+
+
+async def record_observed(
+    provider: GeckoTerminalAdapter,
+    pair: MarketPair,
+    expected: MarketIdentity | None,
+    recorder: MarketRecorder,
+    within: float,
+) -> tuple[AcquisitionOutcome, str | None]:
+    """Store one validated observation, held to the identity it was asked as.
+
+    `expected` is the recorded identity the market was planned under, or None
+    for a discovered market, which *is* what the answer said. A planned market
+    whose answer names anything else — base, payment asset, venue — is refused
+    and never stored against a market it is not. Only what the recorder
+    confirmed durable counts as written; an event already stored is a replay
+    and says so. A write whose outcome is unknown is reported as unknown.
+    """
+    if expected is not None and pair.market_identity != expected:
+        return AcquisitionOutcome.REFUSED, "MARKET_IDENTITY_MISMATCH"
+    try:
+        written = await asyncio.wait_for(
+            record_pair_reporting(provider, pair, recorder), timeout=max(0.001, within)
+        )
+    except TimeoutError:
+        return AcquisitionOutcome.UNKNOWN, "RECORD_OUTCOME_UNKNOWN"
+    except ObservationConflict:
+        return AcquisitionOutcome.REFUSED, "OBSERVATION_CONFLICT"
+    except ValueError:
+        return AcquisitionOutcome.REFUSED, "MARKET_IDENTITY_MISMATCH"
+    if written.inserted:
+        return AcquisitionOutcome.RECORDED, None
+    return AcquisitionOutcome.UNCHANGED, "EVENT_ALREADY_RECORDED"
+
+
 def _refusal(identity: str, chain: str, need: AcquisitionNeed, reason: str) -> AcquiredMarket:
     return AcquiredMarket(
         pair_id=identity,
@@ -291,85 +401,18 @@ class AcquisitionPlanner:
         )
 
     def _unusable(self, identity: MarketIdentity) -> str | None:
-        """Why this market cannot be asked about, if it cannot.
-
-        Every answer is a refusal to *substitute*. A market on a chain nobody
-        configured is not served from another chain, one observed by a different
-        provider is not asked of this one, and a market recorded before pool
-        locators existed is not addressed by taking its address out of its own
-        identifier — that string is a derived name, and reading coordinates back
-        out of a name is exactly the guess this system does not make.
-        """
-        if identity.provider != PROVIDER:
-            return "PROVIDER_NOT_CONFIGURED"
-        if identity.chain not in self._chains:
-            return "CHAIN_NOT_CONFIGURED"
-        if identity.network != NETWORK:
-            return "NETWORK_NOT_SUPPORTED"
-        if identity.pool_locator is None:
-            return "POOL_LOCATOR_UNKNOWN"
-        if identity.is_fixture:
-            return "FIXTURE_MARKET"
-        return None
+        return unaddressable(identity, self._chains)
 
     async def _position_markets(
         self,
     ) -> list[tuple[str, str | None, MarketIdentity | None, str | None]]:
-        """Every open holding's own market, by the identity that was recorded.
+        """Every open holding's market, bounded by the market budget.
 
-        A position names its market by pair, chain, network and provider, and
-        the full canonical identity — venue and pool locator included — lives on
-        the recorded observation. So the observation is what is looked up, and
-        the position's own four fields are then checked against it: two
-        providers observing one pool are two sources, and an address means
-        nothing across chains.
-
-        Bounded by the market budget, like the case list: a run cannot even
-        consider more markets than it is permitted to observe. A portfolio
-        larger than that budget is therefore not fully valuable from this pass
+        A portfolio larger than that budget is not fully valuable from this pass
         alone, and SENTINEL refuses on the holdings it cannot mark rather than
         this stage pretending it covered them.
         """
-        async with self._sessions() as session:
-            rows = (
-                await session.scalars(
-                    select(PositionRow)
-                    .where(PositionRow.quantity != 0)
-                    .order_by(PositionRow.asset_id)
-                    .limit(self._limits.max_markets)
-                )
-            ).all()
-        holdings = [
-            (
-                row.asset_id,
-                row.market_pair_id,
-                row.market_chain,
-                row.market_network,
-                row.market_provider,
-            )
-            for row in rows
-        ]
-        wanted = [item[1] for item in holdings if item[1] is not None]
-        recorded = {
-            identity.pair_id: identity
-            for identity in await self._markets.identities(wanted, limit=100)
-        }
-        found: list[tuple[str, str | None, MarketIdentity | None, str | None]] = []
-        for asset_id, pair_id, chain, network, provider in holdings:
-            if pair_id is None:
-                # The holding never recorded which market it came from.
-                # Choosing one for it would resolve an ambiguity silently.
-                found.append((asset_id, None, None, "POSITION_MARKET_UNKNOWN"))
-                continue
-            identity = recorded.get(pair_id)
-            if identity is None:
-                found.append((asset_id, pair_id, None, "MARKET_NEVER_RECORDED"))
-                continue
-            if (identity.chain, identity.network, identity.provider) != (chain, network, provider):
-                found.append((asset_id, pair_id, None, "MARKET_IDENTITY_MISMATCH"))
-                continue
-            found.append((asset_id, pair_id, identity, None))
-        return found
+        return await position_markets(self._sessions, self._markets, self._limits.max_markets)
 
     async def _case_markets(self) -> list[tuple[MarketIdentity, str]]:
         """The markets the live cases are about, oldest case first.
@@ -893,35 +936,20 @@ class BoundedMarketAcquisition:
         A discovered market has no planned identity to be held to. It *is* what
         the answer said, judged by intake under its own rules.
         """
-        if target.need is not AcquisitionNeed.NEW_CANDIDATE and (
-            pair.market_identity != target.identity
-        ):
-            ledger.note(target, AcquisitionOutcome.REFUSED, "MARKET_IDENTITY_MISMATCH")
-            return True
-        try:
-            written = await asyncio.wait_for(
-                record_pair_reporting(provider, pair, recorder),
-                timeout=max(0.001, window.remaining),
-            )
-        except TimeoutError:
+        outcome, reason = await record_observed(
+            provider,
+            pair,
+            None if target.need is AcquisitionNeed.NEW_CANDIDATE else target.identity,
+            recorder,
+            window.remaining,
+        )
+        ledger.note(target, outcome, reason)
+        if outcome is AcquisitionOutcome.UNKNOWN:
             # It may have committed and it may not, and this run cannot tell.
             # Saying so is the only honest answer, and it is also what stops the
             # trading half from proceeding over data of unstated provenance.
-            ledger.note(target, AcquisitionOutcome.UNKNOWN, "RECORD_OUTCOME_UNKNOWN")
             ledger.stop = AcquisitionStop.OUTCOME_UNKNOWN
             return False
-        except ObservationConflict:
-            ledger.note(target, AcquisitionOutcome.REFUSED, "OBSERVATION_CONFLICT")
-            return True
-        except ValueError:
-            # Provenance or identity did not match what was asked for. A typed
-            # refusal, and never a market substituted for another.
-            ledger.note(target, AcquisitionOutcome.REFUSED, "MARKET_IDENTITY_MISMATCH")
-            return True
-        if written.inserted:
-            ledger.note(target, AcquisitionOutcome.RECORDED)
-        else:
-            ledger.note(target, AcquisitionOutcome.UNCHANGED, "EVENT_ALREADY_RECORDED")
         return True
 
     def _affordable(self, ledger: Ledger, window: Window) -> str | None:

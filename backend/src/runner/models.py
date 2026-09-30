@@ -368,6 +368,32 @@ class MarketAcquisition(Immutable):
         return self.unknown > 0 or self.stop == AcquisitionStop.OUTCOME_UNKNOWN.value
 
 
+class PreRiskRefresh(Immutable):
+    """One exact-locator observation of a risk request's markets, just before it.
+
+    Distinct from the run-start acquisition, which observes the open work's
+    markets once per pass, and from a workflow source refresh, which asks ATLAS
+    or ANCHOR to look again. This is what the run did immediately before asking
+    SENTINEL, so SENTINEL reads observations that are younger than its own
+    bound. Counts and codes only: never a payload.
+    """
+
+    # Whether every market the request needs was shown fresh. False means the
+    # request was not sent.
+    ready: bool = Field(strict=True)
+    # A `PreRiskReason` value: the first thing that stopped it.
+    reason: Code | None = None
+    attempted: int = Field(default=0, ge=0)
+    recorded: int = Field(default=0, ge=0)
+    unchanged: int = Field(default=0, ge=0)
+    refused: int = Field(default=0, ge=0)
+    failed: int = Field(default=0, ge=0)
+    provider_requests: int = Field(default=0, ge=0)
+    # Canonical pair ids of the markets in the set: the case's first, then the
+    # portfolio's, each once.
+    markets: tuple[Identifier, ...] = Field(default=(), max_length=8)
+
+
 class CaseProgress(Immutable):
     """What happened to one case in this run."""
 
@@ -382,6 +408,14 @@ class CaseProgress(Immutable):
     # Empty means it never needed to: nothing had aged out, or what stopped the
     # case was not something a new observation could fix.
     refreshes: tuple[SourceRefresh, ...] = Field(default=(), max_length=8)
+    # Each exact-locator market observation made immediately before a risk
+    # request: one before the first request, and one more before each request
+    # re-asked after a source refresh. Empty when no request was about to be
+    # made, when the stage is not enabled, or on a `RISK_APPROVED` replay.
+    market_refreshes: tuple[PreRiskRefresh, ...] = Field(default=(), max_length=4)
+    # Set when the market refresh could not show the request's markets fresh,
+    # so no risk request was sent. A `PreRiskReason` value.
+    pre_risk_refusal: Code | None = None
     fill_refusal: Code | None = None
     execution_id: UUID | None = None
     # A decisive call was cut off before it answered. It may have committed and

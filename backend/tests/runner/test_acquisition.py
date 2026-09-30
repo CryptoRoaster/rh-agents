@@ -191,7 +191,11 @@ async def test_a_provider_response_becomes_a_recorded_market_a_case_and_a_fill(r
     assert second.exit_code is ExitCode.COMPLETED, second
     # The case's own market and its payment asset, both asked for by locator.
     assert second.acquisition.recorded == 2, second.acquisition
-    assert len(moved.multi_requests) == 1, moved.paths
+    # One read at the start of the pass, and one more immediately before the
+    # risk request — of the case's own market only. The payment asset's
+    # reference is ANCHOR's business, not SENTINEL's, and is not re-read.
+    assert len(moved.multi_requests) == 2, moved.paths
+    assert moved.multi_requests[1].rsplit("/", 1)[-1] == POOL, moved.paths
     assert {item.need for item in second.acquisition.markets} == {
         AcquisitionNeed.CASE_MARKET.value,
         AcquisitionNeed.QUOTE_ASSET.value,
@@ -201,6 +205,9 @@ async def test_a_provider_response_becomes_a_recorded_market_a_case_and_a_fill(r
 
     progress = next(item for item in second.cases if item.trade_case_id == case)
     assert progress.risk_outcome == "APPROVE", (progress, second)
+    assert [(item.ready, item.recorded, item.markets) for item in progress.market_refreshes] == [
+        (True, 1, (PAIR_ID,))
+    ], progress
     assert progress.execution_id is not None
     assert second.fills == 1, second
 
@@ -767,7 +774,11 @@ async def test_a_foreign_open_position_is_valued_from_its_own_acquired_market(ri
         )
     }, summary.acquisition
     assert summary.fills == 1, summary
-    assert len(await observations(sessions, PAYMENT_PAIR_ID)) == 2
+    # The opening pass, this pass's acquisition, and the pre-risk refresh: the
+    # holding is valued by SENTINEL, so its market is re-read before the request.
+    assert len(await observations(sessions, PAYMENT_PAIR_ID)) == 3
+    (refreshed,) = next(item for item in summary.cases if item.risk_outcome).market_refreshes
+    assert refreshed.markets == (PAIR_ID, PAYMENT_PAIR_ID), refreshed
 
 
 async def test_a_holding_whose_market_cannot_be_acquired_prevents_every_fill(risk_db, now, trace):
@@ -776,7 +787,8 @@ async def test_a_holding_whose_market_cannot_be_acquired_prevents_every_fill(ris
     The market this position names was never recorded, so there is no identity
     to ask the provider about — reading its address out of its own identifier
     would be inventing coordinates — and the portfolio therefore cannot be
-    marked. SENTINEL refuses, terminally, and nothing fills.
+    marked. The pre-risk refresh cannot show that market fresh either, so no
+    risk request is sent at all, and nothing fills.
     """
     _, sessions = risk_db
     model = ScriptedSpecialists()
@@ -808,8 +820,10 @@ async def test_a_holding_whose_market_cannot_be_acquired_prevents_every_fill(ris
         (unknown_market, "MARKET_NEVER_RECORDED")
     ], summary.acquisition
     assert summary.fills == 0
-    progress = [item for item in summary.cases if item.risk_refusal is not None]
-    assert progress and progress[0].risk_refusal == "PORTFOLIO_MARKS_UNAVAILABLE", summary.cases
+    assert summary.risk_requests == 0
+    progress = [item for item in summary.cases if item.pre_risk_refusal is not None]
+    assert progress and progress[0].pre_risk_refusal == "MARKET_IDENTITY_UNKNOWN", summary.cases
+    assert progress[0].market_refreshes[0].provider_requests == 0
 
 
 async def test_a_historical_replay_needs_no_new_acquisition(risk_db, now, trace):
@@ -832,6 +846,7 @@ async def test_a_historical_replay_needs_no_new_acquisition(risk_db, now, trace)
         ports=acquiring_ports(later, model, moved),
     )
     assert filled.fills == 1, filled
+    recorded = len(await observations(sessions))
 
     # The same case again, with acquisition switched off entirely.
     from tests.runner.conftest import run as plain_run
@@ -845,7 +860,7 @@ async def test_a_historical_replay_needs_no_new_acquisition(risk_db, now, trace)
 
     assert again.acquisition is not None and not again.acquisition.enabled
     assert again.acquisition.stop == AcquisitionStop.NOT_ENABLED.value
-    assert len(await observations(sessions)) == 4, "nothing new was recorded"
+    assert len(await observations(sessions)) == recorded, "nothing new was recorded"
     assert len(await executions(sessions)) == 1
 
 
@@ -917,7 +932,8 @@ async def test_confirmed_recordings_survive_a_later_failure(risk_db, now, trace)
     ]
     # Both observations are durable, and the run went on to do its work with
     # them: a failed discovery says nothing about a market already observed.
-    assert len(await observations(sessions, PAIR_ID)) == 2
+    # The traded market is read once more just before its risk request.
+    assert len(await observations(sessions, PAIR_ID)) == 3
     assert len(await observations(sessions, PAYMENT_PAIR_ID)) == 2
     assert summary.exit_code is ExitCode.COMPLETED, summary
 
@@ -1008,12 +1024,15 @@ async def test_a_pulse_wait_a_new_observation_and_an_evidence_refresh_still_fill
         ports=ports_at(later, model, market_http=moved.transport()),
     )
 
-    # The markets were observed again, by locator, in this pass.
+    # The markets were observed again, by locator, in this pass: once at the
+    # start, once before the first risk request, and once more before the
+    # request is re-asked after ATLAS observed the chain again.
     assert second.acquisition.recorded == 2, second.acquisition
-    assert len(await observations(sessions, PAIR_ID)) == 2
+    assert len(await observations(sessions, PAIR_ID)) == 4
 
     progress = progress_for(second, await traded_case(sessions))
     assert refreshes(progress).get(ATLAS_SOURCE) == "ORDERED", progress
+    assert [item.ready for item in progress.market_refreshes] == [True, True], progress
     assert progress.risk_outcome == "APPROVE", (progress, second)
     assert second.fills == 1, second
 
