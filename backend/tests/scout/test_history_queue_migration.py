@@ -9,7 +9,6 @@ from alembic.operations import Operations
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from src.data.schema import expected_revision
 from tests.exitpolicy.test_migration import THROUGH_0017
 from tests.reentry.test_migration import load
 
@@ -80,8 +79,8 @@ async def shape(engine):
         return await connection.run_sync(read)
 
 
-def test_the_chain_ends_at_0020():
-    assert expected_revision() == "0020"
+def test_0020_follows_0019():
+    # The chain's end is asserted by the newest migration's own test.
     assert load(MODULE).down_revision == "0019"
 
 

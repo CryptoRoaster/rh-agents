@@ -189,16 +189,16 @@ async def test_a_provider_response_becomes_a_recorded_market_a_case_and_a_fill(r
     )
 
     assert second.exit_code is ExitCode.COMPLETED, second
-    # The case's own market and its payment asset, both asked for by locator.
-    assert second.acquisition.recorded == 2, second.acquisition
+    # The case's own pool only. Before version-3 observations this was two
+    # targets — the pool and a separate market for the payment asset; now the
+    # pool itself carries the payment asset's USD price, so it is one.
+    assert second.acquisition.recorded == 1, second.acquisition
     # One read at the start of the pass, and one more immediately before the
-    # risk request — of the case's own market only. The payment asset's
-    # reference is ANCHOR's business, not SENTINEL's, and is not re-read.
+    # risk request — both of the case's own pool, and only of it.
     assert len(moved.multi_requests) == 2, moved.paths
-    assert moved.multi_requests[1].rsplit("/", 1)[-1] == POOL, moved.paths
+    assert [item.rsplit("/", 1)[-1] for item in moved.multi_requests] == [POOL, POOL]
     assert {item.need for item in second.acquisition.markets} == {
         AcquisitionNeed.CASE_MARKET.value,
-        AcquisitionNeed.QUOTE_ASSET.value,
     }
     assert await succeeded(sessions, AgentRole.PULSE, case), second
     assert await succeeded(sessions, AgentRole.ANCHOR, case), second
@@ -414,7 +414,8 @@ async def test_an_unavailable_new_reading_does_not_fall_back_to_the_usable_old_o
         ports=acquiring_ports(later, model, unpriced),
     )
 
-    assert summary.acquisition.recorded == 2, summary.acquisition
+    # The case's own pool, and no separate payment-asset market any more.
+    assert summary.acquisition.recorded == 1, summary.acquisition
     from src.markets.reader import MarketReader
 
     reader = MarketReader(sessions)
@@ -479,6 +480,14 @@ async def test_a_full_market_budget_leaves_the_rest_visibly_unattempted(risk_db,
     settings = full_acquiring_settings(pulse_worker_enabled=False, anchor_worker_enabled=False)
     await run(sessions, settings, now, ports=acquiring_ports(now, model, opening))
 
+    # Two markets wanted: a holding's, which comes first, and the case's own.
+    await hold(
+        sessions,
+        now,
+        trace,
+        pair_id=PAYMENT_PAIR_ID,
+        asset_id=f"{CHAIN}:{NETWORK}:" + "0x" + "b2" * 20,
+    )
     later = now + timedelta(seconds=20)
     provider = MarketProvider(discovery=[], targeted=[traded(SPOT), payment()])
     summary = await run(
@@ -494,9 +503,9 @@ async def test_a_full_market_budget_leaves_the_rest_visibly_unattempted(risk_db,
     assert summary.acquisition.stop == AcquisitionStop.MARKET_BUDGET_REACHED.value
     assert summary.acquisition.not_attempted == 1, summary.acquisition
     left = entries(summary, outcome=AcquisitionOutcome.NOT_ATTEMPTED)
-    assert [(item.pair_id, item.reason) for item in left] == [
-        (PAYMENT_PAIR_ID, "MARKET_BUDGET_REACHED")
-    ], summary.acquisition
+    assert [(item.pair_id, item.reason) for item in left] == [(PAIR_ID, "MARKET_BUDGET_REACHED")], (
+        summary.acquisition
+    )
     assert len(provider.multi_requests[0].rsplit("/", 1)[-1].split(",")) == 1
 
 
@@ -765,14 +774,9 @@ async def test_a_foreign_open_position_is_valued_from_its_own_acquired_market(ri
     assert [(item.pair_id, item.outcome) for item in held] == [
         (PAYMENT_PAIR_ID, AcquisitionOutcome.RECORDED.value)
     ], summary.acquisition
-    # The case wanted the same market as its payment asset. One request, and the
-    # second need answered by that same reading.
-    assert PAYMENT_PAIR_ID in {
-        item.pair_id
-        for item in entries(
-            summary, need=AcquisitionNeed.QUOTE_ASSET, outcome=AcquisitionOutcome.UNCHANGED
-        )
-    }, summary.acquisition
+    # No need is planned for the case's payment asset: its USD price comes
+    # from the case's own pool.
+    assert not entries(summary, need=AcquisitionNeed.QUOTE_ASSET), summary.acquisition
     assert summary.fills == 1, summary
     # The opening pass, this pass's acquisition, and the pre-risk refresh: the
     # holding is valued by SENTINEL, so its market is re-read before the request.
@@ -923,18 +927,20 @@ async def test_confirmed_recordings_survive_a_later_failure(risk_db, now, trace)
         ports=acquiring_ports(later, model, partial),
     )
 
-    assert summary.acquisition.recorded == 2, summary.acquisition
+    # The case's own pool, then the failed discovery read.
+    assert summary.acquisition.recorded == 1, summary.acquisition
     assert summary.acquisition.failed == 1, summary.acquisition
     assert summary.acquisition.stop == AcquisitionStop.PROVIDER_FAILED.value
     failed = entries(summary, outcome=AcquisitionOutcome.FAILED)
     assert [(item.pair_id, item.need) for item in failed] == [
         ("*", AcquisitionNeed.NEW_CANDIDATE.value)
     ]
-    # Both observations are durable, and the run went on to do its work with
-    # them: a failed discovery says nothing about a market already observed.
+    # The observation is durable, and the run went on to do its work with it:
+    # a failed discovery says nothing about a market already observed.
     # The traded market is read once more just before its risk request.
     assert len(await observations(sessions, PAIR_ID)) == 3
-    assert len(await observations(sessions, PAYMENT_PAIR_ID)) == 2
+    # The payment asset's own pool is no longer a target: only the opening read.
+    assert len(await observations(sessions, PAYMENT_PAIR_ID)) == 1
     assert summary.exit_code is ExitCode.COMPLETED, summary
 
 
@@ -1027,7 +1033,7 @@ async def test_a_pulse_wait_a_new_observation_and_an_evidence_refresh_still_fill
     # The markets were observed again, by locator, in this pass: once at the
     # start, once before the first risk request, and once more before the
     # request is re-asked after ATLAS observed the chain again.
-    assert second.acquisition.recorded == 2, second.acquisition
+    assert second.acquisition.recorded == 1, second.acquisition
     assert len(await observations(sessions, PAIR_ID)) == 4
 
     progress = progress_for(second, await traded_case(sessions))

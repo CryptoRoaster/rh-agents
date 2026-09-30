@@ -74,6 +74,7 @@ def pool(
     volume: str = "125000",
     venue: str = VENUE,
     network: str = NETWORK_ID,
+    quote_price: Decimal | str | None = None,
 ) -> dict[str, Any]:
     """One pool resource, as the documented schema carries it.
 
@@ -81,6 +82,10 @@ def pool(
     cannot price a pool says so, and the observation that is recorded is then
     unavailable — which is exactly the contract that stops an unusable new
     reading from falling back to a usable old one.
+
+    `quote_price` is the pool's own `quote_token_price_usd`: the payment asset's
+    USD price as the provider states it for this pool. Absent means the provider
+    did not state it, and the recorded quote price is then UNKNOWN.
     """
     return {
         "id": f"{network}_{address}",
@@ -89,6 +94,7 @@ def pool(
             "address": address,
             "name": "PAIR",
             "base_token_price_usd": None if price is None else str(price),
+            "quote_token_price_usd": None if quote_price is None else str(quote_price),
             "reserve_in_usd": liquidity,
             "volume_usd": {"h24": volume},
         },
@@ -100,8 +106,9 @@ def pool(
     }
 
 
-def traded(price: Decimal | str) -> dict[str, Any]:
-    return pool(POOL, base=TOKEN, quote=QUOTE, price=price)
+def traded(price: Decimal | str, quote_price: Decimal | str | None = "1") -> dict[str, Any]:
+    """The traded pool, stating its payment asset at a dollar unless told otherwise."""
+    return pool(POOL, base=TOKEN, quote=QUOTE, price=price, quote_price=quote_price)
 
 
 def payment(price: Decimal | str = "1") -> dict[str, Any]:

@@ -76,6 +76,10 @@ class Volume(DTO):
 class PoolAttributes(Provenance):
     address: Annotated[str, Field(strict=True, pattern=r"^0x(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")]
     base_token_price_usd: Amount | None = None
+    # The pool's quote token in USD, as the provider states it for this same
+    # pool. Read only as given: never derived from the base price, the reserve
+    # ratio, a symbol or an assumed peg.
+    quote_token_price_usd: Amount | None = None
     reserve_in_usd: Amount | None = None
     volume_usd: Volume | None = None
 

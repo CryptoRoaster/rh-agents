@@ -586,6 +586,8 @@ async def test_an_unrefreshable_watch_does_not_starve_the_review_budget(db):
             pair_id="robinhood:mainnet:contract_address:0x" + "0a" * 20,
             base_asset_id="robinhood:mainnet:0x" + "9b" * 20,
             label="legacy-unaddressable",
+            # A version-1 observation: no pool locator, no quote price.
+            quote_price="legacy",
         )
     )
     orbit = EchoOrbit()

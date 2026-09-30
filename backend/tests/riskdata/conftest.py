@@ -10,8 +10,10 @@ asset ids that ATLAS refuses — it demands real twenty-byte addresses. Building
 it here keeps both halves of the phase pointed at one token.
 """
 
+import re
 from datetime import timedelta
 from decimal import Decimal
+from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
@@ -24,6 +26,8 @@ from src.markets.models import (
     LiquiditySnapshot,
     MarketPair,
     MarketSnapshot,
+    PoolLocator,
+    PoolLocatorKind,
     PriceSnapshot,
     VolumeSnapshot,
 )
@@ -117,6 +121,7 @@ def recorded_snapshot(
     pair_id: str = PAIR_ID,
     label: str = "",
     quote_address: str = QUOTE,
+    quote_price: Decimal | None | Literal["legacy"] = Decimal(1),
 ) -> MarketSnapshot:
     """One observation of the ATLAS market, shaped as the recorder stores them.
 
@@ -126,6 +131,12 @@ def recorded_snapshot(
     older asset metadata inside a fresh snapshot is exactly the shape the
     recorder can legitimately produce — and precisely the case a freshness check
     that read the snapshot's own time would miss.
+
+    Recorded as a version-3 observation when the pair names a pool address: the
+    pool locator is bound and `quote_price` states the payment asset's USD price
+    from the same pool (a dollar by default; `None` is stated as UNKNOWN), which
+    is what ANCHOR converts its ladder with. `quote_price="legacy"` keeps the
+    version-1 shape, which carries no quote price at all.
     """
     observed_at = now - age
     metadata_at = observed_at if metadata_age is None else now - metadata_age
@@ -154,6 +165,8 @@ def recorded_snapshot(
         symbol="USDC",
         decimals=6,
     )
+    pool = re.fullmatch(r".+:contract_address:(0x[0-9a-f]{40})", pair_id)
+    versioned = quote_price != "legacy" and pool is not None
     pair = MarketPair(
         **{**meta, "asset_id": base_asset_id},
         id=stable_id(f"{tag}pair"),
@@ -161,10 +174,29 @@ def recorded_snapshot(
         base=base,
         quote=quote,
         venue="uniswap-v3",
+        pool_locator=(
+            PoolLocator(
+                kind=PoolLocatorKind.CONTRACT_ADDRESS, value=pool.group(1), venue="uniswap-v3"
+            )
+            if versioned and pool is not None
+            else None
+        ),
     )
+    stated = None if quote_price == "legacy" else quote_price
     return MarketSnapshot(
         **{**meta, "asset_id": base_asset_id},
         id=stable_id(f"{tag}snapshot"),
+        schema_version=3 if versioned else 1,
+        quote_price=(
+            PriceSnapshot(
+                **{**meta, "asset_id": quote.asset_id},
+                id=stable_id(f"{tag}quote-price"),
+                status=Availability.AVAILABLE if stated is not None else Availability.UNKNOWN,
+                value_usd=stated,
+            )
+            if versioned
+            else None
+        ),
         pair=pair,
         price=PriceSnapshot(
             **{**meta, "asset_id": base_asset_id},

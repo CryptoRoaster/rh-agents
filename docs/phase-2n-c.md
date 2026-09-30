@@ -111,10 +111,10 @@ name, and never a pool chosen by ranking or search.
   identity is looked up from the recorded observation and then **checked against
   those four fields**. A disagreement is `MARKET_IDENTITY_MISMATCH` — two
   providers observing one pool are two sources.
-- A payment asset's market is a recorded market in which that asset is the
-  **base**, because only such a market prices it. Where several exist, the most
-  recently observed one is taken — a stated rule rather than whichever row the
-  database returned first.
+- ~~A payment asset's market is a recorded market in which that asset is the
+  base.~~ **Superseded (version-3 observations):** a case's own pool now carries
+  its quote asset's USD price (`quote_price`), so no separate payment-asset
+  market is planned or read. See `docs/anchor-generic-quote-valuation.md`.
 
 `MarketReader.identities()` is the new read that supports this, and it is
 deliberately *not* a market reading: it returns coordinates only, never a price,

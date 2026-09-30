@@ -384,20 +384,11 @@ class AcquisitionPlanner:
                 continue
             admit(identity, AcquisitionNeed.POSITION_VALUATION)
 
-        for identity, quote_asset_id in await self._case_markets():
+        # A case needs its own pool and nothing else: a version-3 observation of
+        # it carries both the base and the quote asset's USD price, so ANCHOR
+        # no longer needs a second market for the payment asset.
+        for identity in await self._case_markets():
             admit(identity, AcquisitionNeed.CASE_MARKET)
-            payment = await self._payment_market(quote_asset_id)
-            if payment is None:
-                refused.append(
-                    _refusal(
-                        quote_asset_id,
-                        identity.chain,
-                        AcquisitionNeed.QUOTE_ASSET,
-                        "MARKET_NEVER_RECORDED",
-                    )
-                )
-                continue
-            admit(payment, AcquisitionNeed.QUOTE_ASSET, source=quote_asset_id)
 
         return AcquisitionPlan(
             targets=tuple(targets),
@@ -419,7 +410,7 @@ class AcquisitionPlanner:
         """
         return await position_markets(self._sessions, self._markets, self._limits.max_markets)
 
-    async def _case_markets(self) -> list[tuple[MarketIdentity, str]]:
+    async def _case_markets(self) -> list[MarketIdentity]:
         """The markets the live cases are about, oldest case first.
 
         Bounded by the *market* budget and by nothing else. This is deliberately
@@ -440,27 +431,7 @@ class AcquisitionPlanner:
                     .limit(self._limits.max_markets)
                 )
             ).all()
-        found = []
-        for row in rows:
-            identity = MarketIdentity.model_validate(row.market_payload)
-            found.append((identity, identity.quote_asset_id))
-        return found
-
-    async def _payment_market(self, quote_asset_id: str) -> MarketIdentity | None:
-        """A recorded market in which the payment asset itself is what is priced.
-
-        ANCHOR denominates its ladder in the token that would actually be spent,
-        so it needs that token's own USD reading — a different observation from
-        the pair's, and one it refuses to infer. Only a market where the asset is
-        the *base* can answer, so a market that merely mentions it is not
-        accepted, and where several do the most recently observed one is taken:
-        a stated rule, rather than whichever row the database happened to
-        return first.
-        """
-        for identity in await self._markets.identities([quote_asset_id], limit=100):
-            if identity.base_asset_id == quote_asset_id:
-                return identity
-        return None
+        return [MarketIdentity.model_validate(row.market_payload) for row in rows]
 
 
 @dataclass

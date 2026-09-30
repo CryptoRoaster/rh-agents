@@ -507,8 +507,8 @@ async def test_the_market_is_observed_and_committed_before_risk_is_asked(risk_db
     (refreshed,) = progress.market_refreshes
     assert (refreshed.ready, refreshed.recorded, refreshed.markets) == (True, 1, (PAIR_ID,))
     assert progress.risk_outcome == "APPROVE", progress
-    # The run-start acquisition is reported apart from it.
-    assert summary.acquisition.recorded == 2
+    # The run-start acquisition is reported apart from it: the case's own pool.
+    assert summary.acquisition.recorded == 1
     assert refreshed.stage == "PRE_RISK_MARKET_REFRESH"
     assert (summary.pre_risk_market_refreshes, summary.pre_risk_refusals) == (1, 0)
 

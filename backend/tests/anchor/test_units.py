@@ -196,15 +196,8 @@ async def test_scenario_ac_an_unvalued_payment_asset_stops_before_any_request(no
 
 async def test_an_unpriced_payment_asset_is_not_a_thin_market(now):
     """The distinction that keeps a missing price from reading as missing depth."""
-    pair = snapshot_for(now)
-    unpriced = pair.model_copy(
-        update={
-            "id": pair.id,
-            "price": pair.price.model_copy(
-                update={"value_usd": None, "status": Availability.UNAVAILABLE}
-            ),
-        }
-    )
+    # The pool's own quote price, stated as unavailable by the provider.
+    unpriced = payment_snapshot(snapshot_for(now), status=Availability.UNAVAILABLE)
     quotes = source(now)
     with pytest.raises(AnchorContextUnavailable) as error:
         await read(now, quotes=quotes, payment=unpriced)
@@ -215,15 +208,8 @@ async def test_an_unpriced_payment_asset_is_not_a_thin_market(now):
 
 async def test_a_stale_payment_price_is_refused_like_a_missing_one(now):
     """An old valuation would silently misprice every rung on the ladder."""
-    pair = snapshot_for(now)
-    stale = payment_snapshot(pair)
-    stale = stale.model_copy(
-        update={
-            "price": stale.price.model_copy(
-                update={"observed_at": now - timedelta(hours=2)},
-            )
-        }
-    )
+    # The pool's quote price, observed two hours before the rest of it.
+    stale = payment_snapshot(snapshot_for(now), observed_at=now - timedelta(hours=2))
     quotes = source(now)
     with pytest.raises(AnchorContextUnavailable):
         await read(now, quotes=quotes, payment=stale)

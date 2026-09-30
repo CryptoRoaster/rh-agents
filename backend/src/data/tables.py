@@ -47,7 +47,7 @@ class MarketRow(Document):
 class MarketObservationRow(Base):
     __tablename__ = "market_observations"
     __table_args__ = (
-        CheckConstraint("schema_version IN (1, 2)", name="market_observation_version"),
+        CheckConstraint("schema_version IN (1, 2, 3)", name="market_observation_version"),
         Index("ix_observation_pair_time", "provider", "pair_id", "observed_at", "id"),
         Index("ix_observation_asset_time", "asset_id", "observed_at"),
         Index("ix_observation_observed_at", "observed_at"),
