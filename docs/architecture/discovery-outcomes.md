@@ -27,6 +27,27 @@ the horizon; otherwise it is `MISSING` with `HISTORY_NOT_COVERED`,
 intervals without trades, so a covered window without bars is labelled as a
 fact: no trades, not survived. Labels are exact to one bar (15 minutes).
 
+**Out-of-range outcomes.** A percent outcome is a label only if it fits the
+canonical `NUMERIC(24, 6)` — eighteen integer digits. That is a technical
+bound, not a market rule: a 100x (9,900 %), a 1000x (99,900 %) and even a
+10^9-fold move (~10^11 %) are ordinary labels. A horizon whose return, maximum
+return or maximum drawdown does not fit — in practice a provider bar off by
+many orders of magnitude, or an absurdly small reference price — is recorded as
+`MISSING` with `OUTCOME_PERCENT_OUT_OF_RANGE`: no value is clamped, rounded to a
+bound or replaced by a sentinel, the percent, survival and volume fields are
+null, and the measurement's provenance (timeframe, aggregate, bars used) is
+kept. Other horizons of the same stream are unaffected, the stream is sampled
+once like any other, and the read view lists the reason without letting it
+reach any median or top-outcome comparison.
+
+**Isolation.** Each stream is stored in its own transaction. A value the
+database still refuses as out of range (SQLSTATE 22003) rolls back that stream
+alone and is counted as `OUTCOME_VALUE_NOT_STORABLE`; the next stream is
+stored. Every other database error — a lost connection, a broken transaction —
+still ends the step as `OUTCOME_STORE_UNAVAILABLE`. Origin: on 2026-10-01 a BSC
+stream with a 9.3e-9 USD reference and a 195,753,160 USD bar open produced a
+2.1e18 % maximum return, and the overflow stopped all outcome sampling.
+
 ## Data model (migration 0017, PostgreSQL)
 
 - `market_ohlcv_fetches` — one row per OHLCV read: stream key, timeframe,
@@ -41,7 +62,9 @@ fact: no trades, not survived. Labels are exact to one bar (15 minutes).
   liquidity at reference and at sampling.
 - `discovery_stream_outcomes` — one row per stream, horizon and schema version
   (`UNIQUE`), the labels above; checks enforce "missing ⇔ reason" and a
-  positive horizon.
+  positive horizon. The three percent columns are `NUMERIC(24, 6)` since
+  migration 0022 (0017 created them unbounded while the models declared
+  `NUMERIC(24, 6)`).
 
 Everything is keyed by the existing stream identity (provider, chain, network,
 pair, fixture flag), so watches, declines, JEV-0 rows and outcomes join
