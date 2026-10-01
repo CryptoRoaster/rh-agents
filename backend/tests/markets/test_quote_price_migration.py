@@ -11,7 +11,6 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from src.data.schema import expected_revision
 from tests.reentry.test_migration import load
 from tests.scout.test_history_queue_migration import THROUGH_0019
 
@@ -23,8 +22,8 @@ THROUGH_0020 = (*THROUGH_0019, "0020_scout_history_fair_queue")
 MODULE = "0021_market_snapshot_quote_price"
 
 
-def test_the_chain_ends_at_0021():
-    assert expected_revision() == "0021"
+def test_0021_follows_0020():
+    # The chain's end is asserted by the newest migration's own test.
     assert load(MODULE).down_revision == "0020"
 
 

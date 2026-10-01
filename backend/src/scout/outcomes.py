@@ -42,6 +42,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import and_, exists, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.data.repository import aware
@@ -68,6 +69,15 @@ ELIGIBLE_AFTER = timedelta(minutes=HORIZONS_MINUTES[-1]) + SAMPLE_STEP
 # Older streams can no longer be labelled from one read and are left alone.
 ELIGIBLE_UNTIL = timedelta(hours=240)
 PERCENT = Decimal("0.000001")
+# The largest magnitude a percent outcome may have to be a label at all: what
+# the canonical column type, NUMERIC(24, 6), can hold — eighteen integer digits.
+# A technical bound, not a market judgement: a 1000x is 99,900 %, a 10^9-fold
+# move is still about 10^11 %, and both are labels. Only a value that cannot be
+# stored exactly — in practice a provider bar whose price is off by many orders
+# of magnitude — is recorded as MISSING with `OUT_OF_RANGE` instead, and never
+# clamped, rounded to a bound or replaced by a sentinel.
+PERCENT_LIMIT = Decimal(10) ** 18
+OUT_OF_RANGE = "OUTCOME_PERCENT_OUT_OF_RANGE"
 
 StreamKey = tuple[str, str, str, str, bool]
 
@@ -138,8 +148,22 @@ class Label:
     second_half_volume_share: Decimal | None = None
 
 
-def _pct(value: Decimal, reference: Decimal) -> Decimal:
-    return ((value / reference - 1) * 100).quantize(PERCENT)
+def _pct(value: Decimal, reference: Decimal) -> Decimal | None:
+    """The move from `reference` to `value` in percent, or None if not storable.
+
+    None when the exact percentage, at the stored scale, does not fit the
+    canonical column — including when decimal arithmetic itself cannot represent
+    it. Never clamped.
+    """
+    try:
+        pct = ((value / reference - 1) * 100).quantize(PERCENT)
+    except ArithmeticError:
+        # InvalidOperation (quantize beyond the context precision), Overflow,
+        # DivisionByZero: a number no column could hold.
+        return None
+    if not pct.is_finite() or abs(pct) >= PERCENT_LIMIT:
+        return None
+    return pct
 
 
 def label_horizon(
@@ -180,11 +204,29 @@ def label_horizon(
     late = sum(
         (bar.volume for bar in inside if bar.opened_at >= first_seen + horizon / 2), Decimal(0)
     )
+    moves = (
+        _pct(inside[-1].close, price),
+        _pct(max(bar.high for bar in inside), price),
+        _pct(min(bar.low for bar in inside), price),
+    )
+    if any(item is None for item in moves):
+        # Measured, and not representable. Kept as an audited gap with the
+        # measurement's provenance — never a clamped or estimated label, and
+        # nothing else of this horizon is kept beside it.
+        return Label(
+            horizon_minutes,
+            "MISSING",
+            OUT_OF_RANGE,
+            timeframe=chosen.timeframe,
+            aggregate=chosen.aggregate,
+            bars_used=len(inside),
+        )
+    return_pct, max_return_pct, max_drawdown_pct = moves
     return Label(
         **base,  # type: ignore[arg-type]
-        return_pct=_pct(inside[-1].close, price),
-        max_return_pct=_pct(max(bar.high for bar in inside), price),
-        max_drawdown_pct=_pct(min(bar.low for bar in inside), price),
+        return_pct=return_pct,
+        max_return_pct=max_return_pct,
+        max_drawdown_pct=max_drawdown_pct,
         survived=any(bar.volume > 0 and bar.opened_at + bar.step > end - tail for bar in inside),
         volume_usd=total,
         second_half_volume_share=(late / total).quantize(PERCENT) if total > 0 else None,
@@ -450,6 +492,41 @@ class OutcomeStore:
         reason: str | None,
         liquidity_now: Decimal | None,
     ) -> None:
+        """Store one stream's sample and horizons in one transaction, or nothing.
+
+        A value the database refuses as out of range (SQLSTATE 22003) is a fact
+        about this stream's data: the transaction rolls back as a whole and
+        `OutcomeValueNotStorable` is raised for the caller to count and move
+        on. Every other database error is the store's and propagates.
+        """
+        try:
+            await self._save(
+                candidate,
+                labels,
+                now=now,
+                history_source=history_source,
+                requests=requests,
+                reason=reason,
+                liquidity_now=liquidity_now,
+            )
+        except DBAPIError as error:
+            # asyncpg reaches here as a plain DBAPIError rather than DataError,
+            # so the class says little; the SQLSTATE says exactly what happened.
+            if not out_of_range(error):
+                raise
+            raise OutcomeValueNotStorable() from None
+
+    async def _save(
+        self,
+        candidate: Candidate,
+        labels: list[Label],
+        *,
+        now: datetime,
+        history_source: str,
+        requests: int,
+        reason: str | None,
+        liquidity_now: Decimal | None,
+    ) -> None:
         provider, chain, network, pair_id, fixture = candidate.key
         sample_id = uuid4()
         async with self.sessions.begin() as session:
@@ -501,6 +578,22 @@ class OutcomeStore:
                         computed_at=now,
                     )
                 )
+
+
+class OutcomeValueNotStorable(Exception):
+    """One stream's outcome was refused by the database as out of range."""
+
+
+def out_of_range(error: DBAPIError) -> bool:
+    """Whether a database error is exactly a numeric range refusal (22003).
+
+    Narrow on purpose: only this SQLSTATE says the data, not the store, is the
+    problem. Anything else — a lost connection, a broken transaction, a schema
+    mismatch — is not reinterpreted as bad market data.
+    """
+    original = getattr(error, "orig", None)
+    code = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    return code == "22003"
 
 
 @dataclass
@@ -560,7 +653,13 @@ class OutcomeSampler:
         Hourly VECTOR reads cannot resolve 15 minutes; they still label the
         other seven horizons, and one missing 15-minute label is not worth a read.
         """
-        missing = [item for item in labels if item.status == "MISSING"]
+        # A horizon measured and found unstorable needs no new read: the bars
+        # are recorded, and asking again would only measure them again.
+        missing = [
+            item
+            for item in labels
+            if item.status == "MISSING" and item.missing_reason != OUT_OF_RANGE
+        ]
         return not missing or (
             len(missing) == 1
             and missing[0].horizon_minutes == HORIZONS_MINUTES[0]
@@ -618,15 +717,22 @@ class OutcomeSampler:
             except SamplerStop as stop:
                 tally.failure(stop.code)
         for candidate, labels, source, requests, reason in done:
-            await self.store.save(
-                candidate,
-                labels,
-                now=now,
-                history_source=source,
-                requests=requests,
-                reason=reason,
-                liquidity_now=liquidity.get(candidate.key[3]),
-            )
+            # Each stream is its own transaction, and one stream's data cannot
+            # stop the rest: a range refusal is counted and the next stream is
+            # stored. A store failure of any other kind still ends the run.
+            try:
+                await self.store.save(
+                    candidate,
+                    labels,
+                    now=now,
+                    history_source=source,
+                    requests=requests,
+                    reason=reason,
+                    liquidity_now=liquidity.get(candidate.key[3]),
+                )
+            except OutcomeValueNotStorable:
+                tally.failure("OUTCOME_VALUE_NOT_STORABLE")
+                continue
             tally.sampled += 1
         return tally
 
