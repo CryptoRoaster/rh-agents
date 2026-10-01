@@ -331,10 +331,16 @@ def _exit_read(settings: Settings, ports: RunnerPorts, clock: Clock) -> ExitOnch
     """
     if ports.onchain is None:
         return UnavailableExitRead(ports.onchain_unavailable)
-    return AtlasExitRead(builder=atlas_builder(settings, ports, clock), clock=clock)
+    # No pool census for a sale: its result cannot bind one, and its reads
+    # would only slow the exit down.
+    return AtlasExitRead(
+        builder=atlas_builder(settings, ports, clock, pool_control=False), clock=clock
+    )
 
 
-def atlas_builder(settings: Settings, ports: RunnerPorts, clock: Clock) -> SnapshotBuilderPort:
+def atlas_builder(
+    settings: Settings, ports: RunnerPorts, clock: Clock, *, pool_control: bool = True
+) -> SnapshotBuilderPort:
     """ATLAS's snapshot builder: one per chain when several are configured.
 
     The holder and origin sources take a chain argument and are shared; only
@@ -342,16 +348,34 @@ def atlas_builder(settings: Settings, ports: RunnerPorts, clock: Clock) -> Snaps
     a PAPER exit's fresh read alike, so both route a case the same way.
     """
     from src.agents.atlas.context import AtlasSnapshotBuilder, ChainRoutedSnapshotBuilder
+    from src.agents.atlas.rpc_source import RpcTokenContractSource
     from src.agents.atlas.sources.factory import holder_sources, origin_sources
+    from src.agents.atlas.v4.census import V4PoolCensus
+    from src.agents.atlas.v4.rpc import RpcV4ChainReads
 
     holders = ports.holders if ports.holders is not None else holder_sources(settings, clock=clock)
     origins = ports.origins if ports.origins is not None else origin_sources(settings)
 
     def one(contracts: object) -> AtlasSnapshotBuilder:
+        census: V4PoolCensus | None = None
+        verifier: RpcTokenContractSource | None = None
+        if (
+            pool_control
+            and settings.atlas_v4_pool_control_enabled
+            and isinstance(contracts, RpcTokenContractSource)
+        ):
+            # The same chain-bound client as the contract source, so the census
+            # can only ever answer for the chain this builder is routed to.
+            census = V4PoolCensus(
+                reads=RpcV4ChainReads(contracts.client), chain=contracts.config.chain
+            )
+            verifier = contracts
         return AtlasSnapshotBuilder(
             contracts=contracts,  # type: ignore[arg-type]
             holders=holders,  # type: ignore[arg-type]
             origins=origins,  # type: ignore[arg-type]
+            verifier=verifier,
+            pool_census=census,
             clock=clock,
         )
 

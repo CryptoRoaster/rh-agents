@@ -10,6 +10,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
+from decimal import Decimal
 from hashlib import sha256
 from typing import Protocol
 from uuid import UUID
@@ -33,12 +34,16 @@ from src.agents.atlas.ports import (
     ContractOriginReadPort,
     CreationVerificationPort,
     HolderIntelligenceReadPort,
+    PoolControlReadPort,
     TokenContractReadPort,
 )
 from src.agents.atlas.sources.normalize import HolderNormalizationError, concentration
+from src.agents.atlas.v4.census import PoolControlChainRefused
+from src.agents.atlas.v4.economic import pool_control
+from src.agents.atlas.v4.models import PoolControlFacts, PoolControlGap, V4Census
 from src.core.clock import Clock, SystemClock
 from src.core.numbers import canonical_decimal
-from src.markets.models import Availability, MarketIdentity
+from src.markets.models import Availability, MarketIdentity, PoolLocatorKind
 from src.orchestration.workflow.engine import active_evidence
 from src.orchestration.workflow.models import EvidenceEnvelope, EvidenceType, TradeCase
 
@@ -105,6 +110,9 @@ class AtlasSnapshotBuilder:
     # Optional chain-side confirmation of what a creation provider claims. Absent
     # means claims stay UNVERIFIED, never silently trusted.
     verifier: CreationVerificationPort | None = None
+    # The V4 pool census. Absent means none is configured: a V4 market then
+    # records its pool control as unavailable, and nothing else changes.
+    pool_census: PoolControlReadPort | None = None
     clock: Clock = SystemClock()
 
     async def build(
@@ -121,6 +129,7 @@ class AtlasSnapshotBuilder:
         # on-chain total supply, never a figure the holder provider supplies.
         holders = await self._holder_facts(chain, token_address, contract)
         origin = await self._origin_facts(chain, token_address)
+        control = await self._pool_control(market, chain, token_address, contract, holders, origin)
         return AtlasOnchainSnapshot(
             trade_case_id=trade_case_id,
             task_id=task_id,
@@ -131,6 +140,60 @@ class AtlasSnapshotBuilder:
             holders=holders,
             origin=origin,
             collected_at=self.clock.now(),
+            pool_control=control,
+        )
+
+    async def _pool_control(
+        self,
+        market: MarketIdentity,
+        chain: ChainSnapshot,
+        token_address: str,
+        contract: ContractFacts,
+        holders: HolderFacts,
+        origin: OriginFacts,
+    ) -> PoolControlFacts | None:
+        """Pool control for this token, or None where it was never in question.
+
+        The census starts at the origin source's creation block, which the
+        census itself proves against contract code before relying on it. Any
+        failure other than a wrong chain is an unavailable census, so a V4
+        token without one is unestablished rather than judged on raw holders.
+        """
+        v4_market = (
+            market.pool_locator is not None
+            and market.pool_locator.kind == PoolLocatorKind.BYTES32_POOL_ID
+        )
+        if self.pool_census is None:
+            if not v4_market:
+                return None
+            census = V4Census(
+                status=Availability.UNAVAILABLE,
+                gap=PoolControlGap.DEPLOYMENT_NOT_CONFIGURED,
+                failure=AtlasSourceFailure.NOT_CONFIGURED,
+                source="unconfigured",
+            )
+        else:
+            created = origin.creation_block if origin.status == Availability.AVAILABLE else None
+            try:
+                census = await self.pool_census.census(chain, token_address, created)
+            except PoolControlChainRefused:
+                raise AtlasContextUnavailable("SOURCE_CHAIN_MISMATCH") from None
+            except Exception:
+                census = V4Census(
+                    status=Availability.UNAVAILABLE,
+                    gap=PoolControlGap.CENSUS_UNAVAILABLE,
+                    failure=AtlasSourceFailure.UNAVAILABLE,
+                    source="unknown",
+                )
+        return pool_control(
+            census,
+            holders,
+            contract,
+            origin,
+            required=v4_market or census.has_pools,
+            market_pool=(
+                market.pool_locator.value if v4_market and market.pool_locator is not None else None
+            ),
         )
 
     async def _contract_facts(self, token_address: str, chain: ChainSnapshot) -> ContractFacts:
@@ -364,6 +427,108 @@ def _measurement(status: Availability, failure: AtlasSourceFailure | None) -> di
     return {"status": status.value, "failure": None if failure is None else failure.value}
 
 
+def _raw(value: int | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _ratio(value: Decimal | None) -> str | None:
+    return None if value is None else canonical_decimal(value)
+
+
+def pool_control_document(control: PoolControlFacts) -> dict[str, object]:
+    """Pool control, every safety-relevant fact, in one bounded canonical form.
+
+    Bounded by the fact model itself (pools and positions are capped there), so
+    nothing here truncates. Integers that can exceed a JSON number travel as
+    text, exactly as the holder figures do.
+    """
+    census = control.census
+    return {
+        "measurement": control.measurement,
+        **_measurement(control.status, census.failure),
+        "gap": None if control.gap is None else control.gap.value,
+        "required": control.required,
+        "census": {
+            "status": census.status.value,
+            "gap": None if census.gap is None else census.gap.value,
+            "source": census.source,
+            "chain_id": census.chain_id,
+            "pool_manager": census.pool_manager,
+            "position_managers": list(census.position_managers),
+            "scan_from_block": census.scan_from_block,
+            "scan_to_block": census.scan_to_block,
+            "pool_manager_balance_raw": _raw(census.pool_manager_balance_raw),
+        },
+        "pools": [
+            {
+                "pool_id": pool.pool_id,
+                "pool_manager": pool.pool_manager,
+                "currency0": pool.currency0,
+                "currency1": pool.currency1,
+                "fee": pool.fee,
+                "tick_spacing": pool.tick_spacing,
+                "hook": pool.hook,
+                "created_block": pool.created_block,
+                "created_at": None if pool.created_at is None else pool.created_at.isoformat(),
+                "initialized": pool.initialized,
+                "sqrt_price_x96": _raw(pool.sqrt_price_x96),
+                "tick": pool.tick,
+                "hook_facts": None
+                if pool.hook_facts is None
+                else {
+                    "code_present": pool.hook_facts.code_present,
+                    "permissions": list(pool.hook_facts.permissions),
+                    "owner": pool.hook_facts.owner,
+                    "owner_status": pool.hook_facts.owner_status.value,
+                    "owner_is_creator": pool.hook_facts.owner_is_creator,
+                },
+            }
+            for pool in census.pools
+        ],
+        "positions": [
+            {
+                "kind": item.kind.value,
+                "pool_id": item.pool_id,
+                "owner_key": item.owner_key,
+                "salt": item.salt,
+                "position_manager": item.position_manager,
+                "token_id": _raw(item.token_id),
+                "tick_lower": item.tick_lower,
+                "tick_upper": item.tick_upper,
+                "liquidity": str(item.liquidity),
+                "owner": item.owner,
+                "owner_status": item.owner_status.value,
+                "controlled_token_raw": str(item.controlled_token_raw),
+                "owner_is_creator": item.owner_is_creator,
+            }
+            for item in census.positions
+        ],
+        "total_supply_raw": _raw(control.total_supply_raw),
+        "attributed_raw": _raw(control.attributed_raw),
+        "unattributed_raw": _raw(control.unattributed_raw),
+        "creator_controlled_raw": _raw(control.creator_controlled_raw),
+        "pool_held_supply_fraction": _ratio(control.pool_held_supply_fraction),
+        "attributable_pool_supply_fraction": _ratio(control.attributable_pool_supply_fraction),
+        "creator_controlled_pool_supply_fraction": _ratio(
+            control.creator_controlled_pool_supply_fraction
+        ),
+        "unattributed_pool_supply_fraction": _ratio(control.unattributed_pool_supply_fraction),
+        "basis": None if control.basis is None else control.basis.value,
+        "economic_top1_share": _ratio(control.economic_top1_share),
+        "economic_top5_share": _ratio(control.economic_top5_share),
+        "economic_top10_share": _ratio(control.economic_top10_share),
+        "economic_top_holders": [
+            {
+                "holder": item.holder,
+                "balance_raw": str(item.balance_raw),
+                "share": canonical_decimal(item.share),
+                "is_burn_address": item.is_burn_address,
+            }
+            for item in control.economic_top_holders
+        ],
+    }
+
+
 def snapshot_document(snapshot: AtlasOnchainSnapshot) -> dict[str, object]:
     """The bounded fact document, built once and used for both model and digest.
 
@@ -469,6 +634,13 @@ def snapshot_document(snapshot: AtlasOnchainSnapshot) -> dict[str, object]:
             "creator_is_contract": snapshot.origin.creator_is_contract,
             "verification": snapshot.origin.verification.value,
         },
+        # Only present where pool control was collected, so every snapshot
+        # without it keeps the digest it always had.
+        **(
+            {}
+            if snapshot.pool_control is None
+            else {"pool_control": pool_control_document(snapshot.pool_control)}
+        ),
     }
 
 
