@@ -96,6 +96,12 @@ class TaskDefinition:
     #
     # Empty for every task that observes rather than derives.
     derived_from: frozenset[EvidenceType] = frozenset()
+    # A claim prerequisite: the task may not be leased until the case holds a
+    # current, usable trigger for its current setup (`untriggered_reason`).
+    # Before that there is no work — waiting for a trigger is not a failure of
+    # the task, and a lease taken early could only fail and spend the task's
+    # failure budget on the absence of something that is not its job to supply.
+    after_trigger: bool = False
 
     @property
     def claim_ceiling(self) -> int | None:
@@ -310,7 +316,8 @@ TRADE_CASE_V1 = WorkflowPolicy(
                 terminal_reasons=frozenset({"SETUP_EXPIRED"}),
             ),
         ),
-        TaskDefinition(AgentRole.ANCHOR, "ASSESS_EXECUTION", True),
+        # Execution is assessed for a triggered setup, never ahead of one.
+        TaskDefinition(AgentRole.ANCHOR, "ASSESS_EXECUTION", True, after_trigger=True),
     ),
     # Two, and only two. Each is reached through the requirement above rather
     # than named twice here, so the role and task type have one home.

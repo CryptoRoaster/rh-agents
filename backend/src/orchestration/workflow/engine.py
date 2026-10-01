@@ -127,6 +127,31 @@ def unusable_reason(item: EvidenceEnvelope, now: datetime) -> str | None:
     return None
 
 
+def untriggered_reason(current: dict[EvidenceType, EvidenceEnvelope], now: datetime) -> str | None:
+    """Why the case has no current, usable trigger for its current setup, if not.
+
+    One definition, used both where a post-trigger task is claimed and where
+    ANCHOR assembles its context, so the two cannot drift apart. The setup and
+    the trigger must each be the live envelope of their type and usable by the
+    workflow's own test; the trigger must be a trigger; and it must name exactly
+    the current setup — a trigger for a setup
+    that has since been replaced unlocks nothing.
+    """
+    setup = current.get(EvidenceType.TRADE_SETUP)
+    trigger = current.get(EvidenceType.TRIGGER)
+    if setup is None or trigger is None:
+        return "NO_TRIGGERED_SETUP"
+    if unusable_reason(setup, now) is not None or unusable_reason(trigger, now) is not None:
+        return "NO_TRIGGERED_SETUP"
+    if not isinstance(setup.payload, TradeSetupPayload):
+        return "NO_TRIGGERED_SETUP"
+    if not isinstance(trigger.payload, TriggerPayload):
+        return "NO_TRIGGERED_SETUP"
+    if trigger.payload.setup_evidence_id != setup.evidence_id:
+        return "TRIGGER_NOT_FOR_CURRENT_SETUP"
+    return None
+
+
 def aged_out(item: EvidenceEnvelope, now: datetime) -> bool:
     """Whether age is the *only* thing wrong with this envelope.
 

@@ -103,6 +103,33 @@ work forever. A heartbeat updates current task state and never writes attempt
 history, which is why that history is genuinely immutable once finished rather
 than merely labelled so.
 
+### Claim prerequisites
+
+A task may carry a prerequisite in the versioned workflow policy. Today there is
+one: `ANCHOR / ASSESS_EXECUTION` is `after_trigger` in trade-case-v1 and -v2 — it
+is not claimable until the case holds a current, usable trigger for its current
+setup, as `untriggered_reason` (the workflow engine's single definition, also
+used by ANCHOR's own context reader) decides: live and usable `TRADE_SETUP`,
+live and usable `TRIGGER`, a trigger payload, naming exactly the current setup.
+
+Before that there is no work, and none is recorded: no lease, no attempt row, no
+change to the task's attempt counter, schedule or reason, and no failure budget
+spent. The candidate query excludes such tasks in SQL: it requires a live
+(not superseded), available, unexpired `TRADE_SETUP` and a live, available,
+unexpired `TRIGGER` whose payload names exactly that setup. The setup id is
+compared as lower-cased text without hyphens on both sides, because the id
+column and the JSON payload spell a UUID differently per backend (PostgreSQL
+hyphenated, SQLite 32 hex characters); stored payloads are not changed. So no
+number of cases waiting for a trigger — or holding one for a setup since
+replaced — can fill the bounded claim batch (`claim_batch`, unchanged) ahead of
+a ready one. The exact test then runs in `_try_claim` under the case lock that
+every evidence write also takes, so a trigger cannot appear or be replaced
+between the check and the lease. Once a trigger is committed, the task that already exists is
+claimed as attempt one. A genuine failure after that spends the ordinary budget,
+and a source-refresh re-arm after an assessment claims as before. ANCHOR's own
+`NO_TRIGGERED_SETUP` / `TRIGGER_NOT_FOR_CURRENT_SETUP` refusals stay as the
+defensive check for direct calls and races.
+
 ## Attempts
 
 `worker_task_attempts` is written once on claim and exactly once more when the

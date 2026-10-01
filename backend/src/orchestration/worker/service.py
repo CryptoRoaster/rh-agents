@@ -13,17 +13,20 @@ services, so worker claims can never deadlock against workflow commands.
 from collections.abc import Collection
 from datetime import datetime
 from hashlib import sha256
+from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from sqlalchemy import func, select
+from sqlalchemy import String, cast, exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from src.core.clock import Clock, SystemClock
 from src.core.models import AgentRole
 from src.data.repository import aware
 from src.data.tables import (
     TradeCaseEventRow,
+    TradeCaseEvidenceRow,
     TradeCaseRow,
     TradeCaseTaskRow,
     WorkerInstanceRow,
@@ -51,21 +54,77 @@ from src.orchestration.worker.policy import (
     authorized_evidence_type,
     authorized_task_type,
 )
+from src.orchestration.workflow.engine import active_evidence, untriggered_reason
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
+    EvidenceStatus,
     EvidenceSubmission,
+    EvidenceType,
     SpecialistTaskStatus,
     TradeCaseStatus,
     WorkflowErrorCode,
     WorkflowFailure,
 )
-from src.orchestration.workflow.policy import WaitPolicy
-from src.orchestration.workflow.service import TradeCaseService
+from src.orchestration.workflow.policy import WORKFLOW_POLICIES, WaitPolicy, policy_for
+from src.orchestration.workflow.service import TradeCaseService, evidence_from_row
 
 CLAIMABLE_TASK_STATUSES = (
     SpecialistTaskStatus.PENDING.value,
     SpecialistTaskStatus.BLOCKED.value,
 )
+
+
+def after_trigger_versions(role: AgentRole, task_type: str) -> tuple[str, ...]:
+    """The workflow versions under which this task may only be claimed after a trigger."""
+    return tuple(
+        version
+        for version, policy in sorted(WORKFLOW_POLICIES.items())
+        if (definition := policy.task(role, task_type)) is not None and definition.after_trigger
+    )
+
+
+def has_current_trigger(trade_case_id: Any, now: datetime) -> Any:
+    """SQL: the case holds a current trigger naming its current setup.
+
+    The candidate-selection form of `untriggered_reason(...) is None`: a live
+    (not superseded), AVAILABLE, unexpired TRADE_SETUP, and a live, AVAILABLE,
+    unexpired TRIGGER whose payload names exactly that setup. Only such cases
+    may take a place in the bounded candidate batch, so no number of cases that
+    are waiting for a trigger — or holding one for a setup since replaced — can
+    starve one that is ready.
+
+    It decides nothing on its own. Acceptance of each payload and the envelope
+    integrity rules are checked exactly, under the case lock, by
+    `_prerequisite_met` before any lease.
+
+    The setup id is compared as text with hyphens removed and lower-cased on
+    both sides, because the id column and the JSON payload spell a UUID
+    differently per backend (PostgreSQL: hyphenated uuid text; SQLite: 32 hex
+    characters; JSON: hyphenated) — the stored payload is never changed.
+    """
+    setup = aliased(TradeCaseEvidenceRow)
+    trigger = aliased(TradeCaseEvidenceRow)
+    replaced_setup = aliased(TradeCaseEvidenceRow)
+    replaced_trigger = aliased(TradeCaseEvidenceRow)
+
+    def canonical(value: Any) -> Any:
+        return func.lower(func.replace(value, "-", ""))
+
+    named_setup = trigger.payload["payload"]["setup_evidence_id"].as_string()
+    return (
+        exists()
+        .where(setup.trade_case_id == trade_case_id)
+        .where(setup.evidence_type == EvidenceType.TRADE_SETUP.value)
+        .where(setup.status == EvidenceStatus.AVAILABLE.value)
+        .where(setup.valid_until > now)
+        .where(~exists().where(replaced_setup.supersedes_id == setup.evidence_id))
+        .where(trigger.trade_case_id == trade_case_id)
+        .where(trigger.evidence_type == EvidenceType.TRIGGER.value)
+        .where(trigger.status == EvidenceStatus.AVAILABLE.value)
+        .where(trigger.valid_until > now)
+        .where(~exists().where(replaced_trigger.supersedes_id == trigger.evidence_id))
+        .where(canonical(cast(setup.evidence_id, String)) == canonical(named_setup))
+    )
 
 
 def instance_from_row(row: WorkerInstanceRow) -> WorkerInstance:
@@ -259,6 +318,21 @@ class WorkerRuntimeService:
                 statement = statement.where(
                     TradeCaseTaskRow.trade_case_id.in_(list(trade_case_ids))
                 )
+            gated = after_trigger_versions(role, task_type)
+            if gated:
+                # A post-trigger task of a case without a current trigger for its
+                # current setup is not a candidate at all, so no number of such
+                # cases can fill the bounded batch ahead of one that is ready. A
+                # necessary condition only; the exact test runs under the case
+                # lock in `_try_claim`.
+                statement = statement.where(
+                    exists()
+                    .where(TradeCaseRow.id == TradeCaseTaskRow.trade_case_id)
+                    .where(
+                        TradeCaseRow.workflow_version.notin_(gated)
+                        | has_current_trigger(TradeCaseRow.id, now)
+                    )
+                )
             candidates = (
                 await session.scalars(
                     statement.order_by(TradeCaseTaskRow.created_at, TradeCaseTaskRow.task_id).limit(
@@ -299,6 +373,12 @@ class WorkerRuntimeService:
             .execution_options(populate_existing=True)
         )
         if task is None or not self._claimable(task, case_row, now):
+            return None
+        if not await self._prerequisite_met(session, task, case_row, now):
+            # Not work yet. Nothing is written: no attempt, no failure, no
+            # change to the task. Decided here, under the case lock every
+            # evidence write also takes, so a trigger cannot land or be replaced
+            # between this check and the lease.
             return None
         attempt_number = task.attempt
         lease_id = uuid4()
@@ -363,6 +443,38 @@ class WorkerRuntimeService:
         if task.expires_at is not None and now >= aware(task.expires_at):
             return False
         return self._case_workable(case_row, now)
+
+    @staticmethod
+    async def _prerequisite_met(
+        session: AsyncSession, task: TradeCaseTaskRow, case_row: TradeCaseRow, now: datetime
+    ) -> bool:
+        """Whether the case's own workflow lets this task be worked yet.
+
+        Only a task its policy marks `after_trigger` has a prerequisite: a
+        current, usable trigger for the current setup, by the workflow's own
+        definition. Evidence the workflow cannot read coherently is not a
+        trigger, so an integrity failure answers no.
+        """
+        definition = policy_for(case_row.workflow_version).task(
+            AgentRole(task.role), task.task_type
+        )
+        if definition is None or not definition.after_trigger:
+            return True
+        rows = (
+            await session.scalars(
+                select(TradeCaseEvidenceRow).where(
+                    TradeCaseEvidenceRow.trade_case_id == case_row.id,
+                    TradeCaseEvidenceRow.evidence_type.in_(
+                        [EvidenceType.TRADE_SETUP.value, EvidenceType.TRIGGER.value]
+                    ),
+                )
+            )
+        ).all()
+        try:
+            current = active_evidence(tuple(evidence_from_row(row) for row in rows))
+        except WorkflowFailure:
+            return False
+        return untriggered_reason(current, now) is None
 
     @staticmethod
     def _case_workable(case_row: TradeCaseRow, now: datetime) -> bool:
