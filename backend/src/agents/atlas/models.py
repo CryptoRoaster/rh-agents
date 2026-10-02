@@ -19,15 +19,18 @@ from enum import StrEnum
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 
-from src.markets.models import Availability, MarketIdentity
-
-EvmAddress = Annotated[str, Field(strict=True, pattern=r"^0x[0-9a-f]{40}$")]
-Hash32 = Annotated[str, Field(strict=True, pattern=r"^0x[0-9a-f]{64}$")]
-Identifier = Annotated[str, Field(min_length=1, max_length=200, pattern=r"^\S(?:.*\S)?$")]
-SafeSummary = Annotated[str, Field(min_length=1, max_length=600)]
-Ratio = Annotated[Decimal, Field(ge=0, le=1, allow_inf_nan=False)]
+# Re-exported: these names have always been imported from this module.
+from src.agents.atlas.primitives import AtlasSourceFailure as AtlasSourceFailure
+from src.agents.atlas.primitives import EvmAddress as EvmAddress
+from src.agents.atlas.primitives import Hash32 as Hash32
+from src.agents.atlas.primitives import Identifier as Identifier
+from src.agents.atlas.primitives import Immutable as Immutable
+from src.agents.atlas.primitives import Ratio as Ratio
+from src.agents.atlas.primitives import SafeSummary as SafeSummary
+from src.agents.atlas.v4.models import PoolControlFacts
+from src.markets.models import Availability, MarketIdentity, PoolLocatorKind
 
 ATLAS_OUTPUT_SCHEMA_VERSION: Literal[1] = 1
 
@@ -35,10 +38,6 @@ ATLAS_OUTPUT_SCHEMA_VERSION: Literal[1] = 1
 # because its hex "looks like" 0xdead; an unproven sink stays an ordinary holder.
 ZERO_ADDRESS = "0x" + "0" * 40
 BURN_ADDRESSES = frozenset({ZERO_ADDRESS, "0x" + "0" * 36 + "dead"})
-
-
-class Immutable(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
 
 class AtlasDomain(StrEnum):
@@ -53,24 +52,6 @@ class AtlasVerdict(StrEnum):
     CLEAR = "CLEAR"
     BLOCKED = "BLOCKED"
     INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
-
-
-class AtlasSourceFailure(StrEnum):
-    """Why a source could not answer, mapped safely from provider detail."""
-
-    NOT_CONFIGURED = "NOT_CONFIGURED"
-    UNSUPPORTED_CHAIN = "UNSUPPORTED_CHAIN"
-    UNSUPPORTED_ENDPOINT = "UNSUPPORTED_ENDPOINT"
-    REQUIRES_ARCHIVE = "REQUIRES_ARCHIVE"
-    TIMEOUT = "TIMEOUT"
-    RATE_LIMIT = "RATE_LIMIT"
-    UNAVAILABLE = "UNAVAILABLE"
-    INVALID_RESPONSE = "INVALID_RESPONSE"
-    CHAIN_MISMATCH = "CHAIN_MISMATCH"
-    TOKEN_MISMATCH = "TOKEN_MISMATCH"
-    INCOMPLETE_RESULT = "INCOMPLETE_RESULT"
-    SUPPLY_INCONSISTENT = "SUPPLY_INCONSISTENT"
-    DENOMINATOR_UNKNOWN = "DENOMINATOR_UNKNOWN"
 
 
 class HolderCompleteness(StrEnum):
@@ -151,6 +132,12 @@ class AtlasReasonCode(StrEnum):
     TOTAL_SUPPLY_UNKNOWN = "TOTAL_SUPPLY_UNKNOWN"
     SNAPSHOT_SKEW_EXCEEDED = "SNAPSHOT_SKEW_EXCEEDED"
     SNAPSHOT_STALE = "SNAPSHOT_STALE"
+    # A V4 token's economic concentration could not be established, so its raw
+    # holder figures may not stand in for it. The detailed cause travels on the
+    # pool-control fact itself.
+    V4_POOL_CENSUS_UNAVAILABLE = "V4_POOL_CENSUS_UNAVAILABLE"
+    V4_POSITION_FACTS_INCOMPLETE = "V4_POSITION_FACTS_INCOMPLETE"
+    V4_POOL_BALANCE_UNATTRIBUTED = "V4_POOL_BALANCE_UNATTRIBUTED"
 
     # Risk blockers: the fact was established and violates policy.
     CHAIN_ID_MISMATCH = "CHAIN_ID_MISMATCH"
@@ -170,6 +157,9 @@ DATA_QUALITY_REASONS = frozenset(
         AtlasReasonCode.TOTAL_SUPPLY_UNKNOWN,
         AtlasReasonCode.SNAPSHOT_SKEW_EXCEEDED,
         AtlasReasonCode.SNAPSHOT_STALE,
+        AtlasReasonCode.V4_POOL_CENSUS_UNAVAILABLE,
+        AtlasReasonCode.V4_POSITION_FACTS_INCOMPLETE,
+        AtlasReasonCode.V4_POOL_BALANCE_UNATTRIBUTED,
     }
 )
 
@@ -435,6 +425,10 @@ class AtlasOnchainSnapshot(Immutable):
     holders: HolderFacts
     origin: OriginFacts
     collected_at: AwareDatetime
+    # Absent where no pool-control fact was collected: a market that is not a
+    # V4 pool on a builder without a census. Never absent for a V4 market,
+    # whose missing census is itself recorded as unavailable.
+    pool_control: PoolControlFacts | None = None
 
     @field_validator("token_address")
     @classmethod
@@ -448,6 +442,19 @@ class AtlasOnchainSnapshot(Immutable):
         if self.chain.chain != self.market.chain or self.chain.network != self.market.network:
             raise ValueError("Snapshot chain must match the TradeCase market identity")
         return self
+
+    @property
+    def pool_control_required(self) -> bool:
+        """Whether holder concentration must be read through V4 pool control.
+
+        A market that is itself a V4 pool always requires it, whether or not a
+        census ran. Any other market requires it once a census found V4 pools
+        for the token, because supply can sit in a pool the market never names.
+        """
+        locator = self.market.pool_locator
+        if locator is not None and locator.kind == PoolLocatorKind.BYTES32_POOL_ID:
+            return True
+        return self.pool_control is not None and self.pool_control.required
 
     @property
     def oldest_source_observation(self) -> datetime:
@@ -482,6 +489,15 @@ class AtlasOnchainSnapshot(Immutable):
             if value is not None:
                 found.add(value)
         found.update(holder.address for holder in self.holders.top_holders)
+        if self.pool_control is not None:
+            for pool in self.pool_control.census.pools:
+                if pool.hook_facts is not None:
+                    found.add(pool.hook)
+                    if pool.hook_facts.owner is not None:
+                        found.add(pool.hook_facts.owner)
+            found.update(
+                item.owner for item in self.pool_control.census.positions if item.owner is not None
+            )
         return frozenset(found)
 
 

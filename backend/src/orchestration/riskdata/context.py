@@ -19,7 +19,7 @@ from typing import Protocol
 from uuid import UUID
 
 from src.core.clock import Clock, SystemClock
-from src.markets.models import Availability, MarketSnapshot
+from src.markets.models import Availability, MarketIdentity, MarketSnapshot, PoolLocatorKind
 from src.orchestration.commander.context import SystemPausePort, SystemPauseUnavailable
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
 from src.orchestration.riskdata.models import (
@@ -141,7 +141,15 @@ class RiskDataReader:
         _market_facts(snapshot, base_asset_id, now, self.policy, facts, gaps)
         _cost_facts(self.costs, facts, gaps)
         _routing_fact(current.get(EvidenceType.LIQUIDITY_EXECUTION), now, facts, gaps)
-        _onchain_facts(current.get(EvidenceType.ONCHAIN), base_asset_id, now, facts, gaps, blockers)
+        _onchain_facts(
+            current.get(EvidenceType.ONCHAIN),
+            base_asset_id,
+            now,
+            facts,
+            gaps,
+            blockers,
+            v4_market=is_v4_market(trade_case.market),
+        )
         workflow = self.workflow or policy_for(trade_case.workflow_version)
         _established_blockers(current, now, workflow.safety_types, blockers)
         _control_blockers(trade_case, paused, pause_readable, blockers)
@@ -356,6 +364,12 @@ def _routing_fact(
     )
 
 
+def is_v4_market(market: MarketIdentity) -> bool:
+    """A market addressed by a bytes32 pool id lives in a V4-style singleton."""
+    locator = market.pool_locator
+    return locator is not None and locator.kind == PoolLocatorKind.BYTES32_POOL_ID
+
+
 def _onchain_facts(
     atlas: EvidenceEnvelope | None,
     base_asset_id: str,
@@ -363,6 +377,8 @@ def _onchain_facts(
     facts: list[RiskFact],
     gaps: list[RiskDataGap],
     blockers: list[RiskDataBlocker],
+    *,
+    v4_market: bool = False,
 ) -> None:
     """Tradability, holder integrity and the two holder numbers behind it."""
     origin = RiskFactOrigin.ATLAS_ONCHAIN_EVIDENCE
@@ -434,7 +450,20 @@ def _onchain_facts(
         _gap(gaps, RiskFactKind.HOLDER_COUNT, code, origin)
         _gap(gaps, RiskFactKind.HOLDER_CONCENTRATION, code, origin)
         return
-    _holder_facts(holders, atlas, base_asset_id, now, facts, gaps)
+    control = None if intelligence is None else intelligence.pool_control
+    economic_required = v4_market or (control is not None and control.required)
+    _holder_facts(
+        holders,
+        atlas,
+        base_asset_id,
+        now,
+        facts,
+        gaps,
+        economic_known=(
+            not economic_required
+            or (control is not None and control.economic_concentration is not None)
+        ),
+    )
 
 
 def _holder_facts(
@@ -444,6 +473,8 @@ def _holder_facts(
     now: datetime,
     facts: list[RiskFact],
     gaps: list[RiskDataGap],
+    *,
+    economic_known: bool = True,
 ) -> None:
     origin = RiskFactOrigin.ATLAS_ONCHAIN_EVIDENCE
     if holders.observed_at > now:
@@ -477,6 +508,11 @@ def _holder_facts(
         _gap(gaps, kind, RiskDataGapCode.HOLDER_METRIC_UNDERSTATED, origin)
     elif holders.top_ten_fraction is None:
         _gap(gaps, kind, RiskDataGapCode.NOT_ESTABLISHED, origin)
+    elif not economic_known:
+        # A V4 token is judged on its economic concentration. Without one —
+        # legacy evidence written before pool control existed included — the
+        # raw figure is not a safe substitute, so the fact is missing.
+        _gap(gaps, kind, RiskDataGapCode.ECONOMIC_CONCENTRATION_UNKNOWN, origin)
     else:
         _add(
             facts,

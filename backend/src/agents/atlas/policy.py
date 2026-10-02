@@ -5,7 +5,7 @@ no model, reads no prompt, and nothing it produces can be argued with. Threshold
 live here as code, never in prompt text and never chosen by a model.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -19,12 +19,29 @@ from src.agents.atlas.models import (
     HolderObservationBasis,
     ProxyObservation,
 )
+from src.agents.atlas.v4.models import PoolControlGap
 from src.markets.models import Availability
 
 UNAVAILABLE_REASONS: dict[AtlasDomain, AtlasReasonCode] = {
     AtlasDomain.CONTRACT: AtlasReasonCode.CONTRACT_FACTS_UNAVAILABLE,
     AtlasDomain.HOLDERS: AtlasReasonCode.HOLDER_FACTS_UNAVAILABLE,
     AtlasDomain.ORIGIN: AtlasReasonCode.ORIGIN_FACTS_UNAVAILABLE,
+}
+
+# Every detailed pool-control cause, folded into the three stable policy codes.
+POOL_CONTROL_REASONS: dict[PoolControlGap, AtlasReasonCode] = {
+    PoolControlGap.DEPLOYMENT_NOT_CONFIGURED: AtlasReasonCode.V4_POOL_CENSUS_UNAVAILABLE,
+    PoolControlGap.DEPLOYMENT_UNVERIFIED: AtlasReasonCode.V4_POOL_CENSUS_UNAVAILABLE,
+    PoolControlGap.CREATION_BLOCK_UNKNOWN: AtlasReasonCode.V4_POOL_CENSUS_UNAVAILABLE,
+    PoolControlGap.CENSUS_UNAVAILABLE: AtlasReasonCode.V4_POOL_CENSUS_UNAVAILABLE,
+    PoolControlGap.CENSUS_BOUNDS_EXCEEDED: AtlasReasonCode.V4_POOL_CENSUS_UNAVAILABLE,
+    PoolControlGap.POOL_KEY_MISMATCH: AtlasReasonCode.V4_POOL_CENSUS_UNAVAILABLE,
+    PoolControlGap.MARKET_POOL_NOT_FOUND: AtlasReasonCode.V4_POOL_CENSUS_UNAVAILABLE,
+    # The census held; the raw distribution it is added to did not.
+    PoolControlGap.HOLDER_BASIS_UNAVAILABLE: AtlasReasonCode.HOLDER_FACTS_UNAVAILABLE,
+    PoolControlGap.POSITION_FACTS_INCOMPLETE: AtlasReasonCode.V4_POSITION_FACTS_INCOMPLETE,
+    PoolControlGap.POSITION_OWNER_UNKNOWN: AtlasReasonCode.V4_POSITION_FACTS_INCOMPLETE,
+    PoolControlGap.POOL_BALANCE_UNATTRIBUTED: AtlasReasonCode.V4_POOL_BALANCE_UNATTRIBUTED,
 }
 
 NOT_CONFIGURED_REASONS: dict[AtlasDomain, AtlasReasonCode] = {
@@ -66,6 +83,12 @@ class AtlasPolicy:
     accepted_holder_observation_bases: frozenset[HolderObservationBasis] = frozenset(
         {HolderObservationBasis.SOURCE_BLOCK, HolderObservationBasis.RESPONSE_TIME}
     )
+    # Whether a V4 token's holder domain waits on its economic concentration.
+    # It does for an entry, which is judged on concentration. A sale is not —
+    # SENTINEL binds concentration to purchases only — so the read behind an
+    # exit must not make a position unsellable because a pool census, which
+    # only an entry needs, is missing.
+    pool_control_binds: bool = True
 
     def __post_init__(self) -> None:
         if self.snapshot_validity <= timedelta(0) or self.max_source_skew < timedelta(0):
@@ -116,6 +139,12 @@ ATLAS_POLICY_V2 = AtlasPolicy(
 # The name Phase 2D shipped under. Kept as an alias so existing call sites and
 # evidence readers keep working; the policy itself is versioned in its payload.
 ATLAS_POLICY_V1 = ATLAS_POLICY_V2
+
+# The same policy, read for a sale. Identical for every market that is not a
+# V4 pool; for one that is, the economic concentration an entry waits on does
+# not hold a sale hostage. Same version: no threshold differs, only which
+# reasons bind the consumer.
+ATLAS_EXIT_POLICY_V2 = replace(ATLAS_POLICY_V2, pool_control_binds=False)
 
 
 def _data_gaps(
@@ -188,7 +217,29 @@ def _data_gaps(
         # exceeding a limit on an understated figure means the true figure
         # exceeds it too.
         gaps.append(AtlasReasonCode.HOLDER_FACTS_UNAVAILABLE)
+    if policy.pool_control_binds:
+        gaps.extend(_pool_control_gaps(snapshot))
     return gaps
+
+
+def _pool_control_gaps(snapshot: AtlasOnchainSnapshot) -> list[AtlasReasonCode]:
+    """A V4 token's holder domain is unestablished until its pool control is.
+
+    The raw top-ten of a V4 token can miss every unit sitting in a liquidity
+    position, so for such a token the raw figure is not a weaker version of the
+    answer but possibly the wrong one. Without a complete economic view the
+    holder domain is a gap — never a pass on the raw number. Other markets keep
+    exactly the holder path they had.
+    """
+    if not snapshot.pool_control_required:
+        return []
+    control = snapshot.pool_control
+    if control is None:
+        return [AtlasReasonCode.V4_POOL_CENSUS_UNAVAILABLE]
+    if control.status == Availability.AVAILABLE:
+        return []
+    gap = control.gap or PoolControlGap.CENSUS_UNAVAILABLE
+    return [POOL_CONTROL_REASONS[gap]]
 
 
 def _blockers(snapshot: AtlasOnchainSnapshot, policy: AtlasPolicy) -> list[AtlasReasonCode]:
@@ -219,6 +270,17 @@ def _blockers(snapshot: AtlasOnchainSnapshot, policy: AtlasPolicy) -> list[Atlas
         and holders.top10_share is not None
         and holders.top10_share > policy.max_top10_concentration
     ):
+        blockers.append(AtlasReasonCode.HOLDER_CONCENTRATION_EXCEEDED)
+    control = snapshot.pool_control
+    if (
+        policy.max_top10_concentration is not None
+        and policy.pool_control_binds
+        and control is not None
+        and control.economic_top10_share is not None
+        and control.economic_top10_share > policy.max_top10_concentration
+    ):
+        # The economic figure never understates, so exceeding a limit on it is
+        # an established violation even where the raw figure stays below.
         blockers.append(AtlasReasonCode.HOLDER_CONCENTRATION_EXCEEDED)
     return blockers
 

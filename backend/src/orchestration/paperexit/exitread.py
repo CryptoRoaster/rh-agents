@@ -22,7 +22,7 @@ from src.agents.atlas.context import (
     atlas_snapshot_digest,
 )
 from src.agents.atlas.handler import onchain_payload
-from src.agents.atlas.policy import ATLAS_POLICY_V1, AtlasPolicy, evaluate_snapshot
+from src.agents.atlas.policy import ATLAS_EXIT_POLICY_V2, AtlasPolicy, evaluate_snapshot
 from src.core.clock import Clock, SystemClock
 from src.markets.models import MarketIdentity
 from src.orchestration.workflow.models import OnchainPayload
@@ -69,7 +69,7 @@ class AtlasExitRead:
     """ATLAS's collector and policy, run for a sale instead of for a case."""
 
     builder: SnapshotBuilderPort
-    policy: AtlasPolicy = ATLAS_POLICY_V1
+    policy: AtlasPolicy = ATLAS_EXIT_POLICY_V2
     clock: Clock = SystemClock()
 
     async def read(

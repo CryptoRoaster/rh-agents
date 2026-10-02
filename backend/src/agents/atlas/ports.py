@@ -14,6 +14,7 @@ from src.agents.atlas.models import (
     HolderFactsSourceResult,
     OriginFacts,
 )
+from src.agents.atlas.v4.models import V4Census
 
 
 class TokenContractReadPort(Protocol):
@@ -64,3 +65,17 @@ class ContractOriginReadPort(Protocol):
     """
 
     async def origin_facts(self, chain: str, token_address: str) -> OriginFacts: ...
+
+
+class PoolControlReadPort(Protocol):
+    """A token's Uniswap V4 pools and positions, read from the chain itself.
+
+    Answers for exactly the snapshot's chain and pinned block, scanning from
+    ``from_block`` — a creation block it must verify, never a guess. Raises
+    only when the source belongs to another chain, which is a hard stop; every
+    other failure is an unavailable census with its reason.
+    """
+
+    async def census(
+        self, snapshot: ChainSnapshot, token: str, from_block: int | None
+    ) -> V4Census: ...

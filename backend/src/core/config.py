@@ -181,6 +181,11 @@ class Settings(BaseSettings):
     atlas_source_timeout_seconds: int = Field(default=10, ge=1, le=60)
     atlas_holder_page_size: int = Field(default=50, ge=10, le=200)
     atlas_holder_max_pages: int = Field(default=1, ge=1, le=5)
+    # The Uniswap V4 pool census over the chain's own RPC. Off by default: off,
+    # no census read is made and a V4 market's holder concentration stays
+    # unestablished (fail closed) rather than judged on raw holders. On, the
+    # census also verifies creation receipts so creator control can be named.
+    atlas_v4_pool_control_enabled: bool = False
     # Phase 2F SIGNAL. Disabled by default like every other worker, and with no
     # provider credential of any kind: no social source is integrated yet, so
     # there is nothing here a misconfiguration could cause to be fetched.

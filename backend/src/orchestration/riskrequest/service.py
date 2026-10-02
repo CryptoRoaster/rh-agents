@@ -637,6 +637,21 @@ def risk_market(
     )
 
 
+def entry_concentration(
+    onchain: OnchainPayload, holders: HolderDistributionFacts
+) -> Decimal | None:
+    """The top-ten fraction an entry is judged on.
+
+    The raw figure, unless ATLAS recorded that this token's concentration must
+    be read through V4 pool control — then the economic figure or nothing. The
+    raw holder record itself stays unchanged in the evidence for audit.
+    """
+    control = None if onchain.intelligence is None else onchain.intelligence.pool_control
+    if control is None or not control.required:
+        return holders.top_ten_fraction
+    return control.economic_concentration
+
+
 def market_view(
     *,
     base_asset_id: str,
@@ -742,9 +757,17 @@ def market_view(
             correlation_id=correlation_id,
             asset_id=base_asset_id,
             holder_count=holders.holder_count,
-            # Top ten over total supply, unadjusted — the measure this field
-            # means and the one the limit is written against.
-            top_ten_fraction=holders.top_ten_fraction,
+            # Top ten over total supply — the measure the limit is written
+            # against. For a purchase of a token held in V4 pools it is the
+            # economic figure, which counts supply in liquidity positions with
+            # the party that controls it; unestablished, it is unknown and the
+            # engine refuses. A sale is not judged on concentration, so it
+            # keeps the raw figure and is never trapped by a missing census.
+            top_ten_fraction=(
+                entry_concentration(payload, holders)
+                if side is Side.BUY
+                else holders.top_ten_fraction
+            ),
             concentration_check=SAFETY_STATUS[payload.holder_integrity],
         ),
         # The configured proportional fee on one side's executed notional.

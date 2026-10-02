@@ -26,6 +26,10 @@ Sleep = Callable[[int], Awaitable[None]]
 
 # ERC-20 `balanceOf(address)`.
 BALANCE_OF_SELECTOR = "0x70a08231"
+# The widest block range one filtered log read may span. A caller chooses its
+# own smaller chunk; this is the ceiling no caller can raise.
+MAX_EVENT_LOG_SPAN = 100_000
+MAX_EVENT_LOGS = 5000
 
 
 class RedactTransport(logging.Filter):
@@ -218,6 +222,24 @@ class EvmRpcClient:
             raise RuntimeFailure(ErrorCode.CONTRACT)
         return result
 
+    async def call_word(self, address: str, selector: str, argument: str, block: int) -> str:
+        """A single view call with exactly one 32-byte argument.
+
+        The argument is one ABI word — a token id, a storage slot — never free
+        calldata, so this reads one value and cannot be made to do anything else.
+        """
+        self._require_address(address, block)
+        if (
+            re.fullmatch(r"0x[0-9a-f]{8}", selector) is None
+            or re.fullmatch(r"0x[0-9a-f]{64}", argument) is None
+        ):
+            raise RuntimeFailure(ErrorCode.CONFIGURATION)
+        data = selector + argument[2:]
+        result = await self._request("eth_call", [{"to": address, "data": data}, hex(block)])
+        if not isinstance(result, str) or not result.startswith("0x"):
+            raise RuntimeFailure(ErrorCode.CONTRACT)
+        return result
+
     async def balance_of(self, token: str, holder: str, block: int) -> int:
         """ERC-20 `balanceOf(holder)` on `token` at an explicit block.
 
@@ -288,6 +310,65 @@ class EvmRpcClient:
             raise RuntimeFailure(ErrorCode.CONTRACT)
         logs = tuple(Log.from_rpc(item) for item in payload)
         if any(not item.matches(spec) or not start <= item.block_number <= end for item in logs):
+            raise RuntimeFailure(ErrorCode.CONTRACT)
+        return tuple(
+            sorted(
+                logs, key=lambda item: (item.block_number, item.transaction_index, item.log_index)
+            )
+        )
+
+    async def event_logs(
+        self, address: str, topics: tuple[str | None, ...], start: int, end: int
+    ) -> tuple[Log, ...]:
+        """Logs of one contract matching an explicit topic filter, over a bounded range.
+
+        Unlike `logs`, which serves the ingestion cursor and its chunk setting,
+        this answers a bounded historical question such as "which pools were
+        initialized with this token". The range is capped here, a full or
+        malformed answer is a contract failure — never a short list — and every
+        returned log must match what was asked.
+        """
+        if (
+            re.fullmatch(r"0x[0-9a-f]{40}", address) is None
+            or not 1 <= len(topics) <= 4
+            or topics[0] is None
+            or any(
+                topic is not None and re.fullmatch(r"0x[0-9a-f]{64}", topic) is None
+                for topic in topics
+            )
+            or type(start) is not int
+            or type(end) is not int
+            or start < 0
+            or end < start
+            or end - start + 1 > MAX_EVENT_LOG_SPAN
+        ):
+            raise RuntimeFailure(ErrorCode.CONFIGURATION)
+        payload = await self._request(
+            "eth_getLogs",
+            [
+                {
+                    "address": address,
+                    "topics": list(topics),
+                    "fromBlock": hex(start),
+                    "toBlock": hex(end),
+                }
+            ],
+        )
+        # A provider that caps its answer at the limit may have cut it, and a
+        # cut list read as complete is exactly the silent truncation to avoid.
+        if not isinstance(payload, list) or len(payload) >= MAX_EVENT_LOGS:
+            raise RuntimeFailure(ErrorCode.CONTRACT)
+        logs = tuple(Log.from_rpc(item) for item in payload)
+        if any(
+            item.address != address
+            or len(item.topics) < len(topics)
+            or any(
+                expected is not None and item.topics[index] != expected
+                for index, expected in enumerate(topics)
+            )
+            or not start <= item.block_number <= end
+            for item in logs
+        ):
             raise RuntimeFailure(ErrorCode.CONTRACT)
         return tuple(
             sorted(

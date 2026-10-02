@@ -105,6 +105,10 @@ class RiskDataGapCode(StrEnum):
     # The evidence carries a verdict but no measured figure. A `PASS` says the
     # domain met its prerequisites; it is not a number and cannot stand in for one.
     VERDICT_WITHOUT_METRIC = "VERDICT_WITHOUT_METRIC"
+    # A V4 token whose economic concentration — raw holders plus the liquidity
+    # positions they control — was not established. Its raw figure can miss
+    # every unit sitting in a position, so it cannot stand in.
+    ECONOMIC_CONCENTRATION_UNKNOWN = "ECONOMIC_CONCENTRATION_UNKNOWN"
 
 
 class RiskDataOutcome(StrEnum):

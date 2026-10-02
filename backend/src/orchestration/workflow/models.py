@@ -373,6 +373,131 @@ class HolderDistributionFacts(Immutable):
         )
 
 
+RawAmount = Annotated[str, Field(pattern=r"^[0-9]{1,78}$")]
+PoolControlAddress = Annotated[str, Field(pattern=r"^0x[0-9a-f]{40}$")]
+PoolControlId = Annotated[str, Field(pattern=r"^0x[0-9a-f]{64}$")]
+POOL_CONTROL_KEY = "pool_control"
+# How many positions the durable record lists by name. The census itself is
+# bounded and complete; this only bounds what is written per row, largest
+# first, and the counts beside it always cover every position.
+POOL_CONTROL_LISTED_POSITIONS = 16
+
+
+class PoolControlPool(Immutable):
+    """One V4 pool of the token, exactly as the PoolManager initialized it."""
+
+    pool_id: PoolControlId
+    currency0: PoolControlAddress
+    currency1: PoolControlAddress
+    fee: int = Field(strict=True, ge=0, lt=1 << 24)
+    tick_spacing: int = Field(strict=True)
+    hook: PoolControlAddress
+    created_block: int = Field(strict=True, ge=0)
+    created_at: AwareDatetime | None = None
+    initialized: bool
+    hook_code_present: bool | None = None
+    hook_permissions: tuple[Code, ...] = Field(default=(), max_length=14)
+    hook_owner: PoolControlAddress | None = None
+    # OWNER_READ or OWNER_UNKNOWN; a failed `owner()` is never "no owner".
+    hook_owner_status: Code | None = None
+    hook_owner_is_creator: bool | None = None
+
+
+class PoolControlPosition(Immutable):
+    """One active liquidity position and the token amount it controls."""
+
+    kind: Code
+    pool_id: PoolControlId
+    owner_key: PoolControlAddress
+    position_manager: PoolControlAddress | None = None
+    token_id: RawAmount | None = None
+    tick_lower: int = Field(strict=True)
+    tick_upper: int = Field(strict=True)
+    liquidity: RawAmount
+    owner: PoolControlAddress | None = None
+    owner_status: Code
+    controlled_token_raw: RawAmount
+    owner_is_creator: bool | None = None
+
+
+class EconomicHolderShare(Immutable):
+    # An address, or the UNATTRIBUTED_POOL_BALANCE pseudo-holder.
+    holder: Identifier
+    balance_raw: RawAmount
+    share: Share
+
+
+class PoolControlSummary(Immutable):
+    """Who economically controls the token supply held in Uniswap V4.
+
+    Recorded beside the raw holder distribution, never in place of it. The
+    economic figures move PoolManager-held supply to the owners of the
+    positions holding it, as far as that is exact, and rank any remainder as
+    one unattributed holder — so they can overstate concentration (``basis``
+    says when) but never understate it.
+
+    ``required`` says that this token's concentration must be read here: its
+    market is a V4 pool or V4 pools were found. A required summary that is not
+    ``AVAILABLE`` carries no economic figure, and the raw one may not stand in.
+    """
+
+    measurement: Literal["V4_POOL_CONTROL"] = "V4_POOL_CONTROL"
+    status: Code
+    gap: Code | None = None
+    failure: Code | None = None
+    required: bool
+    source: Identifier
+    chain_id: int | None = Field(default=None, strict=True, gt=0)
+    pool_manager: PoolControlAddress | None = None
+    position_managers: tuple[PoolControlAddress, ...] = Field(default=(), max_length=4)
+    scan_from_block: int | None = Field(default=None, strict=True, ge=0)
+    snapshot_block: int | None = Field(default=None, strict=True, ge=0)
+    total_supply_raw: RawAmount | None = None
+    pool_manager_balance_raw: RawAmount | None = None
+    attributed_raw: RawAmount | None = None
+    unattributed_raw: RawAmount | None = None
+    creator_controlled_raw: RawAmount | None = None
+    pool_held_supply_fraction: Share | None = None
+    attributable_pool_supply_fraction: Share | None = None
+    creator_controlled_pool_supply_fraction: Share | None = None
+    unattributed_pool_supply_fraction: Share | None = None
+    pools_total: int = Field(strict=True, ge=0)
+    pools_with_hooks: int = Field(strict=True, ge=0)
+    creator_controlled_hooks: int = Field(strict=True, ge=0)
+    positions_total: int = Field(strict=True, ge=0)
+    positions_attributed: int = Field(strict=True, ge=0)
+    positions_unattributed: int = Field(strict=True, ge=0)
+    pools: tuple[PoolControlPool, ...] = Field(default=(), max_length=16)
+    positions: tuple[PoolControlPosition, ...] = Field(
+        default=(), max_length=POOL_CONTROL_LISTED_POSITIONS
+    )
+    # The raw figure, repeated here so the two can be compared in one place.
+    raw_top_ten_fraction: Share | None = None
+    basis: Code | None = None
+    economic_top_one_fraction: Share | None = None
+    economic_top_five_fraction: Share | None = None
+    economic_top_ten_fraction: Share | None = None
+    economic_top_holders: tuple[EconomicHolderShare, ...] = Field(default=(), max_length=10)
+
+    @model_validator(mode="after")
+    def figures_match_status(self) -> Self:
+        if self.status == "AVAILABLE":
+            if self.economic_top_ten_fraction is None or self.basis is None:
+                raise ValueError("Available pool control carries its economic figures")
+        elif self.economic_top_ten_fraction is not None or self.gap is None:
+            raise ValueError("Unavailable pool control names its gap and carries no figure")
+        if self.positions_attributed + self.positions_unattributed != self.positions_total:
+            raise ValueError("Position counts must add up")
+        return self
+
+    @property
+    def economic_concentration(self) -> Decimal | None:
+        """The figure a limit may judge, or None when it was not established."""
+        if self.status != "AVAILABLE":
+            return None
+        return self.economic_top_ten_fraction
+
+
 class OnchainIntelligence(Immutable):
     """The deterministic record behind an on-chain verdict.
 
@@ -398,6 +523,9 @@ class OnchainIntelligence(Immutable):
     # Absent on evidence written before the holder metrics were carried, and
     # omitted rather than serialised as `null` for exactly those rows.
     holders: "HolderDistributionFacts | None" = None
+    # V4 pool control. Absent where it was never collected, and then omitted
+    # entirely, so every row written without it replays byte for byte.
+    pool_control: PoolControlSummary | None = None
 
     _holder_facts_key_present: bool = PrivateAttr(default=False)
 
@@ -412,6 +540,8 @@ class OnchainIntelligence(Immutable):
     @model_serializer(mode="wrap")
     def _historical_shape(self, handler: Any) -> dict[str, Any]:
         emitted: dict[str, Any] = handler(self)
+        if self.pool_control is None:
+            emitted = {key: value for key, value in emitted.items() if key != POOL_CONTROL_KEY}
         if self._holder_facts_key_present:
             return emitted
         return {key: value for key, value in emitted.items() if key != HOLDER_FACTS_KEY}

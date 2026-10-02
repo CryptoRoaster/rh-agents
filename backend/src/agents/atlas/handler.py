@@ -12,6 +12,7 @@ commentary. System safety does not depend on model uptime.
 
 from dataclasses import dataclass
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 
 from src.agents.atlas.context import (
@@ -31,6 +32,7 @@ from src.agents.atlas.models import (
 )
 from src.agents.atlas.policy import ATLAS_POLICY_V1, AtlasPolicy, evaluate_snapshot
 from src.agents.atlas.prompt import ATLAS_INSTRUCTIONS, ATLAS_PROMPT_HASH, ATLAS_PROMPT_VERSION
+from src.agents.atlas.v4.models import PoolControlFacts
 from src.agents.atlas.validation import AtlasValidationError, validate_assessment
 from src.core.clock import Clock, SystemClock
 from src.core.models import AgentRole
@@ -44,6 +46,8 @@ from src.orchestration.worker.models import (
     WorkerFailureCategory,
 )
 from src.orchestration.workflow.models import (
+    POOL_CONTROL_LISTED_POSITIONS,
+    EconomicHolderShare,
     EvidenceProvenance,
     EvidenceStatus,
     EvidenceSubmission,
@@ -52,6 +56,9 @@ from src.orchestration.workflow.models import (
     OnchainAdvisoryFinding,
     OnchainIntelligence,
     OnchainPayload,
+    PoolControlPool,
+    PoolControlPosition,
+    PoolControlSummary,
     ReconciledExclusion,
 )
 from src.reasoning.models import ReasoningFailure, ReasoningRequest, ReasoningResult
@@ -80,6 +87,10 @@ REASON_DOMAIN: dict[AtlasReasonCode, AtlasDomain] = {
     AtlasReasonCode.SNAPSHOT_SKEW_EXCEEDED: AtlasDomain.HOLDERS,
     AtlasReasonCode.ORIGIN_FACTS_UNAVAILABLE: AtlasDomain.ORIGIN,
     AtlasReasonCode.ORIGIN_SOURCE_NOT_CONFIGURED: AtlasDomain.ORIGIN,
+    # Pool control decides whether a V4 token's holder concentration is known.
+    AtlasReasonCode.V4_POOL_CENSUS_UNAVAILABLE: AtlasDomain.HOLDERS,
+    AtlasReasonCode.V4_POSITION_FACTS_INCOMPLETE: AtlasDomain.HOLDERS,
+    AtlasReasonCode.V4_POOL_BALANCE_UNATTRIBUTED: AtlasDomain.HOLDERS,
 }
 
 
@@ -152,6 +163,106 @@ def holder_distribution(facts: HolderFacts) -> HolderDistributionFacts | None:
     return HolderDistributionFacts(**fields)
 
 
+def pool_control_summary(
+    control: PoolControlFacts | None, raw_top_ten: Decimal | None
+) -> PoolControlSummary | None:
+    """The bounded, durable record of a token's V4 pool control.
+
+    Every pool is listed (the census caps them); positions are listed largest
+    controlled amount first up to a fixed count, and the counts beside them
+    always cover all of them. No event list is written, only what it proved.
+    """
+    if control is None:
+        return None
+    census = control.census
+    listed = sorted(
+        census.positions,
+        key=lambda item: (-item.controlled_token_raw, item.pool_id, item.owner_key, item.salt),
+    )[:POOL_CONTROL_LISTED_POSITIONS]
+
+    def raw(value: int | None) -> str | None:
+        return None if value is None else str(value)
+
+    return PoolControlSummary(
+        status=control.status.value,
+        gap=None if control.gap is None else control.gap.value,
+        failure=None if census.failure is None else census.failure.value,
+        required=control.required,
+        source=census.source,
+        chain_id=census.chain_id,
+        pool_manager=census.pool_manager,
+        position_managers=census.position_managers,
+        scan_from_block=census.scan_from_block,
+        snapshot_block=census.scan_to_block,
+        total_supply_raw=raw(control.total_supply_raw),
+        pool_manager_balance_raw=raw(census.pool_manager_balance_raw),
+        attributed_raw=raw(control.attributed_raw),
+        unattributed_raw=raw(control.unattributed_raw),
+        creator_controlled_raw=raw(control.creator_controlled_raw),
+        pool_held_supply_fraction=control.pool_held_supply_fraction,
+        attributable_pool_supply_fraction=control.attributable_pool_supply_fraction,
+        creator_controlled_pool_supply_fraction=control.creator_controlled_pool_supply_fraction,
+        unattributed_pool_supply_fraction=control.unattributed_pool_supply_fraction,
+        pools_total=control.pools_total,
+        pools_with_hooks=control.pools_with_hooks,
+        creator_controlled_hooks=control.creator_controlled_hooks,
+        positions_total=control.positions_total,
+        positions_attributed=control.positions_attributed,
+        positions_unattributed=control.positions_unattributed,
+        pools=tuple(
+            PoolControlPool(
+                pool_id=pool.pool_id,
+                currency0=pool.currency0,
+                currency1=pool.currency1,
+                fee=pool.fee,
+                tick_spacing=pool.tick_spacing,
+                hook=pool.hook,
+                created_block=pool.created_block,
+                created_at=pool.created_at,
+                initialized=pool.initialized,
+                hook_code_present=None if pool.hook_facts is None else pool.hook_facts.code_present,
+                hook_permissions=() if pool.hook_facts is None else pool.hook_facts.permissions,
+                hook_owner=None if pool.hook_facts is None else pool.hook_facts.owner,
+                hook_owner_status=(
+                    None if pool.hook_facts is None else pool.hook_facts.owner_status.value
+                ),
+                hook_owner_is_creator=(
+                    None if pool.hook_facts is None else pool.hook_facts.owner_is_creator
+                ),
+            )
+            for pool in census.pools
+        ),
+        positions=tuple(
+            PoolControlPosition(
+                kind=item.kind.value,
+                pool_id=item.pool_id,
+                owner_key=item.owner_key,
+                position_manager=item.position_manager,
+                token_id=raw(item.token_id),
+                tick_lower=item.tick_lower,
+                tick_upper=item.tick_upper,
+                liquidity=str(item.liquidity),
+                owner=item.owner,
+                owner_status=item.owner_status.value,
+                controlled_token_raw=str(item.controlled_token_raw),
+                owner_is_creator=item.owner_is_creator,
+            )
+            for item in listed
+        ),
+        raw_top_ten_fraction=raw_top_ten,
+        basis=None if control.basis is None else control.basis.value,
+        economic_top_one_fraction=control.economic_top1_share,
+        economic_top_five_fraction=control.economic_top5_share,
+        economic_top_ten_fraction=control.economic_top10_share,
+        economic_top_holders=tuple(
+            EconomicHolderShare(
+                holder=item.holder, balance_raw=str(item.balance_raw), share=item.share
+            )
+            for item in control.economic_top_holders
+        ),
+    )
+
+
 def onchain_payload(
     snapshot: AtlasOnchainSnapshot,
     decision: AtlasSafetyDecision,
@@ -199,6 +310,7 @@ def onchain_payload(
             # a different fact from a row written before the block
             # existed — and the two must not serialise alike.
             holders=holder_distribution(snapshot.holders),
+            pool_control=pool_control_summary(snapshot.pool_control, snapshot.holders.top10_share),
         ),
     )
 
