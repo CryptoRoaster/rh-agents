@@ -304,6 +304,32 @@ async def test_a_failure_keeps_its_exact_reason_beside_its_category(db):
     assert run.model_failure_reasons == summary.model_failure_reasons
 
 
+async def test_a_dead_codex_login_is_recorded_as_login_required(db):
+    """The code that says what to do: sign in again. Never a free-text message."""
+    _, sessions = db
+    orbit = EchoOrbit(
+        failure=ReasoningErrorCategory.PROVIDER_NOT_CONFIGURED,
+        reason_code="CODEX_LOGIN_REQUIRED",
+    )
+    summary = await scout(sessions, T0, provider=MarketProvider(discovery=[young(0)]), orbit=orbit)
+    watch = await watch_for(sessions, 0)
+    (row,) = await assessments(sessions, watch)
+    assert row.status == "FAILED"
+    assert row.failure_reason == "PROVIDER_NOT_CONFIGURED"
+    assert row.failure_reason_code == "CODEX_LOGIN_REQUIRED"
+    assert [item.model_dump() for item in summary.model_failure_reasons] == [
+        {
+            "provider": "fake",
+            "category": "PROVIDER_NOT_CONFIGURED",
+            "reason_code": "CODEX_LOGIN_REQUIRED",
+            "count": 1,
+        }
+    ]
+    # Still watched, and the slot is spent: no loop of retries against a dead login.
+    assert watch.status is WatchStatus.WATCHING
+    assert watch.next_orbit_review_at == T0 + HOUR
+
+
 async def test_the_requested_and_the_reported_effort_are_stored_apart(db):
     _, sessions = db
     await scout(

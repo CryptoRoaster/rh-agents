@@ -237,3 +237,20 @@ __all__ = [
     "orbit_domain_validator",
     "write_launcher",
 ]
+
+
+@pytest.fixture(autouse=True)
+def private_credential_leases(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Every credential lease a test takes lives in a directory of its own.
+
+    The production lease directory is shared by every process of this uid on
+    the machine, the scheduler included; a test must neither leave lock files
+    there nor wait on a lease a real attempt holds.
+    """
+    from src.evaluation.codex import credential_lease
+
+    parent = tmp_path_factory.mktemp("leases")
+    monkeypatch.setattr(credential_lease, "LEASE_PARENT", parent)
+    return parent

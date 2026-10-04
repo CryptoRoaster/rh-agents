@@ -384,6 +384,14 @@ def _version_gate(cli_version: str | None, supported: str) -> list[Gate]:
 
 
 def _session_gate(chatgpt_session: bool | None) -> list[Gate]:
+    """`codex login status` in the isolated home: a *local* ChatGPT session.
+
+    The CLI answers from the copied `auth.json` without asking the provider, so
+    a PASS means LOCAL_CHATGPT_SESSION_PRESENT and never that the session is
+    still accepted remotely. A login whose refresh token was already redeemed
+    passes this gate and fails the first request; that question belongs to
+    `AUTH_REMOTE_VALIDITY` and, in the end, to the turn itself.
+    """
     if chatgpt_session is None:
         # Not probed. Saying PASS because a login exists somewhere would be a
         # guess about the home the attempt will actually use.
@@ -392,7 +400,11 @@ def _session_gate(chatgpt_session: bool | None) -> list[Gate]:
         Gate(
             "CHATGPT_SESSION",
             GateState.PASS if chatgpt_session else GateState.FAIL,
-            "ChatGPT session reported" if chatgpt_session else "no ChatGPT session",
+            (
+                "local ChatGPT session present; remote validity not proven"
+                if chatgpt_session
+                else "no local ChatGPT session"
+            ),
         )
     ]
 

@@ -494,3 +494,86 @@ def test_tool_activity_seen_before_the_error_is_still_counted() -> None:
     )
     observed = state.observed_tool_activity()
     assert [(item.item_type, item.count) for item in observed] == [("command_execution", 1)]
+
+
+# The permanent ChatGPT login failures, verbatim from the Codex 0.153.4 build.
+REFRESH_REUSED = (
+    "Your access token could not be refreshed because your refresh token was already used. "
+    "Please log out and sign in again."
+)
+REFRESH_EXPIRED = (
+    "Your access token could not be refreshed because your refresh token has expired. "
+    "Please log out and sign in again."
+)
+REFRESH_REVOKED = (
+    "Your access token could not be refreshed because your refresh token was revoked. "
+    "Please log out and sign in again."
+)
+REFRESH_UNKNOWN = "Your access token could not be refreshed. Please log out and sign in again."
+ACCOUNT_CHANGED = (
+    "Your access token could not be refreshed because you have since logged out or signed in "
+    "to another account. Please sign in again."
+)
+
+
+@pytest.mark.parametrize(
+    "text", [REFRESH_REUSED, REFRESH_EXPIRED, REFRESH_REVOKED, REFRESH_UNKNOWN, ACCOUNT_CHANGED]
+)
+def test_a_turn_failed_on_a_dead_login_requires_a_login(text: str) -> None:
+    state = accumulator()
+    with pytest.raises(StreamError) as caught:
+        feed(state, THREAD, TURN, {"type": "turn.failed", "error": {"message": text}})
+    assert caught.value.failure is EvaluationFailure.LOGIN_REQUIRED
+    assert caught.value.reason_code == "LOGIN_REQUIRED"
+    # The code is the whole public answer; the text stays redacted diagnostics.
+    assert str(caught.value) == "LOGIN_REQUIRED:LOGIN_REQUIRED"
+
+
+def test_the_observed_sequence_requires_a_login() -> None:
+    """Exactly what the runtime saw: an `error` event, then `turn.failed`."""
+    state = accumulator()
+    feed(state, THREAD, TURN, error_event(REFRESH_REUSED))
+    assert state.login_required is True
+    with pytest.raises(StreamError) as caught:
+        feed(state, {"type": "turn.failed", "error": {"message": REFRESH_REUSED}})
+    assert caught.value.failure is EvaluationFailure.LOGIN_REQUIRED
+
+
+def test_a_dead_login_reported_only_by_an_error_event_still_decides_the_failure() -> None:
+    state = accumulator()
+    feed(state, THREAD, TURN, error_event(REFRESH_EXPIRED))
+    with pytest.raises(StreamError) as caught:
+        feed(state, {"type": "turn.failed", "error": {"message": "stream disconnected"}})
+    assert caught.value.failure is EvaluationFailure.LOGIN_REQUIRED
+
+
+def test_an_error_event_about_the_login_does_not_end_the_run_by_itself() -> None:
+    state = accumulator()
+    feed(state, THREAD, TURN, error_event(REFRESH_REUSED), message("{}"))
+    feed(state, {"type": "turn.completed"})
+    assert state.require_consistent_completion() == "{}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "unexpected status 401 Unauthorized",
+        '{"error": {"code": "token_expired", "status": 401}}',
+        "Provided authentication token is expired. Please try signing in again.",
+        "OAuth refresh token was rejected; reauthorization required",
+        "Reconnecting... 5/5",
+        "",
+    ],
+)
+def test_anything_else_stays_an_ordinary_turn_failure(text: str) -> None:
+    """A bare 401 or an expired *access* token is not proof the login is dead."""
+    state = accumulator()
+    with pytest.raises(StreamError) as caught:
+        feed(
+            state,
+            THREAD,
+            TURN,
+            error_event(text),
+            {"type": "turn.failed", "error": {"message": text}},
+        )
+    assert caught.value.failure is EvaluationFailure.TURN_FAILED

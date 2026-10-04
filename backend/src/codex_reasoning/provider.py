@@ -13,6 +13,16 @@ this process, and no rejection carries more than the harness's own codes.
 
 The port's `max_output_tokens` has no Codex counterpart and is not enforced
 here; the harness bounds the final message by bytes instead.
+
+The login state is leased, not just copied: `prepare_real_run` holds an
+exclusive lease on the source `auth.json` for the whole call and writes a
+refreshed generation back at teardown. What became of it is checked after the
+context has closed, and an outcome that leaves the source stale or contested
+fails the call -- even one whose turn succeeded -- because the next call would
+otherwise start from a login state nobody vouches for. A turn that failed
+because the login can no longer be refreshed is `CODEX_LOGIN_REQUIRED`: the
+provider is unusable until someone signs in again, so it is reported as not
+configured rather than as a transient outage to retry.
 """
 
 import re
@@ -28,6 +38,18 @@ from pydantic import BaseModel
 
 from src.core.config import Settings
 from src.core.numbers import canonical_decimal
+from src.evaluation.codex.auth_home import (
+    PERSISTENCE_FAILURES,
+    SOURCE_CHANGED,
+    SOURCE_UNSAFE,
+    AuthSourceError,
+    Persistence,
+)
+from src.evaluation.codex.credential_lease import (
+    LEASE_TIMEOUT,
+    LEASE_UNAVAILABLE,
+    CredentialLeaseError,
+)
 from src.evaluation.codex.final_preflight import default_launcher
 from src.evaluation.codex.models import (
     CodexLauncher,
@@ -70,6 +92,9 @@ FAILURE_CATEGORIES: dict[EvaluationFailure, ReasoningErrorCategory] = {
     EvaluationFailure.PROCESS_START_FAILED: _Category.PROVIDER_UNAVAILABLE,
     EvaluationFailure.PROCESS_FAILED: _Category.PROVIDER_UNAVAILABLE,
     EvaluationFailure.TURN_FAILED: _Category.PROVIDER_UNAVAILABLE,
+    # Not transient: no retry helps until someone signs in again, the same
+    # standing a rejected API key has for the other providers.
+    EvaluationFailure.LOGIN_REQUIRED: _Category.PROVIDER_NOT_CONFIGURED,
     EvaluationFailure.CLEANUP_INCOMPLETE: _Category.PROVIDER_UNAVAILABLE,
     EvaluationFailure.EVENT_STREAM_INVALID: _Category.PROVIDER_UNAVAILABLE,
     EvaluationFailure.STDOUT_OVERFLOW: _Category.PROVIDER_UNAVAILABLE,
@@ -82,6 +107,16 @@ FAILURE_CATEGORIES: dict[EvaluationFailure, ReasoningErrorCategory] = {
     EvaluationFailure.OUTPUT_NOT_JSON: _Category.INVALID_MODEL_OUTPUT,
     EvaluationFailure.OUTPUT_SCHEMA_MISMATCH: _Category.INVALID_MODEL_OUTPUT,
     EvaluationFailure.OUTPUT_DOMAIN_INVALID: _Category.INVALID_MODEL_OUTPUT,
+}
+
+# The credential lease and the source login state, before anything ran. Another
+# holder or a source that moved meanwhile is worth another attempt later; an
+# unusable lock directory or an unsafe source file is not.
+LEASE_CATEGORIES: dict[str, ReasoningErrorCategory] = {
+    LEASE_TIMEOUT: _Category.PROVIDER_UNAVAILABLE,
+    LEASE_UNAVAILABLE: _Category.PROVIDER_NOT_CONFIGURED,
+    SOURCE_UNSAFE: _Category.PROVIDER_NOT_CONFIGURED,
+    SOURCE_CHANGED: _Category.PROVIDER_UNAVAILABLE,
 }
 
 PrepareRun = Callable[..., AbstractAsyncContextManager[Any]]
@@ -111,6 +146,13 @@ def _refused(blocking: Sequence[Any]) -> str:
     return code if _SAFE_CODE.fullmatch(code) else "CODEX_RELEASE_NOT_GRANTED"
 
 
+def _check_persistence(credentials: object) -> None:
+    """Fail the call when the login state could not be brought back cleanly."""
+    persistence = getattr(credentials, "persistence", None)
+    if isinstance(persistence, Persistence) and persistence in PERSISTENCE_FAILURES:
+        raise ReasoningFailure(_Category.PROVIDER_UNAVAILABLE, PERSISTENCE_FAILURES[persistence])
+
+
 def find_launcher(executable: str) -> CodexLauncher | None:
     """The platform binary behind a configured `codex` command, or on PATH."""
     return default_launcher(Path(executable) if executable else None)
@@ -138,6 +180,7 @@ class CodexReasoningProvider:
         probe_budget = request.timeout_seconds - CLEANUP_RESERVE_SECONDS - MIN_TURN_SECONDS
         if probe_budget <= 0:
             raise ReasoningFailure(_Category.PROVIDER_REJECTED_REQUEST, "CODEX_TIMEOUT_TOO_SHORT")
+        credentials: object = None
         try:
             async with self.prepare(
                 launcher=self.launcher,
@@ -145,6 +188,7 @@ class CodexReasoningProvider:
                 effort=self.effort,
                 probe_budget_seconds=probe_budget,
             ) as prepared:
+                credentials = getattr(prepared, "credentials", None)
                 if prepared.runner is None:
                     elapsed = self.monotonic() - started
                     if elapsed >= probe_budget - PREFLIGHT_SLACK_SECONDS:
@@ -167,12 +211,23 @@ class CodexReasoningProvider:
                         cleanup_reserve_seconds=CLEANUP_RESERVE_SECONDS,
                     )
                 )
+        except (CredentialLeaseError, AuthSourceError) as error:
+            raise ReasoningFailure(
+                LEASE_CATEGORIES.get(error.code, _Category.PROVIDER_UNAVAILABLE), error.code
+            ) from None
         except OSError:
             # Building or tearing down the isolated environment failed. Nothing
             # from the error is kept: it may name paths under the login home.
             raise ReasoningFailure(
                 _Category.PROVIDER_UNAVAILABLE, "CODEX_ENVIRONMENT_FAILED"
             ) from None
+        except ReasoningFailure:
+            # A refusal inside the context still had a teardown, and a login
+            # state that could not be brought back outranks it: it decides
+            # whether the next call can work at all.
+            _check_persistence(credentials)
+            raise
+        _check_persistence(credentials)
         if isinstance(outcome, EvaluationRejected):
             raise ReasoningFailure(
                 FAILURE_CATEGORIES.get(outcome.reason, _Category.PROVIDER_UNAVAILABLE),

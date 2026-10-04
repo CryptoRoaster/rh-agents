@@ -80,16 +80,85 @@ substitutes a value it did not observe.
 
 Only the official ChatGPT login path.
 
-`auth.json` is copied — by the filesystem, byte for byte, into a temporary
-isolated `CODEX_HOME` — and it is never *read into this process*: no value from
-it is parsed, logged, asserted on, reported or committed. The user's own file is
-opened only by `shutil.copyfile`, and it is not modified: the probe run was
-checked against its digest, size, mode and mtime before and after.
+`auth.json` is copied — byte for byte, through one descriptor opened without
+following links, into a temporary isolated `CODEX_HOME` — and it is never
+*parsed*: no value from it is decoded, logged, asserted on, reported or
+committed, on the way in or on the way back.
 
 Every invocation pins `cli_auth_credentials_store="file"`. The default store
 reaches the login keychain, which is shared with the real session and is not
 inside the isolated home; pinned to `file`, both the read and any refresh write
-stay in the copy, which is the one path the outer profile makes writable.
+happen in the copy, which is the one path the outer profile makes writable.
+
+### A refreshed login state is written back
+
+Codex 0.153.4 rotates ChatGPT refresh tokens: a refresh redeems the stored
+refresh token, the provider invalidates it, and the CLI rewrites `auth.json`
+(truncate, write) with the new access token, id token, refresh token and
+`last_refresh`. The harness used to discard that copy after every attempt. The
+source therefore kept a refresh token the provider had already invalidated,
+every later attempt copied it, and every one was refused with "refresh token
+was already used". On 2026-10-01 at 20:28Z ORBIT stopped completing reviews
+this way, while the preflight kept passing — `codex login status` reads the
+local file and never asks the provider.
+
+rotating refresh token + per-call isolated copy + discarded refreshed
+generation = a source login state that is permanently stale.
+
+So the copy is now a **lease** on the login state (`credential_lease.py`,
+`auth_home.py`):
+
+* **One holder per source `auth.json`, across processes.** An exclusive
+  `flock` on a lock file of its own, held from before the copy until after the
+  teardown — copy, probes, the turn, the write-back, the removal. Locking only
+  the copy would let attempt A and attempt B both hold generation 1; whichever
+  refreshed second would be refused for good. The lock file lives outside the
+  Codex home, under `/tmp/rh-agents-codex-lease-<uid>/` (`0700`, owner-checked,
+  not a symlink), is named `auth-<sha256 of the canonical home path>.lock`
+  (`0600`, empty), and is never deleted. The wait is bounded — at most 30 s, and
+  never past the caller's probe budget — and running out is
+  `CODEX_AUTH_LEASE_TIMEOUT`. The kernel drops the lock if the holder dies.
+* **The source state is recorded, not read.** Device, inode, mode, size, mtime
+  and ctime of the source file the copy was taken from. A symlink or any other
+  non-regular file is `CODEX_AUTH_SOURCE_UNSAFE`; a source that moves during
+  the copy is `CODEX_AUTH_SOURCE_CHANGED`.
+* **A rewrite is recognised from file properties alone.** The copy's
+  timestamps are pinned to a fixed sentinel after it is written; the CLI's
+  rewrite stamps the current time, so even a rewrite of the same size shows.
+* **Write-back at teardown, whatever the turn did.** A refresh can succeed and
+  the turn still fail afterwards; that generation is still the only valid one.
+  Only `auth.json` is written — never `config.toml`, `installation_id`,
+  history, sessions or anything else in the source home — and only when the
+  copy changed, is a non-empty regular file, and held still while it was read.
+* **The source wins a conflict.** If the source is no longer exactly the file
+  the copy came from — a manual login or logout, another Codex — nothing is
+  written, and the attempt fails closed with `CODEX_AUTH_SOURCE_CHANGED`.
+* **Atomic.** A private `0600` sibling (`.auth.json.rh-agents-*.tmp`) in the
+  source directory, filled byte for byte, `fsync`ed, the source re-checked,
+  then `os.replace`, then a directory `fsync` where the platform allows it. On
+  any failure the sibling is removed and the source is the complete old file
+  (`CODEX_AUTH_WRITEBACK_FAILED`).
+
+Granting the attempt the whole `~/.codex` instead would have fixed the refresh
+by putting config, history, sessions, skills and plugins inside the boundary.
+The isolated home keeps its closed set of two files; the only new write is the
+harness's own, after the CLI has exited, to one named file.
+
+Remaining limit: a Codex process outside this harness (an interactive session
+on the same `~/.codex`) does not take the lease. If it and an attempt refresh
+the same generation at the same time, one of them is refused; the attempt then
+reports either `CODEX_AUTH_SOURCE_CHANGED` or `CODEX_LOGIN_REQUIRED`.
+
+### A dead login is named
+
+A turn whose `error` or `turn.failed` message is one of the five fixed
+0.153.4 texts for a refresh that cannot succeed — refresh token expired,
+already used, revoked, refused for an unclassified reason, or the login having
+changed to another account — is `LOGIN_REQUIRED`, and the provider reports
+`CODEX_LOGIN_REQUIRED` (`PROVIDER_NOT_CONFIGURED`: no retry helps until someone
+signs in again). A bare 401, an expired *access* token or the MCP OAuth
+wording is not enough and stays `TURN_FAILED`. Only the flag survives; the
+message itself is redacted like every other.
 
 The login probe reads **stderr as well as stdout**. In 0.153.4,
 `run_login_status` (`codex-rs/cli/src/login.rs`) reports every outcome with
@@ -618,9 +687,9 @@ not implemented.
 Pointing the attempt at `~/.codex` would put config, history, sessions, skills,
 plugins and caches inside the boundary. Instead the harness builds a `0700`
 directory holding a `0600` copy of the one file 0.153.4 reads for a ChatGPT
-session, `auth.json`, and discards it afterwards. No token value is read into
-the harness, logged, asserted on or reported; a refresh during an attempt lands
-in the copy, so the user's own session is untouched.
+session, `auth.json`, and removes it afterwards — after a refresh the CLI wrote
+into it has been brought back into the source (see *A refreshed login state is
+written back*). No token value is parsed, logged, asserted on or reported.
 
 Three questions were once one gate, and that gate could never clear: `may_run`
 demanded every gate pass, while the only thing that could have cleared it was
@@ -628,8 +697,8 @@ the turn it was blocking. They are now separate.
 
 | gate | question | how it is answered |
 |---|---|---|
-| `AUTH_HOME_ISOLATION` | is the home isolated? | checked here and now: `0700` directory holding exactly `auth.json` (`0600`) and `installation_id` (`0644`), source home unchanged, and the outer profile confines reads to this home |
-| `CHATGPT_SESSION` | does *this* copy carry a ChatGPT session? | `codex login status` really runs — in this home, behind the same profile, with the credential store pinned to `file`. Not a guess, and not a model request |
+| `AUTH_HOME_ISOLATION` | is the home isolated? | checked here and now: `0700` directory holding exactly `auth.json` (`0600`) and `installation_id` (`0644`), and the outer profile confines reads to this home |
+| `CHATGPT_SESSION` | does *this* copy carry a ChatGPT session? | `codex login status` really runs — in this home, behind the same profile, with the credential store pinned to `file`. Not a guess, and not a model request. A PASS means LOCAL_CHATGPT_SESSION_PRESENT, never that the provider still accepts it: a login whose refresh token was already redeemed passes this gate |
 | `AUTH_REMOTE_VALIDITY` | will the provider accept the token? | unknowable without a request. **Advisory**: it is `UNVERIFIED` and never blocks, because blocking on it would be circular |
 
 ## Release gates
@@ -761,7 +830,10 @@ measured, the gates evaluated, and — only if nothing blocking failed — a
 `authorization` are `None` together; there is no state where a caller holds a
 runner whose preflight failed.
 
-On exit: the profile, the isolated home and the whole tree are removed.
+On exit: a login state the CLI refreshed in the isolated home is written back
+(only `auth.json`, only if the source is unchanged), and then the profile, the
+isolated home and the whole tree are removed. All of it runs under the
+credential lease.
 
 **The placeholder boundary probe.** The write check rewrites the auth file it is
 pointed at, so it gets a home of its own; pointing it at the copied login state
