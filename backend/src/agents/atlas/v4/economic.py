@@ -209,11 +209,7 @@ def pool_control(
     # Only the retained prefix of the raw distribution is known by address. An
     # owner outside it holds at most what the smallest retained row holds,
     # unless the holder set is complete and was retained whole.
-    retained_whole = (
-        holders.completeness == HolderCompleteness.COMPLETE
-        and len(holders.top_holders) < RETAINED_HOLDERS
-    )
-    unseen = 0 if retained_whole else holders.top_holders[-1].balance_raw
+    unseen = 0 if retained_whole(holders) else holders.top_holders[-1].balance_raw
     controlled = [
         (item.controller, item.controlled_token_raw)
         for item in attributed
@@ -239,6 +235,22 @@ def pool_control(
         or (unseen and any(owner not in _retained(holders, census) for owner, _ in controlled))
         else ConcentrationBasis.EXACT
     )
+    if (not ranked or ranked[0][1] == 0) and _nobody_controls_principal(
+        holders, census, buckets, supply, held, unattributed_raw, owner_unknown_raw
+    ):
+        # Proven, not assumed: the whole holder universe was seen, all of it
+        # sits in the PoolManager, and every unit there is permanently locked.
+        # Nobody can move any principal, so concentration is exactly zero --
+        # over the full on-chain supply, which a lock does not shrink.
+        return PoolControlFacts(
+            status=Availability.AVAILABLE,
+            basis=ConcentrationBasis.EXACT,
+            economic_top1_share=Decimal(0),
+            economic_top5_share=Decimal(0),
+            economic_top10_share=Decimal(0),
+            economic_top_holders=(),
+            **figures,  # type: ignore[arg-type]
+        )
     if not ranked or ranked[0][1] == 0:
         return PoolControlFacts(
             status=Availability.UNAVAILABLE,
@@ -261,6 +273,58 @@ def pool_control(
             for holder, value in ranked[:TOP_N]
         ),
         **figures,  # type: ignore[arg-type]
+    )
+
+
+def retained_whole(holders: HolderFacts) -> bool:
+    """Whether the retained rows are every holder the provider exposes.
+
+    ``COMPLETE`` is about our paging; rows beyond the retention cap are cut.
+    Only a complete set retained below the cap is whole -- as far as the
+    provider exposes it, which says nothing about its own exclusions.
+    """
+    return (
+        holders.completeness == HolderCompleteness.COMPLETE
+        and len(holders.top_holders) < RETAINED_HOLDERS
+    )
+
+
+def _nobody_controls_principal(
+    holders: HolderFacts,
+    census: V4Census,
+    buckets: dict[PositionControlState, int],
+    supply: int,
+    held: int,
+    unattributed_raw: int,
+    owner_unknown_raw: int,
+) -> bool:
+    """Whether an empty economic distribution is a proven zero, not missing data.
+
+    Every condition is required. The holder universe is whole and unfiltered
+    -- no server-side exclusion left unreconciled -- and accounts for the
+    entire on-chain supply; its only holder is the PoolManager; and everything
+    the PoolManager holds is in positions verified as permanently locked, with
+    no remainder, no unknown owner and nothing controlled or releasable.
+    """
+    rows = holders.top_holders
+    return (
+        retained_whole(holders)
+        # The provider's own count, where it gave one, must agree: a count
+        # above the rows means holders exist that were never seen.
+        and holders.holder_count in (None, len(rows))
+        and not holders.unresolved_exclusions
+        and sum(row.balance_raw for row in rows) == supply
+        and all(row.address == census.pool_manager for row in rows)
+        and held == supply
+        and unattributed_raw == 0
+        and owner_unknown_raw == 0
+        and all(item.control is not None for item in census.positions)
+        and buckets[PositionControlState.PERMANENTLY_LOCKED] == held
+        and not any(
+            buckets[state]
+            for state in PositionControlState
+            if state != PositionControlState.PERMANENTLY_LOCKED
+        )
     )
 
 

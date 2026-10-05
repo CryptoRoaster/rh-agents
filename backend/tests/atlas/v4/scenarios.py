@@ -50,6 +50,8 @@ UNIT = 10**18
 # Bits 13 and 7: BEFORE_INITIALIZE and BEFORE_SWAP, as on the historical hook.
 CREATOR_HOOK = "0x" + "5d" * 18 + "e080"
 LOCKER = "0x" + "ef" * 20
+# The last real block before the REVENUE creator's position was removed.
+REVENUE_REFERENCE_BLOCK = 77_205_381
 LAUNCH_WALLET = "0x" + "4d" * 20
 # A higher address than the token, so the token sorts as currency0 against it.
 MEME = "0x" + "fe" * 20
@@ -123,6 +125,12 @@ def traded_pool(**changes: object) -> Pool:
 def revenue_like(custody: str = "unverified") -> tuple[FakeV4Chain, Pool, Pool]:
     """The historical mechanism, on synthetic addresses.
 
+    The snapshot is pinned before the creator's liquidity left the pool. On
+    the real token that is block ``REVENUE_REFERENCE_BLOCK`` (77 205 381): the
+    creator's position was decreased to zero at 77 205 382 and the dump came at
+    77 205 425, so 77 205 424 already shows the supply in a wallet, not in a
+    position. The fixture's head lies before the removal.
+
     ``custody`` says who holds the traded pool's launch position NFT: an
     unverified contract (``"unverified"``, the locker as it stood), the official
     FeeSplitter (``"official"``), or an account (``"account"``). The creator's
@@ -185,20 +193,25 @@ def builder(
     origin_facts: OriginFacts | None = None,
     bounds: CensusBounds | None = None,
     block: int = HEAD_BLOCK,
+    supply: int = SUPPLY,
+    holder_count: int | None = 4200,
+    excluded: tuple[str, ...] = (),
 ) -> AtlasSnapshotBuilder:
+    holder_result = holder_source_result(
+        now,
+        rows=wallets() if rows is None else rows,
+        completeness=completeness,
+        snapshot_block=block,
+        provider_total_supply_raw=supply,
+        holder_count=holder_count,
+    )
+    if excluded:
+        holder_result = holder_result.model_copy(update={"excluded_addresses": excluded})
     return AtlasSnapshotBuilder(
         contracts=StubContracts(
-            chain_snapshot(now, block=block), contract_facts(total_supply_raw=SUPPLY, block=block)
+            chain_snapshot(now, block=block), contract_facts(total_supply_raw=supply, block=block)
         ),
-        holders=StubHolders(
-            holder_source_result(
-                now,
-                rows=wallets() if rows is None else rows,
-                completeness=completeness,
-                snapshot_block=block,
-                provider_total_supply_raw=SUPPLY,
-            )
-        ),
+        holders=StubHolders(holder_result),
         origins=StubOrigins(origin() if origin_facts is None else origin_facts),
         pool_census=None if chain is None else census_for(chain, bounds=bounds),
         clock=FixedClock(now),
@@ -269,3 +282,24 @@ def official_launch(
         *buyers,
     )
     return chain, pool, rows
+
+
+def locked_only_launch(
+    *, owner: str = OFFICIAL_SPLITTER, extra: int = 0
+) -> tuple[FakeV4Chain, Pool, int, tuple[HolderSourceRow, ...]]:
+    """An official launch at T+0: the whole supply in one locked position, no buyers.
+
+    The supply is exactly what the position holds plus ``extra`` -- a remainder
+    the PoolManager keeps beyond every position -- so the PoolManager is the
+    only holder and owns every unit. Returns chain, pool, supply and the raw
+    rows a complete holder provider would report: the PoolManager alone.
+    """
+    chain = FakeV4Chain(token=TOKEN)
+    if owner == OFFICIAL_SPLITTER:
+        chain.codes[OFFICIAL_SPLITTER] = fee_splitter_code()
+    pool = chain.add_pool(traded_pool(tick=LAUNCH_TICK))
+    liquidity = liquidity_for(SUPPLY, LAUNCH_TICK, MIN_LAUNCH_TICK)
+    chain.mint(pool, owner, LAUNCH_TOKEN_ID, MIN_LAUNCH_TICK, LAUNCH_TICK, liquidity)
+    chain.extra_pool_balance = extra
+    supply = chain.pool_balance(chain.head)
+    return chain, pool, supply, (HolderSourceRow(address=POOL_MANAGER, balance_raw=supply),)

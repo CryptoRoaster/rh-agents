@@ -209,12 +209,41 @@ Outcome at the pinned block:
     proves nothing.
   - No minimum lock duration exists. A timelock is never a safe pass until a
     separate holding-horizon policy is decided.
+- **A proven empty distribution is exactly zero.** At T+0 an official launch
+  can have one holder, the PoolManager, and one permanently locked position.
+  After the PoolManager row leaves the ranking, nothing is left. That empty
+  ranking is reported as top 1, 5 and 10 = `0` with basis `EXACT`, against the
+  unchanged total-supply denominator, and only when **all** of the following
+  hold:
+  - the holder set is `COMPLETE` and retained whole (below the retention cap);
+  - the provider's holder count, if given, equals the rows;
+  - no provider exclusion is unreconciled;
+  - the rows account for the entire on-chain supply and are the PoolManager
+    alone;
+  - the PoolManager holds the whole supply;
+  - there is no unattributed remainder and no unknown owner;
+  - every PoolManager unit is in `PERMANENTLY_LOCKED` positions, with nothing
+    direct, releasable, timelocked or of unknown custody.
+
+  Anything less behaves as before:
+  - a `TOP_N_ONLY` prefix, a count above the rows, an exclusion, or supply
+    outside the rows: `V4_HOLDER_BASIS_UNAVAILABLE`;
+  - a small remainder: ranked as `UNATTRIBUTED_POOL_BALANCE` with basis
+    `UPPER_BOUND`;
+  - a remainder over 1 %: unknown;
+  - unresolved custody: `V4_POSITION_CONTROL_UNRESOLVED`.
+
+  Zero means "no economically controllable principal was found". It does not
+  mean "safe".
 - **Exits are never bound:** a sale keeps its raw figure.
 - **ATLAS limited policy:** a token read through pool control is no longer
   also judged on its raw top ten, which counts the PoolManager as one holder.
   The production policy sets no ATLAS limit.
 
-The REVENUE mechanism is unchanged. The creator-owned position is
+The REVENUE mechanism is unchanged. Its live reference point is block
+77 205 381, the last block before the creator's position was decreased to zero
+(77 205 382). The dump followed at 77 205 425, so block 77 205 424 already shows
+the supply in a wallet rather than in a position. The creator-owned position is
 `DIRECT_CONTROL` (~57.4 %). With the launch NFT in an unverified locker, the
 figure is unknown and its floor exceeds 35 %. With it in the official
 FeeSplitter, the established figure exceeds 35 %. A creator's own position
