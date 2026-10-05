@@ -44,10 +44,26 @@ never modified; an economic distribution is derived beside it.
   current `sqrtPriceX96` (Slot0 via `extsload`), rounded down; in-range,
   below-range and above-range (single-sided) positions are exact.
 
-Bounds (`CensusBounds`): block chunk 10 000, at most 240 requests, 16 pools,
-4 000 position events, 64 active positions, 30 s wall clock; sequential reads
-only. `eth_getLogs` is additionally capped at 100 000 blocks and a page of
-5 000 logs is treated as possibly cut. Reaching any bound, and any RPC failure
+Bounds (`CensusBounds`): at most 240 requests, 16 pools, 4 000 position
+events, 64 active positions, 30 s wall clock; sequential reads only.
+
+Log windows are adaptive:
+- Every filtered log stream (both `Initialize` orientations and each pool's
+  `ModifyLiquidity`) starts with a 100 000-block window, the RPC client's own
+  `eth_getLogs` cap.
+- If the provider fails a window with `RPC_ERROR`, `RPC_CONTRACT` (which
+  includes a possibly cut page of 5 000 logs) or `TIMEOUT`, the same window is
+  asked again, half as wide.
+- The narrower span that worked is kept for the rest of that stream.
+- Narrowing stops at one block. Rate limits, credentials, chain identity,
+  connectivity and an unavailable provider are never split.
+- Every attempt, failed probes included, is one budgeted read. No read happens
+  once the budget is spent.
+- Answered windows tile the range exactly, and a failed window is never "no
+  logs". Before any log read, a history that even full-width windows could not
+  cover in the remaining budget is refused at once.
+
+Reaching any bound, and any RPC failure
 or timeout, is an unavailable census with a reason — never a short list
 reported as complete. A source answering for another chain is a hard refusal.
 
@@ -115,11 +131,15 @@ read-only RPC client.
 
 ## Known limits
 
-* **History budget.** With the default bounds (10 000-block chunks, 240
-  requests) a token's history is covered for roughly a day of Robinhood Chain
-  blocks; older tokens end as `V4_POOL_CENSUS_BOUNDS_EXCEEDED` — fail closed.
-  Chunk size and budget must be tuned against the live RPC's `eth_getLogs`
-  limits before activation.
+* **History budget.** At full 100 000-block windows the discovery alone fits
+  up to about 11.7 million blocks of history (2 x 117 windows plus the fixed
+  reads), roughly two weeks of Robinhood Chain; pools and positions take their
+  share of the rest; the live 2.66-million-block case needs 94
+  reads. A provider that only answers narrower windows covers proportionally
+  less: at 25 000 blocks, the same 2.66 million blocks need more than 240 reads
+  and fail closed. Older or busier histories end as
+  `V4_POOL_CENSUS_BOUNDS_EXCEEDED`, which is fail closed; a persistent,
+  incremental census would be a separate change.
 * **Holder/chain skew.** Provider holder rows belong to their own snapshot,
   pool facts to the pinned block; a withdrawal between the two is bounded only
   by the existing source-skew policy.

@@ -13,7 +13,7 @@ truncates quietly and reports itself complete. A failed read is unknown, never
 """
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
@@ -80,6 +80,15 @@ FAILURES: dict[ErrorCode, AtlasSourceFailure] = {
 # A call that reverted or answered malformed bytes. For an optional read such
 # as a hook's `owner()` this means "not established", never a transport error.
 CALL_REFUSALS = frozenset({ErrorCode.RPC_ERROR, ErrorCode.CONTRACT})
+# Range read failures a smaller window can plausibly answer: the provider
+# refused the span, cut or garbled a large answer, or ran out of time on it.
+# Anything else -- rate limits, credentials, chain identity, connectivity, an
+# unavailable provider -- is not about the window, and asking more often would
+# only make it worse, so it fails the census as it always did.
+SPLITTABLE_LOG_FAILURES = frozenset({ErrorCode.RPC_ERROR, ErrorCode.CONTRACT, ErrorCode.TIMEOUT})
+# The smallest window a failing range is narrowed to: one block. A range that
+# fails even there fails the census.
+MIN_LOG_SPAN = 1
 
 
 @dataclass(frozen=True)
@@ -117,10 +126,14 @@ class PoolControlChainRefused(Exception):
 
 @dataclass(frozen=True)
 class CensusBounds:
-    # Blocks per `eth_getLogs` request. Robinhood Chain produces roughly ten
-    # blocks a second, so one chunk is about seventeen minutes of history.
-    chunk_blocks: int = 10_000
-    # Every read counts: logs, calls, code, balances and block headers.
+    # The largest window one `eth_getLogs` request starts with, and the most
+    # the RPC client accepts (`MAX_EVENT_LOG_SPAN`). A maximum, not a promise:
+    # a provider that refuses it gets the same unanswered window again, halved,
+    # until one is answered (`_scan`). Robinhood Chain produces roughly ten
+    # blocks a second, so a full window is close to three hours of history.
+    chunk_blocks: int = 100_000
+    # Every read counts: logs -- each narrowing retry included -- calls, code,
+    # balances and block headers. Never exceeded, never reset.
     max_requests: int = 240
     max_pools: int = MAX_POOLS
     max_positions: int = MAX_POSITIONS
@@ -162,9 +175,10 @@ class _Run:
     owner_codes: dict[str, str] = field(default_factory=dict)
 
     def spend(self) -> None:
-        self.requests += 1
-        if self.requests > self.bounds.max_requests:
+        """Claim one read before it is made. With the budget gone, no read happens."""
+        if self.requests >= self.bounds.max_requests:
             raise _Incomplete(self.bound_gap, AtlasSourceFailure.INCOMPLETE_RESULT)
+        self.requests += 1
 
 
 @dataclass(frozen=True)
@@ -185,10 +199,6 @@ class _CustodyReads:
     async def call(self, address: str, selector: str) -> str:
         self.run.spend()
         return await self.run.reads.call(address, selector, self.block)
-
-
-def block_ranges(start: int, end: int, chunk: int) -> tuple[tuple[int, int], ...]:
-    return tuple((low, min(low + chunk - 1, end)) for low in range(start, end + 1, chunk))
 
 
 def address_topic(address: str) -> str:
@@ -277,13 +287,16 @@ class V4PoolCensus:
         await self._verify_deployment(run, deployment, block)
         await self._verify_creation(run, token, from_block)
 
-        ranges = block_ranges(from_block, block, self.bounds.chunk_blocks)
-        if 2 * len(ranges) > self.bounds.max_requests:
-            # Known before the first scan: the history is longer than the budget.
+        # The cheapest conceivable discovery: both orientations, every window
+        # at the largest span, none refused. If even that exceeds what is left
+        # of the budget the census cannot complete, and saying so now spends
+        # nothing. Anything this does not rule out is attempted.
+        windows = -(-(block - from_block + 1) // self.bounds.chunk_blocks)
+        if run.requests + 2 * windows > self.bounds.max_requests:
             raise _Incomplete(
                 PoolControlGap.CENSUS_BOUNDS_EXCEEDED, AtlasSourceFailure.INCOMPLETE_RESULT
             )
-        found = await self._initializations(run, deployment.pool_manager, token, ranges)
+        found = await self._initializations(run, deployment.pool_manager, token, from_block, block)
         pools = [await self._pool(run, deployment, item, block) for item in found]
 
         run.phase = PoolControlGap.POSITION_FACTS_INCOMPLETE
@@ -348,54 +361,95 @@ class V4PoolCensus:
         if before != "0x" or len(at) <= 2:
             raise _Incomplete(PoolControlGap.CREATION_BLOCK_UNKNOWN, None)
 
+    async def _scan(
+        self,
+        run: _Run,
+        address: str,
+        topics: tuple[str | None, ...],
+        start: int,
+        end: int,
+        accept: Callable[[tuple[ChainLog, ...], int, int], None],
+    ) -> None:
+        """Every matching log over ``[start, end]``, window by window, in order.
+
+        One stream: one contract, one topic filter, one range. Each window is
+        one budgeted read. A window the provider fails to answer in a way a
+        smaller window might fix is asked again from the same block, half as
+        wide; the narrower span that worked is kept for the rest of the stream.
+        A failed window is never read as "no logs": the cursor moves only past
+        windows that were answered and accepted, so the accepted windows tile
+        the range exactly -- no gap, no overlap, each boundary block once.
+        Narrowing is sequential, never a tree of parallel halves, and stops at
+        one block: a range unanswerable even there fails the census.
+        """
+        span = self.bounds.chunk_blocks
+        cursor = start
+        while cursor <= end:
+            window_end = min(cursor + span - 1, end)
+            run.spend()
+            try:
+                logs = await self.reads.logs(address, topics, cursor, window_end)
+            except RuntimeFailure as error:
+                width = window_end - cursor + 1
+                if error.code not in SPLITTABLE_LOG_FAILURES or width <= MIN_LOG_SPAN:
+                    raise
+                span = max(MIN_LOG_SPAN, width // 2)
+                continue
+            accept(logs, cursor, window_end)
+            cursor = window_end + 1
+
     async def _initializations(
         self,
         run: _Run,
         manager: str,
         token: str,
-        ranges: tuple[tuple[int, int], ...],
+        start: int,
+        end: int,
     ) -> list[InitializeEvent]:
         topic = address_topic(token)
         found: dict[str, InitializeEvent] = {}
-        for start, end in ranges:
-            for topics in ((INITIALIZE_TOPIC, None, topic), (INITIALIZE_TOPIC, None, None, topic)):
-                run.spend()
-                for log in await self.reads.logs(manager, topics, start, end):
-                    try:
-                        event = decode_initialize(log.topics, log.data, log.block_number)
-                    except V4DecodeError:
-                        raise _Incomplete(
-                            PoolControlGap.CENSUS_UNAVAILABLE, AtlasSourceFailure.INVALID_RESPONSE
-                        ) from None
-                    expected = pool_id(
-                        event.currency0,
-                        event.currency1,
-                        event.fee,
-                        event.tick_spacing,
-                        event.hooks,
+
+        def accept(logs: tuple[ChainLog, ...], low: int, high: int) -> None:
+            for log in logs:
+                try:
+                    event = decode_initialize(log.topics, log.data, log.block_number)
+                except V4DecodeError:
+                    raise _Incomplete(
+                        PoolControlGap.CENSUS_UNAVAILABLE, AtlasSourceFailure.INVALID_RESPONSE
+                    ) from None
+                expected = pool_id(
+                    event.currency0,
+                    event.currency1,
+                    event.fee,
+                    event.tick_spacing,
+                    event.hooks,
+                )
+                if (
+                    expected != event.pool_id
+                    or token not in (event.currency0, event.currency1)
+                    or not low <= event.block_number <= high
+                ):
+                    # The id the chain reported does not hash from the key it
+                    # reported, or the log is not what was asked for.
+                    raise _Incomplete(
+                        PoolControlGap.POOL_KEY_MISMATCH, AtlasSourceFailure.INVALID_RESPONSE
                     )
-                    if (
-                        expected != event.pool_id
-                        or token not in (event.currency0, event.currency1)
-                        or not start <= event.block_number <= end
-                    ):
-                        # The id the chain reported does not hash from the key it
-                        # reported, or the log is not what was asked for.
-                        raise _Incomplete(
-                            PoolControlGap.POOL_KEY_MISMATCH, AtlasSourceFailure.INVALID_RESPONSE
-                        )
-                    if event.pool_id in found:
-                        # A pool initializes once; a second Initialize is not V4.
-                        raise _Incomplete(
-                            PoolControlGap.POOL_KEY_MISMATCH, AtlasSourceFailure.INVALID_RESPONSE
-                        )
-                    found[event.pool_id] = event
-                    run.pools_found = len(found)
-                    if len(found) > self.bounds.max_pools:
-                        raise _Incomplete(
-                            PoolControlGap.CENSUS_BOUNDS_EXCEEDED,
-                            AtlasSourceFailure.INCOMPLETE_RESULT,
-                        )
+                if event.pool_id in found:
+                    # A pool initializes once; a second Initialize is not V4.
+                    raise _Incomplete(
+                        PoolControlGap.POOL_KEY_MISMATCH, AtlasSourceFailure.INVALID_RESPONSE
+                    )
+                found[event.pool_id] = event
+                run.pools_found = len(found)
+                if len(found) > self.bounds.max_pools:
+                    raise _Incomplete(
+                        PoolControlGap.CENSUS_BOUNDS_EXCEEDED,
+                        AtlasSourceFailure.INCOMPLETE_RESULT,
+                    )
+
+        # The token as currency0, then as currency1: no quote asset is assumed.
+        for topics in ((INITIALIZE_TOPIC, None, topic), (INITIALIZE_TOPIC, None, None, topic)):
+            await self._scan(run, manager, topics, start, end, accept)
         return sorted(found.values(), key=lambda item: (item.block_number, item.pool_id))
 
     async def _pool(
@@ -483,11 +537,11 @@ class V4PoolCensus:
         net: dict[tuple[str, str, int, int, str], int] = {}
         events = 0
         for pool in pools:
-            for start, end in block_ranges(pool.created_block, block, self.bounds.chunk_blocks):
-                run.spend()
-                logs = await self.reads.logs(
-                    deployment.pool_manager, (MODIFY_LIQUIDITY_TOPIC, pool.pool_id), start, end
-                )
+
+            def accept(
+                logs: tuple[ChainLog, ...], low: int, high: int, pool: V4PoolFacts = pool
+            ) -> None:
+                nonlocal events
                 events += len(logs)
                 if events > self.bounds.max_position_events:
                     raise _Incomplete(
@@ -499,7 +553,7 @@ class V4PoolCensus:
                         change = decode_modify_liquidity(log.topics, log.data, log.block_number)
                     except V4DecodeError:
                         raise invalid from None
-                    if change.pool_id != pool.pool_id or not start <= change.block_number <= end:
+                    if change.pool_id != pool.pool_id or not low <= change.block_number <= high:
                         raise invalid
                     key = (
                         pool.pool_id,
@@ -509,6 +563,15 @@ class V4PoolCensus:
                         change.salt,
                     )
                     net[key] = net.get(key, 0) + change.liquidity_delta
+
+            await self._scan(
+                run,
+                deployment.pool_manager,
+                (MODIFY_LIQUIDITY_TOPIC, pool.pool_id),
+                pool.created_block,
+                block,
+                accept,
+            )
         if any(value < 0 for value in net.values()):
             # More liquidity removed than was ever added: the history is not whole.
             raise invalid
