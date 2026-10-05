@@ -17,6 +17,8 @@ from src.codex_reasoning.provider import (
     codex_provider_from,
 )
 from src.core.config import Settings
+from src.evaluation.codex.auth_home import AuthSourceError, Persistence
+from src.evaluation.codex.credential_lease import CredentialLeaseError
 from src.evaluation.codex.models import (
     AttemptConfiguration,
     CleanupReport,
@@ -83,9 +85,15 @@ class Status:
 
 
 @dataclass
+class Credentials:
+    persistence: Persistence | None = None
+
+
+@dataclass
 class Prepared:
     runner: Runner | None
     status: Status = field(default_factory=Status)
+    credentials: Credentials = field(default_factory=Credentials)
 
 
 @dataclass
@@ -95,6 +103,9 @@ class FakePrepare:
     respond: Callable[[EvaluationRequest[Any]], Any] = lambda _: completed()
     grant: bool = True
     fail: bool = False
+    refuse_with: Exception | None = None
+    # What teardown reports about the copied login state.
+    persistence: Persistence = Persistence.UNCHANGED
     blocking: tuple[Gate, ...] = (Gate("CODEX_VERSION"),)
     entries: list[dict[str, Any]] = field(default_factory=list)
     runners: list[Runner] = field(default_factory=list)
@@ -105,12 +116,16 @@ class FakePrepare:
         self.entries.append(kwargs)
         if self.fail:
             raise PermissionError("/Users/someone/.codex/auth.json")
+        if self.refuse_with is not None:
+            raise self.refuse_with
         runner = Runner(self.respond) if self.grant else None
         if runner is not None:
             self.runners.append(runner)
+        prepared = Prepared(runner, Status(() if runner is not None else self.blocking))
         try:
-            yield Prepared(runner, Status(() if runner is not None else self.blocking))
+            yield prepared
         finally:
+            prepared.credentials.persistence = self.persistence
             self.exits += 1
 
 
@@ -345,3 +360,86 @@ def test_the_configured_cli_and_home_are_used(
     assert codex.launcher.executable == binary
     assert codex.source_codex_home == tmp_path / "home"
     assert codex.effort == "medium"
+
+
+@pytest.mark.asyncio
+async def test_a_dead_login_is_reported_as_one_that_needs_signing_in() -> None:
+    """Not a transient outage: retrying cannot help until someone signs in again."""
+    prepare = FakePrepare(respond=lambda _: rejected(EvaluationFailure.LOGIN_REQUIRED))
+    with pytest.raises(ReasoningFailure) as caught:
+        await provider(prepare).generate_structured(request())
+    assert caught.value.category is ReasoningErrorCategory.PROVIDER_NOT_CONFIGURED
+    assert caught.value.reason_code == "CODEX_LOGIN_REQUIRED"
+
+
+@pytest.mark.parametrize(
+    ("error", "category", "code"),
+    [
+        (
+            CredentialLeaseError("CODEX_AUTH_LEASE_TIMEOUT"),
+            ReasoningErrorCategory.PROVIDER_UNAVAILABLE,
+            "CODEX_AUTH_LEASE_TIMEOUT",
+        ),
+        (
+            CredentialLeaseError("CODEX_AUTH_LEASE_UNAVAILABLE"),
+            ReasoningErrorCategory.PROVIDER_NOT_CONFIGURED,
+            "CODEX_AUTH_LEASE_UNAVAILABLE",
+        ),
+        (
+            AuthSourceError("CODEX_AUTH_SOURCE_UNSAFE"),
+            ReasoningErrorCategory.PROVIDER_NOT_CONFIGURED,
+            "CODEX_AUTH_SOURCE_UNSAFE",
+        ),
+        (
+            AuthSourceError("CODEX_AUTH_SOURCE_CHANGED"),
+            ReasoningErrorCategory.PROVIDER_UNAVAILABLE,
+            "CODEX_AUTH_SOURCE_CHANGED",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_lease_or_source_refusal_is_a_typed_failure_and_no_turn(
+    error: Exception, category: ReasoningErrorCategory, code: str
+) -> None:
+    prepare = FakePrepare(refuse_with=error)
+    with pytest.raises(ReasoningFailure) as caught:
+        await provider(prepare).generate_structured(request())
+    assert caught.value.category is category
+    assert caught.value.reason_code == code
+    assert prepare.runners == []
+
+
+@pytest.mark.parametrize(
+    ("persistence", "code"),
+    [
+        (Persistence.SOURCE_CHANGED, "CODEX_AUTH_SOURCE_CHANGED"),
+        (Persistence.REFRESH_UNSAFE, "CODEX_AUTH_REFRESH_UNSAFE"),
+        (Persistence.WRITEBACK_FAILED, "CODEX_AUTH_WRITEBACK_FAILED"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_login_state_that_did_not_come_back_fails_even_a_good_turn(
+    persistence: Persistence, code: str
+) -> None:
+    """Fail closed: the next call would start from a login state nobody vouches for."""
+    prepare = FakePrepare(persistence=persistence)
+    with pytest.raises(ReasoningFailure) as caught:
+        await provider(prepare).generate_structured(request())
+    assert caught.value.category is ReasoningErrorCategory.PROVIDER_UNAVAILABLE
+    assert caught.value.reason_code == code
+
+
+@pytest.mark.asyncio
+async def test_a_persistence_failure_outranks_a_refused_release() -> None:
+    prepare = FakePrepare(grant=False, persistence=Persistence.WRITEBACK_FAILED)
+    with pytest.raises(ReasoningFailure) as caught:
+        await provider(prepare).generate_structured(request())
+    assert caught.value.reason_code == "CODEX_AUTH_WRITEBACK_FAILED"
+
+
+@pytest.mark.parametrize("persistence", [Persistence.PERSISTED, Persistence.UNCHANGED])
+@pytest.mark.asyncio
+async def test_a_refresh_written_back_is_an_ordinary_success(persistence: Persistence) -> None:
+    prepare = FakePrepare(persistence=persistence)
+    result = await provider(prepare).generate_structured(request())
+    assert result.output == Answer(verdict="ok")

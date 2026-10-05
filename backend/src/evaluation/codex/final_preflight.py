@@ -17,7 +17,9 @@ import os
 import shutil
 from pathlib import Path
 
+from src.evaluation.codex.auth_home import AuthSourceError
 from src.evaluation.codex.catalogs import GPT_5_5_CATALOG, GPT_5_5_CATALOG_SLUG
+from src.evaluation.codex.credential_lease import CredentialLeaseError
 from src.evaluation.codex.models import CodexLauncher, LauncherKind
 from src.evaluation.codex.prepared_run import prepare_real_run
 from src.evaluation.codex.release import PreflightStatus
@@ -68,9 +70,15 @@ def main() -> int:
     if launcher is None:
         print("CODEX_LAUNCHER  FAIL  platform binary not found")
         return 2
-    status, authorised = asyncio.run(
-        run_preflight(launcher=launcher, source_codex_home=arguments.source_codex_home)
-    )
+    try:
+        status, authorised = asyncio.run(
+            run_preflight(launcher=launcher, source_codex_home=arguments.source_codex_home)
+        )
+    except (CredentialLeaseError, AuthSourceError) as error:
+        # A code and nothing else: the lease or the source login state refused
+        # before anything was measured.
+        print(f"CODEX_CREDENTIALS  FAIL  {error.code}")
+        return 1
     print(status.render())
     print()
     print(f"RUNNER_BOUND_TO_THIS_ENVIRONMENT  {'YES' if authorised else 'NO'}")

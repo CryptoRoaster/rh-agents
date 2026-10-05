@@ -63,6 +63,35 @@ from src.evaluation.codex.models import (
 
 TOOL_ITEM_TYPES = frozenset({"command_execution", "file_change", "mcp_tool_call", "web_search"})
 
+# The messages Codex 0.153.4 (`codex-rs/login`, the ChatGPT auth manager)
+# reports when an access token cannot be refreshed, every one of which ends
+# with the instruction to sign in again. They are the build's own fixed text,
+# matched as whole sentences: an expired, already used or revoked refresh
+# token, a refresh that failed for an unclassified reason, and a login that
+# changed to another account underneath the attempt.
+#
+# Deliberately absent: a bare HTTP 401 or `token_expired`. An expired *access*
+# token is routine and normally refreshed in place; it means a login is
+# required only when one of these messages says the refresh failed. And the
+# MCP OAuth wording ("OAuth refresh token was rejected") is about a tool
+# server, not about the ChatGPT session.
+LOGIN_REQUIRED_MESSAGES = (
+    "Your access token could not be refreshed because your refresh token has expired. "
+    "Please log out and sign in again.",
+    "Your access token could not be refreshed because your refresh token was already used. "
+    "Please log out and sign in again.",
+    "Your access token could not be refreshed because your refresh token was revoked. "
+    "Please log out and sign in again.",
+    "Your access token could not be refreshed. Please log out and sign in again.",
+    "Your access token could not be refreshed because you have since logged out or signed in "
+    "to another account. Please sign in again.",
+)
+
+
+def requires_login(message: str) -> bool:
+    """Whether a Codex error message is one of the permanent ChatGPT login failures."""
+    return any(known in message for known in LOGIN_REQUIRED_MESSAGES)
+
 
 class StreamError(Exception):
     """The event stream cannot be interpreted, or the turn did not succeed.
@@ -111,6 +140,10 @@ class EventAccumulator:
     # events, so these accumulate while the run continues and are what makes a
     # later terminal failure explainable.
     error_lines: tuple[str, ...] = ()
+    # Set when an `error` or `turn.failed` message is one of the permanent
+    # login failures. Only this flag survives; the message itself is redacted
+    # like any other.
+    login_required: bool = False
 
     def feed(self, line: bytes) -> None:
         text = line.strip()
@@ -178,6 +211,8 @@ class EventAccumulator:
             # describing a retry, and it stays a refusal for the same reason
             # `ITEM_MISSING` does.
             raise StreamError(EvaluationFailure.PROCESS_FAILED, "STREAM_ERROR_MALFORMED")
+        if requires_login(message):
+            self.login_required = True
         self._remember(redact(message.encode("utf-8", errors="replace"), self.aliases))
 
     def _remember(self, lines: tuple[str, ...]) -> None:
@@ -275,7 +310,14 @@ class EventAccumulator:
         error = event.get("error")
         message = error.get("message") if isinstance(error, dict) else None
         if isinstance(message, str):
+            if requires_login(message):
+                self.login_required = True
             self._remember(redact(message.encode("utf-8", errors="replace"), self.aliases))
+        if self.login_required:
+            # A turn that failed after the CLI said its login cannot be
+            # refreshed failed for that reason. Retrying it cannot help; only
+            # signing in again can, and the code says exactly that.
+            raise StreamError(EvaluationFailure.LOGIN_REQUIRED, "LOGIN_REQUIRED", self.error_lines)
         raise StreamError(
             EvaluationFailure.TURN_FAILED,
             "TURN_FAILED" if isinstance(message, str) else "TURN_FAILED_MALFORMED",

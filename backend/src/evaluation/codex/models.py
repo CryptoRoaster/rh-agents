@@ -76,6 +76,10 @@ class EvaluationFailure(StrEnum):
     PARSER_BUDGET_EXCEEDED = "PARSER_BUDGET_EXCEEDED"
     EVENT_STREAM_INVALID = "EVENT_STREAM_INVALID"
     TURN_FAILED = "TURN_FAILED"
+    # The turn failed because the ChatGPT login can no longer be refreshed:
+    # only signing in again helps. Recognised from the CLI's own fixed
+    # messages, never from a status code alone (see `stream.py`).
+    LOGIN_REQUIRED = "LOGIN_REQUIRED"
     NO_FINAL_MESSAGE = "NO_FINAL_MESSAGE"
     INCONSISTENT_COMPLETION = "INCONSISTENT_COMPLETION"
     OUTPUT_NOT_JSON = "OUTPUT_NOT_JSON"

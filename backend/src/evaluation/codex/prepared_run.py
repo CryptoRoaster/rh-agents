@@ -31,8 +31,19 @@ load consumed parses as an empty document on the second. The name is the point;
 the file is 0400 in a 0500 directory, the profile grants read and nothing else
 on that one literal path, and the digest is bound and re-checked before exec.
 
-On exit: the runtime catalog, the profile, the isolated home and the whole tree
-are removed.
+On exit: a login state the CLI refreshed in the isolated home is written back
+to the source (`auth_home.persist_refresh`), and only then are the runtime
+catalog, the profile, the isolated home and the whole tree removed. The outcome
+is recorded on `PreparedRealRun.credentials`, where a caller reads it after the
+context has closed.
+
+All of it -- copy, probes, the caller's turn, write-back and teardown -- runs
+under the credential lease for the source home (`credential_lease.py`). Codex
+rotates refresh tokens, so two attempts holding copies of one generation at the
+same time would redeem one refresh token twice, and the provider refuses the
+second redemption for good. Waiting for the lease draws on the caller's probe
+budget; running out of it is `CredentialLeaseError`, raised before anything is
+built.
 
 The boundary probe keeps a home of its own. Its write check rewrites the auth
 file it is pointed at, and pointing that at the copied login state would push a
@@ -62,7 +73,9 @@ from src.evaluation.codex.auth_home import (
     INSTALLATION_ID_FILE,
     INSTALLATION_ID_MODE,
     IsolatedHome,
+    Persistence,
     build_isolated_home,
+    persist_refresh,
 )
 from src.evaluation.codex.catalog import (
     RUNTIME_CATALOG_FILE,
@@ -80,6 +93,7 @@ from src.evaluation.codex.command import (
     build_version_arguments,
     child_environment,
 )
+from src.evaluation.codex.credential_lease import LEASE_WAIT_SECONDS, credential_lease
 from src.evaluation.codex.deadline import MIN_WORK_SECONDS, Deadline
 from src.evaluation.codex.models import (
     SUPPORTED_CLI_VERSION,
@@ -106,6 +120,13 @@ PLACEHOLDER_AUTH = '{"placeholder": "not a credential"}\n'
 PLACEHOLDER_INSTALLATION_ID = "00000000-0000-4000-8000-000000000000"
 
 
+@dataclass
+class CredentialOutcome:
+    """What became of the copied login state. Set at teardown, read afterwards."""
+
+    persistence: Persistence | None = None
+
+
 @dataclass(frozen=True)
 class PreparedRealRun:
     """A measured environment, and what it does or does not authorise.
@@ -122,6 +143,7 @@ class PreparedRealRun:
     runtime_catalog: RuntimeCatalog | None
     authorization: ReleaseAuthorization | None
     runner: RealCodexRunner | None
+    credentials: CredentialOutcome
 
     def require_runner(self) -> RealCodexRunner:
         """The runner, or the refusal that explains why there is none."""
@@ -312,131 +334,155 @@ async def prepare_real_run(
     source_codex_home: Path,
     effort: str | None = None,
     probe_budget_seconds: float | None = None,
+    lease_wait_seconds: float = LEASE_WAIT_SECONDS,
+    lease_parent: Path | None = None,
 ) -> AsyncIterator[PreparedRealRun]:
     """Build the environment, measure it, and hold it open while it is valid.
 
     `effort` is carried into the bound configuration unchanged; an effort the
     client does not support is refused at the attempt, before any exec.
 
-    `probe_budget_seconds` bounds every probe together: the version and login
-    probes and the boundary probe all draw on it, so a caller's deadline also
-    holds for the preflight. Without it each probe keeps its own fixed budget.
-    A probe that ran out of time fails its gate; it never passes one.
+    `probe_budget_seconds` bounds every probe together: the wait for the
+    credential lease, the version and login probes and the boundary probe all
+    draw on it, so a caller's deadline also holds for the preflight. Without it
+    each probe keeps its own fixed budget. A probe that ran out of time fails
+    its gate; it never passes one.
+
+    Raises `CredentialLeaseError` when the lease cannot be taken in time, and
+    `AuthSourceError` when the source login state cannot be copied safely. Both
+    carry a stable code and nothing else, and both leave nothing behind.
     """
     ends = None if probe_budget_seconds is None else time.monotonic() + probe_budget_seconds
-    root = Path(tempfile.mkdtemp(prefix="codex-preflight-"))
-    os.chmod(root, 0o700)
-    tree = _build_tree(root)
-    profile = sandbox.write_bound_profile(root)
-    isolated = build_isolated_home(source_codex_home, root)
-    # One materialisation, held for the whole context. The file keeps its name
-    # until teardown precisely because Codex reopens it: the catalog is loaded
-    # once by the initial `ConfigBuilder::build()` and again at `thread/start`.
-    runtime_catalog = materialise_runtime_catalog(GPT_5_5_CATALOG, tree.catalog_runtime)
-    vendor = sandbox.codex_vendor_root(launcher.executable)
-    try:
-        version: str | None = None
-        session: bool | None = None
-        roots = sandbox.SandboxRoots(
-            codex_vendor=vendor,
-            workspace=tree.workspace,
-            codex_home=isolated.path if isolated is not None else tree.probe_home,
-            # Falls back to the placeholder when the runtime catalog could not
-            # be written, so the profile still has every parameter it names.
-            # The gates then fail on the catalog rather than on a malformed
-            # `sandbox-exec` invocation.
-            catalog_file=(
-                runtime_catalog.path if runtime_catalog is not None else tree.probe_catalog_file
-            ),
-        )
-        if isolated is not None:
-            version, session = await _ask_the_cli(
-                launcher=launcher,
-                roots=roots,
-                profile=profile,
-                environment=child_environment(
-                    codex_home=isolated.path,
-                    home=tree.home,
-                    tmpdir=tree.tmpdir,
-                    path_entries=launcher.path_entries,
-                ),
+    wait = lease_wait_seconds if ends is None else min(lease_wait_seconds, ends - time.monotonic())
+    async with credential_lease(source_codex_home, wait_seconds=wait, parent=lease_parent):
+        credentials = CredentialOutcome()
+        root = Path(tempfile.mkdtemp(prefix="codex-preflight-"))
+        isolated: IsolatedHome | None = None
+        runtime_catalog: RuntimeCatalog | None = None
+        profile: sandbox.WrittenProfile | None = None
+        tree: _Tree | None = None
+        try:
+            os.chmod(root, 0o700)
+            tree = _build_tree(root)
+            profile = sandbox.write_bound_profile(root)
+            isolated = build_isolated_home(source_codex_home, root)
+            # One materialisation, held for the whole context. The file keeps
+            # its name until teardown precisely because Codex reopens it: the
+            # catalog is loaded once by the initial `ConfigBuilder::build()`
+            # and again at `thread/start`.
+            runtime_catalog = materialise_runtime_catalog(GPT_5_5_CATALOG, tree.catalog_runtime)
+            vendor = sandbox.codex_vendor_root(launcher.executable)
+            version: str | None = None
+            session: bool | None = None
+            roots = sandbox.SandboxRoots(
+                codex_vendor=vendor,
                 workspace=tree.workspace,
-                ends=ends,
+                codex_home=isolated.path if isolated is not None else tree.probe_home,
+                # Falls back to the placeholder when the runtime catalog could
+                # not be written, so the profile still has every parameter it
+                # names. The gates then fail on the catalog rather than on a
+                # malformed `sandbox-exec` invocation.
+                catalog_file=(
+                    runtime_catalog.path if runtime_catalog is not None else tree.probe_catalog_file
+                ),
+            )
+            if isolated is not None:
+                version, session = await _ask_the_cli(
+                    launcher=launcher,
+                    roots=roots,
+                    profile=profile,
+                    environment=child_environment(
+                        codex_home=isolated.path,
+                        home=tree.home,
+                        tmpdir=tree.tmpdir,
+                        path_entries=launcher.path_entries,
+                    ),
+                    workspace=tree.workspace,
+                    ends=ends,
+                )
+
+            # The boundary probe gets the same floor as the CLI probes: below
+            # it, it is not started and both sandbox gates fail as unmeasured.
+            boundary_seconds = _left(ends, sandbox.PROBE_TIMEOUT_SECONDS)
+            if boundary_seconds - PROBE_CLEANUP_RESERVE_SECONDS < MIN_WORK_SECONDS:
+                boundary_seconds = 0.0
+            status = evaluate_release(
+                probe_timeout_seconds=boundary_seconds,
+                catalog_path=GPT_5_5_CATALOG,
+                expected_digest=GPT_5_5_CATALOG_SHA256,
+                model=GPT_5_5_CATALOG_SLUG,
+                snapshot_dir=tree.scratch,
+                cli_version=version,
+                supported_version=SUPPORTED_CLI_VERSION,
+                chatgpt_session=session,
+                # Measured against the placeholder home, for the reason in the
+                # module docstring. Same profile bytes; different `-D` values,
+                # and the real ones are what the binding pins.
+                roots=sandbox.SandboxRoots(
+                    codex_vendor=vendor,
+                    workspace=tree.probe_workspace,
+                    codex_home=tree.probe_home,
+                    # A placeholder, never the runtime catalog. The catalog
+                    # checks in the boundary probe try to write, truncate and
+                    # unlink the file they are pointed at; they are measurements
+                    # only because the policy refuses them, and a hole in that
+                    # policy must not cost the run its catalog.
+                    catalog_file=tree.probe_catalog_file,
+                ),
+                probe_outside=tree.probe_outside,
+                isolated_home=isolated,
             )
 
-        # The boundary probe gets the same floor as the CLI probes: below it,
-        # it is not started and both sandbox gates fail as unmeasured.
-        boundary_seconds = _left(ends, sandbox.PROBE_TIMEOUT_SECONDS)
-        if boundary_seconds - PROBE_CLEANUP_RESERVE_SECONDS < MIN_WORK_SECONDS:
-            boundary_seconds = 0.0
-        status = evaluate_release(
-            probe_timeout_seconds=boundary_seconds,
-            catalog_path=GPT_5_5_CATALOG,
-            expected_digest=GPT_5_5_CATALOG_SHA256,
-            model=GPT_5_5_CATALOG_SLUG,
-            snapshot_dir=tree.scratch,
-            cli_version=version,
-            supported_version=SUPPORTED_CLI_VERSION,
-            chatgpt_session=session,
-            # Measured against the placeholder home, for the reason in the
-            # module docstring. Same profile bytes; different `-D` values,
-            # and the real ones are what the binding pins.
-            roots=sandbox.SandboxRoots(
-                codex_vendor=vendor,
-                workspace=tree.probe_workspace,
-                codex_home=tree.probe_home,
-                # A placeholder, never the runtime catalog. The catalog checks
-                # in the boundary probe try to write, truncate and unlink the
-                # file they are pointed at; they are measurements only because
-                # the policy refuses them, and a hole in that policy must not
-                # cost the run its catalog.
-                catalog_file=tree.probe_catalog_file,
-            ),
-            probe_outside=tree.probe_outside,
-            isolated_home=isolated,
-        )
+            config = _configuration(
+                launcher=launcher,
+                tree=tree,
+                isolated=isolated if isolated is not None else IsolatedHome(tree.probe_home, False),
+                roots=roots,
+                profile=profile,
+                runtime_catalog=runtime_catalog,
+                effort=effort,
+            )
+            authorization: ReleaseAuthorization | None = None
+            runner: RealCodexRunner | None = None
+            try:
+                authorization = authorize(status, binding_for(config, profile.digest))
+                runner = RealCodexRunner(authorization=authorization, config=config)
+            except ReleaseRefused:
+                authorization = None
+                runner = None
 
-        config = _configuration(
-            launcher=launcher,
-            tree=tree,
-            isolated=isolated if isolated is not None else IsolatedHome(tree.probe_home, False),
-            roots=roots,
-            profile=profile,
-            runtime_catalog=runtime_catalog,
-            effort=effort,
-        )
-        authorization: ReleaseAuthorization | None = None
-        runner: RealCodexRunner | None = None
-        try:
-            authorization = authorize(status, binding_for(config, profile.digest))
-            runner = RealCodexRunner(authorization=authorization, config=config)
-        except ReleaseRefused:
-            authorization = None
-            runner = None
-
-        yield PreparedRealRun(
-            root=root,
-            status=status,
-            profile=profile,
-            config=config,
-            runtime_catalog=runtime_catalog,
-            authorization=authorization,
-            runner=runner,
-        )
-    finally:
-        if isolated is not None:
-            isolated.discard()
-        if runtime_catalog is not None:
-            # Its own teardown, because the directory is 0500 and the file is
-            # 0400 by the time anyone gets here; `rmtree` alone would leave
-            # both behind.
-            runtime_catalog.discard()
-        # The probe's placeholder catalog is left in the same read-only shape,
-        # for the same reason. `rmtree(ignore_errors=True)` would silently
-        # abandon the whole tree over one unwritable directory.
-        _reopen_for_teardown(tree.probe_catalog_runtime)
-        profile.path.unlink(missing_ok=True)
-        shutil.rmtree(root, ignore_errors=True)
+            yield PreparedRealRun(
+                root=root,
+                status=status,
+                profile=profile,
+                config=config,
+                runtime_catalog=runtime_catalog,
+                authorization=authorization,
+                runner=runner,
+                credentials=credentials,
+            )
+        finally:
+            # First, while the copy still exists and the lease is still held:
+            # a refresh that happened in it -- also before a turn that failed
+            # afterwards -- is the only valid generation there is.
+            credentials.persistence = (
+                persist_refresh(isolated) if isolated is not None else Persistence.NOT_APPLICABLE
+            )
+            if isolated is not None:
+                isolated.discard()
+            if runtime_catalog is not None:
+                # Its own teardown, because the directory is 0500 and the file
+                # is 0400 by the time anyone gets here; `rmtree` alone would
+                # leave both behind.
+                runtime_catalog.discard()
+            if tree is not None:
+                # The probe's placeholder catalog is left in the same read-only
+                # shape, for the same reason. `rmtree(ignore_errors=True)` would
+                # silently abandon the whole tree over one unwritable directory.
+                _reopen_for_teardown(tree.probe_catalog_runtime)
+            if profile is not None:
+                profile.path.unlink(missing_ok=True)
+            shutil.rmtree(root, ignore_errors=True)
 
 
-__all__ = ["PLACEHOLDER_AUTH", "PreparedRealRun", "prepare_real_run"]
+__all__ = ["PLACEHOLDER_AUTH", "CredentialOutcome", "PreparedRealRun", "prepare_real_run"]
