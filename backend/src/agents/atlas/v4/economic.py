@@ -8,8 +8,17 @@ it can be traced exactly — to the owners of the positions that hold it:
   distribution, because every unit of it is re-assigned below or remains
   explicitly unattributed — counting it as well would count the same tokens
   twice;
-* each attributed position's exact token amount is added to its owner;
+* each attributed position's exact token amount is added to its controller --
+  the account that owns it, or the controller a verified release names
+  (``control.py``); never to a custody contract as if it were a holder;
+* a position verified as permanently locked is nobody's: its amount is recorded
+  as locked liquidity and ranked for no holder;
+* a position whose control is unresolved -- unverified contract custody, or a
+  timelock not yet passed -- makes the figure unknown; only a floor is kept;
 * whatever the PoolManager holds beyond that is ``UNATTRIBUTED_POOL_BALANCE``.
+
+A fee entitlement is not control. Who is paid a position's fees has no bearing
+here: holder concentration is about who can move principal supply.
 
 Wherever a quantity can only be bounded it is ranked at its bound, so the
 result may overstate concentration but can never understate it, and is labelled
@@ -28,6 +37,7 @@ from src.agents.atlas.models import (
     OriginVerification,
 )
 from src.agents.atlas.sources.normalize import RETAINED_HOLDERS, TOP_N
+from src.agents.atlas.v4.control import UNRESOLVED_STATES, PositionControlState
 from src.agents.atlas.v4.models import (
     UNATTRIBUTED_POOL_BALANCE,
     ConcentrationBasis,
@@ -36,6 +46,7 @@ from src.agents.atlas.v4.models import (
     PoolControlGap,
     PositionOwnerStatus,
     V4Census,
+    V4PositionFacts,
 )
 from src.core.numbers import quantize
 from src.markets.models import Availability
@@ -147,10 +158,11 @@ def pool_control(
         for item in census.positions
         if item.owner_status == PositionOwnerStatus.OWNER_UNKNOWN
     )
+    buckets = _control_buckets(attributed)
     creator_raw = (
         None
         if creator is None
-        else sum(item.controlled_token_raw for item in attributed if item.owner == creator)
+        else sum(item.controlled_token_raw for item in attributed if item.controller == creator)
     )
     figures = {
         "required": required,
@@ -177,6 +189,11 @@ def pool_control(
         "attributable_pool_supply_fraction": _share(attributed_raw, supply),
         "unattributed_pool_supply_fraction": _share(unattributed_raw, supply),
     }
+    for state, field in BUCKET_FIELDS.items():
+        figures |= {
+            f"{field}_raw": buckets[state],
+            f"{field}_pool_supply_fraction": _share(buckets[state], supply),
+        }
     if Decimal(unattributed_raw) > MAX_UNATTRIBUTED_POOL_FRACTION * supply:
         gap = (
             PoolControlGap.POSITION_OWNER_UNKNOWN
@@ -189,12 +206,6 @@ def pool_control(
             **figures,  # type: ignore[arg-type]
         )
 
-    basis = ConcentrationBasis.EXACT
-    balances = {
-        row.address: row.balance_raw
-        for row in holders.top_holders
-        if row.address != census.pool_manager
-    }
     # Only the retained prefix of the raw distribution is known by address. An
     # owner outside it holds at most what the smallest retained row holds,
     # unless the holder set is complete and was retained whole.
@@ -203,18 +214,31 @@ def pool_control(
         and len(holders.top_holders) < RETAINED_HOLDERS
     )
     unseen = 0 if retained_whole else holders.top_holders[-1].balance_raw
-    for owner, amount in ((item.owner, item.controlled_token_raw) for item in attributed):
-        if owner is None:
-            continue
-        if owner not in balances:
-            balances[owner] = unseen
-            if unseen:
-                basis = ConcentrationBasis.UPPER_BOUND
-        balances[owner] += amount
-    if unattributed_raw:
-        balances[UNATTRIBUTED_POOL_BALANCE] = unattributed_raw
-        basis = ConcentrationBasis.UPPER_BOUND
-    ranked = sorted(balances.items(), key=lambda pair: (-pair[1], pair[0]))
+    controlled = [
+        (item.controller, item.controlled_token_raw)
+        for item in attributed
+        if item.controller is not None
+    ]
+    if any(buckets[state] for state in UNRESOLVED_STATES):
+        # Supply nobody can be named for and nobody may call locked. Whatever
+        # figure is put on it is a guess, so the concentration is unknown. What
+        # is still established is a floor: the distribution without that
+        # supply, with every owner credited only with what was seen.
+        floor = _ranked(holders, census, controlled, unseen=0, unattributed_raw=0)
+        return PoolControlFacts(
+            status=Availability.UNAVAILABLE,
+            gap=PoolControlGap.POSITION_CONTROL_UNRESOLVED,
+            economic_top10_floor=_share(sum(value for _, value in floor[:TOP_N]), supply),
+            **figures,  # type: ignore[arg-type]
+        )
+
+    ranked = _ranked(holders, census, controlled, unseen=unseen, unattributed_raw=unattributed_raw)
+    basis = (
+        ConcentrationBasis.UPPER_BOUND
+        if unattributed_raw
+        or (unseen and any(owner not in _retained(holders, census) for owner, _ in controlled))
+        else ConcentrationBasis.EXACT
+    )
     if not ranked or ranked[0][1] == 0:
         return PoolControlFacts(
             status=Availability.UNAVAILABLE,
@@ -238,3 +262,59 @@ def pool_control(
         ),
         **figures,  # type: ignore[arg-type]
     )
+
+
+# The control buckets recorded beside the distribution, by their field stem.
+BUCKET_FIELDS: dict[PositionControlState, str] = {
+    PositionControlState.PERMANENTLY_LOCKED: "permanently_locked",
+    PositionControlState.TIMELOCKED: "timelocked",
+    PositionControlState.RELEASABLE: "releasable",
+    PositionControlState.UNKNOWN_CONTRACT_CUSTODY: "unknown_custody",
+}
+
+
+def _control_buckets(attributed: list[V4PositionFacts]) -> dict[PositionControlState, int]:
+    """Token supply per control state, over every position with control facts."""
+    buckets = dict.fromkeys(PositionControlState, 0)
+    for item in attributed:
+        if item.control is not None:
+            buckets[item.control.control_state] += item.controlled_token_raw
+    return buckets
+
+
+def _retained(holders: HolderFacts, census: V4Census) -> dict[str, int]:
+    """The raw distribution by address, without the PoolManager's own row.
+
+    Every unit of the PoolManager row is re-assigned below or remains explicitly
+    unattributed or locked, so counting the row as well would count it twice.
+    """
+    return {
+        row.address: row.balance_raw
+        for row in holders.top_holders
+        if row.address != census.pool_manager
+    }
+
+
+def _ranked(
+    holders: HolderFacts,
+    census: V4Census,
+    controlled: list[tuple[str, int]],
+    *,
+    unseen: int,
+    unattributed_raw: int,
+) -> list[tuple[str, int]]:
+    """Holders ranked by what they control, largest first, ties by address.
+
+    Permanently locked supply is in no holder's row: it is not anyone's to
+    move. A controller outside the retained prefix is credited with ``unseen``
+    on top of its position -- the most it could hold unseen for an upper
+    bound, nothing for a floor.
+    """
+    balances = _retained(holders, census)
+    for owner, amount in controlled:
+        if owner not in balances:
+            balances[owner] = unseen
+        balances[owner] += amount
+    if unattributed_raw:
+        balances[UNATTRIBUTED_POOL_BALANCE] = unattributed_raw
+    return sorted(balances.items(), key=lambda pair: (-pair[1], pair[0]))

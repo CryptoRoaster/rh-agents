@@ -138,6 +138,9 @@ class AtlasReasonCode(StrEnum):
     V4_POOL_CENSUS_UNAVAILABLE = "V4_POOL_CENSUS_UNAVAILABLE"
     V4_POSITION_FACTS_INCOMPLETE = "V4_POSITION_FACTS_INCOMPLETE"
     V4_POOL_BALANCE_UNATTRIBUTED = "V4_POOL_BALANCE_UNATTRIBUTED"
+    # Token supply sits in a position held by contract custody that is not
+    # verified, or verified as timelocked: who controls it is not established.
+    V4_POSITION_CONTROL_UNRESOLVED = "V4_POSITION_CONTROL_UNRESOLVED"
 
     # Risk blockers: the fact was established and violates policy.
     CHAIN_ID_MISMATCH = "CHAIN_ID_MISMATCH"
@@ -160,6 +163,7 @@ DATA_QUALITY_REASONS = frozenset(
         AtlasReasonCode.V4_POOL_CENSUS_UNAVAILABLE,
         AtlasReasonCode.V4_POSITION_FACTS_INCOMPLETE,
         AtlasReasonCode.V4_POOL_BALANCE_UNATTRIBUTED,
+        AtlasReasonCode.V4_POSITION_CONTROL_UNRESOLVED,
     }
 )
 
@@ -497,6 +501,11 @@ class AtlasOnchainSnapshot(Immutable):
                         found.add(pool.hook_facts.owner)
             found.update(
                 item.owner for item in self.pool_control.census.positions if item.owner is not None
+            )
+            found.update(
+                item.control.controller
+                for item in self.pool_control.census.positions
+                if item.control is not None and item.control.controller is not None
             )
         return frozenset(found)
 

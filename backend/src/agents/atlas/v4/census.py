@@ -19,6 +19,18 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from src.agents.atlas.models import AtlasSourceFailure, ChainSnapshot
+from src.agents.atlas.v4.control import (
+    CustodyChainRefused,
+    CustodyQuery,
+    PositionControlFacts,
+    PositionCustodyAdapter,
+)
+from src.agents.atlas.v4.custody.resolver import (
+    DEFAULT_ADAPTERS,
+    is_externally_owned,
+    resolve_owner,
+)
+from src.agents.atlas.v4.custody.template import code_keccak
 from src.agents.atlas.v4.math import LiquidityMathError, position_amounts
 from src.agents.atlas.v4.models import (
     MAX_POOLS,
@@ -68,8 +80,6 @@ FAILURES: dict[ErrorCode, AtlasSourceFailure] = {
 # A call that reverted or answered malformed bytes. For an optional read such
 # as a hook's `owner()` this means "not established", never a transport error.
 CALL_REFUSALS = frozenset({ErrorCode.RPC_ERROR, ErrorCode.CONTRACT})
-# EIP-7702 delegation designator: an externally owned account with delegated code.
-DELEGATION_PREFIX = "0xef0100"
 
 
 @dataclass(frozen=True)
@@ -97,6 +107,8 @@ class V4ChainReadPort(Protocol):
     async def call_word(self, address: str, selector: str, argument: str, block: int) -> str: ...
 
     async def balance_of(self, token: str, holder: str, block: int) -> int: ...
+
+    async def storage(self, address: str, slot: str, block: int) -> str: ...
 
 
 class PoolControlChainRefused(Exception):
@@ -146,6 +158,8 @@ class _Run:
     timestamps: dict[int, int] = field(default_factory=dict)
     # Pools proven before any later failure: they keep pool control required.
     pools_found: int = 0
+    # Runtime code per position owner, read once per census.
+    owner_codes: dict[str, str] = field(default_factory=dict)
 
     def spend(self) -> None:
         self.requests += 1
@@ -153,9 +167,24 @@ class _Run:
             raise _Incomplete(self.bound_gap, AtlasSourceFailure.INCOMPLETE_RESULT)
 
 
-def is_externally_owned(code: str) -> bool:
-    """No code, or only an EIP-7702 delegation: an account a private key controls."""
-    return code == "0x" or (code.startswith(DELEGATION_PREFIX) and len(code) == 2 + 46)
+@dataclass(frozen=True)
+class _CustodyReads:
+    """The custody adapters' reads: pinned to the census block, charged to its budget."""
+
+    run: _Run
+    block: int
+
+    async def code(self, address: str) -> str:
+        self.run.spend()
+        return await self.run.reads.code(address, self.block)
+
+    async def storage(self, address: str, slot: str) -> str:
+        self.run.spend()
+        return await self.run.reads.storage(address, slot, self.block)
+
+    async def call(self, address: str, selector: str) -> str:
+        self.run.spend()
+        return await self.run.reads.call(address, selector, self.block)
 
 
 def block_ranges(start: int, end: int, chunk: int) -> tuple[tuple[int, int], ...]:
@@ -177,6 +206,9 @@ class V4PoolCensus:
         default_factory=lambda: dict(V4_DEPLOYMENTS)
     )
     source: str = "evm-rpc-v4-pool-manager"
+    # What a contract holding a position NFT is verified to allow. Order is
+    # irrelevant: each adapter recognises only its own exact code.
+    custody: tuple[PositionCustodyAdapter, ...] = DEFAULT_ADAPTERS
 
     async def census(self, snapshot: ChainSnapshot, token: str, from_block: int | None) -> V4Census:
         if snapshot.chain != self.chain:
@@ -209,6 +241,8 @@ class V4PoolCensus:
         try:
             async with asyncio.timeout(self.bounds.timeout_seconds):
                 return await self._collect(run, deployment, snapshot, token, from_block)
+        except CustodyChainRefused:
+            raise PoolControlChainRefused(snapshot.chain) from None
         except _Incomplete as error:
             gap, failure = error.gap, error.failure
         except TimeoutError:
@@ -254,7 +288,7 @@ class V4PoolCensus:
 
         run.phase = PoolControlGap.POSITION_FACTS_INCOMPLETE
         run.bound_gap = PoolControlGap.POSITION_FACTS_INCOMPLETE
-        positions = await self._positions(run, deployment, pools, token, block)
+        positions = await self._positions(run, deployment, pools, token, snapshot)
 
         run.spend()
         balance = await self.reads.balance_of(token, deployment.pool_manager, block)
@@ -440,8 +474,9 @@ class V4PoolCensus:
         deployment: V4Deployment,
         pools: list[V4PoolFacts],
         token: str,
-        block: int,
+        snapshot: ChainSnapshot,
     ) -> list[V4PositionFacts]:
+        block = snapshot.block_number
         invalid = _Incomplete(
             PoolControlGap.POSITION_FACTS_INCOMPLETE, AtlasSourceFailure.INVALID_RESPONSE
         )
@@ -510,7 +545,16 @@ class V4PoolCensus:
             if sender in managers:
                 found.append(
                     await self._managed(
-                        run, sender, pool_key, salt, lower, upper, liquidity, controlled, block
+                        run,
+                        deployment,
+                        sender,
+                        pool_key,
+                        salt,
+                        lower,
+                        upper,
+                        liquidity,
+                        controlled,
+                        snapshot,
                     )
                 )
             else:
@@ -524,6 +568,7 @@ class V4PoolCensus:
     async def _managed(
         self,
         run: _Run,
+        deployment: V4Deployment,
         manager: str,
         pool_key: str,
         salt: str,
@@ -531,9 +576,15 @@ class V4PoolCensus:
         upper: int,
         liquidity: int,
         controlled: int,
-        block: int,
+        snapshot: ChainSnapshot,
     ) -> V4PositionFacts:
-        """A verified PositionManager position: its ERC-721 owner controls it."""
+        """A verified PositionManager position, its ERC-721 owner and what that means.
+
+        The owner is recorded exactly as `ownerOf` answered. Whether it controls
+        the principal is a separate fact: an account does, a contract only as
+        far as a verified custody adapter establishes.
+        """
+        block = snapshot.block_number
         token_id = int(salt, 16)
         run.spend()
         try:
@@ -570,6 +621,11 @@ class V4PoolCensus:
             if error.code not in CALL_REFUSALS:
                 raise
             owner = None
+        control = (
+            None
+            if owner is None
+            else await self._control(run, deployment, manager, token_id, pool_key, owner, snapshot)
+        )
         return V4PositionFacts(
             kind=PositionKind.POSITION_MANAGER,
             pool_id=pool_key,
@@ -587,7 +643,36 @@ class V4PoolCensus:
                 else PositionOwnerStatus.OWNER_UNKNOWN
             ),
             controlled_token_raw=controlled,
+            control=control,
         )
+
+    async def _control(
+        self,
+        run: _Run,
+        deployment: V4Deployment,
+        manager: str,
+        token_id: int,
+        pool_key: str,
+        owner: str,
+        snapshot: ChainSnapshot,
+    ) -> PositionControlFacts:
+        reads = _CustodyReads(run, snapshot.block_number)
+        if owner not in run.owner_codes:
+            run.owner_codes[owner] = await reads.code(owner)
+        code = run.owner_codes[owner]
+        query = CustodyQuery(
+            chain=snapshot.chain,
+            chain_id=snapshot.chain_id,
+            block=snapshot.block_number,
+            pool_manager=deployment.pool_manager,
+            position_manager=manager,
+            token_id=token_id,
+            pool_id=pool_key,
+            owner=owner,
+            owner_code=code,
+            owner_code_hash=code_keccak(code),
+        )
+        return await resolve_owner(reads, query, self.custody)
 
     async def _direct(
         self,

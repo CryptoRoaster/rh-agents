@@ -25,6 +25,7 @@ from src.agents.atlas.primitives import (
     Immutable,
     Ratio,
 )
+from src.agents.atlas.v4.control import PositionControlFacts
 from src.markets.models import Availability
 
 # Bounds on what one snapshot may carry. Exceeding one is never a silent cut:
@@ -50,6 +51,10 @@ class PoolControlGap(StrEnum):
     HOLDER_BASIS_UNAVAILABLE = "V4_HOLDER_BASIS_UNAVAILABLE"
     # The market's own V4 pool is not among the pools the census found.
     MARKET_POOL_NOT_FOUND = "V4_MARKET_POOL_NOT_FOUND"
+    # Token supply sits in a position whose NFT is held by a contract that is
+    # either not verified at all or verified as timelocked: nobody can be named
+    # as its controller and nobody may call it locked.
+    POSITION_CONTROL_UNRESOLVED = "V4_POSITION_CONTROL_UNRESOLVED"
 
 
 class HookOwnerStatus(StrEnum):
@@ -140,6 +145,10 @@ class V4PositionFacts(Immutable):
     owner_status: PositionOwnerStatus
     controlled_token_raw: int = Field(ge=0)
     owner_is_creator: bool | None = None
+    # What the NFT owner means for control. Present exactly for a
+    # PositionManager position whose `ownerOf` was read; the raw owner above
+    # stays what the chain said.
+    control: PositionControlFacts | None = None
 
     @model_validator(mode="after")
     def owner_matches_status(self) -> Self:
@@ -149,7 +158,30 @@ class V4PositionFacts(Immutable):
             self.position_manager is not None and self.token_id is not None
         ):
             raise ValueError("Only a PositionManager position carries a manager and token id")
+        managed_and_read = (
+            self.kind == PositionKind.POSITION_MANAGER
+            and self.owner_status == PositionOwnerStatus.ATTRIBUTED
+        )
+        if (self.control is not None) != managed_and_read:
+            raise ValueError("Control facts belong to every read PositionManager position")
+        if self.control is not None and (
+            self.control.position_owner != self.owner
+            or self.control.position_manager != self.position_manager
+            or self.control.token_id != self.token_id
+        ):
+            raise ValueError("Control facts describe this position's own NFT")
         return self
+
+    @property
+    def controller(self) -> str | None:
+        """Who can take this position's principal, where anyone established can.
+
+        A direct position's protocol owner is its controller when it is an
+        account; a PositionManager position's is what its control facts name.
+        """
+        if self.control is None:
+            return self.owner
+        return self.control.controller
 
 
 class V4Census(Immutable):
@@ -220,6 +252,21 @@ class PoolControlFacts(Immutable):
     attributable_pool_supply_fraction: Ratio | None = None
     creator_controlled_pool_supply_fraction: Ratio | None = None
     unattributed_pool_supply_fraction: Ratio | None = None
+    # Pool-held supply by what its position's control facts established. The
+    # denominator of every fraction is the on-chain total supply.
+    permanently_locked_raw: int | None = Field(default=None, ge=0)
+    timelocked_raw: int | None = Field(default=None, ge=0)
+    releasable_raw: int | None = Field(default=None, ge=0)
+    unknown_custody_raw: int | None = Field(default=None, ge=0)
+    permanently_locked_pool_supply_fraction: Ratio | None = None
+    timelocked_pool_supply_fraction: Ratio | None = None
+    releasable_pool_supply_fraction: Ratio | None = None
+    unknown_custody_pool_supply_fraction: Ratio | None = None
+    # Only with POSITION_CONTROL_UNRESOLVED: the top ten with every unresolved
+    # unit left out and nobody credited with more than they were seen to hold.
+    # A floor, never the figure: the unresolved supply may belong to anyone,
+    # so the true concentration is this or higher.
+    economic_top10_floor: Ratio | None = None
     basis: ConcentrationBasis | None = None
     economic_top1_share: Ratio | None = None
     economic_top5_share: Ratio | None = None
@@ -238,6 +285,10 @@ class PoolControlFacts(Immutable):
                 raise ValueError("Unavailable pool control must say why")
             if self.economic_top10_share is not None or self.economic_top_holders:
                 raise ValueError("Unavailable pool control carries no economic figures")
+        if self.economic_top10_floor is not None and (
+            self.gap != PoolControlGap.POSITION_CONTROL_UNRESOLVED
+        ):
+            raise ValueError("Only unresolved position control carries a floor")
         return self
 
     @property

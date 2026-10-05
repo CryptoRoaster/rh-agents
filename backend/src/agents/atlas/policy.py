@@ -42,6 +42,7 @@ POOL_CONTROL_REASONS: dict[PoolControlGap, AtlasReasonCode] = {
     PoolControlGap.POSITION_FACTS_INCOMPLETE: AtlasReasonCode.V4_POSITION_FACTS_INCOMPLETE,
     PoolControlGap.POSITION_OWNER_UNKNOWN: AtlasReasonCode.V4_POSITION_FACTS_INCOMPLETE,
     PoolControlGap.POOL_BALANCE_UNATTRIBUTED: AtlasReasonCode.V4_POOL_BALANCE_UNATTRIBUTED,
+    PoolControlGap.POSITION_CONTROL_UNRESOLVED: AtlasReasonCode.V4_POSITION_CONTROL_UNRESOLVED,
 }
 
 NOT_CONFIGURED_REASONS: dict[AtlasDomain, AtlasReasonCode] = {
@@ -266,6 +267,11 @@ def _blockers(snapshot: AtlasOnchainSnapshot, policy: AtlasPolicy) -> list[Atlas
     holders = snapshot.holders
     if (
         policy.max_top10_concentration is not None
+        # A token read through V4 pool control is judged on its economic
+        # figure below, exactly as SENTINEL judges it. Its raw top ten counts
+        # the PoolManager -- every pool's reserves -- as one holder, which says
+        # nothing about who controls that supply.
+        and not (policy.pool_control_binds and snapshot.pool_control_required)
         and holders.status == Availability.AVAILABLE
         and holders.top10_share is not None
         and holders.top10_share > policy.max_top10_concentration
@@ -281,6 +287,17 @@ def _blockers(snapshot: AtlasOnchainSnapshot, policy: AtlasPolicy) -> list[Atlas
     ):
         # The economic figure never understates, so exceeding a limit on it is
         # an established violation even where the raw figure stays below.
+        blockers.append(AtlasReasonCode.HOLDER_CONCENTRATION_EXCEEDED)
+    if (
+        policy.max_top10_concentration is not None
+        and policy.pool_control_binds
+        and control is not None
+        and control.economic_top10_floor is not None
+        and control.economic_top10_floor > policy.max_top10_concentration
+    ):
+        # Unresolved custody leaves the figure unknown, but never lowers it:
+        # a floor already above the limit is a violation whoever controls the
+        # rest. Below the limit the floor proves nothing and only the gap holds.
         blockers.append(AtlasReasonCode.HOLDER_CONCENTRATION_EXCEEDED)
     return blockers
 

@@ -34,9 +34,10 @@ never modified; an economic distribution is derived beside it.
   receipt-verified creator.
 * **Positions:** rebuilt from `ModifyLiquidity` events per pool, then checked
   against the PoolManager's own storage (`extsload` of the position slot); any
-  disagreement refuses the census. A verified PositionManager position belongs
-  to its current `ownerOf(tokenId)`, with `getPoolAndPositionInfo` binding the
-  token id to this pool and range. A direct position belongs to its owner key
+  disagreement refuses the census. A verified PositionManager position records
+  its current `ownerOf(tokenId)` exactly, with `getPoolAndPositionInfo` binding
+  the token id to this pool and range; what that owner means for control is a
+  separate fact (see [position control](atlas-v4-position-control.md)). A direct position belongs to its owner key
   only when that key is an externally owned account (or an EIP-7702 delegated
   one); a contract key is `OWNER_UNKNOWN`.
 * **Amounts:** canonical `TickMath`/`SqrtPriceMath` in integers at the pool's
@@ -53,7 +54,9 @@ reported as complete. A source answering for another chain is a hard refusal.
 ## Economic concentration
 
 * The PoolManager's own holder row (if a provider reported one) leaves the
-  distribution; each attributed position's amount is added to its owner; the
+  distribution; each attributed position's amount is added to its controller
+  (an account owner, or a verified release's controller), permanently locked
+  supply goes to no holder, and unresolved custody makes the figure unknown; the
   PoolManager balance not traced to an owner is `UNATTRIBUTED_POOL_BALANCE`,
   ranked as one pseudo-holder. Nothing is counted twice.
 * Owners outside the retained raw rows are ranked with the smallest retained
@@ -92,8 +95,8 @@ on pool control, runs no census, and a V4 position can always be sold.
 
 SENTINEL's existing `max_top_ten_holder_fraction` (0.35) judges the economic
 figure; no new limit exists. Note the consequence: liquidity held in one
-position counts for that position's owner, exactly as a V2 pair counts as a
-holder in the raw view.
+position counts for that position's controller, exactly as a V2 pair counts as
+a holder in the raw view -- unless verified code proves nobody can take it.
 
 ## Evidence and compatibility
 

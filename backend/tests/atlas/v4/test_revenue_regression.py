@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 
 from src.agents.atlas.handler import onchain_payload
 from src.agents.atlas.policy import evaluate_snapshot
-from src.core.models import AgentRole, RiskLimits, Side
+from src.core.models import AgentRole, RiskLimits, SafetyStatus, Side
 from src.orchestration.riskdata.models import RiskDataGapCode, RiskFactKind
 from src.orchestration.riskrequest.service import entry_concentration, risk_market
 from src.orchestration.sizing.context import base_asset_metadata, reference_price
@@ -76,24 +76,55 @@ def buy(intent):
 async def test_sentinel_rejects_the_revenue_like_entry_on_holder_concentration(
     now, intent, context
 ) -> None:
+    """The fixture as it stood: launch NFT in a locker nobody verified.
+
+    The creator's own position is DIRECT_CONTROL and alone is ~57.4 % of
+    supply. The locker's position is unknown custody, so the economic figure
+    is not established -- but its floor already exceeds the limit, and the
+    entry is refused on concentration and on the unknown holder domain both.
+    """
     payload = await atlas_payload(now, revenue_like()[0])
+    summary = payload.intelligence.pool_control
     raw = payload.intelligence.holders.top_ten_fraction
-    economic = payload.intelligence.pool_control.economic_concentration
-    assert raw < Decimal("0.10") and economic > Decimal("0.60")
+    assert raw < Decimal("0.10")
+    assert summary.creator_controlled_pool_supply_fraction == Decimal("0.574")
+    assert summary.economic_concentration is None
+    floor = summary.economic_concentration_floor
+    assert floor > Decimal("0.60")
+
+    market = sentinel_market(now, payload)
+    assert market.holders.top_ten_fraction == floor
+    assert market.holders.concentration_check is SafetyStatus.UNKNOWN
+
+    decision = evaluate(buy(intent), market, context, RiskLimits(), now=now)
+    assert "HOLDER_CONCENTRATION_LIMIT" in decision.reason_codes
+    assert "HOLDERS_UNKNOWN" in decision.reason_codes
+    assert RiskLimits().max_top_ten_holder_fraction == Decimal("0.35")
+
+
+async def test_sentinel_rejects_it_on_an_established_figure_with_an_official_lock(
+    now, intent, context
+) -> None:
+    """The launch NFT in the official FeeSplitter: the lock hides nothing of the creator's."""
+    payload = await atlas_payload(now, revenue_like("official")[0])
+    summary = payload.intelligence.pool_control
+    economic = summary.economic_concentration
+    assert economic > Decimal("0.60")
+    assert summary.permanently_locked_pool_supply_fraction == Decimal("0.15")
+    assert summary.creator_controlled_pool_supply_fraction == Decimal("0.574")
 
     market = sentinel_market(now, payload)
     assert market.holders.top_ten_fraction == economic
 
     decision = evaluate(buy(intent), market, context, RiskLimits(), now=now)
     assert "HOLDER_CONCENTRATION_LIMIT" in decision.reason_codes
-    assert RiskLimits().max_top_ten_holder_fraction == Decimal("0.35")
 
 
 async def test_the_same_token_judged_on_its_raw_figure_would_have_passed_that_check(
     now, intent, context
 ) -> None:
     """What the blind spot looked like: the limit never fired on raw holders."""
-    payload = await atlas_payload(now, revenue_like()[0])
+    payload = await atlas_payload(now, revenue_like("official")[0])
     intelligence = payload.intelligence.model_copy(update={"pool_control": None})
     blind = payload.model_copy(update={"intelligence": intelligence})
     decision = evaluate(buy(intent), sentinel_market(now, blind), context, RiskLimits(), now=now)
@@ -156,7 +187,7 @@ def concentration_gap(reading):
 async def test_risk_data_carries_the_established_economic_figure(worker_db, now, trace) -> None:
     _, sessions = worker_db
     reader = v4_reader(sessions, now)
-    payload = await atlas_payload(now, revenue_like()[0])
+    payload = await atlas_payload(now, revenue_like("official")[0])
     trade_case = await v4_case(reader, now, trace, payload)
 
     reading = await reader.readiness(trade_case.id)
@@ -185,7 +216,7 @@ async def test_legacy_evidence_for_a_v4_case_is_readable_and_insufficient(
     """Evidence written before pool control existed still parses — and cannot pass."""
     _, sessions = worker_db
     reader = v4_reader(sessions, now)
-    payload = await atlas_payload(now, revenue_like()[0])
+    payload = await atlas_payload(now, revenue_like("official")[0])
     legacy = payload.model_copy(
         update={
             "intelligence": OnchainIntelligence.model_validate(
