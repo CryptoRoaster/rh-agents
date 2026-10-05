@@ -643,13 +643,27 @@ def entry_concentration(
     """The top-ten fraction an entry is judged on.
 
     The raw figure, unless ATLAS recorded that this token's concentration must
-    be read through V4 pool control — then the economic figure or nothing. The
-    raw holder record itself stays unchanged in the evidence for audit.
+    be read through V4 pool control -- then the economic figure, or, where the
+    control of some position supply is unresolved, the floor the economic
+    figure is known to reach, or nothing. The raw holder record itself stays
+    unchanged in the evidence for audit.
     """
     control = None if onchain.intelligence is None else onchain.intelligence.pool_control
     if control is None or not control.required:
         return holders.top_ten_fraction
-    return control.economic_concentration
+    if control.economic_concentration is not None:
+        return control.economic_concentration
+    return control.economic_concentration_floor
+
+
+def entry_concentration_established(onchain: OnchainPayload) -> bool:
+    """Whether the figure an entry is judged on is the whole measure.
+
+    A floor is not: it can prove a limit exceeded, never one respected. So an
+    entry judged on one has its holder check unknown, whatever else says PASS.
+    """
+    control = None if onchain.intelligence is None else onchain.intelligence.pool_control
+    return control is None or not control.required or control.economic_concentration is not None
 
 
 def market_view(
@@ -768,7 +782,11 @@ def market_view(
                 if side is Side.BUY
                 else holders.top_ten_fraction
             ),
-            concentration_check=SAFETY_STATUS[payload.holder_integrity],
+            concentration_check=(
+                SAFETY_STATUS[payload.holder_integrity]
+                if side is not Side.BUY or entry_concentration_established(payload)
+                else SafetyStatus.UNKNOWN
+            ),
         ),
         # The configured proportional fee on one side's executed notional.
         fee_bps=costs.fee_bps,

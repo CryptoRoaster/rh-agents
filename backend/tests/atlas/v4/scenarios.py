@@ -43,12 +43,14 @@ from tests.atlas.v4.chain import (
     FakeV4Chain,
     Pool,
 )
+from tests.atlas.v4.custody import OFFICIAL_SPLITTER, fee_splitter_code
 
 SUPPLY = 1_000_000_000 * 10**18
 UNIT = 10**18
 # Bits 13 and 7: BEFORE_INITIALIZE and BEFORE_SWAP, as on the historical hook.
 CREATOR_HOOK = "0x" + "5d" * 18 + "e080"
 LOCKER = "0x" + "ef" * 20
+LAUNCH_WALLET = "0x" + "4d" * 20
 # A higher address than the token, so the token sorts as currency0 against it.
 MEME = "0x" + "fe" * 20
 FULL_RANGE = (-887272, 887272)
@@ -118,10 +120,22 @@ def traded_pool(**changes: object) -> Pool:
     return Pool(**values)  # type: ignore[arg-type]
 
 
-def revenue_like() -> tuple[FakeV4Chain, Pool, Pool]:
-    """The historical mechanism, on synthetic addresses."""
+def revenue_like(custody: str = "unverified") -> tuple[FakeV4Chain, Pool, Pool]:
+    """The historical mechanism, on synthetic addresses.
+
+    ``custody`` says who holds the traded pool's launch position NFT: an
+    unverified contract (``"unverified"``, the locker as it stood), the official
+    FeeSplitter (``"official"``), or an account (``"account"``). The creator's
+    own position in the hidden pool is the creator's in every variant.
+    """
     chain = FakeV4Chain(token=TOKEN)
-    chain.contracts.add(LOCKER)
+    launch_owner = {"unverified": LOCKER, "official": OFFICIAL_SPLITTER, "account": LAUNCH_WALLET}[
+        custody
+    ]
+    if custody == "unverified":
+        chain.contracts.add(LOCKER)
+    elif custody == "official":
+        chain.codes[OFFICIAL_SPLITTER] = fee_splitter_code()
     traded = chain.add_pool(traded_pool())
     hidden = chain.add_pool(
         Pool(
@@ -136,10 +150,10 @@ def revenue_like() -> tuple[FakeV4Chain, Pool, Pool]:
         )
     )
     chain.hook_owners[CREATOR_HOOK] = CREATOR
-    # The traded pool's launch liquidity, held by a locker contract's NFT.
+    # The traded pool's launch liquidity, its NFT held by ``launch_owner``.
     chain.mint(
         traded,
-        LOCKER,
+        launch_owner,
         3_498_758,
         -160_100,
         198_050,
@@ -204,3 +218,54 @@ async def build(now, chain: FakeV4Chain | None, market: MarketIdentity | None = 
 
 def share(units: int) -> Decimal:
     return Decimal(units) / Decimal(SUPPLY)
+
+
+# ------------------------------------------------------- official launch
+
+
+# The InstantLaunchStrategy's pool: native ETH against the token, 0.25 %, no
+# hook, and a single-sided launch position from MIN_LAUNCH_TICK up to the
+# launch tick, holding the whole supply until buyers take some of it.
+LAUNCH_TICK = 198_050
+MIN_LAUNCH_TICK = -160_100
+LAUNCH_TOKEN_ID = 41_007
+# Where the launch's 40 % ETH fee share goes: the beneficiary vault, which
+# credits the creator. A fee route, not a holder of principal.
+BENEFICIARY_VAULT = "0x26d2f7acb07707034406a0dc458351bb63c02553"
+
+
+def official_launch(
+    *, owner: str = OFFICIAL_SPLITTER, sold: int = 120_000_000 * UNIT, tick: int = 190_000
+) -> tuple[FakeV4Chain, Pool, tuple[HolderSourceRow, ...]]:
+    """A fixed-supply InstantLaunch-style token whose launch NFT sits in ``owner``.
+
+    Returns the chain, the pool and the raw holder rows a provider would report:
+    the PoolManager itself, holding nearly everything, and the buyers.
+    """
+    chain = FakeV4Chain(token=TOKEN)
+    if owner == OFFICIAL_SPLITTER:
+        chain.codes[OFFICIAL_SPLITTER] = fee_splitter_code()
+    pool = chain.add_pool(traded_pool(tick=tick))
+    chain.mint(
+        pool,
+        owner,
+        LAUNCH_TOKEN_ID,
+        MIN_LAUNCH_TICK,
+        LAUNCH_TICK,
+        liquidity_for(SUPPLY - sold, tick, MIN_LAUNCH_TICK),
+    )
+    chain.extra_pool_balance = 3 * UNIT
+    buyers = tuple(
+        # Ten units short of what was sold: the fee and rounding remainder the
+        # PoolManager keeps must still fit inside the supply.
+        HolderSourceRow(
+            address="0x" + f"{index + 0x90:02x}" * 20,
+            balance_raw=(sold - 10 * UNIT) // 12 - index,
+        )
+        for index in range(12)
+    )
+    rows = (
+        HolderSourceRow(address=POOL_MANAGER, balance_raw=chain.pool_balance(chain.head)),
+        *buyers,
+    )
+    return chain, pool, rows

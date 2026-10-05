@@ -403,6 +403,47 @@ class PoolControlPool(Immutable):
     hook_owner_is_creator: bool | None = None
 
 
+# Keys added after pool control was first written. Each is omitted while it
+# holds nothing, so a summary recorded before it existed replays byte for byte.
+POSITION_CONTROL_KEY = "control"
+POOL_CONTROL_ADDED_KEYS = (
+    "permanently_locked_raw",
+    "timelocked_raw",
+    "releasable_raw",
+    "unknown_custody_raw",
+    "permanently_locked_pool_supply_fraction",
+    "timelocked_pool_supply_fraction",
+    "releasable_pool_supply_fraction",
+    "unknown_custody_pool_supply_fraction",
+    "position_control_states",
+    "economic_top_ten_floor_fraction",
+)
+
+
+class PositionControlRecord(Immutable):
+    """What a position NFT's raw owner means for control of its principal.
+
+    ``position_owner`` is ``ownerOf`` as read. ``control_state`` is what verified
+    code established: DIRECT_CONTROL (an account), PERMANENTLY_LOCKED,
+    TIMELOCKED, RELEASABLE (to ``controller``) or UNKNOWN_CONTRACT_CUSTODY. A
+    lock rests only on a pinned contract version (``proof_contract``,
+    ``proof_version``) matched against the owner's code (``owner_code_hash``);
+    never on a name, label or website.
+    """
+
+    position_owner: PoolControlAddress
+    owner_kind: Code
+    control_state: Code
+    controller: PoolControlAddress | None = None
+    unlock_block: int | None = Field(default=None, strict=True, ge=0)
+    proof_kind: Code
+    proof_contract: Identifier | None = None
+    proof_version: Identifier | None = None
+    owner_code_hash: PoolControlId | None = None
+    completeness: Code
+    refusal: Code | None = None
+
+
 class PoolControlPosition(Immutable):
     """One active liquidity position and the token amount it controls."""
 
@@ -418,6 +459,16 @@ class PoolControlPosition(Immutable):
     owner_status: Code
     controlled_token_raw: RawAmount
     owner_is_creator: bool | None = None
+    # Absent on positions recorded before control facts existed, and on direct
+    # positions, which have no NFT; omitted then rather than written as null.
+    control: PositionControlRecord | None = None
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        emitted: dict[str, Any] = handler(self)
+        if self.control is None:
+            emitted.pop(POSITION_CONTROL_KEY, None)
+        return emitted
 
 
 class EconomicHolderShare(Immutable):
@@ -478,6 +529,23 @@ class PoolControlSummary(Immutable):
     economic_top_five_fraction: Share | None = None
     economic_top_ten_fraction: Share | None = None
     economic_top_holders: tuple[EconomicHolderShare, ...] = Field(default=(), max_length=10)
+    # Pool-held supply by the control its positions' NFT owners established,
+    # over the on-chain total supply. Permanently locked supply is in no
+    # holder's row; unresolved supply (timelocked, unknown custody) makes the
+    # economic figure unknown.
+    permanently_locked_raw: RawAmount | None = None
+    timelocked_raw: RawAmount | None = None
+    releasable_raw: RawAmount | None = None
+    unknown_custody_raw: RawAmount | None = None
+    permanently_locked_pool_supply_fraction: Share | None = None
+    timelocked_pool_supply_fraction: Share | None = None
+    releasable_pool_supply_fraction: Share | None = None
+    unknown_custody_pool_supply_fraction: Share | None = None
+    # Every position with control facts, counted by state.
+    position_control_states: dict[Code, int] | None = None
+    # Only with V4_POSITION_CONTROL_UNRESOLVED: the top ten without any
+    # unresolved supply. A floor -- the true figure is this or higher.
+    economic_top_ten_floor_fraction: Share | None = None
 
     @model_validator(mode="after")
     def figures_match_status(self) -> Self:
@@ -488,7 +556,19 @@ class PoolControlSummary(Immutable):
             raise ValueError("Unavailable pool control names its gap and carries no figure")
         if self.positions_attributed + self.positions_unattributed != self.positions_total:
             raise ValueError("Position counts must add up")
+        if self.economic_top_ten_floor_fraction is not None and (
+            self.gap != "V4_POSITION_CONTROL_UNRESOLVED"
+        ):
+            raise ValueError("Only unresolved position control carries a floor")
         return self
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        emitted: dict[str, Any] = handler(self)
+        for key in POOL_CONTROL_ADDED_KEYS:
+            if emitted.get(key) is None:
+                emitted.pop(key, None)
+        return emitted
 
     @property
     def economic_concentration(self) -> Decimal | None:
@@ -496,6 +576,13 @@ class PoolControlSummary(Immutable):
         if self.status != "AVAILABLE":
             return None
         return self.economic_top_ten_fraction
+
+    @property
+    def economic_concentration_floor(self) -> Decimal | None:
+        """With unresolved position control: what the figure is at least."""
+        if self.status == "AVAILABLE":
+            return None
+        return self.economic_top_ten_floor_fraction
 
 
 class OnchainIntelligence(Immutable):

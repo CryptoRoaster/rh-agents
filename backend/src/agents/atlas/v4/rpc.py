@@ -36,3 +36,6 @@ class RpcV4ChainReads:
 
     async def balance_of(self, token: str, holder: str, block: int) -> int:
         return await self.client.balance_of(token, holder, block)
+
+    async def storage(self, address: str, slot: str, block: int) -> str:
+        return await self.client.storage_at(address, slot, block)

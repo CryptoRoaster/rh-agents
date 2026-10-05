@@ -71,7 +71,9 @@ def spread_pool(chain: FakeV4Chain, owners: int = 8, each: int = 15_000_000 * UN
 
 
 async def test_revenue_like_supply_reappears_with_its_controller(now) -> None:
-    chain, _, hidden = revenue_like()
+    # The launch NFT in the official FeeSplitter: everything else is resolved,
+    # so the economic figure is established -- and the creator still tops it.
+    chain, _, hidden = revenue_like("official")
     snapshot = await build(now, chain)
     control = snapshot.pool_control
 
@@ -92,7 +94,7 @@ async def test_revenue_like_supply_reappears_with_its_controller(now) -> None:
 
 
 async def test_atlas_policy_never_passes_it_on_a_limit(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     snapshot = await build(now, chain)
     # The provisional policy sets no limit of its own: the domain is
     # established, and SENTINEL's existing limit judges the figure.
@@ -108,7 +110,7 @@ async def test_atlas_policy_never_passes_it_on_a_limit(now) -> None:
 
 
 async def test_a_reported_pool_manager_row_is_not_counted_twice(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     held = chain.pool_balance(chain.head)
     rows = (HolderSourceRow(address=POOL_MANAGER, balance_raw=held), *wallets())
     with_row = (await build(now, chain, rows=rows)).pool_control
@@ -123,7 +125,7 @@ async def test_a_reported_pool_manager_row_is_not_counted_twice(now) -> None:
 
 
 async def test_a_small_remainder_is_ranked_as_one_unattributed_holder(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     control = (await build(now, chain)).pool_control
     assert control.unattributed_raw == chain.extra_pool_balance
     assert control.basis is ConcentrationBasis.UPPER_BOUND
@@ -137,7 +139,7 @@ async def test_a_small_remainder_is_ranked_as_one_unattributed_holder(now) -> No
 
 
 async def test_a_ranking_remainder_appears_as_its_own_holder(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     chain.extra_pool_balance = 9_900_000 * UNIT
     control = (await build(now, chain)).pool_control
     ranked = {item.holder: item.balance_raw for item in control.economic_top_holders}
@@ -164,7 +166,7 @@ async def test_an_exact_view_has_no_bound(now) -> None:
 
 async def test_a_large_unexplained_remainder_is_unknown_not_a_figure(now) -> None:
     """A pool initialized before the scan start is missed — and still caught."""
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     early = chain.add_pool(
         traded_pool(fee=10_000, tick_spacing=200, created_block=CREATED_BLOCK - 5)
     )
@@ -221,7 +223,7 @@ async def test_a_second_legitimate_pool_is_no_false_block(now) -> None:
 
 
 async def test_a_hook_without_owner_is_never_the_creators(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     del chain.hook_owners[CREATOR_HOOK]
     control = (await build(now, chain)).pool_control
     assert control.creator_controlled_hooks == 0
@@ -230,7 +232,7 @@ async def test_a_hook_without_owner_is_never_the_creators(now) -> None:
 
 
 async def test_creator_control_needs_a_verified_creator(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     unverified = origin(verification=OriginVerification.UNVERIFIED)
     control = (await build(now, chain, origin_facts=unverified)).pool_control
     assert control.creator_controlled_pool_supply_fraction is None
@@ -240,7 +242,7 @@ async def test_creator_control_needs_a_verified_creator(now) -> None:
 
 
 async def test_a_position_owner_who_is_not_the_creator_is_attributed_to_them(now) -> None:
-    chain, _, hidden = revenue_like()
+    chain, _, hidden = revenue_like("official")
     from tests.atlas.v4.chain import POSITION_MANAGER
 
     other = "0x" + "b9" * 20
@@ -276,7 +278,7 @@ async def test_an_unknown_direct_position_fails_closed(now) -> None:
 
 
 async def test_a_census_timeout_leaves_a_v4_token_unestablished(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     chain.fail_at = 9
     snapshot = await build(now, chain)
     decision = evaluate_snapshot(snapshot, now)
@@ -287,7 +289,7 @@ async def test_a_census_timeout_leaves_a_v4_token_unestablished(now) -> None:
 
 
 async def test_a_v4_market_without_a_census_is_unestablished(now) -> None:
-    chain, traded, _ = revenue_like()
+    chain, traded, _ = revenue_like("official")
     from tests.atlas.v4.scenarios import v4_market
 
     snapshot = await build(now, None, market=v4_market(traded))
@@ -306,7 +308,7 @@ async def test_another_market_without_a_census_is_exactly_as_before(now) -> None
 
 
 async def test_another_market_whose_census_fails_keeps_its_holder_path(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     chain.fail_at = 2
     snapshot = await build(now, chain, market=market_identity())
     assert snapshot.pool_control is not None and not snapshot.pool_control.required
@@ -314,14 +316,14 @@ async def test_another_market_whose_census_fails_keeps_its_holder_path(now) -> N
 
 
 async def test_another_market_whose_token_has_v4_pools_requires_them(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     snapshot = await build(now, chain, market=market_identity())
     assert snapshot.pool_control_required
     assert snapshot.pool_control.economic_top10_share > Decimal("0.60")
 
 
 async def test_a_wrong_chain_census_is_refused_through_the_builder(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     chain.network_id = 56
     with pytest.raises(AtlasContextUnavailable) as refused:
         await build(now, chain)
@@ -329,7 +331,7 @@ async def test_a_wrong_chain_census_is_refused_through_the_builder(now) -> None:
 
 
 async def test_unavailable_holders_leave_no_economic_figure(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     control = (await build(now, chain, rows=())).pool_control
     assert control.status is Availability.UNAVAILABLE
     assert control.gap is PoolControlGap.HOLDER_BASIS_UNAVAILABLE
@@ -339,7 +341,7 @@ async def test_unavailable_holders_leave_no_economic_figure(now) -> None:
 
 
 async def test_the_digest_covers_pool_control(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     first = await build(now, chain)
     again = await build(now, chain)
     assert atlas_snapshot_digest(first) == atlas_snapshot_digest(again)
@@ -354,7 +356,7 @@ async def test_the_digest_covers_pool_control(now) -> None:
 
 
 async def test_evidence_carries_a_bounded_audit_record(now) -> None:
-    chain, traded, hidden = revenue_like()
+    chain, traded, hidden = revenue_like("official")
     snapshot = await build(now, chain)
     payload = onchain_payload(snapshot, evaluate_snapshot(snapshot, now))
     summary = payload.intelligence.pool_control
@@ -407,7 +409,7 @@ def test_legacy_evidence_without_pool_control_replays_byte_for_byte() -> None:
 
 
 async def test_unavailable_pool_control_is_recorded_with_its_reason(now) -> None:
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     chain.fail_at = 9
     snapshot = await build(now, chain)
     summary = onchain_payload(snapshot, evaluate_snapshot(snapshot, now)).intelligence.pool_control
@@ -425,7 +427,7 @@ async def test_the_model_may_cite_pool_control_addresses(now) -> None:
 
 async def test_a_census_that_breaks_off_after_finding_pools_keeps_them_required(now) -> None:
     """Pools proven before a failure cannot make the token look V4-free."""
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     chain.fail_at = 20  # inside the position reads, after both pools were found
     snapshot = await build(now, chain, market=market_identity())
     control = snapshot.pool_control
@@ -439,7 +441,7 @@ async def test_a_census_that_breaks_off_after_finding_pools_keeps_them_required(
 async def test_a_v4_market_whose_own_pool_is_missing_is_incomplete(now) -> None:
     from tests.atlas.v4.scenarios import v4_market
 
-    chain, _, _ = revenue_like()
+    chain, _, _ = revenue_like("official")
     elsewhere = Pool(NATIVE, TOKEN, 3000, 60, created_block=CREATED_BLOCK - 5)
     snapshot = await build(now, chain, market=v4_market(elsewhere))
     control = snapshot.pool_control

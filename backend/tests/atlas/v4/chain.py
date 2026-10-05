@@ -31,8 +31,10 @@ from src.agents.atlas.v4.protocol import (
 from src.runtime.models import ErrorCode, RuntimeFailure
 
 NATIVE = "0x" + "0" * 40
-POOL_MANAGER = "0x" + "a0" * 19 + "01"
-POSITION_MANAGER = "0x" + "a0" * 19 + "02"
+# The Robinhood Chain V4 deployment, as configured in production: the official
+# custody registry binds its FeeSplitters to exactly these two contracts.
+POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951"
+POSITION_MANAGER = "0x58daec3116aae6d93017baaea7749052e8a04fa7"
 SECOND_POSITION_MANAGER = "0x" + "a0" * 19 + "03"
 CHAIN_ID = 4663
 CREATED_BLOCK = 77_186_957
@@ -107,6 +109,10 @@ class FakeV4Chain:
     contracts: set[str] = field(default_factory=set)
     # EIP-7702 delegated accounts.
     delegated: set[str] = field(default_factory=set)
+    # Exact runtime code for chosen contracts, such as a custody contract.
+    codes: dict[str, str] = field(default_factory=dict)
+    # (address, slot) -> word, for EIP-1967 proxy slots and the like.
+    slots: dict[tuple[str, str], int] = field(default_factory=dict)
     # A manager bound to some other PoolManager, for verification failures.
     manager_binding: dict[str, str] = field(default_factory=dict)
     # Token units the PoolManager holds beyond every position: fees, rounding.
@@ -275,16 +281,23 @@ class FakeV4Chain:
     def _has_code(self, address: str, block: int) -> bool:
         if address == self.token:
             return block >= self.created_block
-        return address in self.contracts or address in (
-            self.pool_manager,
-            *self.position_managers,
+        return (
+            address in self.contracts
+            or address in self.codes
+            or address in (self.pool_manager, *self.position_managers)
         )
 
     async def code(self, address: str, block: int) -> str:
         self._tick()
         if address in self.delegated:
             return "0xef0100" + "11" * 20
+        if address in self.codes:
+            return self.codes[address]
         return CODE if self._has_code(address, block) else "0x"
+
+    async def storage(self, address: str, slot: str, block: int) -> str:
+        self._tick()
+        return hex_word(self.slots.get((address, slot), 0))
 
     async def call(self, address: str, selector: str, block: int) -> str:
         self._tick()

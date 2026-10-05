@@ -39,6 +39,7 @@ from src.agents.atlas.ports import (
 )
 from src.agents.atlas.sources.normalize import HolderNormalizationError, concentration
 from src.agents.atlas.v4.census import PoolControlChainRefused
+from src.agents.atlas.v4.control import PositionControlFacts
 from src.agents.atlas.v4.economic import pool_control
 from src.agents.atlas.v4.models import PoolControlFacts, PoolControlGap, V4Census
 from src.core.clock import Clock, SystemClock
@@ -500,6 +501,9 @@ def pool_control_document(control: PoolControlFacts) -> dict[str, object]:
                 "owner_status": item.owner_status.value,
                 "controlled_token_raw": str(item.controlled_token_raw),
                 "owner_is_creator": item.owner_is_creator,
+                # Only where control facts exist, so a position without them
+                # keeps the digest it always had.
+                **({} if item.control is None else {"control": _control(item.control)}),
             }
             for item in census.positions
         ],
@@ -526,6 +530,34 @@ def pool_control_document(control: PoolControlFacts) -> dict[str, object]:
             }
             for item in control.economic_top_holders
         ],
+        # Control buckets and the floor, each only where it was established.
+        **{
+            key: value
+            for key, value in {
+                "permanently_locked_raw": _raw(control.permanently_locked_raw),
+                "timelocked_raw": _raw(control.timelocked_raw),
+                "releasable_raw": _raw(control.releasable_raw),
+                "unknown_custody_raw": _raw(control.unknown_custody_raw),
+                "economic_top10_floor": _ratio(control.economic_top10_floor),
+            }.items()
+            if value is not None
+        },
+    }
+
+
+def _control(facts: PositionControlFacts) -> dict[str, object]:
+    return {
+        "position_owner": facts.position_owner,
+        "owner_kind": facts.owner_kind.value,
+        "control_state": facts.control_state.value,
+        "controller": facts.controller,
+        "unlock_block": facts.unlock_block,
+        "proof_kind": facts.proof_kind.value,
+        "proof_contract": facts.proof_contract,
+        "proof_version": facts.proof_version,
+        "owner_code_hash": facts.owner_code_hash,
+        "completeness": facts.completeness.value,
+        "refusal": None if facts.refusal is None else facts.refusal.value,
     }
 
 

@@ -32,6 +32,7 @@ from src.agents.atlas.models import (
 )
 from src.agents.atlas.policy import ATLAS_POLICY_V1, AtlasPolicy, evaluate_snapshot
 from src.agents.atlas.prompt import ATLAS_INSTRUCTIONS, ATLAS_PROMPT_HASH, ATLAS_PROMPT_VERSION
+from src.agents.atlas.v4.control import PositionControlFacts
 from src.agents.atlas.v4.models import PoolControlFacts
 from src.agents.atlas.validation import AtlasValidationError, validate_assessment
 from src.core.clock import Clock, SystemClock
@@ -59,6 +60,7 @@ from src.orchestration.workflow.models import (
     PoolControlPool,
     PoolControlPosition,
     PoolControlSummary,
+    PositionControlRecord,
     ReconciledExclusion,
 )
 from src.reasoning.models import ReasoningFailure, ReasoningRequest, ReasoningResult
@@ -91,6 +93,7 @@ REASON_DOMAIN: dict[AtlasReasonCode, AtlasDomain] = {
     AtlasReasonCode.V4_POOL_CENSUS_UNAVAILABLE: AtlasDomain.HOLDERS,
     AtlasReasonCode.V4_POSITION_FACTS_INCOMPLETE: AtlasDomain.HOLDERS,
     AtlasReasonCode.V4_POOL_BALANCE_UNATTRIBUTED: AtlasDomain.HOLDERS,
+    AtlasReasonCode.V4_POSITION_CONTROL_UNRESOLVED: AtlasDomain.HOLDERS,
 }
 
 
@@ -163,6 +166,25 @@ def holder_distribution(facts: HolderFacts) -> HolderDistributionFacts | None:
     return HolderDistributionFacts(**fields)
 
 
+def position_control_record(facts: PositionControlFacts | None) -> PositionControlRecord | None:
+    """The durable form of one position's control facts."""
+    if facts is None:
+        return None
+    return PositionControlRecord(
+        position_owner=facts.position_owner,
+        owner_kind=facts.owner_kind.value,
+        control_state=facts.control_state.value,
+        controller=facts.controller,
+        unlock_block=facts.unlock_block,
+        proof_kind=facts.proof_kind.value,
+        proof_contract=facts.proof_contract,
+        proof_version=facts.proof_version,
+        owner_code_hash=facts.owner_code_hash,
+        completeness=facts.completeness.value,
+        refusal=None if facts.refusal is None else facts.refusal.value,
+    )
+
+
 def pool_control_summary(
     control: PoolControlFacts | None, raw_top_ten: Decimal | None
 ) -> PoolControlSummary | None:
@@ -182,6 +204,12 @@ def pool_control_summary(
 
     def raw(value: int | None) -> str | None:
         return None if value is None else str(value)
+
+    states: dict[str, int] = {}
+    for item in census.positions:
+        if item.control is not None:
+            state = item.control.control_state.value
+            states[state] = states.get(state, 0) + 1
 
     return PoolControlSummary(
         status=control.status.value,
@@ -246,6 +274,7 @@ def pool_control_summary(
                 owner_status=item.owner_status.value,
                 controlled_token_raw=str(item.controlled_token_raw),
                 owner_is_creator=item.owner_is_creator,
+                control=position_control_record(item.control),
             )
             for item in listed
         ),
@@ -260,6 +289,16 @@ def pool_control_summary(
             )
             for item in control.economic_top_holders
         ),
+        permanently_locked_raw=raw(control.permanently_locked_raw),
+        timelocked_raw=raw(control.timelocked_raw),
+        releasable_raw=raw(control.releasable_raw),
+        unknown_custody_raw=raw(control.unknown_custody_raw),
+        permanently_locked_pool_supply_fraction=control.permanently_locked_pool_supply_fraction,
+        timelocked_pool_supply_fraction=control.timelocked_pool_supply_fraction,
+        releasable_pool_supply_fraction=control.releasable_pool_supply_fraction,
+        unknown_custody_pool_supply_fraction=control.unknown_custody_pool_supply_fraction,
+        position_control_states=dict(sorted(states.items())) or None,
+        economic_top_ten_floor_fraction=control.economic_top10_floor,
     )
 
 
