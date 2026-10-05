@@ -123,6 +123,14 @@ class FakeV4Chain:
     # Rewrites applied to logs and storage answers, for tampering tests.
     tamper_log: Callable[[ChainLog], ChainLog] | None = None
     tamper_liquidity: Callable[[int], int] | None = None
+    # A provider log-range limit: wider `eth_getLogs` windows fail with
+    # `span_failure`, as a real provider refuses or cuts them.
+    max_log_span: int | None = None
+    span_failure: ErrorCode = ErrorCode.RPC_ERROR
+    # A block no window containing it can be read across, whatever its width.
+    unreadable_block: int | None = None
+    # Every window that was answered, in order, for coverage checks.
+    answered_windows: list[tuple[tuple[str | None, ...], int, int]] = field(default_factory=list)
     requests: int = 0
     log_requests: list[tuple[str, tuple[str | None, ...], int, int]] = field(default_factory=list)
 
@@ -215,6 +223,11 @@ class FakeV4Chain:
     ) -> tuple[ChainLog, ...]:
         self._tick()
         self.log_requests.append((address, topics, start, end))
+        if self.max_log_span is not None and end - start + 1 > self.max_log_span:
+            raise RuntimeFailure(self.span_failure)
+        if self.unreadable_block is not None and start <= self.unreadable_block <= end:
+            raise RuntimeFailure(ErrorCode.RPC_ERROR)
+        self.answered_windows.append((topics, start, end))
         if address != self.pool_manager:
             return ()
         found: list[ChainLog] = []
