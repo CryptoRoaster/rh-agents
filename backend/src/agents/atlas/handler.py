@@ -21,6 +21,7 @@ from src.agents.atlas.context import (
     atlas_snapshot_digest,
     snapshot_document,
 )
+from src.agents.atlas.funding.models import FundingGraphFacts
 from src.agents.atlas.models import (
     AtlasAssessment,
     AtlasDomain,
@@ -53,6 +54,8 @@ from src.orchestration.workflow.models import (
     EvidenceStatus,
     EvidenceSubmission,
     EvidenceType,
+    FundingEdgeRecord,
+    FundingGraphSummary,
     HolderDistributionFacts,
     OnchainAdvisoryFinding,
     OnchainIntelligence,
@@ -164,6 +167,53 @@ def holder_distribution(facts: HolderFacts) -> HolderDistributionFacts | None:
             for item in facts.reconciled_exclusions
         )
     return HolderDistributionFacts(**fields)
+
+
+def funding_graph_summary(facts: FundingGraphFacts | None) -> FundingGraphSummary | None:
+    """The durable funding measurement: every figure, a bounded edge sample, a digest."""
+    if facts is None:
+        return None
+    return FundingGraphSummary(
+        status=facts.status.value,
+        gap=None if facts.gap is None else facts.gap.value,
+        failure=None if facts.failure is None else facts.failure.value,
+        source=facts.source,
+        root_address=facts.root_address,
+        origin_source=facts.origin_source,
+        origin_verification=facts.origin_verification,
+        factory_address=facts.factory_address,
+        creation_block=facts.creation_block,
+        snapshot_block=facts.snapshot_block,
+        coverage=None if facts.coverage is None else facts.coverage.value,
+        requests_made=facts.requests_made,
+        transactions_read=facts.transactions_read,
+        direct_funding_tx_count=facts.direct_funding_tx_count,
+        unique_direct_funded_address_count=facts.unique_direct_funded_address_count,
+        total_direct_native_funding_raw=(
+            None
+            if facts.total_direct_native_funding_raw is None
+            else str(facts.total_direct_native_funding_raw)
+        ),
+        first_funding_block=facts.first_funding_block,
+        last_funding_block=facts.last_funding_block,
+        edges_digest=facts.edges_digest,
+        sample_edges=tuple(
+            FundingEdgeRecord(
+                recipient=edge.recipient,
+                tx_hash=edge.tx_hash,
+                block_number=edge.block_number,
+                native_value_raw=str(edge.native_value_raw),
+            )
+            for edge in facts.sample_edges
+        ),
+        holder_basis=facts.holder_basis.value,
+        observed_holder_count=facts.observed_holder_count,
+        creator_funded_observed_holder_count=facts.creator_funded_observed_holder_count,
+        creator_funded_observed_holder_fraction=facts.creator_funded_observed_holder_fraction,
+        creator_funded_observed_supply_fraction=facts.creator_funded_observed_supply_fraction,
+        creator_funded_observed_top10_count=facts.creator_funded_observed_top10_count,
+        creator_funded_observed_holders=facts.creator_funded_observed_holders,
+    )
 
 
 def position_control_record(facts: PositionControlFacts | None) -> PositionControlRecord | None:
@@ -350,6 +400,7 @@ def onchain_payload(
             # existed — and the two must not serialise alike.
             holders=holder_distribution(snapshot.holders),
             pool_control=pool_control_summary(snapshot.pool_control, snapshot.holders.top10_share),
+            funding_graph=funding_graph_summary(snapshot.funding_graph),
         ),
     )
 

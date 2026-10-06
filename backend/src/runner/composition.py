@@ -341,6 +341,8 @@ def _exit_read(settings: Settings, ports: RunnerPorts, clock: Clock) -> ExitOnch
 def atlas_builder(
     settings: Settings, ports: RunnerPorts, clock: Clock, *, pool_control: bool = True
 ) -> SnapshotBuilderPort:
+    # ``pool_control`` is False for a PAPER exit's read: neither the V4 census
+    # nor the funding graph can bind a sale, so neither is collected for one.
     """ATLAS's snapshot builder: one per chain when several are configured.
 
     The holder and origin sources take a chain argument and are shared; only
@@ -349,7 +351,7 @@ def atlas_builder(
     """
     from src.agents.atlas.context import AtlasSnapshotBuilder, ChainRoutedSnapshotBuilder
     from src.agents.atlas.rpc_source import RpcTokenContractSource
-    from src.agents.atlas.sources.factory import holder_sources, origin_sources
+    from src.agents.atlas.sources.factory import funding_source, holder_sources, origin_sources
     from src.agents.atlas.v4.census import V4PoolCensus
     from src.agents.atlas.v4.rpc import RpcV4ChainReads
 
@@ -370,12 +372,18 @@ def atlas_builder(
                 reads=RpcV4ChainReads(contracts.client), chain=contracts.config.chain
             )
             verifier = contracts
+        funding = (
+            funding_source(settings, contracts.config.chain)
+            if pool_control and isinstance(contracts, RpcTokenContractSource)
+            else None
+        )
         return AtlasSnapshotBuilder(
             contracts=contracts,  # type: ignore[arg-type]
             holders=holders,  # type: ignore[arg-type]
             origins=origins,  # type: ignore[arg-type]
             verifier=verifier,
             pool_census=census,
+            funding=funding,
             clock=clock,
         )
 

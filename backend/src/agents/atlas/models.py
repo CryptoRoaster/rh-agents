@@ -21,6 +21,8 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, Field, field_validator, model_validator
 
+from src.agents.atlas.funding.models import FundingGraphFacts
+
 # Re-exported: these names have always been imported from this module.
 from src.agents.atlas.primitives import AtlasSourceFailure as AtlasSourceFailure
 from src.agents.atlas.primitives import EvmAddress as EvmAddress
@@ -433,6 +435,10 @@ class AtlasOnchainSnapshot(Immutable):
     # V4 pool on a builder without a census. Never absent for a V4 market,
     # whose missing census is itself recorded as unavailable.
     pool_control: PoolControlFacts | None = None
+    # CREATOR_FUNDING_GRAPH, a shadow measurement. Absent where no funding
+    # source is configured, so every snapshot without one keeps its digest.
+    # No policy reads it.
+    funding_graph: FundingGraphFacts | None = None
 
     @field_validator("token_address")
     @classmethod

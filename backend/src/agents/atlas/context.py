@@ -15,6 +15,8 @@ from hashlib import sha256
 from typing import Protocol
 from uuid import UUID
 
+from src.agents.atlas.funding.graph import funding_graph
+from src.agents.atlas.funding.models import FundingGraphFacts, FundingSourceResult
 from src.agents.atlas.models import (
     RECONCILABLE_EXCLUSIONS,
     AtlasOnchainSnapshot,
@@ -33,6 +35,7 @@ from src.agents.atlas.models import (
 from src.agents.atlas.ports import (
     ContractOriginReadPort,
     CreationVerificationPort,
+    FundingReadPort,
     HolderIntelligenceReadPort,
     PoolControlReadPort,
     TokenContractReadPort,
@@ -114,6 +117,9 @@ class AtlasSnapshotBuilder:
     # The V4 pool census. Absent means none is configured: a V4 market then
     # records its pool control as unavailable, and nothing else changes.
     pool_census: PoolControlReadPort | None = None
+    # The creator funding source. Absent means none is configured, and the
+    # snapshot carries no funding graph at all.
+    funding: FundingReadPort | None = None
     clock: Clock = SystemClock()
 
     async def build(
@@ -131,6 +137,7 @@ class AtlasSnapshotBuilder:
         holders = await self._holder_facts(chain, token_address, contract)
         origin = await self._origin_facts(chain, token_address)
         control = await self._pool_control(market, chain, token_address, contract, holders, origin)
+        funding = await self._funding_graph(market, chain, contract, holders, origin, control)
         return AtlasOnchainSnapshot(
             trade_case_id=trade_case_id,
             task_id=task_id,
@@ -142,6 +149,53 @@ class AtlasSnapshotBuilder:
             origin=origin,
             collected_at=self.clock.now(),
             pool_control=control,
+            funding_graph=funding,
+        )
+
+    async def _funding_graph(
+        self,
+        market: MarketIdentity,
+        chain: ChainSnapshot,
+        contract: ContractFacts,
+        holders: HolderFacts,
+        origin: OriginFacts,
+        control: PoolControlFacts | None,
+    ) -> FundingGraphFacts | None:
+        """The creator funding measurement, from the facts already established.
+
+        Runs last: its root is the origin creator, its window ends at the pinned
+        block, and its holder overlap uses the holder basis that holder and pool
+        control already settled. A shadow fact -- no policy reads it.
+        """
+        if self.funding is None:
+            return None
+        root = origin.creator_address if origin.status == Availability.AVAILABLE else None
+        created = origin.creation_block
+        read: FundingSourceResult | None = None
+        if root is not None and created is not None and created <= chain.block_number:
+            try:
+                read = await self.funding.funding_transactions(
+                    chain.chain, root, created, chain.block_number
+                )
+            except Exception:
+                read = FundingSourceResult(
+                    status=Availability.UNAVAILABLE,
+                    failure=AtlasSourceFailure.UNAVAILABLE,
+                    source=self.funding.source,
+                )
+        v4_market = (
+            market.pool_locator is not None
+            and market.pool_locator.kind == PoolLocatorKind.BYTES32_POOL_ID
+        )
+        return funding_graph(
+            read,
+            source=self.funding.source,
+            origin=origin,
+            contract=contract,
+            holders=holders,
+            pool_control=control,
+            v4_required=v4_market or (control is not None and control.required),
+            snapshot_block=chain.block_number,
         )
 
     async def _pool_control(
@@ -436,6 +490,53 @@ def _ratio(value: Decimal | None) -> str | None:
     return None if value is None else canonical_decimal(value)
 
 
+def funding_graph_document(facts: FundingGraphFacts) -> dict[str, object]:
+    """The funding measurement in canonical form: every figure, a bounded edge sample."""
+    return {
+        "measurement": facts.measurement,
+        "scope": facts.scope,
+        "status": facts.status.value,
+        "gap": None if facts.gap is None else facts.gap.value,
+        "failure": None if facts.failure is None else facts.failure.value,
+        "source": facts.source,
+        "root_address": facts.root_address,
+        "origin_source": facts.origin_source,
+        "origin_verification": facts.origin_verification,
+        "factory_address": facts.factory_address,
+        "creation_block": facts.creation_block,
+        "snapshot_block": facts.snapshot_block,
+        "coverage": None if facts.coverage is None else facts.coverage.value,
+        "requests_made": facts.requests_made,
+        "transactions_read": facts.transactions_read,
+        "direct_funding_tx_count": facts.direct_funding_tx_count,
+        "unique_direct_funded_address_count": facts.unique_direct_funded_address_count,
+        "total_direct_native_funding_raw": _raw(facts.total_direct_native_funding_raw),
+        "first_funding_block": facts.first_funding_block,
+        "last_funding_block": facts.last_funding_block,
+        "edges_digest": facts.edges_digest,
+        "sample_edges": [
+            {
+                "recipient": edge.recipient,
+                "tx_hash": edge.tx_hash,
+                "block_number": edge.block_number,
+                "native_value_raw": str(edge.native_value_raw),
+            }
+            for edge in facts.sample_edges
+        ],
+        "holder_basis": facts.holder_basis.value,
+        "observed_holder_count": facts.observed_holder_count,
+        "creator_funded_observed_holder_count": facts.creator_funded_observed_holder_count,
+        "creator_funded_observed_holder_fraction": _ratio(
+            facts.creator_funded_observed_holder_fraction
+        ),
+        "creator_funded_observed_supply_fraction": _ratio(
+            facts.creator_funded_observed_supply_fraction
+        ),
+        "creator_funded_observed_top10_count": facts.creator_funded_observed_top10_count,
+        "creator_funded_observed_holders": list(facts.creator_funded_observed_holders),
+    }
+
+
 def pool_control_document(control: PoolControlFacts) -> dict[str, object]:
     """Pool control, every safety-relevant fact, in one bounded canonical form.
 
@@ -672,6 +773,12 @@ def snapshot_document(snapshot: AtlasOnchainSnapshot) -> dict[str, object]:
             {}
             if snapshot.pool_control is None
             else {"pool_control": pool_control_document(snapshot.pool_control)}
+        ),
+        # Likewise only where a funding source is configured.
+        **(
+            {}
+            if snapshot.funding_graph is None
+            else {"funding_graph": funding_graph_document(snapshot.funding_graph)}
         ),
     }
 

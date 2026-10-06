@@ -8,6 +8,7 @@ deterministic collector does.
 
 from typing import Protocol
 
+from src.agents.atlas.funding.models import FundingSourceResult
 from src.agents.atlas.models import (
     ChainSnapshot,
     ContractFacts,
@@ -79,3 +80,19 @@ class PoolControlReadPort(Protocol):
     async def census(
         self, snapshot: ChainSnapshot, token: str, from_block: int | None
     ) -> V4Census: ...
+
+
+class FundingReadPort(Protocol):
+    """A root address's normal transactions over one block window, read-only.
+
+    Answers for exactly ``chain``, ``address`` and ``[from_block, to_block]``.
+    ``coverage`` says whether every transaction of the window was read; a read
+    cut short by a bound is a lower bound, never an empty answer.
+    """
+
+    @property
+    def source(self) -> str: ...
+
+    async def funding_transactions(
+        self, chain: str, address: str, from_block: int, to_block: int
+    ) -> FundingSourceResult: ...

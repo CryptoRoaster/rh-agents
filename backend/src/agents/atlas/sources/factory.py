@@ -6,6 +6,8 @@ the routing table, which makes its facts explicitly unavailable rather than
 quietly optional.
 """
 
+from typing import TYPE_CHECKING
+
 from src.agents.atlas.ports import ContractOriginReadPort, HolderIntelligenceReadPort
 from src.agents.atlas.sources.blockscout import (
     BlockscoutConfig,
@@ -18,6 +20,39 @@ from src.agents.atlas.sources.nodereal import MAX_PAGE_SIZE, NodeRealConfig, Nod
 from src.agents.atlas.sources.routing import RoutedHolderSource, RoutedOriginSource
 from src.core.clock import Clock, SystemClock
 from src.core.config import Settings
+
+if TYPE_CHECKING:
+    from src.agents.atlas.sources.blockscout_funding import BlockscoutFundingSource
+
+
+def funding_source(settings: Settings, chain: str) -> "BlockscoutFundingSource | None":
+    """The creator funding source for ``chain``, where one is configured.
+
+    Robinhood Chain through Blockscout only, and only when the funding graph is
+    switched on and Blockscout is this chain's selected ATLAS provider. Any
+    other chain has none; BSC is deferred.
+    """
+    from src.agents.atlas.sources.blockscout_funding import (
+        BlockscoutFundingConfig,
+        BlockscoutFundingSource,
+    )
+
+    if (
+        not settings.atlas_funding_graph_enabled
+        or chain != "robinhood"
+        or settings.atlas_rh_origin_provider != "blockscout"
+        or not settings.blockscout_api_key.get_secret_value()
+    ):
+        return None
+    return BlockscoutFundingSource(
+        config=BlockscoutFundingConfig(
+            base_url=settings.blockscout_base_url,
+            chain_id=settings.rh_chain_id,
+            api_key=settings.blockscout_api_key.get_secret_value(),
+            timeout_seconds=settings.atlas_source_timeout_seconds,
+        ),
+        chain="robinhood",
+    )
 
 
 def _blockscout(settings: Settings) -> BlockscoutConfig:
