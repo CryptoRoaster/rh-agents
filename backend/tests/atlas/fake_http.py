@@ -36,7 +36,7 @@ class RecordingRoutes:
         def factory(config: object) -> SourceTransport:
             headers: dict[str, str] = {}
             key = getattr(config, "api_key", "")
-            if isinstance(config, object) and type(config).__name__ == "BlockscoutConfig":
+            if type(config).__name__ in ("BlockscoutConfig", "BlockscoutFundingConfig"):
                 headers["Authorization"] = f"Bearer {key}"
             if type(config).__name__ == "MoralisConfig":
                 headers["X-API-Key"] = str(key)

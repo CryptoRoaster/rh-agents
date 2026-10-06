@@ -377,6 +377,7 @@ RawAmount = Annotated[str, Field(pattern=r"^[0-9]{1,78}$")]
 PoolControlAddress = Annotated[str, Field(pattern=r"^0x[0-9a-f]{40}$")]
 PoolControlId = Annotated[str, Field(pattern=r"^0x[0-9a-f]{64}$")]
 POOL_CONTROL_KEY = "pool_control"
+FUNDING_GRAPH_KEY = "funding_graph"
 # How many positions the durable record lists by name. The census itself is
 # bounded and complete; this only bounds what is written per row, largest
 # first, and the counts beside it always cover every position.
@@ -585,6 +586,71 @@ class PoolControlSummary(Immutable):
         return self.economic_top_ten_floor_fraction
 
 
+class FundingEdgeRecord(Immutable):
+    recipient: PoolControlAddress
+    tx_hash: PoolControlId
+    block_number: int = Field(strict=True, ge=0)
+    native_value_raw: RawAmount
+
+
+class FundingGraphSummary(Immutable):
+    """Direct native transfers from the origin creator, and their holder overlap.
+
+    A measurement and nothing more: no policy reads it. ``scope`` is exactly
+    what was counted -- direct native transfers from the origin source's
+    creator between the creation block and the snapshot block -- and nobody is
+    called a buyer, a bot or a sybil. With ``coverage`` LOWER_BOUND every count
+    is what was seen, and the truth is that or more. Holder fractions are within
+    the observed holder basis, a bounded prefix; the supply fraction is over
+    the on-chain total supply.
+    """
+
+    measurement: Literal["CREATOR_FUNDING_GRAPH"] = "CREATOR_FUNDING_GRAPH"
+    scope: Literal["DIRECT_NATIVE_FROM_ORIGIN_CREATOR"] = "DIRECT_NATIVE_FROM_ORIGIN_CREATOR"
+    status: Code
+    gap: Code | None = None
+    failure: Code | None = None
+    source: Identifier
+    root_address: PoolControlAddress | None = None
+    origin_source: Identifier | None = None
+    origin_verification: Code | None = None
+    factory_address: PoolControlAddress | None = None
+    creation_block: int | None = Field(default=None, strict=True, ge=0)
+    snapshot_block: int | None = Field(default=None, strict=True, ge=0)
+    coverage: Code | None = None
+    requests_made: int = Field(default=0, strict=True, ge=0)
+    transactions_read: int = Field(default=0, strict=True, ge=0)
+    direct_funding_tx_count: int | None = Field(default=None, strict=True, ge=0)
+    unique_direct_funded_address_count: int | None = Field(default=None, strict=True, ge=0)
+    total_direct_native_funding_raw: RawAmount | None = None
+    first_funding_block: int | None = Field(default=None, strict=True, ge=0)
+    last_funding_block: int | None = Field(default=None, strict=True, ge=0)
+    edges_digest: Identifier | None = None
+    sample_edges: tuple[FundingEdgeRecord, ...] = Field(default=(), max_length=16)
+    holder_basis: Code
+    observed_holder_count: int | None = Field(default=None, strict=True, ge=0)
+    creator_funded_observed_holder_count: int | None = Field(default=None, strict=True, ge=0)
+    creator_funded_observed_holder_fraction: Share | None = None
+    creator_funded_observed_supply_fraction: Share | None = None
+    creator_funded_observed_top10_count: int | None = Field(default=None, strict=True, ge=0)
+    creator_funded_observed_holders: tuple[PoolControlAddress, ...] = Field(
+        default=(), max_length=50
+    )
+
+    @model_validator(mode="after")
+    def figures_match_status(self) -> Self:
+        if self.status == "AVAILABLE":
+            if self.coverage is None or self.direct_funding_tx_count is None:
+                raise ValueError("An available funding graph carries its coverage and counts")
+        elif self.gap is None or self.direct_funding_tx_count is not None:
+            raise ValueError("An unavailable funding graph names its gap and carries no count")
+        return self
+
+    @property
+    def counts_are_lower_bounds(self) -> bool:
+        return self.coverage != "COMPLETE"
+
+
 class OnchainIntelligence(Immutable):
     """The deterministic record behind an on-chain verdict.
 
@@ -613,6 +679,9 @@ class OnchainIntelligence(Immutable):
     # V4 pool control. Absent where it was never collected, and then omitted
     # entirely, so every row written without it replays byte for byte.
     pool_control: PoolControlSummary | None = None
+    # CREATOR_FUNDING_GRAPH, shadow only. Absent where it was never collected,
+    # and then omitted entirely, so every earlier row replays byte for byte.
+    funding_graph: FundingGraphSummary | None = None
 
     _holder_facts_key_present: bool = PrivateAttr(default=False)
 
@@ -629,6 +698,8 @@ class OnchainIntelligence(Immutable):
         emitted: dict[str, Any] = handler(self)
         if self.pool_control is None:
             emitted = {key: value for key, value in emitted.items() if key != POOL_CONTROL_KEY}
+        if self.funding_graph is None:
+            emitted = {key: value for key, value in emitted.items() if key != FUNDING_GRAPH_KEY}
         if self._holder_facts_key_present:
             return emitted
         return {key: value for key, value in emitted.items() if key != HOLDER_FACTS_KEY}

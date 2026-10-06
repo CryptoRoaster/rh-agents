@@ -186,6 +186,11 @@ class Settings(BaseSettings):
     # unestablished (fail closed) rather than judged on raw holders. On, the
     # census also verifies creation receipts so creator control can be named.
     atlas_v4_pool_control_enabled: bool = False
+    # CREATOR_FUNDING_GRAPH V1: the origin creator's direct native transfers in
+    # the launch window, read from Blockscout on Robinhood Chain. A shadow
+    # measurement recorded in evidence; no policy reads it. Off by default, so
+    # no deployment makes these provider calls until it is switched on.
+    atlas_funding_graph_enabled: bool = False
     # Phase 2F SIGNAL. Disabled by default like every other worker, and with no
     # provider credential of any kind: no social source is integrated yet, so
     # there is nothing here a misconfiguration could cause to be fetched.
