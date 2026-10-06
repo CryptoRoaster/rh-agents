@@ -11,7 +11,9 @@ Contract: ``GET /{chain_id}/api/v2/addresses/{address_hash}/transactions`` with
 * the default order is ``desc block_number, desc index`` (then
   ``inserted_at``, ``hash``), so a later page only holds older transactions;
 * pages are keyset cursors in ``next_page_params`` -- ``null`` when nothing
-  older exists -- with 50 items per page;
+  older exists -- with 50 items per page; the cursor also echoes the request's
+  own documented ``filter`` query parameter, which is accepted only as the
+  exact ``"from"`` this adapter sent;
 * ``status`` is ``"ok"`` or ``"error"``, ``value`` is an integer string in wei,
   ``to`` is absent for a contract creation, ``block_number`` absent while pending.
 
@@ -43,6 +45,11 @@ from src.markets.models import Availability
 PAGE_PARAMETERS = frozenset(
     {"block_number", "index", "inserted_at", "hash", "value", "fee", "items_count"}
 )
+# The request's own direction filter, which Blockscout echoes in the cursor.
+# A documented query parameter of this endpoint, but never the provider's to
+# choose: it must repeat exactly what was sent, and is not echoed back again.
+FILTER_PARAMETER = "filter"
+FILTER_FROM = "from"
 PAGE_SIZE = 50
 # Fixed V1 bounds: at most ten pages, so at most 500 transactions per read.
 MAX_FUNDING_PAGES = 10
@@ -133,7 +140,7 @@ class BlockscoutFundingSource:
         self, transport: SourceTransport, address_hash: str, from_block: int
     ) -> tuple[list[FundingTransaction], FundingCoverage]:
         path = f"{self.config.chain_id}/api/v2/addresses/{address_hash}/transactions"
-        params: dict[str, str | int] = {"filter": "from"}
+        params: dict[str, str | int] = {FILTER_PARAMETER: FILTER_FROM}
         found: list[FundingTransaction] = []
         cursors: set[str] = set()
         last: tuple[int, int] | None = None
@@ -163,7 +170,7 @@ class BlockscoutFundingSource:
                 return found, FundingCoverage.COMPLETE
             if not items:
                 raise invalid()  # promises more, delivers nothing
-            params = {"filter": "from", **self._page_params(next_params)}
+            params = {FILTER_PARAMETER: FILTER_FROM, **self._page_params(next_params)}
             marker = repr(sorted(params.items()))
             if marker in cursors:
                 raise invalid()  # a repeating cursor loops forever
@@ -172,7 +179,10 @@ class BlockscoutFundingSource:
 
     @staticmethod
     def _page_params(value: object) -> dict[str, str | int]:
-        raw = mapping(value)
+        raw = dict(mapping(value))
+        if FILTER_PARAMETER in raw and raw.pop(FILTER_PARAMETER) != FILTER_FROM:
+            # An echoed direction other than ours is an answer to another query.
+            raise invalid()
         if not raw or not set(raw) <= PAGE_PARAMETERS:
             raise invalid()
         params: dict[str, str | int] = {}
