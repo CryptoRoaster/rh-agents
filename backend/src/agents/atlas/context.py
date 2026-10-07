@@ -9,14 +9,21 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from typing import Protocol
 from uuid import UUID
 
 from src.agents.atlas.funding.graph import funding_graph
-from src.agents.atlas.funding.models import FundingGraphFacts, FundingSourceResult
+from src.agents.atlas.funding.models import (
+    LONGEST_LOOKBACK,
+    FundingEdge,
+    FundingGraphFacts,
+    FundingSourceResult,
+    PrelaunchFundingFacts,
+)
+from src.agents.atlas.funding.prelaunch import prelaunch_facts
 from src.agents.atlas.models import (
     RECONCILABLE_EXCLUSIONS,
     AtlasOnchainSnapshot,
@@ -166,16 +173,27 @@ class AtlasSnapshotBuilder:
         Runs last: its root is the origin creator, its window ends at the pinned
         block, and its holder overlap uses the holder basis that holder and pool
         control already settled. A shadow fact -- no policy reads it.
+
+        One provider read serves both V1 (the launch window) and V2 (the
+        prelaunch windows): it is asked for history back to the creation
+        block's chain-side time minus the longest lookback. Without that time
+        the read is V1 only, and the prelaunch measurement says why.
         """
         if self.funding is None:
             return None
         root = origin.creator_address if origin.status == Availability.AVAILABLE else None
         created = origin.creation_block
         read: FundingSourceResult | None = None
+        created_at: datetime | None = None
         if root is not None and created is not None and created <= chain.block_number:
+            created_at = await self._creation_time(created)
             try:
                 read = await self.funding.funding_transactions(
-                    chain.chain, root, created, chain.block_number
+                    chain.chain,
+                    root,
+                    created,
+                    chain.block_number,
+                    history_until=None if created_at is None else created_at - LONGEST_LOOKBACK,
                 )
             except Exception:
                 read = FundingSourceResult(
@@ -187,6 +205,7 @@ class AtlasSnapshotBuilder:
             market.pool_locator is not None
             and market.pool_locator.kind == PoolLocatorKind.BYTES32_POOL_ID
         )
+        v4_required = v4_market or (control is not None and control.required)
         return funding_graph(
             read,
             source=self.funding.source,
@@ -194,9 +213,26 @@ class AtlasSnapshotBuilder:
             contract=contract,
             holders=holders,
             pool_control=control,
-            v4_required=v4_market or (control is not None and control.required),
+            v4_required=v4_required,
             snapshot_block=chain.block_number,
+            prelaunch=prelaunch_facts(
+                read,
+                source=self.funding.source,
+                origin=origin,
+                creation_timestamp=created_at,
+                holders=holders,
+                pool_control=control,
+                v4_required=v4_required,
+                snapshot_block=chain.block_number,
+            ),
         )
+
+    async def _creation_time(self, created: int) -> datetime | None:
+        """The creation block's chain-side timestamp, or None: never an estimate."""
+        try:
+            return await self.contracts.block_timestamp(created)
+        except Exception:
+            return None
 
     async def _pool_control(
         self,
@@ -490,6 +526,75 @@ def _ratio(value: Decimal | None) -> str | None:
     return None if value is None else canonical_decimal(value)
 
 
+def _edge_document(edge: FundingEdge) -> dict[str, object]:
+    return {
+        "recipient": edge.recipient,
+        "tx_hash": edge.tx_hash,
+        "block_number": edge.block_number,
+        "native_value_raw": str(edge.native_value_raw),
+    }
+
+
+def _instant(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def prelaunch_document(facts: PrelaunchFundingFacts) -> dict[str, object]:
+    """V2 in canonical form: every window's figures and coverage, one bounded sample."""
+    return {
+        "scope": facts.scope,
+        "version": facts.version,
+        "status": facts.status.value,
+        "gap": None if facts.gap is None else facts.gap.value,
+        "failure": None if facts.failure is None else facts.failure.value,
+        "source": facts.source,
+        "root_address": facts.root_address,
+        "origin_source": facts.origin_source,
+        "origin_verification": facts.origin_verification,
+        "creation_block": facts.creation_block,
+        "creation_timestamp": _instant(facts.creation_timestamp),
+        "creation_time_source": facts.creation_time_source,
+        "history_ended": facts.history_ended,
+        "oldest_observed_at": _instant(facts.oldest_observed_at),
+        "transactions_read": facts.transactions_read,
+        "windows": [
+            {
+                "window": item.window.value,
+                "lookback_seconds": item.lookback_seconds,
+                "cutoff_at": _instant(item.cutoff_at),
+                "coverage": item.coverage.value,
+                "funding_tx_count": item.funding_tx_count,
+                "unique_funded_address_count": item.unique_funded_address_count,
+                "total_native_funding_raw": str(item.total_native_funding_raw),
+                "first_funding_block": item.first_funding_block,
+                "last_funding_block": item.last_funding_block,
+                "first_funding_at": _instant(item.first_funding_at),
+                "last_funding_at": _instant(item.last_funding_at),
+                "edges_digest": item.edges_digest,
+                "unique_funding_value_count": item.unique_funding_value_count,
+                "repeated_funding_tx_count": item.repeated_funding_tx_count,
+                "max_funding_txs_per_recipient": item.max_funding_txs_per_recipient,
+                "largest_identical_value_recipient_cluster_count": (
+                    item.largest_identical_value_recipient_cluster_count
+                ),
+                "largest_identical_value_raw": _raw(item.largest_identical_value_raw),
+                "largest_identical_value_recipient_fraction": _ratio(
+                    item.largest_identical_value_recipient_fraction
+                ),
+                "max_unique_recipients_in_rolling_10m": item.max_unique_recipients_in_rolling_10m,
+            }
+            for item in facts.windows
+        ],
+        "sample_edges": [_edge_document(edge) for edge in facts.sample_edges],
+        "holder_basis": facts.holder_basis.value,
+        "observed_holder_count": facts.observed_holder_count,
+        "creator_funded_observed_holder_count": facts.creator_funded_observed_holder_count,
+        "creator_funded_observed_holder_fraction": _ratio(
+            facts.creator_funded_observed_holder_fraction
+        ),
+    }
+
+
 def funding_graph_document(facts: FundingGraphFacts) -> dict[str, object]:
     """The funding measurement in canonical form: every figure, a bounded edge sample."""
     return {
@@ -534,6 +639,8 @@ def funding_graph_document(facts: FundingGraphFacts) -> dict[str, object]:
         ),
         "creator_funded_observed_top10_count": facts.creator_funded_observed_top10_count,
         "creator_funded_observed_holders": list(facts.creator_funded_observed_holders),
+        # V2 only where it was measured, so a V1 document keeps its digest.
+        **({} if facts.prelaunch is None else {"prelaunch": prelaunch_document(facts.prelaunch)}),
     }
 
 

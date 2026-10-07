@@ -378,6 +378,7 @@ PoolControlAddress = Annotated[str, Field(pattern=r"^0x[0-9a-f]{40}$")]
 PoolControlId = Annotated[str, Field(pattern=r"^0x[0-9a-f]{64}$")]
 POOL_CONTROL_KEY = "pool_control"
 FUNDING_GRAPH_KEY = "funding_graph"
+PRELAUNCH_KEY = "prelaunch"
 # How many positions the durable record lists by name. The census itself is
 # bounded and complete; this only bounds what is written per row, largest
 # first, and the counts beside it always cover every position.
@@ -593,6 +594,76 @@ class FundingEdgeRecord(Immutable):
     native_value_raw: RawAmount
 
 
+class PrelaunchWindowRecord(Immutable):
+    """One prelaunch lookback window, with its own coverage."""
+
+    window: Code
+    lookback_seconds: int = Field(strict=True, gt=0)
+    cutoff_at: AwareDatetime
+    coverage: Code
+    funding_tx_count: int = Field(strict=True, ge=0)
+    unique_funded_address_count: int = Field(strict=True, ge=0)
+    total_native_funding_raw: RawAmount
+    first_funding_block: int | None = Field(default=None, strict=True, ge=0)
+    last_funding_block: int | None = Field(default=None, strict=True, ge=0)
+    first_funding_at: AwareDatetime | None = None
+    last_funding_at: AwareDatetime | None = None
+    edges_digest: Identifier
+    unique_funding_value_count: int = Field(strict=True, ge=0)
+    repeated_funding_tx_count: int = Field(strict=True, ge=0)
+    max_funding_txs_per_recipient: int = Field(strict=True, ge=0)
+    largest_identical_value_recipient_cluster_count: int = Field(strict=True, ge=0)
+    largest_identical_value_raw: RawAmount | None = None
+    largest_identical_value_recipient_fraction: Share | None = None
+    max_unique_recipients_in_rolling_10m: int = Field(strict=True, ge=0)
+
+    @property
+    def counts_are_lower_bounds(self) -> bool:
+        return self.coverage != "COMPLETE"
+
+
+class PrelaunchFundingSummary(Immutable):
+    """V2: the origin creator's direct native transfers before the creation block.
+
+    Shadow only. Each window carries its own coverage; a LOWER_BOUND count is
+    what was seen and never means "none". ``origin_verification`` is the
+    root's provenance and is not upgraded by the measurement being available.
+    """
+
+    scope: Literal["DIRECT_NATIVE_FROM_ORIGIN_CREATOR_PRELAUNCH"] = (
+        "DIRECT_NATIVE_FROM_ORIGIN_CREATOR_PRELAUNCH"
+    )
+    version: Literal[2] = 2
+    status: Code
+    gap: Code | None = None
+    failure: Code | None = None
+    source: Identifier
+    root_address: PoolControlAddress | None = None
+    origin_source: Identifier | None = None
+    origin_verification: Code | None = None
+    creation_block: int | None = Field(default=None, strict=True, ge=0)
+    creation_timestamp: AwareDatetime | None = None
+    creation_time_source: Identifier | None = None
+    history_ended: bool | None = None
+    oldest_observed_at: AwareDatetime | None = None
+    transactions_read: int = Field(default=0, strict=True, ge=0)
+    windows: tuple[PrelaunchWindowRecord, ...] = Field(default=(), max_length=3)
+    sample_edges: tuple[FundingEdgeRecord, ...] = Field(default=(), max_length=16)
+    holder_basis: Code
+    observed_holder_count: int | None = Field(default=None, strict=True, ge=0)
+    creator_funded_observed_holder_count: int | None = Field(default=None, strict=True, ge=0)
+    creator_funded_observed_holder_fraction: Share | None = None
+
+    @model_validator(mode="after")
+    def windows_match_status(self) -> Self:
+        if self.status == "AVAILABLE":
+            if self.creation_timestamp is None or len(self.windows) != 3:
+                raise ValueError("An available prelaunch measurement carries every window")
+        elif self.gap is None or self.windows:
+            raise ValueError("An unavailable prelaunch measurement names its gap only")
+        return self
+
+
 class FundingGraphSummary(Immutable):
     """Direct native transfers from the origin creator, and their holder overlap.
 
@@ -636,6 +707,16 @@ class FundingGraphSummary(Immutable):
     creator_funded_observed_holders: tuple[PoolControlAddress, ...] = Field(
         default=(), max_length=50
     )
+    # V2. Absent where it was not measured, and then omitted entirely, so a
+    # V1 record replays byte for byte.
+    prelaunch: PrelaunchFundingSummary | None = None
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        emitted: dict[str, Any] = handler(self)
+        if self.prelaunch is None:
+            emitted.pop(PRELAUNCH_KEY, None)
+        return emitted
 
     @model_validator(mode="after")
     def figures_match_status(self) -> Self:

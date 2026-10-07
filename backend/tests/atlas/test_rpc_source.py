@@ -47,11 +47,13 @@ class FakeClient:
 
     async def block(self, number: int) -> Head:
         self.calls.append(("block", number))
+        if isinstance(self.overrides.get("block"), Exception):
+            raise self.overrides["block"]
         return Head(
             number=number,
             hash="0x" + "1" * 64,
             parent_hash="0x" + "2" * 64,
-            timestamp=1,
+            timestamp=int(self.overrides.get("timestamp", 1)),
         )
 
     async def code(self, address: str, block: int) -> str:
@@ -258,3 +260,17 @@ async def test_an_unreadable_creator_address_answers_unknown_not_false(now):
         clock=FixedClock(now),
     )
     assert await source.is_contract("0x" + "e7" * 20, 1_000_000) is None
+
+
+async def test_a_block_timestamp_is_the_header_time_in_utc(now):
+    from datetime import UTC, datetime
+
+    client = FakeClient(timestamp=1_759_302_824)
+    when = await source(now, client).block_timestamp(77_186_957)
+    assert when == datetime(2025, 10, 1, 7, 13, 44, tzinfo=UTC)
+    assert client.calls == [("block", 77_186_957)]
+
+
+async def test_an_unreadable_block_timestamp_is_none_not_an_estimate(now):
+    client = FakeClient(block=RuntimeFailure(ErrorCode.TIMEOUT))
+    assert await source(now, client).block_timestamp(77_186_957) is None

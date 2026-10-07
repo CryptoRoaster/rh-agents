@@ -21,7 +21,11 @@ from src.agents.atlas.context import (
     atlas_snapshot_digest,
     snapshot_document,
 )
-from src.agents.atlas.funding.models import FundingGraphFacts
+from src.agents.atlas.funding.models import (
+    FundingEdge,
+    FundingGraphFacts,
+    PrelaunchFundingFacts,
+)
 from src.agents.atlas.models import (
     AtlasAssessment,
     AtlasDomain,
@@ -64,6 +68,8 @@ from src.orchestration.workflow.models import (
     PoolControlPosition,
     PoolControlSummary,
     PositionControlRecord,
+    PrelaunchFundingSummary,
+    PrelaunchWindowRecord,
     ReconciledExclusion,
 )
 from src.reasoning.models import ReasoningFailure, ReasoningRequest, ReasoningResult
@@ -169,6 +175,71 @@ def holder_distribution(facts: HolderFacts) -> HolderDistributionFacts | None:
     return HolderDistributionFacts(**fields)
 
 
+def funding_edge_record(edge: FundingEdge) -> FundingEdgeRecord:
+    return FundingEdgeRecord(
+        recipient=edge.recipient,
+        tx_hash=edge.tx_hash,
+        block_number=edge.block_number,
+        native_value_raw=str(edge.native_value_raw),
+    )
+
+
+def prelaunch_summary(facts: PrelaunchFundingFacts) -> PrelaunchFundingSummary:
+    """The durable V2 measurement: each window's figures and coverage, one bounded sample."""
+    return PrelaunchFundingSummary(
+        status=facts.status.value,
+        gap=None if facts.gap is None else facts.gap.value,
+        failure=None if facts.failure is None else facts.failure.value,
+        source=facts.source,
+        root_address=facts.root_address,
+        origin_source=facts.origin_source,
+        origin_verification=facts.origin_verification,
+        creation_block=facts.creation_block,
+        creation_timestamp=facts.creation_timestamp,
+        creation_time_source=facts.creation_time_source,
+        history_ended=facts.history_ended,
+        oldest_observed_at=facts.oldest_observed_at,
+        transactions_read=facts.transactions_read,
+        windows=tuple(
+            PrelaunchWindowRecord(
+                window=item.window.value,
+                lookback_seconds=item.lookback_seconds,
+                cutoff_at=item.cutoff_at,
+                coverage=item.coverage.value,
+                funding_tx_count=item.funding_tx_count,
+                unique_funded_address_count=item.unique_funded_address_count,
+                total_native_funding_raw=str(item.total_native_funding_raw),
+                first_funding_block=item.first_funding_block,
+                last_funding_block=item.last_funding_block,
+                first_funding_at=item.first_funding_at,
+                last_funding_at=item.last_funding_at,
+                edges_digest=item.edges_digest,
+                unique_funding_value_count=item.unique_funding_value_count,
+                repeated_funding_tx_count=item.repeated_funding_tx_count,
+                max_funding_txs_per_recipient=item.max_funding_txs_per_recipient,
+                largest_identical_value_recipient_cluster_count=(
+                    item.largest_identical_value_recipient_cluster_count
+                ),
+                largest_identical_value_raw=(
+                    None
+                    if item.largest_identical_value_raw is None
+                    else str(item.largest_identical_value_raw)
+                ),
+                largest_identical_value_recipient_fraction=(
+                    item.largest_identical_value_recipient_fraction
+                ),
+                max_unique_recipients_in_rolling_10m=item.max_unique_recipients_in_rolling_10m,
+            )
+            for item in facts.windows
+        ),
+        sample_edges=tuple(funding_edge_record(edge) for edge in facts.sample_edges),
+        holder_basis=facts.holder_basis.value,
+        observed_holder_count=facts.observed_holder_count,
+        creator_funded_observed_holder_count=facts.creator_funded_observed_holder_count,
+        creator_funded_observed_holder_fraction=facts.creator_funded_observed_holder_fraction,
+    )
+
+
 def funding_graph_summary(facts: FundingGraphFacts | None) -> FundingGraphSummary | None:
     """The durable funding measurement: every figure, a bounded edge sample, a digest."""
     if facts is None:
@@ -197,15 +268,7 @@ def funding_graph_summary(facts: FundingGraphFacts | None) -> FundingGraphSummar
         first_funding_block=facts.first_funding_block,
         last_funding_block=facts.last_funding_block,
         edges_digest=facts.edges_digest,
-        sample_edges=tuple(
-            FundingEdgeRecord(
-                recipient=edge.recipient,
-                tx_hash=edge.tx_hash,
-                block_number=edge.block_number,
-                native_value_raw=str(edge.native_value_raw),
-            )
-            for edge in facts.sample_edges
-        ),
+        sample_edges=tuple(funding_edge_record(edge) for edge in facts.sample_edges),
         holder_basis=facts.holder_basis.value,
         observed_holder_count=facts.observed_holder_count,
         creator_funded_observed_holder_count=facts.creator_funded_observed_holder_count,
@@ -213,6 +276,7 @@ def funding_graph_summary(facts: FundingGraphFacts | None) -> FundingGraphSummar
         creator_funded_observed_supply_fraction=facts.creator_funded_observed_supply_fraction,
         creator_funded_observed_top10_count=facts.creator_funded_observed_top10_count,
         creator_funded_observed_holders=facts.creator_funded_observed_holders,
+        prelaunch=None if facts.prelaunch is None else prelaunch_summary(facts.prelaunch),
     )
 
 

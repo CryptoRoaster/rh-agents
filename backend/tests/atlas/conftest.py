@@ -246,15 +246,20 @@ def snapshot(
 
 
 class StubContracts:
-    def __init__(self, chain, contract) -> None:
+    def __init__(self, chain, contract, block_times=None) -> None:
         self._chain = chain
         self._contract = contract
+        # Explicit block -> UTC time; any other block is unreadable (None).
+        self.block_times = dict(block_times or {})
 
     async def chain_snapshot(self):
         return self._chain
 
     async def contract_facts(self, token_address, block):
         return self._contract
+
+    async def block_timestamp(self, block):
+        return self.block_times.get(block)
 
 
 class StubHolders:
