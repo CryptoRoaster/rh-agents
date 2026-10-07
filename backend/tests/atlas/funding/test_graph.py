@@ -1,9 +1,11 @@
 """CREATOR_FUNDING_GRAPH V1 through the real ATLAS builder, with a scripted funding source.
 
-The REVENUE mechanism: a creator directly funds a large number of distinct
-addresses in the launch window, many of which then appear among the observed
-economic holders. V1 measures that -- counts, overlap, coverage -- and changes
-no verdict. Synthetic addresses only; nothing keys on the historical token.
+A generic V1 case: a creator directly funds many distinct addresses inside the
+launch window ``[creation, snapshot]``, some of which then appear among the
+observed economic holders. V1 measures that -- counts, overlap, coverage -- and
+changes no verdict. This is not the historical REVENUE mechanism: REVENUE had
+no post-creation direct funding at all; its funding happened before creation
+and is covered by the V2 prelaunch tests. Synthetic addresses only.
 """
 
 from dataclasses import dataclass, field
@@ -72,9 +74,11 @@ class StubFunding:
     answer_address: str | None = None
     source: str = SOURCE
     calls: list[tuple[str, str, int, int]] = field(default_factory=list)
+    history: list[object] = field(default_factory=list)
 
-    async def funding_transactions(self, chain, address, from_block, to_block):
+    async def funding_transactions(self, chain, address, from_block, to_block, history_until=None):
         self.calls.append((chain, address, from_block, to_block))
+        self.history.append(history_until)
         if self.status != Availability.AVAILABLE:
             from src.agents.atlas.models import AtlasSourceFailure
 
@@ -113,20 +117,20 @@ def funded_holder_rows(funded: int, unfunded: int, each: int = 2_000_000 * UNIT)
     return tuple(rows)
 
 
-# ------------------------------------------------------------- REVENUE-like
+# ------------------------------------------------ direct post-creation funding
 
 
-def revenue_funding(count: int = 184) -> StubFunding:
-    """184 distinct addresses funded by the creator, a few of them twice."""
+def direct_creator_funding(count: int = 184) -> StubFunding:
+    """``count`` distinct addresses funded in the launch window, six of them twice."""
     transactions = [tx(i, to=recipient(i)) for i in range(count)]
     transactions += [tx(1_000 + i, to=recipient(i), value=5 * 10**14) for i in range(6)]
     return StubFunding(tuple(transactions))
 
 
-async def test_the_revenue_mechanism_is_measured(now) -> None:
+async def test_direct_post_creation_funding_is_measured(now) -> None:
     chain, _, _ = revenue_like("official")
     rows = funded_holder_rows(funded=12, unfunded=8)
-    snapshot = await snapshot_with(now, chain, revenue_funding(), rows=rows)
+    snapshot = await snapshot_with(now, chain, direct_creator_funding(), rows=rows)
     graph = snapshot.funding_graph
 
     assert graph.status is Availability.AVAILABLE
@@ -157,7 +161,7 @@ async def test_the_revenue_mechanism_is_measured(now) -> None:
 async def test_the_verdict_is_identical_with_and_without_the_graph(now) -> None:
     chain, _, _ = revenue_like("official")
     rows = funded_holder_rows(funded=12, unfunded=8)
-    with_graph = await snapshot_with(now, chain, revenue_funding(), rows=rows)
+    with_graph = await snapshot_with(now, chain, direct_creator_funding(), rows=rows)
     chain.requests = 0
     without = await snapshot_with(now, chain, None, rows=rows)
     assert without.funding_graph is None
@@ -210,7 +214,7 @@ async def test_a_cut_read_is_a_lower_bound_never_an_exact_zero(now) -> None:
 
 async def test_a_cut_read_keeps_what_it_saw(now) -> None:
     chain, _, _ = revenue_like("official")
-    funding = revenue_funding(40)
+    funding = direct_creator_funding(40)
     funding.coverage = FundingCoverage.LOWER_BOUND
     graph = (await snapshot_with(now, chain, funding)).funding_graph
     assert graph.unique_direct_funded_address_count == 40
@@ -319,7 +323,7 @@ async def test_a_source_that_raises_is_unavailable_not_a_crash(now) -> None:
 async def test_unknown_v4_economics_states_no_overlap_and_never_uses_raw_holders(now) -> None:
     chain, _, _ = revenue_like()  # launch NFT in an unverified locker: economics unknown
     rows = funded_holder_rows(funded=12, unfunded=8)
-    graph = (await snapshot_with(now, chain, revenue_funding(), rows=rows)).funding_graph
+    graph = (await snapshot_with(now, chain, direct_creator_funding(), rows=rows)).funding_graph
     assert graph.holder_basis is HolderOverlapBasis.UNKNOWN
     assert graph.creator_funded_observed_holder_count is None
     assert graph.observed_holder_count is None
@@ -330,7 +334,9 @@ async def test_unknown_v4_economics_states_no_overlap_and_never_uses_raw_holders
 async def test_a_non_v4_token_overlaps_with_its_raw_holders(now) -> None:
     rows = funded_holder_rows(funded=3, unfunded=7)
     graph = (
-        await snapshot_with(now, None, revenue_funding(), rows=rows, market=market_identity())
+        await snapshot_with(
+            now, None, direct_creator_funding(), rows=rows, market=market_identity()
+        )
     ).funding_graph
     assert graph.holder_basis is HolderOverlapBasis.RAW
     assert graph.observed_holder_count == 10
@@ -355,7 +361,7 @@ async def test_a_meme_meme_v4_token_overlaps_like_any_other(now) -> None:
         await snapshot_with(
             now,
             chain,
-            revenue_funding(3),
+            direct_creator_funding(3),
             rows=rows,
             completeness=HolderCompleteness.COMPLETE,
             supply=supply,
@@ -373,7 +379,7 @@ async def test_a_meme_meme_v4_token_overlaps_like_any_other(now) -> None:
 
 async def test_evidence_carries_a_bounded_record_and_round_trips(now) -> None:
     chain, _, _ = revenue_like("official")
-    snapshot = await snapshot_with(now, chain, revenue_funding())
+    snapshot = await snapshot_with(now, chain, direct_creator_funding())
     payload = onchain_payload(snapshot, evaluate_snapshot(snapshot, now))
     summary = payload.intelligence.funding_graph
     assert summary.unique_direct_funded_address_count == 184
@@ -387,9 +393,9 @@ async def test_evidence_carries_a_bounded_record_and_round_trips(now) -> None:
 
 async def test_the_digest_moves_with_the_funding_facts(now) -> None:
     chain, _, _ = revenue_like("official")
-    a = await snapshot_with(now, chain, revenue_funding(184))
+    a = await snapshot_with(now, chain, direct_creator_funding(184))
     chain.requests = 0
-    b = await snapshot_with(now, chain, revenue_funding(183))
+    b = await snapshot_with(now, chain, direct_creator_funding(183))
     assert atlas_snapshot_digest(a) != atlas_snapshot_digest(b)
 
 

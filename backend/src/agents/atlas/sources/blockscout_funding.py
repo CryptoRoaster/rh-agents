@@ -15,7 +15,10 @@ Contract: ``GET /{chain_id}/api/v2/addresses/{address_hash}/transactions`` with
   own documented ``filter`` query parameter, which is accepted only as the
   exact ``"from"`` this adapter sent;
 * ``status`` is ``"ok"`` or ``"error"``, ``value`` is an integer string in wei,
-  ``to`` is absent for a contract creation, ``block_number`` absent while pending.
+  ``to`` is absent for a contract creation, ``block_number`` absent while pending;
+* ``timestamp`` is a required, nullable ``date-time`` -- the transaction's block
+  time. A mined row without a timezone-aware one is refused, and in the
+  newest-first order timestamps never increase.
 
 There is **no** documented block-range filter, so the window is enforced here.
 Coverage down to the creation block is proven only by the provider's own order:
@@ -23,12 +26,19 @@ either the list ends (``next_page_params`` is ``null``) or a page reaches a
 transaction older than the creation block. A read the page budget cuts before
 that is ``LOWER_BOUND`` -- what was seen, never "nothing more".
 
+With ``history_until`` (V2) the same single read goes on past the creation
+block, keeping the rows before it no older than ``history_until``, until the
+list ends, a row older than ``history_until`` proves the history reached it, or
+the page budget runs out. The result says which of these happened; the caller
+derives every window's coverage from that, never from a second read.
+
 The key travels in the ``Authorization`` header, as everywhere else in this
 adapter family. No provider record is persisted, only normalized transactions.
 """
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from src.agents.atlas.funding.models import (
     FundingCoverage,
@@ -99,15 +109,21 @@ class BlockscoutFundingSource:
         return f"{self.source_name}:{self.config.chain_id}"
 
     async def funding_transactions(
-        self, chain: str, address_hash: str, from_block: int, to_block: int
+        self,
+        chain: str,
+        address_hash: str,
+        from_block: int,
+        to_block: int,
+        history_until: datetime | None = None,
     ) -> FundingSourceResult:
         if chain != self.chain:
             return self._failed(AtlasSourceFailure.UNSUPPORTED_CHAIN)
-        if from_block > to_block:
+        if from_block > to_block or (history_until is not None and history_until.tzinfo is None):
             return self._failed(AtlasSourceFailure.INVALID_RESPONSE)
+        until = None if history_until is None else history_until.astimezone(UTC)
         transport = self.transport_factory(self.config)
         try:
-            found, coverage = await self._pages(transport, address_hash, from_block)
+            read = await self._pages(transport, address_hash, from_block, until)
         except SourceRequestError as error:
             return self._failed(error.failure, requests=transport.requests_made)
         finally:
@@ -119,13 +135,17 @@ class BlockscoutFundingSource:
             address=address_hash,
             from_block=from_block,
             to_block=to_block,
-            coverage=coverage,
+            coverage=read.coverage,
             # The window's upper edge is the caller's to enforce as well; rows
             # above it are kept out of the result so nothing later can leak in.
             transactions=tuple(
-                item for item in found if from_block <= item.block_number <= to_block
+                item for item in read.found if from_block <= item.block_number <= to_block
             ),
             requests_made=transport.requests_made,
+            history_until=until,
+            prelaunch_transactions=tuple(read.prelaunch),
+            history_ended=read.ended,
+            oldest_observed_at=read.oldest,
         )
 
     def _failed(self, failure: AtlasSourceFailure, *, requests: int = 0) -> FundingSourceResult:
@@ -137,17 +157,21 @@ class BlockscoutFundingSource:
         )
 
     async def _pages(
-        self, transport: SourceTransport, address_hash: str, from_block: int
-    ) -> tuple[list[FundingTransaction], FundingCoverage]:
+        self,
+        transport: SourceTransport,
+        address_hash: str,
+        from_block: int,
+        until: datetime | None,
+    ) -> "_Read":
         path = f"{self.config.chain_id}/api/v2/addresses/{address_hash}/transactions"
         params: dict[str, str | int] = {FILTER_PARAMETER: FILTER_FROM}
-        found: list[FundingTransaction] = []
+        read = _Read()
         cursors: set[str] = set()
         last: tuple[int, int] | None = None
+        reached_creation = reached_cutoff = False
         for _ in range(self.config.max_pages):
             payload = mapping(await transport.get_json(path, params))
             items = sequence(payload.get("items"), limit=PAGE_SIZE)
-            reached_creation = False
             for item in items:
                 row = self._row(item, address_hash)
                 if row is None:
@@ -159,15 +183,33 @@ class BlockscoutFundingSource:
                     # proves nothing about what older pages hold.
                     raise invalid()
                 last = order
+                when = transaction.observed_at
+                if when is None or (read.oldest is not None and when > read.oldest):
+                    # Time must not run backwards in a newest-first list, or
+                    # no time-based coverage could rest on it.
+                    raise invalid()
+                read.oldest = when
+                if transaction.block_number >= from_block:
+                    read.found.append(transaction)
+                elif until is not None and when >= until:
+                    read.prelaunch.append(transaction)
+                else:
+                    reached_creation = True
+                    reached_cutoff = reached_cutoff or (until is not None and when < until)
+                    continue
                 if transaction.block_number < from_block:
                     reached_creation = True
-                    continue
-                found.append(transaction)
-                if len(found) > MAX_NORMALIZED_TRANSACTIONS:
+                if len(read.found) + len(read.prelaunch) > MAX_NORMALIZED_TRANSACTIONS:
                     raise invalid()
             next_params = payload.get("next_page_params")
-            if next_params is None or reached_creation:
-                return found, FundingCoverage.COMPLETE
+            if next_params is None:
+                read.ended = True
+                read.coverage = FundingCoverage.COMPLETE
+                return read
+            if reached_creation:
+                read.coverage = FundingCoverage.COMPLETE
+                if until is None or reached_cutoff:
+                    return read
             if not items:
                 raise invalid()  # promises more, delivers nothing
             params = {FILTER_PARAMETER: FILTER_FROM, **self._page_params(next_params)}
@@ -175,7 +217,7 @@ class BlockscoutFundingSource:
             if marker in cursors:
                 raise invalid()  # a repeating cursor loops forever
             cursors.add(marker)
-        return found, FundingCoverage.LOWER_BOUND
+        return read
 
     @staticmethod
     def _page_params(value: object) -> dict[str, str | int]:
@@ -228,9 +270,34 @@ class BlockscoutFundingSource:
                 recipient=recipient,
                 native_value_raw=unsigned(value),
                 succeeded=status == "ok",
+                observed_at=_timestamp(entry.get("timestamp")),
             ),
             position,
         )
+
+
+def _timestamp(value: object) -> datetime:
+    """A mined row's block time: an ISO 8601 date-time with its offset, in UTC."""
+    if not isinstance(value, str) or len(value) > 40:
+        raise invalid()
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise invalid() from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise invalid()
+    return parsed.astimezone(UTC)
+
+
+@dataclass
+class _Read:
+    """What one bounded pagination saw. Coverage starts as cut short."""
+
+    found: list[FundingTransaction] = field(default_factory=list)
+    prelaunch: list[FundingTransaction] = field(default_factory=list)
+    coverage: FundingCoverage = FundingCoverage.LOWER_BOUND
+    ended: bool = False
+    oldest: datetime | None = None
 
 
 __all__ = [

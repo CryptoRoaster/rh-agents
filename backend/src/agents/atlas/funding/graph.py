@@ -17,6 +17,7 @@ from src.agents.atlas.funding.models import (
     FundingSourceResult,
     FundingTransaction,
     HolderOverlapBasis,
+    PrelaunchFundingFacts,
 )
 from src.agents.atlas.models import ContractFacts, HolderFacts, OriginFacts
 from src.agents.atlas.primitives import AtlasSourceFailure
@@ -30,7 +31,7 @@ class FundingDataConflict(ValueError):
     """The source named one transaction hash twice with different contents."""
 
 
-def _share(amount: int, denominator: int) -> Decimal:
+def share(amount: int, denominator: int) -> Decimal:
     with localcontext() as context:
         context.prec = 78
         return min(Decimal(1), quantize(Decimal(amount) / Decimal(denominator)))
@@ -114,9 +115,12 @@ def funding_graph(
     pool_control: PoolControlFacts | None,
     v4_required: bool,
     snapshot_block: int,
+    prelaunch: PrelaunchFundingFacts | None = None,
 ) -> FundingGraphFacts:
+    """V1 over ``[creation_block, snapshot_block]``; ``prelaunch`` rides along unchanged."""
     root = origin.creator_address if origin.status == Availability.AVAILABLE else None
     common: dict[str, object] = {
+        "prelaunch": prelaunch,
         "source": source,
         "root_address": root,
         "origin_source": origin.source,
@@ -189,10 +193,10 @@ def funding_graph(
             "observed_holder_count": len(observed),
             "creator_funded_observed_holder_count": len(funded),
             "creator_funded_observed_holder_fraction": (
-                _share(len(funded), len(observed)) if observed else None
+                share(len(funded), len(observed)) if observed else None
             ),
             "creator_funded_observed_supply_fraction": (
-                _share(sum(balance for _, balance in funded), supply) if supply else None
+                share(sum(balance for _, balance in funded), supply) if supply else None
             ),
             "creator_funded_observed_top10_count": sum(
                 1 for holder, _ in observed[:TOP_N] if holder in recipients

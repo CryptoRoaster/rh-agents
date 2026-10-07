@@ -5,6 +5,8 @@ first, 50 per page, keyset cursors in ``next_page_params``. No test performs
 I/O; payloads follow the documented schema.
 """
 
+from datetime import UTC, datetime, timedelta
+
 import httpx
 import pytest
 
@@ -21,6 +23,18 @@ from tests.atlas.fake_http import RecordingRoutes, json_response
 CREATOR = "0x" + "e7" * 20
 CREATED = 1_000
 SNAPSHOT = 5_000
+# Synthetic block times: one block per minute, so block arithmetic is time arithmetic.
+EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def at(block: int) -> datetime:
+    return EPOCH + timedelta(minutes=block)
+
+
+def stamp(block: int | None) -> str | None:
+    return None if block is None else at(block).isoformat().replace("+00:00", "Z")
+
+
 CONFIG = BlockscoutFundingConfig(
     base_url="https://api.blockscout.test", chain_id=4663, api_key="proapi_testkey", max_pages=3
 )
@@ -35,8 +49,10 @@ def item(
     status: str | None = "ok",
     sender: str = CREATOR,
     position: int = 0,
+    timestamp: object = "auto",
 ):
     return {
+        "timestamp": stamp(block) if timestamp == "auto" else timestamp,
         "hash": "0x" + format(index, "064x"),
         "block_number": block,
         "from": {"hash": sender},
@@ -75,8 +91,12 @@ def source(
     )
 
 
-async def read(src: BlockscoutFundingSource, chain: str = "robinhood"):
-    return await src.funding_transactions(chain, CREATOR, CREATED, SNAPSHOT)
+async def read(
+    src: BlockscoutFundingSource, chain: str = "robinhood", history_until: datetime | None = None
+):
+    return await src.funding_transactions(
+        chain, CREATOR, CREATED, SNAPSHOT, history_until=history_until
+    )
 
 
 # ---------------------------------------------------------------- contract
@@ -171,6 +191,10 @@ async def test_failed_creation_and_zero_rows_are_normalized_not_dropped() -> Non
         {"status": "pending"},
         {"position": -1},
         {"to": {"hash": "0xzz"}},
+        {"timestamp": None},  # a mined row has a block time
+        {"timestamp": "2026-01-01T00:00:00"},  # no timezone: not an instant
+        {"timestamp": "yesterday"},
+        {"timestamp": 1_767_225_600},
     ],
 )
 async def test_a_malformed_row_refuses_the_read(bad) -> None:
@@ -287,3 +311,92 @@ def test_the_page_budget_is_hard_capped() -> None:
             api_key="k",
             max_pages=MAX_FUNDING_PAGES + 1,
         )
+
+
+async def test_a_missing_timestamp_refuses_the_read() -> None:
+    row = item(1, 4_000)
+    del row["timestamp"]
+    src, _ = source([page([row])])
+    assert (await read(src)).failure is AtlasSourceFailure.INVALID_RESPONSE
+
+
+async def test_rows_carry_their_block_time_in_utc() -> None:
+    offset = (at(4_000) + timedelta(hours=2)).isoformat().replace("+00:00", "+02:00")
+    src, _ = source([page([item(1, 4_000, timestamp=offset)])])
+    (row,) = (await read(src)).transactions
+    assert row.observed_at == at(4_000) and row.observed_at.tzinfo is UTC
+
+
+async def test_time_running_backwards_in_newest_first_order_is_refused() -> None:
+    src, _ = source(
+        [page([item(2, 4_000, timestamp=stamp(3_000)), item(1, 3_999, timestamp=stamp(3_500))])]
+    )
+    assert (await read(src)).failure is AtlasSourceFailure.INVALID_RESPONSE
+
+
+# ------------------------------------------------------- V2: one read, history
+
+
+async def test_without_history_the_read_stops_at_creation_as_before() -> None:
+    src, routes = source(
+        [
+            page([item(3, 4_900), item(2, CREATED - 1)], cursor(CREATED - 1)),
+            page([item(1, CREATED - 50)]),
+        ]
+    )
+    result = await read(src)
+    assert result.coverage is FundingCoverage.COMPLETE
+    assert len(routes.requests) == 1
+    assert result.prelaunch_transactions == () and result.history_until is None
+
+
+async def test_history_continues_past_creation_until_a_row_older_than_the_cutoff() -> None:
+    until = at(CREATED - 120)
+    src, routes = source(
+        [
+            page([item(5, 4_900), item(4, CREATED - 10)], cursor(CREATED - 10)),
+            page([item(3, CREATED - 60), item(2, CREATED - 120)], cursor(CREATED - 120)),
+            page([item(1, CREATED - 121)], cursor(CREATED - 121)),  # older than the cutoff
+            page([item(0, CREATED - 500)]),  # never requested
+        ]
+    )
+    result = await read(src, history_until=until)
+    assert len(routes.requests) == 3
+    assert result.coverage is FundingCoverage.COMPLETE  # V1 reached creation
+    assert [tx.block_number for tx in result.transactions] == [4_900]
+    # Before creation, no older than the cutoff; the proving row itself is not kept.
+    assert [tx.block_number for tx in result.prelaunch_transactions] == [
+        CREATED - 10,
+        CREATED - 60,
+        CREATED - 120,
+    ]
+    assert result.history_ended is False
+    assert result.oldest_observed_at == at(CREATED - 121) < until
+    assert result.history_until == until
+
+
+async def test_a_history_that_ends_is_complete_without_reaching_the_cutoff() -> None:
+    src, _ = source([page([item(2, 4_900), item(1, CREATED - 5)])])
+    result = await read(src, history_until=at(CREATED - 1_000))
+    assert result.history_ended is True
+    assert result.coverage is FundingCoverage.COMPLETE
+    assert [tx.block_number for tx in result.prelaunch_transactions] == [CREATED - 5]
+
+
+async def test_a_budget_cut_history_says_how_far_it_reached() -> None:
+    pages = [
+        page([item(10 - n, CREATED - 10 * n)], cursor(CREATED - 10 * n)) for n in range(3)
+    ]  # CONFIG allows three pages
+    src, routes = source(pages)
+    result = await read(src, history_until=at(CREATED - 1_000))
+    assert len(routes.requests) == 3
+    assert result.history_ended is False
+    assert result.coverage is FundingCoverage.COMPLETE  # creation itself was reached
+    assert result.oldest_observed_at == at(CREATED - 20)
+
+
+async def test_a_naive_history_bound_is_refused_without_a_request() -> None:
+    src, routes = source([])
+    result = await read(src, history_until=datetime(2026, 1, 1))  # noqa: DTZ001
+    assert result.failure is AtlasSourceFailure.INVALID_RESPONSE
+    assert not routes.requests

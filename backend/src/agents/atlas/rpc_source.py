@@ -118,6 +118,18 @@ class RpcTokenContractSource:
         except RuntimeFailure:
             return None
 
+    async def block_timestamp(self, block: int) -> datetime | None:
+        """The header timestamp of exactly `block`, in UTC, or None when unread.
+
+        The chain's own clock, never an estimate from block numbers. A failed
+        or malformed read is None, so whatever needs the time stays unmeasured.
+        """
+        try:
+            head = await self.client.block(block)
+        except RuntimeFailure:
+            return None
+        return datetime.fromtimestamp(head.timestamp, UTC)
+
     async def creation_receipt_contract(self, tx_hash: str) -> str | None:
         """Chain-side confirmation of a creation claim, or None when unobtainable.
 

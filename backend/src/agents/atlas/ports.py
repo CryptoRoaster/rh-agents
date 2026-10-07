@@ -6,6 +6,7 @@ that was not designed for. A worker never holds one of these directly: the
 deterministic collector does.
 """
 
+from datetime import datetime
 from typing import Protocol
 
 from src.agents.atlas.funding.models import FundingSourceResult
@@ -27,6 +28,10 @@ class TokenContractReadPort(Protocol):
 
     async def balance_of(self, token_address: str, holder: str, block: int) -> int | None:
         """ERC-20 balance of one address at an explicit block, or None if unread."""
+        ...
+
+    async def block_timestamp(self, block: int) -> datetime | None:
+        """The chain's own UTC timestamp of an explicit block, or None if unread."""
         ...
 
 
@@ -87,12 +92,19 @@ class FundingReadPort(Protocol):
 
     Answers for exactly ``chain``, ``address`` and ``[from_block, to_block]``.
     ``coverage`` says whether every transaction of the window was read; a read
-    cut short by a bound is a lower bound, never an empty answer.
+    cut short by a bound is a lower bound, never an empty answer. With
+    ``history_until`` the same read also keeps the rows before ``from_block``
+    no older than it, and says how far back the history provably reached.
     """
 
     @property
     def source(self) -> str: ...
 
     async def funding_transactions(
-        self, chain: str, address: str, from_block: int, to_block: int
+        self,
+        chain: str,
+        address: str,
+        from_block: int,
+        to_block: int,
+        history_until: datetime | None = None,
     ) -> FundingSourceResult: ...
