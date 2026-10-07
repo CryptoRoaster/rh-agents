@@ -44,7 +44,8 @@ as specified in Blockscout's PRO OpenAPI document (`pro-api-v12`) and its
 implementation:
 
 - order is newest first (`block_number`, then `index`);
-- keyset cursors in `next_page_params`, `null` at the end;
+- keyset cursors in `next_page_params`, `null` at the end; the cursor echoes
+  the request's documented `filter` parameter, accepted only as exactly `from`;
 - 50 items per page;
 - `Authorization: Bearer` header.
 

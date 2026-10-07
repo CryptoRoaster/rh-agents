@@ -199,6 +199,58 @@ async def test_a_cursor_with_unknown_keys_is_refused() -> None:
     assert (await read(src)).failure is AtlasSourceFailure.INVALID_RESPONSE
 
 
+def live_cursor(block: int, index: int = 0, **overrides: object) -> dict[str, object]:
+    """The cursor shape Blockscout PRO actually returns for ``filter=from``.
+
+    Synthetic values; the key set and every value type are those of the live
+    response: the documented ``filter`` query parameter is echoed back beside
+    the keyset keys and ``items_count``.
+    """
+    return {
+        "block_number": block,
+        "fee": "21000000000000",
+        "filter": "from",
+        "hash": "0x" + "ab" * 32,
+        "index": index,
+        "inserted_at": "2025-01-01T00:00:00.000000Z",
+        "items_count": 50,
+        "value": "1000000000000000",
+    } | overrides
+
+
+async def test_the_live_cursor_shape_with_its_echoed_filter_is_followed() -> None:
+    later = [item(100 + i, SNAPSHOT + 500 - i, position=0) for i in range(3)]
+    src, routes = source(
+        [
+            page(later, live_cursor(SNAPSHOT + 498)),  # all after the snapshot
+            page([item(2, 4_000), item(1, 900)]),  # 900 < creation
+        ]
+    )
+    result = await read(src)
+    assert result.status is Availability.AVAILABLE
+    assert result.coverage is FundingCoverage.COMPLETE
+    assert [tx.block_number for tx in result.transactions] == [4_000]
+    assert len(routes.requests) == 2
+    follow = routes.requests[1].url.params
+    assert follow.get_list("filter") == ["from"]
+    assert follow["block_number"] == str(SNAPSHOT + 498)
+    assert follow["inserted_at"] == "2025-01-01T00:00:00.000000Z"
+
+
+@pytest.mark.parametrize("echoed", ["to", "", "FROM", 1, True])
+async def test_an_echoed_filter_other_than_ours_is_refused(echoed) -> None:
+    src, routes = source([page([item(3, 4_900)], live_cursor(4_900, filter=echoed))])
+    assert (await read(src)).failure is AtlasSourceFailure.INVALID_RESPONSE
+    assert len(routes.requests) == 1
+
+
+@pytest.mark.parametrize("extra", [{"sort": "block_number"}, {"order": "asc"}, {"apikey": "x"}])
+async def test_a_live_cursor_with_an_undocumented_cursor_key_is_refused(extra) -> None:
+    src, routes = source([page([item(3, 4_900)], live_cursor(4_900) | extra)])
+    assert (await read(src)).failure is AtlasSourceFailure.INVALID_RESPONSE
+    assert len(routes.requests) == 1
+
+
 async def test_an_empty_page_promising_more_is_refused() -> None:
     src, _ = source([page([], cursor(4_000))])
     assert (await read(src)).failure is AtlasSourceFailure.INVALID_RESPONSE
