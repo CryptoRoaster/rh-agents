@@ -167,6 +167,9 @@ def prelaunch_facts(
         return unavailable(
             PrelaunchGap.SOURCE_UNAVAILABLE, failure or AtlasSourceFailure.INVALID_RESPONSE
         )
+    if read.history_failure is not None:
+        # The read answered V1; only its history was unusable.
+        return unavailable(PrelaunchGap.SOURCE_UNAVAILABLE, read.history_failure)
     try:
         observed = clock_of(read, origin, creation_timestamp)
         edges = funding_edges(read.prelaunch_transactions, root, 0, created - 1)

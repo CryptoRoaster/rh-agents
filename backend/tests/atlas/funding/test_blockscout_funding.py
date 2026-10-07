@@ -191,10 +191,6 @@ async def test_failed_creation_and_zero_rows_are_normalized_not_dropped() -> Non
         {"status": "pending"},
         {"position": -1},
         {"to": {"hash": "0xzz"}},
-        {"timestamp": None},  # a mined row has a block time
-        {"timestamp": "2026-01-01T00:00:00"},  # no timezone: not an instant
-        {"timestamp": "yesterday"},
-        {"timestamp": 1_767_225_600},
     ],
 )
 async def test_a_malformed_row_refuses_the_read(bad) -> None:
@@ -313,25 +309,126 @@ def test_the_page_budget_is_hard_capped() -> None:
         )
 
 
-async def test_a_missing_timestamp_refuses_the_read() -> None:
-    row = item(1, 4_000)
-    del row["timestamp"]
-    src, _ = source([page([row])])
-    assert (await read(src)).failure is AtlasSourceFailure.INVALID_RESPONSE
+# A timestamp only V2 history depends on, broken in every way it can be.
+BAD_TIMES = {
+    "missing": "drop",
+    "null": None,
+    "malformed": "yesterday",
+    "naive": "2026-01-01T00:00:00",
+    "epoch_int": 1_767_225_600,
+}
 
 
-async def test_rows_carry_their_block_time_in_utc() -> None:
+def with_time(row: dict, bad: object) -> dict:
+    if bad == "drop":
+        return {key: value for key, value in row.items() if key != "timestamp"}
+    return row | {"timestamp": bad}
+
+
+def pre_v2_row(index: int, block: int, **kw) -> dict:
+    """A row exactly as V1 read it before V2: no timestamp field at all."""
+    return with_time(item(index, block, **kw), "drop")
+
+
+@pytest.mark.parametrize("bad", list(BAD_TIMES.values()), ids=list(BAD_TIMES))
+async def test_a_v1_only_read_never_depends_on_timestamps(bad) -> None:
+    rows = [with_time(item(2, 4_500), bad), with_time(item(1, 1_200), bad)]
+    src, routes = source([page(rows)])
+    result = await read(src)
+    assert result.status is Availability.AVAILABLE
+    assert result.coverage is FundingCoverage.COMPLETE
+    assert [tx.block_number for tx in result.transactions] == [4_500, 1_200]
+    assert all(tx.observed_at is None for tx in result.transactions)
+    assert result.history_failure is None and len(routes.requests) == 1
+
+
+async def test_a_v1_only_read_ignores_timestamps_running_backwards() -> None:
+    rows = [item(2, 4_500, timestamp=stamp(1_000)), item(1, 4_400, timestamp=stamp(4_000))]
+    result = await read(source([page(rows)])[0])
+    assert result.status is Availability.AVAILABLE
+    assert [tx.block_number for tx in result.transactions] == [4_500, 4_400]
+
+
+async def test_a_pre_v2_v1_read_yields_exactly_the_pre_v2_facts() -> None:
+    from src.agents.atlas.funding.models import FundingTransaction
+
+    rows = [
+        pre_v2_row(3, 4_000, status="error"),
+        pre_v2_row(2, 3_900, to=None),
+        pre_v2_row(1, 3_800, value="0"),
+        pre_v2_row(0, CREATED - 1),
+    ]
+    result = await read(source([page(rows, cursor(CREATED - 1))])[0])
+    assert result.status is Availability.AVAILABLE
+    assert result.coverage is FundingCoverage.COMPLETE
+    assert result.transactions == (
+        FundingTransaction(
+            tx_hash="0x" + format(3, "064x"),
+            block_number=4_000,
+            sender=CREATOR,
+            recipient="0x" + format(3, "040x"),
+            native_value_raw=10**15,
+            succeeded=False,
+        ),
+        FundingTransaction(
+            tx_hash="0x" + format(2, "064x"),
+            block_number=3_900,
+            sender=CREATOR,
+            recipient=None,
+            native_value_raw=10**15,
+            succeeded=True,
+        ),
+        FundingTransaction(
+            tx_hash="0x" + format(1, "064x"),
+            block_number=3_800,
+            sender=CREATOR,
+            recipient="0x" + format(1, "040x"),
+            native_value_raw=0,
+            succeeded=True,
+        ),
+    )
+    assert result.prelaunch_transactions == () and result.history_until is None
+
+
+async def test_rows_carry_their_block_time_in_utc_when_history_is_read() -> None:
     offset = (at(4_000) + timedelta(hours=2)).isoformat().replace("+00:00", "+02:00")
     src, _ = source([page([item(1, 4_000, timestamp=offset)])])
-    (row,) = (await read(src)).transactions
+    (row,) = (await read(src, history_until=at(CREATED - 100))).transactions
     assert row.observed_at == at(4_000) and row.observed_at.tzinfo is UTC
 
 
-async def test_time_running_backwards_in_newest_first_order_is_refused() -> None:
-    src, _ = source(
-        [page([item(2, 4_000, timestamp=stamp(3_000)), item(1, 3_999, timestamp=stamp(3_500))])]
+@pytest.mark.parametrize("bad", list(BAD_TIMES.values()), ids=list(BAD_TIMES))
+async def test_a_bad_timestamp_fails_only_the_history(bad) -> None:
+    rows = [item(3, 4_500), with_time(item(2, CREATED - 1), bad), item(1, CREATED - 2)]
+    src, routes = source(
+        [page(rows, cursor(CREATED - 2)), page([item(0, CREATED - 500)])]  # 2nd never read
     )
-    assert (await read(src)).failure is AtlasSourceFailure.INVALID_RESPONSE
+    result = await read(src, history_until=at(CREATED - 1_000))
+    # V1 answered from the same page, exactly where a V1-only read stops.
+    assert result.status is Availability.AVAILABLE
+    assert result.coverage is FundingCoverage.COMPLETE
+    assert [tx.block_number for tx in result.transactions] == [4_500]
+    assert len(routes.requests) == 1
+    # The history is unusable and says so; it carries nothing.
+    assert result.history_failure is AtlasSourceFailure.INVALID_RESPONSE
+    assert result.prelaunch_transactions == ()
+    assert result.history_ended is False and result.oldest_observed_at is None
+
+
+async def test_time_running_backwards_fails_only_the_history() -> None:
+    rows = [item(2, 4_000, timestamp=stamp(3_000)), item(1, 3_999, timestamp=stamp(3_500))]
+    result = await read(source([page(rows)])[0], history_until=at(CREATED - 100))
+    assert result.status is Availability.AVAILABLE
+    assert [tx.block_number for tx in result.transactions] == [4_000, 3_999]
+    assert result.history_failure is AtlasSourceFailure.INVALID_RESPONSE
+    assert result.history_ended is False
+
+
+async def test_a_v1_fault_still_fails_the_whole_read_in_history_mode() -> None:
+    rows = [item(1, 4_000, sender="0x" + "12" * 20)]
+    result = await read(source([page(rows)])[0], history_until=at(CREATED - 100))
+    assert result.status is Availability.UNAVAILABLE
+    assert result.failure is AtlasSourceFailure.INVALID_RESPONSE
 
 
 # ------------------------------------------------------- V2: one read, history

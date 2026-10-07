@@ -98,6 +98,7 @@ class HistoryFunding:
     window: tuple[FundingTransaction, ...] = ()
     ended: bool = True
     oldest: datetime | None = None
+    history_failure: AtlasSourceFailure | None = None
     source: str = SOURCE
     calls: list[tuple[object, ...]] = field(default_factory=list)
 
@@ -115,9 +116,14 @@ class HistoryFunding:
             transactions=self.window,
             requests_made=7,
             history_until=history_until,
-            prelaunch_transactions=self.prelaunch if history_until is not None else (),
-            history_ended=self.ended,
-            oldest_observed_at=self.oldest or (min(times) if times else None),
+            history_failure=self.history_failure,
+            prelaunch_transactions=(
+                self.prelaunch if history_until is not None and not self.history_failure else ()
+            ),
+            history_ended=self.ended and not self.history_failure,
+            oldest_observed_at=(
+                None if self.history_failure else self.oldest or (min(times) if times else None)
+            ),
         )
 
 
@@ -517,3 +523,32 @@ async def test_unknown_v4_economics_state_no_prelaunch_overlap(now) -> None:
     assert pre.holder_basis is HolderOverlapBasis.UNKNOWN
     assert pre.creator_funded_observed_holder_count is None
     assert pre.window(PrelaunchWindow.PT24H).unique_funded_address_count == 182
+
+
+async def test_a_history_defect_leaves_v1_measured_and_prelaunch_unavailable(now) -> None:
+    v1_edge = row(
+        1, to=wallet(1), value=CENT, at=CREATION_AT + timedelta(minutes=1), block=CREATED_BLOCK + 3
+    )
+    funding = HistoryFunding(window=(v1_edge,), history_failure=AtlasSourceFailure.INVALID_RESPONSE)
+    snapshot = await snapshot_with(now, funding)
+    graph = snapshot.funding_graph
+    assert len(funding.calls) == 1  # no second read
+    assert graph.status is Availability.AVAILABLE
+    assert graph.coverage is FundingCoverage.COMPLETE
+    assert graph.direct_funding_tx_count == 1
+    assert graph.unique_direct_funded_address_count == 1
+    assert graph.prelaunch.status is Availability.UNAVAILABLE
+    assert graph.prelaunch.gap is PrelaunchGap.SOURCE_UNAVAILABLE
+    assert graph.prelaunch.failure is AtlasSourceFailure.INVALID_RESPONSE
+    payload = onchain_payload(snapshot, evaluate_snapshot(snapshot, now))
+    summary = payload.intelligence.funding_graph
+    assert summary.direct_funding_tx_count == 1
+    assert summary.prelaunch.status == "UNAVAILABLE" and summary.prelaunch.windows == ()
+
+
+async def test_v1_counts_ignore_the_v2_block_time_of_a_repeated_row(now) -> None:
+    first = row(1, to=wallet(1), value=CENT, at=CREATION_AT, block=CREATED_BLOCK + 3)
+    again = first.model_copy(update={"observed_at": CREATION_AT + timedelta(seconds=9)})
+    graph = (await snapshot_with(now, HistoryFunding(window=(first, again)))).funding_graph
+    assert graph.status is Availability.AVAILABLE
+    assert graph.direct_funding_tx_count == 1  # one transaction, whatever its V2 time says

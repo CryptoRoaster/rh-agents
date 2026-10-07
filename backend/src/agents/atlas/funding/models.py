@@ -149,6 +149,8 @@ class FundingSourceResult(Immutable):
     # V2, from the same read: the rows before ``from_block`` no older than
     # ``history_until``, when the caller asked for history at all.
     history_until: AwareDatetime | None = None
+    # A defect in the history's time data: the history is unusable, V1 is not.
+    history_failure: AtlasSourceFailure | None = None
     prelaunch_transactions: tuple[FundingTransaction, ...] = Field(default=(), max_length=2_000)
     # Whether the provider's list ended, and the oldest valid row it reached.
     history_ended: bool = False
@@ -161,6 +163,10 @@ class FundingSourceResult(Immutable):
                 raise ValueError("An available funding read names its address and coverage")
         elif self.transactions or self.prelaunch_transactions or self.coverage is not None:
             raise ValueError("An unavailable funding read carries no transactions")
+        if self.history_failure is not None and (
+            self.prelaunch_transactions or self.history_ended or self.oldest_observed_at
+        ):
+            raise ValueError("A failed history carries no history")
         return self
 
 

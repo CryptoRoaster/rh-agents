@@ -17,8 +17,10 @@ Contract: ``GET /{chain_id}/api/v2/addresses/{address_hash}/transactions`` with
 * ``status`` is ``"ok"`` or ``"error"``, ``value`` is an integer string in wei,
   ``to`` is absent for a contract creation, ``block_number`` absent while pending;
 * ``timestamp`` is a required, nullable ``date-time`` -- the transaction's block
-  time. A mined row without a timezone-aware one is refused, and in the
-  newest-first order timestamps never increase.
+  time. Only V2 history depends on it: there a mined row without a
+  timezone-aware one, or a timestamp that increases in the newest-first order,
+  makes the *history* unusable (``history_failure``) and leaves V1 untouched.
+  A V1-only read does not read it at all.
 
 There is **no** documented block-range filter, so the window is enforced here.
 Coverage down to the creation block is proven only by the provider's own order:
@@ -30,7 +32,9 @@ With ``history_until`` (V2) the same single read goes on past the creation
 block, keeping the rows before it no older than ``history_until``, until the
 list ends, a row older than ``history_until`` proves the history reached it, or
 the page budget runs out. The result says which of these happened; the caller
-derives every window's coverage from that, never from a second read.
+derives every window's coverage from that, never from a second read. A defect
+in the history's time data stops only the history: the read then ends exactly
+where a V1-only read would, and V1 is answered from the same pages.
 
 The key travels in the ``Authorization`` header, as everywhere else in this
 adapter family. No provider record is persisted, only normalized transactions.
@@ -143,9 +147,10 @@ class BlockscoutFundingSource:
             ),
             requests_made=transport.requests_made,
             history_until=until,
-            prelaunch_transactions=tuple(read.prelaunch),
-            history_ended=read.ended,
-            oldest_observed_at=read.oldest,
+            history_failure=read.history_failure,
+            prelaunch_transactions=() if read.history_failure else tuple(read.prelaunch),
+            history_ended=read.ended and read.history_failure is None,
+            oldest_observed_at=None if read.history_failure else read.oldest,
         )
 
     def _failed(self, failure: AtlasSourceFailure, *, requests: int = 0) -> FundingSourceResult:
@@ -173,7 +178,7 @@ class BlockscoutFundingSource:
             payload = mapping(await transport.get_json(path, params))
             items = sequence(payload.get("items"), limit=PAGE_SIZE)
             for item in items:
-                row = self._row(item, address_hash)
+                row = self._row(item, address_hash, timed=until is not None)
                 if row is None:
                     continue  # pending: no block yet, so outside any pinned window
                 transaction, position = row
@@ -183,22 +188,21 @@ class BlockscoutFundingSource:
                     # proves nothing about what older pages hold.
                     raise invalid()
                 last = order
-                when = transaction.observed_at
-                if when is None or (read.oldest is not None and when > read.oldest):
-                    # Time must not run backwards in a newest-first list, or
-                    # no time-based coverage could rest on it.
-                    raise invalid()
-                read.oldest = when
+                when = (
+                    None
+                    if until is None or read.history_failure
+                    else self._history_time(read, transaction)
+                )
                 if transaction.block_number >= from_block:
                     read.found.append(transaction)
-                elif until is not None and when >= until:
+                elif until is not None and when is not None and when >= until:
                     read.prelaunch.append(transaction)
+                    reached_creation = True
                 else:
                     reached_creation = True
-                    reached_cutoff = reached_cutoff or (until is not None and when < until)
-                    continue
-                if transaction.block_number < from_block:
-                    reached_creation = True
+                    reached_cutoff = reached_cutoff or (
+                        when is not None and until is not None and when < until
+                    )
                 if len(read.found) + len(read.prelaunch) > MAX_NORMALIZED_TRANSACTIONS:
                     raise invalid()
             next_params = payload.get("next_page_params")
@@ -208,7 +212,7 @@ class BlockscoutFundingSource:
                 return read
             if reached_creation:
                 read.coverage = FundingCoverage.COMPLETE
-                if until is None or reached_cutoff:
+                if until is None or reached_cutoff or read.history_failure:
                     return read
             if not items:
                 raise invalid()  # promises more, delivers nothing
@@ -239,7 +243,23 @@ class BlockscoutFundingSource:
         return params
 
     @staticmethod
-    def _row(item: object, address_hash: str) -> tuple[FundingTransaction, int] | None:
+    def _history_time(read: "_Read", transaction: FundingTransaction) -> datetime | None:
+        """The row's time for the history, or None after marking the history unusable.
+
+        Time must not run backwards in a newest-first list, or no time-based
+        coverage could rest on it. Neither defect concerns V1's fields.
+        """
+        when = transaction.observed_at
+        if when is None or (read.oldest is not None and when > read.oldest):
+            read.history_failure = AtlasSourceFailure.INVALID_RESPONSE
+            return None
+        read.oldest = when
+        return when
+
+    @staticmethod
+    def _row(
+        item: object, address_hash: str, *, timed: bool = False
+    ) -> tuple[FundingTransaction, int] | None:
         entry = mapping(item)
         if entry.get("block_number") is None:
             return None
@@ -270,22 +290,24 @@ class BlockscoutFundingSource:
                 recipient=recipient,
                 native_value_raw=unsigned(value),
                 succeeded=status == "ok",
-                observed_at=_timestamp(entry.get("timestamp")),
+                # Read only for a V2 history, and never fatal: a defective
+                # timestamp is None here and fails the history alone.
+                observed_at=_timestamp(entry.get("timestamp")) if timed else None,
             ),
             position,
         )
 
 
-def _timestamp(value: object) -> datetime:
-    """A mined row's block time: an ISO 8601 date-time with its offset, in UTC."""
+def _timestamp(value: object) -> datetime | None:
+    """A mined row's block time in UTC, or None unless it is an exact aware instant."""
     if not isinstance(value, str) or len(value) > 40:
-        raise invalid()
+        return None
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
-        raise invalid() from None
+        return None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise invalid()
+        return None
     return parsed.astimezone(UTC)
 
 
@@ -298,6 +320,8 @@ class _Read:
     coverage: FundingCoverage = FundingCoverage.LOWER_BOUND
     ended: bool = False
     oldest: datetime | None = None
+    # Set once the history's time data is defective; V1 is unaffected.
+    history_failure: AtlasSourceFailure | None = None
 
 
 __all__ = [

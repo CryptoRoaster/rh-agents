@@ -165,7 +165,10 @@ def funding_graph(
             read.requests_made,
         )
     try:
-        edges = funding_edges(read.transactions, root, created, snapshot_block)
+        # V1 reads exactly its own fields: the V2 block time is set aside, so
+        # no defect or disagreement in it can change or void a V1 count.
+        untimed = tuple(item.model_copy(update={"observed_at": None}) for item in read.transactions)
+        edges = funding_edges(untimed, root, created, snapshot_block)
     except FundingDataConflict:
         return unavailable(
             FundingGap.SOURCE_UNAVAILABLE, AtlasSourceFailure.INVALID_RESPONSE, read.requests_made

@@ -68,11 +68,15 @@ The signal V2 measures exists at creation, before any buy does.
   (`PRELAUNCH_CREATION_TIME_UNAVAILABLE`), the read is V1 only, and V1 is
   unchanged.
 - **Transaction time:** Blockscout's `timestamp`, the transaction's block time
-  (required in `pro-api-v12`, nullable while pending). A mined row without a
-  timezone-aware value is refused, and in the newest-first order timestamps
-  must never increase. A prelaunch row later than the creation time, or the
-  creation transaction (where the read contains it) at any other time than the
-  chain's, voids the prelaunch measurement.
+  (required in `pro-api-v12`, nullable while pending). Only the history uses
+  it: a mined row without a timezone-aware value, or a timestamp increasing in
+  the newest-first order, makes the history unusable (`history_failure`,
+  prelaunch `UNAVAILABLE` / `INVALID_RESPONSE`). The read then ends exactly
+  where a V1-only read ends, and **V1 is measured from the same pages as
+  before** -- a V2-only data defect never voids V1. A prelaunch row later than
+  the creation time, or the creation transaction (where the read contains it)
+  at any other time than the chain's, likewise voids only the prelaunch
+  measurement. A V1-only read does not read timestamps at all.
 - **Coverage per window:** `COMPLETE` when the provider's list ended, or the
   validated read reached a row older than that window's cutoff; otherwise
   `LOWER_BOUND`. A short window can be exact while a longer one is not, and a
@@ -117,8 +121,7 @@ truth is that or more. It is never a complete zero.
 
 Rows are refused when any of these apply:
 - the sender is not the root;
-- an address, hash, block, value, status, position or timestamp is malformed;
-- timestamps increase in the newest-first order;
+- an address, hash, block, value, status or position is malformed;
 - the order runs against the documented order;
 - a cursor repeats or carries unknown keys;
 - an empty page still promises more.
