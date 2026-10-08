@@ -454,3 +454,191 @@ async def test_racing_sweeps_at_different_minutes_still_sell_once(risk_db, now):
 
     assert sum(item.executed for item in results) == 1
     assert len(await exit_rows(sessions)) == 1
+
+
+# ------------------------------------------------ peak completeness (> 5000)
+
+
+def _with_provider(value, old, new):
+    """The same observation, as another provider would have recorded it."""
+    if isinstance(value, dict):
+        return {
+            key: (new if key == "provider" and item == old else _with_provider(item, old, new))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_with_provider(item, old, new) for item in value]
+    return value
+
+
+def _rows(snapshots, *, provider=None, fixture=None):
+    """Observation rows exactly as the recorder writes them, inserted in bulk."""
+    rows = []
+    for snapshot in snapshots:
+        payload = snapshot.model_dump(mode="json")
+        if snapshot.pair.pool_locator is None:
+            payload["pair"].pop("pool_locator", None)
+        if provider is not None:
+            payload = _with_provider(payload, snapshot.provider, provider)
+        if fixture is not None:
+            payload["is_fixture"] = fixture
+        rows.append(
+            {
+                "id": uuid4(),
+                "schema_version": snapshot.schema_version,
+                "provider": provider or snapshot.provider,
+                "chain": snapshot.chain,
+                "network": snapshot.network,
+                "asset_id": snapshot.asset_id,
+                "pair_id": snapshot.pair.pair_id,
+                "correlation_id": snapshot.correlation_id,
+                "observed_at": snapshot.observed_at,
+                "recorded_at": snapshot.observed_at,
+                "freshness_at": snapshot.freshness_at,
+                "available": snapshot.available,
+                "is_fixture": snapshot.is_fixture if fixture is None else fixture,
+                "payload": payload,
+            }
+        )
+    return rows
+
+
+async def bulk_observe(sessions, rows):
+    from sqlalchemy import insert
+
+    from src.data.tables import MarketObservationRow
+
+    async with sessions.begin() as session:
+        for start in range(0, len(rows), 1000):
+            await session.execute(insert(MarketObservationRow), rows[start : start + 1000])
+
+
+def held_at(at, price, *, pair=None, label):
+    identity = pair or HELD
+    return recorded_snapshot(
+        at,
+        age=timedelta(0),
+        metadata_age=timedelta(0),
+        pair_id=identity.pair_id,
+        base_asset_id=identity.base_asset_id,
+        label=label,
+        price=Decimal(price),
+    )
+
+
+async def test_a_peak_older_than_five_thousand_observations_still_arms_the_trailing_stop(
+    risk_db, now
+):
+    """Entry 1.00, peak 3.00, then 5,001 lower readings, now 1.40 under the 1.50 level."""
+    from tests.early.test_fill_caps import MARKETS
+    from tests.riskrequest.conftest import fresh_snapshot
+
+    _, sessions = risk_db
+    book = Book(sessions, now, costs=ZERO)
+    book.feed.replace(fresh_snapshot(now, price=Decimal("1.00")))
+    trade_case = await early_ready(book.risk, sessions, now, uuid4(), key="early-peak")
+    assert (await book.risk.request_risk_evaluation(trade_case.id, request_key="early-peak")).kind
+    filled = await book.filler().execute_case_fill(trade_case.id, request_key="early-peak")
+    assert filled.kind == "paper_fill_recorded", getattr(filled, "detail", None)
+
+    peak_at = now + timedelta(minutes=1)
+    peak = held_at(peak_at, "3.00", label="true-peak")
+    later = [
+        held_at(now + timedelta(minutes=2, seconds=index), "1.60", label=f"lower-{index}")
+        for index in range(5001)
+    ]
+    # Higher prices that are not this market's: another pool, another provider,
+    # and a fixture of this very pool. None of them may be the peak.
+    other_pool = held_at(peak_at, "10.00", pair=MARKETS[1], label="other-pool")
+    other_provider = held_at(peak_at, "10.00", label="other-provider")
+    fixture = held_at(peak_at, "10.00", label="fixture-copy")
+    await bulk_observe(
+        sessions,
+        _rows([peak, *later, other_pool])
+        + _rows([other_provider], provider="another-provider")
+        + _rows([fixture], fixture=True),
+    )
+    at = now + timedelta(hours=3)
+    await observe(sessions, at, price="1.40")
+
+    result = await swept(sessions, at)
+
+    assert result.triggers == {"TRAILING_STOP": 1} and result.executed == 1, result
+    [row] = await exit_rows(sessions)
+    recorded = row.exit_trigger_basis["inputs"]["peak"]
+    assert Decimal(recorded["price_usd"]) == Decimal("3.00")
+    assert recorded["observation_id"] is not None
+    assert recorded["observed_at"].startswith(peak.observed_at.isoformat()[:19])
+    assert recorded["truncated"] is False
+
+
+def _corrupt(row):
+    """A stored row claiming an available price whose payload is not a snapshot."""
+    broken = dict(row)
+    payload = dict(row["payload"])
+    payload.pop("pair")
+    broken["payload"] = payload
+    return broken
+
+
+async def test_a_corrupt_higher_row_is_skipped_and_the_valid_peak_decides(risk_db, now):
+    _, sessions = risk_db
+    await early_entry(sessions, now)
+    t1 = now + timedelta(minutes=1)
+    [corrupt] = _rows([held_at(t1, "9.00", label="corrupt")])
+    await bulk_observe(sessions, [_corrupt(corrupt), *_rows([held_at(t1, "3.00", label="valid")])])
+    at = now + timedelta(hours=1)
+    await observe(sessions, at, price="1.50")
+
+    result = await swept(sessions, at)
+
+    # A trailing exit on a lower-bound peak is still correct: the true peak can
+    # only be higher, so its trailing level can only be higher too.
+    assert result.triggers == {"TRAILING_STOP": 1}, result
+    [row] = await exit_rows(sessions)
+    peak = row.exit_trigger_basis["inputs"]["peak"]
+    assert Decimal(peak["price_usd"]) == Decimal("3.00")
+    assert peak["truncated"] is True
+
+
+async def test_a_peak_that_cannot_be_read_is_reported_incomplete(risk_db, now):
+    _, sessions = risk_db
+    await early_entry(sessions, now)
+    t1 = now + timedelta(minutes=1)
+    await bulk_observe(
+        sessions,
+        [_corrupt(item) for item in _rows([held_at(t1, "9.00", label="corrupt-only")])],
+    )
+    at = now + timedelta(hours=1)
+    await observe(sessions, at, price="1.30")
+
+    result = await swept(sessions, at)
+
+    # The unreadable row is skipped, never invented into a peak, and the
+    # incompleteness is visible rather than read as "no peak".
+    assert (result.held, result.executed) == (1, 0)
+    assert result.refusals == {"EARLY_EXIT_PEAK_INCOMPLETE": 1}
+
+
+async def test_liquidity_from_another_provider_never_invalidates_the_position(risk_db, now):
+    _, sessions = risk_db
+    await early_entry(sessions, now)
+    at = now + timedelta(minutes=30)
+    await observe(sessions, at - timedelta(seconds=10), price="1.30")
+    # Newer, same pool id, a different provider — and thin. Not this market's reading.
+    foreign = recorded_snapshot(
+        at,
+        age=FRESH,
+        metadata_age=FRESH,
+        pair_id=HELD.pair_id,
+        base_asset_id=HELD.base_asset_id,
+        label="foreign-provider",
+        price=Decimal("1.30"),
+        liquidity=Decimal("5000"),
+    )
+    await bulk_observe(sessions, _rows([foreign], provider="another-provider"))
+
+    result = await swept(sessions, at)
+
+    assert result.triggers.get("LIQUIDITY_INVALIDATION") is None, result
+    assert result.executed == 0

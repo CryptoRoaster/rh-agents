@@ -33,7 +33,6 @@ SELL check, which may refuse it — then nothing is booked and the next sweep
 asks again.
 """
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -41,8 +40,8 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, Field
-from sqlalchemy import select
+from pydantic import AwareDatetime, Field, ValidationError
+from sqlalchemy import Numeric, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.clock import Clock, SystemClock
@@ -61,13 +60,17 @@ from src.orchestration.paperexit.service import (
 from src.orchestration.riskrequest.service import OneSnapshot
 from src.orchestration.strategy.early import EARLY_ENTRY_V1, PRE_VECTOR_EARLY_ENTRY_V1
 from src.orchestration.valuation.service import PositionValuationReader
+from src.orchestration.valuation.service import _same_market as same_market
 
 EARLY_EXIT_VERSION: Literal["EARLY_PAPER_EXIT_V1"] = "EARLY_PAPER_EXIT_V1"
 BPS = Decimal(10000)
 
-# How many recorded observations one peak read may walk. Bounded so a sweep's
-# cost is bounded; reaching it is stated on the basis, never hidden.
-MAX_PEAK_OBSERVATIONS = 5000
+# The peak read loads candidates, never the window: the database orders every
+# observation since entry by price and only the top page is read and checked.
+# A page whose rows all fail the exact check moves on to the next, up to a bound;
+# exhausting it is stated on the basis as an incomplete peak, never hidden.
+PEAK_CANDIDATE_PAGE = 20
+PEAK_CANDIDATE_PAGES = 5
 
 
 class EarlyExitTrigger(StrEnum):
@@ -162,6 +165,10 @@ def evaluate_early(policy: EarlyExitPolicy, inputs: EarlyExitInputs) -> EarlyExi
         reason = reasons[trigger]
     elif mark is None:
         reason = "HOLD_MARK_UNKNOWN"
+    elif inputs.peak.truncated:
+        # The peak could not be established in full. A trailing exit on a lower
+        # bound is still a correct exit, but holding on one is not a proof.
+        reason = "HOLD_PEAK_INCOMPLETE"
     else:
         reason = "HOLD_TRAILING_ACTIVE" if trailing else "HOLD"
     return EarlyExitVerdict(
@@ -176,6 +183,14 @@ def evaluate_early(policy: EarlyExitPolicy, inputs: EarlyExitInputs) -> EarlyExi
     )
 
 
+def _price_text() -> Any:
+    return MarketObservationRow.payload[("price", "value_usd")].as_string()
+
+
+def _price_status() -> Any:
+    return MarketObservationRow.payload[("price", "status")].as_string()
+
+
 async def observed_peak(
     session: AsyncSession,
     position: Position,
@@ -183,52 +198,87 @@ async def observed_peak(
     since: datetime,
     until: datetime,
     include_fixtures: bool = False,
-    limit: int = MAX_PEAK_OBSERVATIONS,
+    page: int = PEAK_CANDIDATE_PAGE,
+    max_pages: int = PEAK_CANDIDATE_PAGES,
 ) -> ObservedPeak:
     """The highest available price recorded for the held market in [since, until].
 
+    Over the **whole** window: the database orders every matching observation
+    by its recorded USD price, highest first, and only the top candidates are
+    loaded — never the window itself. Each candidate is then read as the
+    recorder's own `MarketSnapshot` and its price checked exactly, so the
+    database's ordering only proposes and the stored observation decides.
+
     Only the position's own market — provider and pair — and only observations
-    that state an available USD price. Fixtures never count unless explicitly
-    included.
+    whose price is stated AVAILABLE and positive. Fixtures never count unless
+    explicitly included. If no candidate within the bounded number of pages
+    survives that check, the peak is reported as incomplete, never as known.
     """
     if position.market_pair_id is None:
         return ObservedPeak()
-    statement = select(MarketObservationRow).where(
+    window = [
         MarketObservationRow.pair_id == position.market_pair_id,
         MarketObservationRow.observed_at >= since,
         MarketObservationRow.observed_at <= until,
         MarketObservationRow.available.is_(True),
-    )
+        _price_status() == Availability.AVAILABLE.value,
+        _price_text().is_not(None),
+    ]
     if position.market_provider is not None:
-        statement = statement.where(MarketObservationRow.provider == position.market_provider)
+        window.append(MarketObservationRow.provider == position.market_provider)
     if not include_fixtures:
-        statement = statement.where(MarketObservationRow.is_fixture.is_(False))
-    statement = statement.order_by(
-        MarketObservationRow.observed_at.desc(), MarketObservationRow.id.desc()
-    ).limit(limit + 1)
-    rows: Sequence[MarketObservationRow] = (await session.scalars(statement)).all()
-    truncated = len(rows) > limit
-    best: tuple[Decimal, datetime, UUID] | None = None
-    counted = 0
-    for row in rows[:limit]:
-        snapshot = MarketSnapshot.model_validate(row.payload)
-        price = snapshot.price
-        if price.status != Availability.AVAILABLE or price.value_usd is None:
-            continue
-        if price.value_usd <= 0:
-            continue
-        counted += 1
-        if best is None or price.value_usd > best[0]:
-            best = (price.value_usd, aware(row.observed_at), row.id)
-    if best is None:
-        return ObservedPeak(observations=counted, truncated=truncated)
-    return ObservedPeak(
-        price_usd=best[0],
-        observed_at=best[1],
-        observation_id=best[2],
-        observations=counted,
-        truncated=truncated,
+        window.append(MarketObservationRow.is_fixture.is_(False))
+    priced = cast(_price_text(), Numeric(38, 18))
+    counted = (
+        await session.scalar(
+            select(func.count()).select_from(MarketObservationRow).where(*window, priced > 0)
+        )
+    ) or 0
+    if counted == 0:
+        return ObservedPeak()
+    statement = (
+        select(MarketObservationRow)
+        .where(*window, priced > 0)
+        .order_by(
+            priced.desc(),
+            MarketObservationRow.observed_at.asc(),
+            MarketObservationRow.id.asc(),
+        )
     )
+    unreadable = False
+    for index in range(max_pages):
+        rows = (await session.scalars(statement.limit(page).offset(index * page))).all()
+        best: tuple[Decimal, datetime, UUID] | None = None
+        for row in rows:
+            try:
+                snapshot = MarketSnapshot.model_validate(row.payload)
+            except ValidationError:
+                # A stored row that is not a snapshot proves no price. Skipped,
+                # never allowed to stop the sweep and never read as a peak.
+                unreadable = True
+                continue
+            price = snapshot.price
+            if price.status != Availability.AVAILABLE or price.value_usd is None:
+                continue
+            if price.value_usd <= 0:
+                continue
+            # Exact comparison within the page: the ordering only proposes.
+            if best is None or price.value_usd > best[0]:
+                best = (price.value_usd, aware(row.observed_at), row.id)
+        if best is not None:
+            # Rows ranked above the winner were skipped as unreadable: the true
+            # maximum may be among them, so the peak is a lower bound and says so.
+            return ObservedPeak(
+                price_usd=best[0],
+                observed_at=best[1],
+                observation_id=best[2],
+                observations=counted,
+                truncated=unreadable,
+            )
+        if len(rows) < page:
+            break
+    # Rows claimed a price and none could be read as one. Not a peak.
+    return ObservedPeak(observations=counted, truncated=True)
 
 
 @dataclass(frozen=True)
@@ -267,6 +317,8 @@ class EarlyExitService:
                 if verdict.reason == "HOLD_MARK_UNKNOWN":
                     # Visible, and asked again next sweep: no price, no price exit.
                     result.refused("EARLY_EXIT_MARK_UNKNOWN")
+                elif verdict.reason == "HOLD_PEAK_INCOMPLETE":
+                    result.refused("EARLY_EXIT_PEAK_INCOMPLETE")
                 continue
             result.triggered += 1
             code = verdict.trigger.value
@@ -318,6 +370,12 @@ class EarlyExitService:
             snapshot = await feed.latest(position.market_pair_id)
             if (
                 snapshot is not None
+                # The held market's own reading: same pool, and the same chain,
+                # network and provider the position recorded — the rule the
+                # mark itself is held to. Another source's reading of the pool
+                # is not this position's liquidity.
+                and snapshot.pair.pair_id == position.market_pair_id
+                and same_market(snapshot, position)
                 and snapshot.liquidity.status == Availability.AVAILABLE
                 and (now - snapshot.freshness_at).total_seconds()
                 <= self.limits.max_snapshot_age_seconds

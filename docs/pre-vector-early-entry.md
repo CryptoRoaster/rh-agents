@@ -156,13 +156,25 @@ the exit.
   price with slippage, fees and gas.
 - **Mark:** the held market's latest recorded observation, only if within
   SENTINEL's snapshot age (the same valuation reader every exit uses).
+- **Liquidity:** only from the held market's own fresh reading — same pool and
+  the chain, network and provider the position recorded, the rule the mark is
+  held to. Another provider's reading of the same pool never invalidates.
 - **Peak:** never stored. The highest available, non-fixture price recorded
   for the held market (same provider and pair) between the entry instant and
   now, together with the mark. Observations are durable, append-only rows, so
   the peak and the trailing state survive restarts by construction; the exit
-  basis names the observation id and time it rested on. At most 5,000
-  observations are read per evaluation; reaching that is stated
-  (`peak.truncated`).
+  basis names the observation id and time it rested on.
+- **Peak completeness:** the whole window since entry is searched, never a
+  recent slice. The database orders every matching observation (pool,
+  provider, window, `available`, `price.status = AVAILABLE`, price > 0,
+  fixtures excluded) by its recorded USD price and only the top candidates are
+  loaded (pages of 20, at most 5); each candidate is re-read as the recorder's
+  `MarketSnapshot` and its price checked exactly, so the ordering only
+  proposes. No migration: the price is read through the portable JSON path
+  (`#>>` on PostgreSQL, `json_extract` on SQLite). A stored row that cannot be
+  read as a snapshot is skipped and marks the peak as a lower bound
+  (`peak.truncated = true`); a trailing exit on a lower bound is still correct,
+  a hold on one is reported as `EARLY_EXIT_PEAK_INCOMPLETE`.
 - **Missing or stale data:** an unknown mark fires no price trigger and is
   reported (`EARLY_EXIT_MARK_UNKNOWN`); unknown liquidity fires no
   invalidation. The time exit needs neither — but the sale still needs a
