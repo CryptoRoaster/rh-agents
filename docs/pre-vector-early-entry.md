@@ -27,8 +27,10 @@ seen within six hours, youngest first, skipping fixtures, markets with a live
 case, markets COMMANDER bars (RISK_REJECTED / EXECUTED), and any market that
 already had an early case (one early attempt per market, in any outcome). No
 market cap, FDV, volume, trending, liquidity or quote-asset filter. The intake
-is COMMANDER's, restricted to Robinhood, one case per cycle, one-hour case
-lifetime.
+is COMMANDER's, restricted to Robinhood, one case per cycle, with a one-hour
+`case_lifetime`. As everywhere in COMMANDER, `expires_at` is
+`candidate.observed_at + case_lifetime` — measured from the observation the
+case was opened on, so slightly less than an hour after the insert.
 
 ## Workflow `trade-case-early-v1`
 
@@ -85,10 +87,23 @@ units.
   If ANCHOR did not prove at least $10, the request is refused before SENTINEL
   (`EARLY_EXECUTABLE_CAPACITY_INSUFFICIENT`, detail `…_UNKNOWN` /
   `…_BELOW_NOTIONAL`).
-- Caps, read from the ledger under the account lock, before SENTINEL:
-  5 open early positions, $50 early exposure (existing + $10), $30 early
-  realised loss since the start of the UTC day (early exits only)
-  → `EARLY_STRATEGY_CAP_REACHED`. A cap never engages the kill switch.
+- Caps: 5 open early positions, $50 early exposure (existing + $10), $30
+  early realised loss since the start of the UTC day (early exits only). They
+  are judged twice, both times under the paper account lock and before
+  SENTINEL is asked: at the risk request (`EARLY_STRATEGY_CAP_REACHED` on the
+  request) and again at the fill, on the ledger as it stands in the fill's own
+  transaction (`ExecutionRefusal.EARLY_STRATEGY_CAP_REACHED`, detail names the
+  cap). An approval reserves nothing, so two early cases approved against the
+  same free slot are settled at the fill: every fill and every exit takes the
+  account lock first, so the second fill reads the first one's position. A cap
+  never engages the kill switch and is not a risk verdict.
+- Exposure is the ledger's cost basis, which includes paper slippage and
+  fees: at 25 bps slippage and 30 bps fees one $10 entry books
+  10.055075 USD. Four entries hold 40.22 USD, so a fifth (40.22 + 10 > 50) is
+  refused by the exposure cap; with any positive cost the $50 exposure cap
+  binds before the five-position cap. That is the conservative reading of
+  $50 as a hard cost-basis cap. The check adds the nominal $10, not the cost
+  of the next entry.
 - One new early entry per bounded run (`EARLY_RUN_ENTRY_LIMIT_REACHED`).
 - No re-entry: a closed early cycle is refused
   (`STRATEGY_REENTRY_NOT_PERMITTED`).

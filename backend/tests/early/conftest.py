@@ -76,10 +76,12 @@ async def open_early_case(cases, sessions, now, trace, *, key="early-case", iden
     return trade_case
 
 
-def young_history(now, bars: int = 3, **overrides):
+def young_history(now, bars: int = 3, *, identity=None, **overrides):
     """A closed hourly series of `bars` bars, as VECTOR requests it (48)."""
     newest = overrides.pop("newest_close", now.replace(minute=0, second=0, microsecond=0))
-    return fixture_history(IDENTITY, newest_close=newest, bars=bars, requested_bars=48, **overrides)
+    return fixture_history(
+        identity or IDENTITY, newest_close=newest, bars=bars, requested_bars=48, **overrides
+    )
 
 
 def early_reader(cases, markets, now, history):

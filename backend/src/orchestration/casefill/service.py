@@ -55,7 +55,7 @@ from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
 from src.orchestration.riskrequest.service import OneSnapshot, risk_market, too_old_for
 from src.orchestration.sizing.context import base_asset_metadata, reference_price
-from src.orchestration.strategy.early import limits_for
+from src.orchestration.strategy.early import cap_refusal, early_ledger, is_early, limits_for
 from src.orchestration.valuation.models import (
     PortfolioValuation,
     unvaluable_reason,
@@ -268,6 +268,13 @@ class CaseFillService:
                     readiness,
                 )
 
+            # The early strategy's book, read under the account lock every fill
+            # and every exit takes, so no other fill can change it before this
+            # transaction commits. Read before the clock like every other input.
+            ledger = (
+                await early_ledger(session) if is_early(trade_case.strategy_policy_id) else None
+            )
+
             # The last clock read, after the last input read. Everything from
             # here to the verdict is synchronous, so one instant governs
             # eligibility, the approval's own validity, every source age, the
@@ -315,6 +322,18 @@ class CaseFillService:
                 return _refused(trade_case, ExecutionRefusal.RISK_DATA_INCOMPLETE, readiness)
             if not readiness.is_current_at(now):
                 return _refused(trade_case, ExecutionRefusal.DECISION_BASIS_EXPIRED, readiness)
+            if ledger is not None:
+                # The approval reserved nothing: another early case approved
+                # against the same free slot may have filled since. Judged again
+                # on the ledger as it stands, before SENTINEL is asked again.
+                capped = cap_refusal(ledger.at(now))
+                if capped is not None:
+                    return _refused(
+                        trade_case,
+                        ExecutionRefusal.EARLY_STRATEGY_CAP_REACHED,
+                        readiness,
+                        detail=capped,
+                    )
 
             onchain = current.get(EvidenceType.ONCHAIN)
             anchor = current.get(EvidenceType.LIQUIDITY_EXECUTION)

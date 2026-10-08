@@ -95,6 +95,12 @@ class ExecutionRefusal(StrEnum):
     # those writes takes real time. Approved and not executed, with everything
     # started rolled back. Never a risk verdict about the market.
     EXECUTION_WINDOW_EXPIRED = "EXECUTION_WINDOW_EXPIRED"
+    # PRE_VECTOR_EARLY_ENTRY_V1 only: one more early position would breach a
+    # strategy cap on the ledger as it stands now. An approval reserves nothing,
+    # so two early cases approved against the same free slot are settled here,
+    # under the account lock that orders fills. The detail names the cap. Not a
+    # risk verdict, and it pauses nothing.
+    EARLY_STRATEGY_CAP_REACHED = "EARLY_STRATEGY_CAP_REACHED"
 
 
 class PaperFillRecorded(Immutable):

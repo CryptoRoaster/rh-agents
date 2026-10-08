@@ -40,12 +40,15 @@ async def _execution_detail(now, capacity):
     return detail.model_copy(update={"largest_tested_acceptable_notional_usd": capacity})
 
 
-async def early_ready(service, sessions, now, trace, *, key="early", capacity=Decimal(10)):
+async def early_ready(
+    service, sessions, now, trace, *, key="early", capacity=Decimal(10), identity=None
+):
     """An early case carried by the real producers and workflow to READY_FOR_RISK."""
     cases = service.cases
-    trade_case = await open_early_case(cases, sessions, now, trace, key=key)
+    trade_case = await open_early_case(cases, sessions, now, trace, key=key, identity=identity)
     await record_early_onchain(cases, trade_case, now)
-    result, setup = await early_setup(cases, trade_case, service.markets, now, young_history(now))
+    history = young_history(now, identity=identity)
+    result, setup = await early_setup(cases, trade_case, service.markets, now, history)
     assert setup is not None, result
     trigger = await record_trigger(cases, trade_case, now, setup)
     payload = anchor_payload(setup.evidence_id, trigger.evidence_id)
