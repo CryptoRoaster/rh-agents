@@ -176,6 +176,7 @@ class Account:
     refreshed: dict[UUID, set[str]] = field(default_factory=dict)
     # What the automatic exit sweep did, when one is configured.
     exits: ExitSweep | None = None
+    early_exits: ExitSweep | None = None
     # PRE_VECTOR_EARLY_ENTRY_V1, when enabled: what its refresh and intake did,
     # and how many early entries this run has filled against its per-run bound.
     early: EarlyEntryReport | None = None
@@ -260,6 +261,7 @@ class BoundedPaperRun:
             # Exits first: closing what the policy says to close reduces risk
             # before any new case is opened, and needs nothing intake produces.
             await self._exit(account, deadline)
+            await self._early_exit(account, deadline)
             await self._promote(account, deadline)
             await self._intake(account, deadline)
             if not account.intake_unknown:
@@ -361,6 +363,17 @@ class BoundedPaperRun:
         if stage is None:
             return
         account.exits = await self._bounded(stage.sweep(), deadline)
+
+    async def _early_exit(self, account: Account, deadline: Deadline) -> None:
+        """One bounded EARLY_PAPER_EXIT_V1 sweep, when configured.
+
+        The same one exit path and SENTINEL SELL check; only the policy that
+        decides when to ask is the early strategy's own.
+        """
+        stage = self.stack.early_exits
+        if stage is None:
+            return
+        account.early_exits = await self._bounded(stage.sweep(), deadline)
 
     async def _intake(self, account: Account, deadline: Deadline) -> None:
         """One bounded intake cycle, through the existing control plane.
@@ -1112,19 +1125,24 @@ class BoundedPaperRun:
             replays=len([item for item in cases if item.replayed]),
             pre_risk_market_refreshes=sum(len(item.market_refreshes) for item in cases),
             pre_risk_refusals=len([item for item in cases if item.pre_risk_refusal is not None]),
-            exits=None
-            if account.exits is None
-            else ExitReport(
-                evaluated=account.exits.evaluated,
-                triggered=account.exits.triggered,
-                executed=account.exits.executed,
-                held=account.exits.held,
-                triggers=tuple(sorted(account.exits.triggers)),
-                refusals=tuple(sorted(account.exits.refusals)),
-            ),
+            exits=_exit_report(account.exits),
+            early_exits=_exit_report(account.early_exits),
             errors=tuple(account.errors),
             early=account.early,
         )
+
+
+def _exit_report(sweep: ExitSweep | None) -> ExitReport | None:
+    if sweep is None:
+        return None
+    return ExitReport(
+        evaluated=sweep.evaluated,
+        triggered=sweep.triggered,
+        executed=sweep.executed,
+        held=sweep.held,
+        triggers=tuple(sorted(sweep.triggers)),
+        refusals=tuple(sorted(sweep.refusals)),
+    )
 
 
 def _code(value: str | None) -> str | None:

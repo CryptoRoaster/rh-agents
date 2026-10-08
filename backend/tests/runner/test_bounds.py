@@ -364,6 +364,8 @@ def test_the_summary_carries_no_secret_and_no_payload(risk_db):
         "pre_risk_refusals",
         # Counts and codes only; absent unless automatic PAPER exits are configured.
         "exits",
+        # Counts and codes only; absent unless EARLY_PAPER_EXIT_ENABLED.
+        "early_exits",
         "errors",
         # Counts and codes only; absent unless PRE_VECTOR_EARLY_ENTRY_V1 is enabled.
         "early",

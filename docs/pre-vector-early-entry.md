@@ -1,8 +1,8 @@
-# PRE_VECTOR_EARLY_ENTRY_V1 (Issue #40, part 1)
+# PRE_VECTOR_EARLY_ENTRY_V1 and EARLY_PAPER_EXIT_V1 (Issue #40)
 
-PAPER only. Off by default (`PRE_VECTOR_EARLY_ENTRY_ENABLED=false`). Part 1 of
-Issue #40: entry only. The early exit contract (`EARLY_PAPER_EXIT_V1`, PR B) is
-required before the strategy may be enabled at runtime.
+PAPER only. Both off by default (`PRE_VECTOR_EARLY_ENTRY_ENABLED=false`,
+`EARLY_PAPER_EXIT_ENABLED=false`). Early entries cannot be enabled without the
+early exit contract; the exit may run on its own.
 
 ## What does not change
 
@@ -126,3 +126,55 @@ the case and its `strategy_policy_id`.
 `PRE_VECTOR_EARLY_ENTRY_ENABLED=true` requires `PAPER_RUNNER_ENABLED`,
 `EARLY_SCOUT_ENABLED` and `ATLAS_FUNDING_GRAPH_ENABLED`. Preflight then also
 requires every role of the early workflow.
+
+## Exit: EARLY_PAPER_EXIT_V1
+
+A deterministic sweep over open positions whose cycle an early case opened,
+run in the bounded PAPER run right after the normal exit sweep. The normal
+`PAPER_EXIT_V1` sweep never closes an early position
+(`EARLY_POSITION_OWN_EXIT_POLICY`), and this sweep never closes a normal one.
+
+Every exit is a **full** exit through the existing `PaperExitService`: whole
+holding, fresh ATLAS exit read, SENTINEL SELL check, one order per key, one
+exit per cycle enforced by the database, fill + ledger + exit record in one
+transaction under the paper account lock. The trigger, the policy version and
+every number it was decided on are stored on that exit
+(`exit_trigger`, `exit_policy_version`, `exit_trigger_basis`). No migration.
+
+| Order | Trigger | Condition |
+|---|---|---|
+| 1 | `STOP_LOSS` | mark ≤ 0.40 × entry cost per unit (−60 %) |
+| 2 | `LIQUIDITY_INVALIDATION` | fresh liquidity known and < 10,000 USD |
+| 3 | `TRAILING_STOP` | peak ≥ 2 × entry cost per unit, and mark ≤ 0.5 × peak |
+| 4 | `TIME_EXIT` | held ≥ 72 h |
+
+All conditions that hold are recorded (`verdict.conditions`); the first names
+the exit.
+
+- **Entry instant:** the case fill's `filled_at`.
+- **Entry cost per unit:** the ledger's cost basis ÷ quantity — execution
+  price with slippage, fees and gas.
+- **Mark:** the held market's latest recorded observation, only if within
+  SENTINEL's snapshot age (the same valuation reader every exit uses).
+- **Peak:** never stored. The highest available, non-fixture price recorded
+  for the held market (same provider and pair) between the entry instant and
+  now, together with the mark. Observations are durable, append-only rows, so
+  the peak and the trailing state survive restarts by construction; the exit
+  basis names the observation id and time it rested on. At most 5,000
+  observations are read per evaluation; reaching that is stated
+  (`peak.truncated`).
+- **Missing or stale data:** an unknown mark fires no price trigger and is
+  reported (`EARLY_EXIT_MARK_UNKNOWN`); unknown liquidity fires no
+  invalidation. The time exit needs neither — but the sale still needs a
+  current price and a fresh exit read, so a time exit that cannot be executed
+  safely is refused by name, not booked, and asked again every sweep.
+- **Retries and parallel sweeps:** the request key is
+  `auto-exit:EARLY_PAPER_EXIT_V1:<cycle>:<UTC minute>`; a replay of the same
+  key returns the recorded sale (reported as `EXIT_ALREADY_RECORDED`, never
+  counted twice), and any other key for the same cycle is refused by the
+  one-exit-per-cycle constraint.
+- **Early ledger:** each exit's realised result is the exit row's
+  `realized_pnl_usd`; losses since the UTC day start count toward the $30
+  early daily loss cap.
+- **No re-entry:** a closed early cycle is refused
+  (`STRATEGY_REENTRY_NOT_PERMITTED`).

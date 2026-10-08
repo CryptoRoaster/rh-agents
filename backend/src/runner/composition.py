@@ -61,6 +61,7 @@ from src.orchestration.commander.context import AccountPauseReader, SystemPauseP
 from src.orchestration.commander.intake import CommanderIntakeService
 from src.orchestration.commander.policy import COMMANDER_CONTROL_V1
 from src.orchestration.costs.models import PaperCostReading, paper_cost_assumptions
+from src.orchestration.exitpolicy.early import EarlyExitService
 from src.orchestration.exitpolicy.policy import PaperExitPolicy
 from src.orchestration.exitpolicy.service import AutoExitService
 from src.orchestration.paper import PaperTradingService
@@ -308,6 +309,8 @@ class RunnerStack:
     # PAPER_EXIT_V1 and exits through PaperExitService. Absent means no position
     # is ever closed without an explicit request, as before.
     exits: AutoExitService | None = None
+    # EARLY_PAPER_EXIT_V1, only under its own consent.
+    early_exits: EarlyExitService | None = None
     # PRE_VECTOR_EARLY_ENTRY_V1, present only under its own explicit consent:
     # the intake that opens early cases from young WATCHING watches, and the
     # refresh that re-observes those watches first. Absent, nothing early exists.
@@ -556,6 +559,29 @@ def build_stack(
             max_exits=settings.paper_exit_max_per_run,
             clock=tick,
         )
+    early_exits = None
+    if settings.early_paper_exit_enabled:
+        # The early strategy's own exit contract, through the same one exit
+        # path and the same fresh exit read as every automatic exit.
+        early_exits = EarlyExitService(
+            sessions=sessions,
+            exits=PaperExitService(
+                sessions=sessions,
+                cases=cases,
+                paper=paper,
+                markets=markets,
+                costs=costs,
+                trading_mode=settings.trading_mode,
+                kill_switch=settings.commander_kill_switch,
+                pause=supplied.pause,
+                clock=tick,
+                exit_read=_exit_read(settings, supplied, tick),
+            ),
+            markets=markets,
+            limits=paper.limits,
+            max_exits=settings.paper_exit_max_per_run,
+            clock=tick,
+        )
     runners, roles = _runners(settings, sessions, runtime, markets, supplied, tick)
     acquisition = None
     pre_risk = None
@@ -604,6 +630,7 @@ def build_stack(
         promotion=promotion,
         watches=watches,
         exits=exits,
+        early_exits=early_exits,
         early_intake=early_intake,
         early_promotion=early_promotion,
         reasoning_unavailable=None
