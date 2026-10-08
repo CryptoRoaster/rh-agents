@@ -100,6 +100,13 @@ class RiskRequestRefusal(StrEnum):
     DECISION_BASIS_EXPIRED = "DECISION_BASIS_EXPIRED"
     # The same key arrived with a different basis. Never silently recomputed.
     RISK_REQUEST_CONFLICT = "RISK_REQUEST_CONFLICT"
+    # PRE_VECTOR_EARLY_ENTRY_V1 only. A strategy cap — open early positions,
+    # early exposure or today's early losses — would be breached by one more
+    # entry. The strategy declining, never a verdict about the market.
+    EARLY_STRATEGY_CAP_REACHED = "EARLY_STRATEGY_CAP_REACHED"
+    # ANCHOR did not prove the fixed early notional executable. No downsizing:
+    # the strategy enters at exactly its notional or not at all.
+    EARLY_EXECUTABLE_CAPACITY_INSUFFICIENT = "EARLY_EXECUTABLE_CAPACITY_INSUFFICIENT"
 
 
 class RiskRequestEvaluated(Immutable):

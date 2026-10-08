@@ -205,6 +205,7 @@ class PaperTradingService:
         market_identity: MarketIdentity | None = None,
         cycle_id: UUID | None = None,
         authorize: Callable[[datetime], str | None] | None = None,
+        limits: RiskLimits | None = None,
     ) -> PaperOutcome:
         """Risk-check, fill and book one order inside a transaction the caller owns.
 
@@ -235,6 +236,10 @@ class PaperTradingService:
         """
         if self.mode != TradingMode.PAPER:
             raise ValueError("Paper execution must be explicitly enabled")
+        # A case-bound caller may name the limits its case is judged against —
+        # the early strategy's profile — and gets exactly those; anyone else
+        # gets this service's own. The engine is the same either way.
+        governing = limits if limits is not None else self.limits
         roll_loss_day(account, now)
         # One implementation of "what does the account hold, valued?", shared
         # with the case-bound risk request. Two would eventually disagree
@@ -247,7 +252,7 @@ class PaperTradingService:
             price_usd=market.price_usd,
             marks=marks,
             now=now,
-            max_snapshot_age_seconds=self.limits.max_snapshot_age_seconds,
+            max_snapshot_age_seconds=governing.max_snapshot_age_seconds,
             correlation_id=intent.correlation_id,
             market=market_identity,
             # Which trading cycle a newly opened holding belongs to. The
@@ -263,10 +268,10 @@ class PaperTradingService:
             # violation rather than a decision to be made.
             raise ValueError(f"Asset already held in another market: {state.conflicting_market}")
         position, prices, context = state.position, state.prices, state.context
-        limits = self.limits.model_copy(
-            update={"kill_switch": self.limits.kill_switch or account.paused}
+        checked = governing.model_copy(
+            update={"kill_switch": governing.kill_switch or account.paused}
         )
-        risk = evaluate(intent, market, context, limits, now=now)
+        risk = evaluate(intent, market, context, checked, now=now)
         await append(session, market)
         await append(session, intent)
         await append(session, risk)

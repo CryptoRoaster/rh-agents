@@ -33,6 +33,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.agents.anchor.context import AnchorContextReader
 from src.agents.anchor.handler import AnchorWorkerHandler
 from src.agents.atlas.context import AtlasContextReader, SnapshotBuilderPort
+from src.agents.early.context import EarlyContextReader
+from src.agents.early.handler import EarlyWorkerHandler
 from src.agents.fuse.context import FuseContextReader
 from src.agents.fuse.handler import FuseWorkerHandler
 from src.agents.orbit.context import OrbitContextReader
@@ -69,15 +71,17 @@ from src.orchestration.paperexit.exitread import (
 )
 from src.orchestration.paperexit.service import PaperExitService
 from src.orchestration.riskrequest.service import RiskRequestService
+from src.orchestration.strategy.early import EARLY_ENTRY_V1, PRE_VECTOR_EARLY_ENTRY_V1
 from src.orchestration.worker.runner import CapabilityProvider, WorkerHandler, WorkerRunner
 from src.orchestration.worker.service import WorkerRuntimeService
+from src.orchestration.workflow.policy import TRADE_CASE_EARLY_V1
 from src.orchestration.workflow.service import TradeCaseService
 from src.reasoning.provider import ReasoningProvider
 from src.runner.acquisition import BoundedMarketAcquisition
 from src.runner.models import AcquisitionLimits, RoleAvailability, RunLimits
 from src.runner.pre_risk import PreRiskLimits, PreRiskMarketRefresh
 from src.runtime.models import chain_configs
-from src.scout.candidates import PromotedWatchCandidates, PromotionRefresh
+from src.scout.candidates import EarlyWatchCandidates, PromotedWatchCandidates, PromotionRefresh
 from src.scout.repository import WatchRepository
 
 Closer = Callable[[], Awaitable[None]]
@@ -304,6 +308,11 @@ class RunnerStack:
     # PAPER_EXIT_V1 and exits through PaperExitService. Absent means no position
     # is ever closed without an explicit request, as before.
     exits: AutoExitService | None = None
+    # PRE_VECTOR_EARLY_ENTRY_V1, present only under its own explicit consent:
+    # the intake that opens early cases from young WATCHING watches, and the
+    # refresh that re-observes those watches first. Absent, nothing early exists.
+    early_intake: CommanderIntakeService | None = None
+    early_promotion: PromotionRefresh | None = None
     # Why no model can be asked, or None when one can. Read by preflight for the
     # scout, which needs ORBIT's model whether or not the ORBIT worker is on.
     reasoning_unavailable: str | None = None
@@ -436,6 +445,40 @@ def build_stack(
             clock=tick,
             http=supplied.market_http,
         )
+    early_intake: CommanderIntakeService | None = None
+    early_promotion: PromotionRefresh | None = None
+    if settings.pre_vector_early_entry_enabled and watches is not None:
+        early_source = EarlyWatchCandidates(
+            sessions=sessions, markets=markets, watches=watches, clock=tick
+        )
+        early_promotion = PromotionRefresh(
+            settings=settings,
+            sessions=sessions,
+            source=early_source,
+            pause=supplied.pause,
+            clock=tick,
+            http=supplied.market_http,
+        )
+        early_intake = CommanderIntakeService(
+            cases=cases,
+            markets=early_source,
+            sessions=sessions,
+            # One new early case per cycle, Robinhood only, and a short life:
+            # an early setup lives ten minutes, so a case that has not reached
+            # its entry within the hour is not an early entry any more.
+            policy=replace(
+                COMMANDER_CONTROL_V1,
+                version=f"{COMMANDER_CONTROL_V1.version}-early",
+                enabled_chains=frozenset({"robinhood"}),
+                max_cases_per_cycle=EARLY_ENTRY_V1.max_entries_per_run,
+                case_lifetime=timedelta(hours=1),
+            ),
+            clock=tick,
+            kill_switch=settings.commander_kill_switch,
+            pause=supplied.pause,
+            strategy_policy_id=PRE_VECTOR_EARLY_ENTRY_V1,
+            workflow=TRADE_CASE_EARLY_V1,
+        )
     intake = CommanderIntakeService(
         cases=cases,
         markets=candidates,
@@ -561,6 +604,8 @@ def build_stack(
         promotion=promotion,
         watches=watches,
         exits=exits,
+        early_intake=early_intake,
+        early_promotion=early_promotion,
         reasoning_unavailable=None
         if supplied.reasoning is not None
         else supplied.reasoning_unavailable,
@@ -730,6 +775,29 @@ def _runners(
                     cases=cases,
                     markets=markets,
                     quotes=ports.quotes if ports.quotes is not None else UnconfiguredQuoteSource(),
+                    clock=clock,
+                ),
+            ),
+        )
+
+    if not settings.pre_vector_early_entry_enabled:
+        note(AgentRole.EARLY, "ROLE_NOT_ENABLED")
+    elif ports.history is None and settings.vector_history_provider != "disabled":
+        # The same history VECTOR would read; a configured provider this run
+        # cannot build is a gap, never a fallback to "no history".
+        note(AgentRole.EARLY, ports.history_unavailable)
+    else:
+        add(
+            AgentRole.EARLY,
+            EarlyWorkerHandler(),
+            CapabilityProvider(
+                service=runtime,
+                early=EarlyContextReader(
+                    cases=cases,
+                    markets=markets,
+                    history=ports.history
+                    if ports.history is not None
+                    else UnconfiguredHistorySource(),
                     clock=clock,
                 ),
             ),

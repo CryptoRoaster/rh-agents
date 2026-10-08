@@ -55,6 +55,7 @@ from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
 from src.orchestration.riskrequest.service import OneSnapshot, risk_market, too_old_for
 from src.orchestration.sizing.context import base_asset_metadata, reference_price
+from src.orchestration.strategy.early import limits_for
 from src.orchestration.valuation.models import (
     PortfolioValuation,
     unvaluable_reason,
@@ -182,6 +183,9 @@ class CaseFillService:
             except WorkflowFailure:
                 raise CaseFillUnavailable("TRADE_CASE_NOT_FOUND") from None
             trade_case = case_from_row(row)
+            # The limits this fill is re-checked against, by the case's own
+            # strategy — the same selection the risk request made.
+            case_limits = limits_for(trade_case.strategy_policy_id, self.limits)
 
             request = await session.scalar(
                 select(TradeCaseRiskRequestRow).where(
@@ -340,7 +344,7 @@ class CaseFillService:
                 identity_key=f"{request.request_key}:fill",
                 side=Side.BUY,
             )
-            stale = too_old_for(market, now, self.limits)
+            stale = too_old_for(market, now, case_limits)
             if stale is not None:
                 return _refused(
                     trade_case,
@@ -421,7 +425,7 @@ class CaseFillService:
                     # prepared. Exposure would then rest on a moment that has
                     # passed, so the fill does not happen.
                     return "POSITION_VALUATION_STALE"
-                return too_old_for(market, at, self.limits)
+                return too_old_for(market, at, case_limits)
 
             outcome = await self.paper.execute_in_session(
                 session,
@@ -434,6 +438,7 @@ class CaseFillService:
                 market_identity=trade_case.market,
                 cycle_id=cycle_id,
                 authorize=still_authorised,
+                limits=case_limits,
             )
             if outcome.stop_reason is not None:
                 # Approved, and the world moved on before it could be acted on.
@@ -608,7 +613,9 @@ class CaseFillService:
             # only way to learn what SENTINEL was shown would be to re-read
             # sources that have since moved.
             "market_snapshot": market.model_dump(mode="json"),
-            "risk_limits": self.limits.model_dump(mode="json"),
+            "risk_limits": limits_for(trade_case.strategy_policy_id, self.limits).model_dump(
+                mode="json"
+            ),
             "cost_assumptions": self.costs.model_dump(mode="json"),
             "intent": request.basis["intent"],
             # The whole valuation the re-check rested on: the holdings, their

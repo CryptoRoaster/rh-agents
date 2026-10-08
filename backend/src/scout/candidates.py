@@ -22,8 +22,10 @@ own ORBIT task on its own fresh input.
 """
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.clock import Clock, SystemClock
@@ -37,6 +39,11 @@ from src.markets.reader import MarketReader
 from src.markets.recorder import MarketRecorder, ObservationConflict, record_pair_reporting
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.commander.intake import active_case_exists, market_barring
+from src.orchestration.strategy.early import (
+    EARLY_ENTRY_V1,
+    PRE_VECTOR_EARLY_ENTRY_V1,
+    EarlyEntryPolicy,
+)
 from src.scout.models import DiscoveryWatch
 from src.scout.repository import SyncResult, WatchRepository, refreshed_identity_contradicts
 
@@ -85,6 +92,92 @@ class PromotedWatchCandidates:
         return await self.markets.latest(identity, include_fixtures=include_fixtures)
 
 
+async def early_case_exists(session: AsyncSession, pair_id: str) -> bool:
+    """Whether this market has ever had a PRE_VECTOR_EARLY_ENTRY_V1 case.
+
+    One early attempt per market, in any outcome. The strategy has no re-entry,
+    and a market it already judged — entered, refused, blocked or expired — is
+    not a new young market by being observed again.
+    """
+    from src.data.tables import TradeCaseRow
+
+    row = await session.scalar(
+        select(TradeCaseRow.id)
+        .where(
+            TradeCaseRow.market_key == pair_id,
+            TradeCaseRow.strategy_policy_id == PRE_VECTOR_EARLY_ENTRY_V1,
+        )
+        .limit(1)
+    )
+    return row is not None
+
+
+@dataclass(frozen=True)
+class EarlyWatchCandidates:
+    """COMMANDER's `MarketCandidateSource` for PRE_VECTOR_EARLY_ENTRY_V1.
+
+    Young WATCHING watches on Robinhood — not PROMOTABLE ones, which belong to
+    the normal VECTOR path — that COMMANDER would not refuse for an existing
+    case and that never had an early case. The scan is pre-filtered on first
+    sight: a pool first seen more than the strategy's maximum age ago is older
+    than that on chain too. Nothing here ranks by liquidity, volume, market cap,
+    provider rank or quote asset.
+    """
+
+    sessions: async_sessionmaker[AsyncSession]
+    markets: MarketReader
+    watches: WatchRepository
+    clock: Clock = SystemClock()
+    policy: EarlyEntryPolicy = EARLY_ENTRY_V1
+    chain: str = "robinhood"
+
+    async def eligible(self, *, include_fixtures: bool = False) -> tuple[DiscoveryWatch, ...]:
+        found: list[DiscoveryWatch] = []
+        since = self.clock.now() - self.policy.max_age
+        for watch in await self.watches.young_watching(
+            SCAN_LIMIT, seen_since=since, chain=self.chain
+        ):
+            if watch.is_fixture and not include_fixtures:
+                continue
+            async with self.sessions() as session:
+                if await active_case_exists(session, watch.pair_id):
+                    continue
+                if await market_barring(session, watch.pair_id) is not None:
+                    continue
+                if await early_case_exists(session, watch.pair_id):
+                    continue
+            found.append(watch)
+        return tuple(found)
+
+    async def candidates(
+        self, *, include_fixtures: bool = False, limit: int = 50, offset: int = 0
+    ) -> tuple[MarketCandidate, ...]:
+        found: list[MarketCandidate] = []
+        for watch in await self.eligible(include_fixtures=include_fixtures):
+            snapshot = await self.markets.latest(watch.pair_id, include_fixtures=include_fixtures)
+            if snapshot is None:
+                continue
+            found.append(MarketCandidate.from_snapshot(snapshot))
+        return tuple(found[offset : offset + limit])
+
+    async def latest(
+        self, identity: str, *, include_fixtures: bool = False
+    ) -> MarketSnapshot | None:
+        return await self.markets.latest(identity, include_fixtures=include_fixtures)
+
+
+class RefreshableWatches(Protocol):
+    """A watch-backed candidate source whose stale markets may be re-observed."""
+
+    @property
+    def markets(self) -> MarketReader: ...
+
+    @property
+    def watches(self) -> WatchRepository: ...
+
+    async def eligible(self, *, include_fixtures: bool = False) -> tuple[DiscoveryWatch, ...]: ...
+
+
 @dataclass(frozen=True)
 class PromotionRefresh:
     """Re-observe eligible PROMOTABLE watches by exact locator before intake.
@@ -98,7 +191,7 @@ class PromotionRefresh:
 
     settings: Settings
     sessions: async_sessionmaker[AsyncSession]
-    source: PromotedWatchCandidates
+    source: RefreshableWatches
     pause: SystemPausePort | None = None
     clock: Clock = SystemClock()
     http: httpx.AsyncBaseTransport | None = None

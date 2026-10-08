@@ -20,6 +20,8 @@ from src.orchestration.worker.capabilities import (
     CommanderCapabilities,
     CommanderContextPort,
     DiscoveryContextPort,
+    EarlyCapabilities,
+    EarlySetupContextPort,
     EvidenceSubmissionPort,
     FuseCapabilities,
     FuseContextPort,
@@ -130,6 +132,7 @@ class CapabilityProvider:
     anchor: AnchorContextPort | None = None
     fuse: FuseContextPort | None = None
     commander: CommanderContextPort | None = None
+    early: EarlySetupContextPort | None = None
 
     def build(self, lease: TaskLease) -> object:
         submit: EvidenceSubmissionPort = BoundEvidenceSubmission(lease, self.service)
@@ -150,6 +153,8 @@ class CapabilityProvider:
                 return FuseCapabilities(lease=lease, context=self.fuse, submit=submit)
             case AgentRole.COMMANDER if self.commander is not None:
                 return CommanderCapabilities(lease=lease, context=self.commander)
+            case AgentRole.EARLY if self.early is not None:
+                return EarlyCapabilities(lease=lease, context=self.early, submit=submit)
             case _:
                 raise WorkerFailure(WorkerErrorCode.ROLE_NOT_AUTHORIZED)
 

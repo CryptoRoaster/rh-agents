@@ -34,7 +34,7 @@ from src.agents.anchor.models import (
     CapacitySemantics,
     ExecutionAssessment,
 )
-from src.agents.anchor.policy import ANCHOR_EXECUTION_V1, AnchorExecutionPolicy
+from src.agents.anchor.policy import ANCHOR_EXECUTION_V1, ANCHOR_POLICIES, AnchorExecutionPolicy
 from src.agents.anchor.ports import AnchorContextUnavailable
 from src.core.models import AgentRole
 from src.core.numbers import canonical_decimal
@@ -176,7 +176,18 @@ class AnchorWorkerHandler:
                 category=WorkerFailureCategory.INTERNAL, reason_code="CONTEXT_SCHEMA_MISMATCH"
             )
 
-        outcome = assess(task_input, task_input.evaluated_at, self.policy)
+        # The policy the context assessed under, named by its own version. A
+        # version this handler does not know is a wiring fault, never a default.
+        policy = (
+            self.policy
+            if task_input.policy_version == self.policy.version
+            else ANCHOR_POLICIES.get(task_input.policy_version)
+        )
+        if policy is None:
+            return TaskFailureReport(
+                category=WorkerFailureCategory.INTERNAL, reason_code="ANCHOR_POLICY_UNKNOWN"
+            )
+        outcome = assess(task_input, task_input.evaluated_at, policy)
         if isinstance(outcome, AnchorReasonCode):
             # No assessment could honestly be made. Never recorded as a fact
             # about the market, because it is not one.
@@ -184,12 +195,17 @@ class AnchorWorkerHandler:
                 category=UNASSESSABLE.get(outcome, WorkerFailureCategory.TRANSIENT),
                 reason_code=outcome.value,
             )
-        return self._evidence(lease, task_input, outcome)
+        return self._evidence(lease, task_input, outcome, policy)
 
     def _evidence(
-        self, lease: TaskLease, task_input: AnchorTaskInput, assessment: ExecutionAssessment
+        self,
+        lease: TaskLease,
+        task_input: AnchorTaskInput,
+        assessment: ExecutionAssessment,
+        policy: AnchorExecutionPolicy | None = None,
     ) -> EvidenceTaskResult:
         """Build the envelope from runtime facts. Nothing here is a judgement."""
+        policy = policy if policy is not None else self.policy
         reference = task_input.reference
         assert reference is not None
         valuation = task_input.quote_asset_valuation
@@ -239,7 +255,7 @@ class AnchorWorkerHandler:
                 provenance=EvidenceProvenance(
                     source=f"anchor:{self.quote_provider}",
                     reference_id=reference.observation_id,
-                    source_version=self.policy.version,
+                    source_version=policy.version,
                 ),
                 observed_at=reference.observed_at,
                 # Execution conditions age quickly, and the horizon runs from the
@@ -253,7 +269,7 @@ class AnchorWorkerHandler:
                 # identical quotes produce different submission fingerprints
                 # under one idempotency key, which the runtime refuses as a
                 # conflict rather than accepting as the replay it is.
-                valid_until=reference.observed_at + self.policy.max_reference_age,
+                valid_until=reference.observed_at + policy.max_reference_age,
                 status=(
                     EvidenceStatus.UNKNOWN
                     if assessment.semantics == CapacitySemantics.UNKNOWN

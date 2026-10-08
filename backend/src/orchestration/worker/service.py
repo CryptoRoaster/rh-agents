@@ -674,7 +674,15 @@ class WorkerRuntimeService:
             )
             if task is None:
                 raise WorkerFailure(WorkerErrorCode.TASK_NOT_FOUND)
-            definition = self.cases.policy.task(AgentRole(task.role), task.task_type)
+            # The wait belongs to the task's own workflow: an early case's EARLY
+            # task is declared only by trade-case-early-v1. The configured policy
+            # still governs the cases of its own version.
+            workflow = (
+                self.cases.policy
+                if self.cases.policy.version == case_row.workflow_version
+                else policy_for(case_row.workflow_version)
+            )
+            definition = workflow.task(AgentRole(task.role), task.task_type)
             policy = None if definition is None else definition.wait
             if policy is None:
                 # A one-shot specialist has no business postponing itself.

@@ -35,7 +35,7 @@ nobody should ask for.
 
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Protocol
 from uuid import UUID
 
@@ -46,7 +46,7 @@ from src.agents.anchor.models import (
     QuoteAttempt,
     ReferenceMarket,
 )
-from src.agents.anchor.policy import ANCHOR_EXECUTION_V1, AnchorExecutionPolicy
+from src.agents.anchor.policy import ANCHOR_EXECUTION_V1, AnchorExecutionPolicy, anchor_policy_for
 from src.agents.anchor.ports import AnchorContextUnavailable
 from src.core.clock import Clock, SystemClock
 from src.core.numbers import quantize
@@ -167,7 +167,9 @@ def quote_asset_valuation(
     )
 
 
-def tokens_for_usd(usd: Decimal, usd_per_token: Decimal, decimals: int) -> tuple[Decimal, int]:
+def tokens_for_usd(
+    usd: Decimal, usd_per_token: Decimal, decimals: int, *, round_up: bool = False
+) -> tuple[Decimal, int]:
     """Turn a USD ladder rung into an exact payment-asset amount.
 
     Returns the token amount and its base units. The division rarely lands on a
@@ -181,7 +183,7 @@ def tokens_for_usd(usd: Decimal, usd_per_token: Decimal, decimals: int) -> tuple
         raise ValueError("A payment asset must have a positive USD price")
     exact = usd / usd_per_token
     step = Decimal(1).scaleb(-decimals)
-    tokens = exact.quantize(step, rounding=ROUND_DOWN)
+    tokens = exact.quantize(step, rounding=ROUND_UP if round_up else ROUND_DOWN)
     return tokens, to_base_units(tokens, decimals)
 
 
@@ -200,6 +202,9 @@ class AnchorContextReader:
 
     async def execution_context(self, trade_case_id: UUID, task_id: UUID) -> AnchorTaskInput:
         trade_case = await self.cases.get_trade_case(trade_case_id)
+        # The case's own workflow chooses the ladder; the integrity bounds are
+        # the same in every policy.
+        policy = anchor_policy_for(getattr(trade_case, "workflow_version", ""), self.policy)
         now = self.clock.now()
         current = active_evidence(await self.cases.evidence(trade_case_id))
 
@@ -235,15 +240,12 @@ class AnchorContextReader:
         # never quoted: spending requests to build a number nobody may use is
         # worse than saying plainly that the number cannot be built.
         valuation = quote_asset_valuation(snapshot, market.quote_asset_id, now)
-        if (
-            valuation is None
-            or valuation.age_seconds > self.policy.max_reference_age.total_seconds()
-        ):
+        if valuation is None or valuation.age_seconds > policy.max_reference_age.total_seconds():
             raise AnchorContextUnavailable("QUOTE_ASSET_USD_VALUE_UNAVAILABLE")
 
         replaces = current.get(EvidenceType.LIQUIDITY_EXECUTION)
 
-        ladder, requests = await self._ladder(market, valuation)
+        ladder, requests = await self._ladder(market, valuation, policy)
         return AnchorTaskInput(
             trade_case_id=trade_case_id,
             task_id=task_id,
@@ -256,7 +258,7 @@ class AnchorContextReader:
             quote_asset_valuation=valuation,
             ladder=ladder,
             quote_requests=requests,
-            policy_version=self.policy.version,
+            policy_version=policy.version,
             evaluated_at=now,
             # Only ANCHOR's own evidence slot is read, so no other role's
             # findings reach the worker.
@@ -264,7 +266,10 @@ class AnchorContextReader:
         )
 
     async def _ladder(
-        self, market: AnchorMarketContext, valuation: QuoteAssetValuation
+        self,
+        market: AnchorMarketContext,
+        valuation: QuoteAssetValuation,
+        policy: AnchorExecutionPolicy | None = None,
     ) -> tuple[tuple[QuoteAttempt, ...], int]:
         """Walk the policy's sizes, stopping at the first the market will not serve.
 
@@ -278,11 +283,15 @@ class AnchorContextReader:
         There is no search and no refinement here: walk the sizes, stop at the
         first the market will not serve.
         """
+        policy = policy if policy is not None else self.policy
         attempts: list[QuoteAttempt] = []
         requests = 0
-        for target_usd in self.policy.ladder_notional:
+        for target_usd in policy.ladder_notional:
             tokens, amount_in = tokens_for_usd(
-                target_usd, valuation.usd_per_token, market.quote_decimals
+                target_usd,
+                valuation.usd_per_token,
+                market.quote_decimals,
+                round_up=policy.rung_rounding == "UP",
             )
             if amount_in <= 0:
                 # The rung is smaller than the payment asset's smallest unit.

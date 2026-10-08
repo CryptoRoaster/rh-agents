@@ -11,37 +11,60 @@ from datetime import timedelta
 from src.core.models import AgentRole
 from src.orchestration.worker.models import WorkerFailureCategory
 from src.orchestration.workflow.models import EvidenceType
-from src.orchestration.workflow.policy import TRADE_CASE_V1, WorkflowPolicy
+from src.orchestration.workflow.policy import WORKFLOW_POLICIES, WorkflowPolicy
 
 # Roles that are deterministic services rather than reasoning workers never appear
 # in AgentRole at all, so SENTINEL, LEDGER and EXECUTOR are structurally incapable
 # of being claimed through this runtime.
 
 
+def _every_policy(policy: WorkflowPolicy | None) -> tuple[WorkflowPolicy, ...]:
+    """The workflows a role's capability is read from.
+
+    A role's evidence type and task type are the same in every workflow that
+    names it — a test holds that — so the answer is taken from whichever
+    workflow does. Reading only one version would leave a role that exists in
+    another, such as EARLY, structurally unclaimable.
+    """
+    if policy is not None:
+        return (policy,)
+    return tuple(WORKFLOW_POLICIES[version] for version in sorted(WORKFLOW_POLICIES))
+
+
 def authorized_evidence_type(
-    role: AgentRole, policy: WorkflowPolicy = TRADE_CASE_V1
+    role: AgentRole, policy: WorkflowPolicy | None = None
 ) -> EvidenceType | None:
     """The single evidence type a role may ever submit, or None if it may not."""
-    for requirement in policy.requirements:
-        if requirement.role == role:
-            return requirement.evidence_type
+    for workflow in _every_policy(policy):
+        for requirement in workflow.requirements:
+            if requirement.role == role:
+                return requirement.evidence_type
     return None
 
 
-def evidence_roles(policy: WorkflowPolicy = TRADE_CASE_V1) -> frozenset[AgentRole]:
-    return frozenset(requirement.role for requirement in policy.requirements)
+def evidence_roles(policy: WorkflowPolicy | None = None) -> frozenset[AgentRole]:
+    return frozenset(
+        requirement.role
+        for workflow in _every_policy(policy)
+        for requirement in workflow.requirements
+    )
 
 
 def role_evidence_matrix(
-    policy: WorkflowPolicy = TRADE_CASE_V1,
+    policy: WorkflowPolicy | None = None,
 ) -> dict[AgentRole, EvidenceType]:
-    return {requirement.role: requirement.evidence_type for requirement in policy.requirements}
+    matrix: dict[AgentRole, EvidenceType] = {}
+    for workflow in _every_policy(policy):
+        for requirement in workflow.requirements:
+            matrix.setdefault(requirement.role, requirement.evidence_type)
+    return matrix
 
 
-def authorized_task_type(role: AgentRole, policy: WorkflowPolicy = TRADE_CASE_V1) -> str | None:
-    for requirement in policy.requirements:
-        if requirement.role == role:
-            return requirement.task_type
+def authorized_task_type(role: AgentRole, policy: WorkflowPolicy | None = None) -> str | None:
+    for workflow in _every_policy(policy):
+        for requirement in workflow.requirements:
+            if requirement.role == role:
+                return requirement.task_type
     return None
 
 

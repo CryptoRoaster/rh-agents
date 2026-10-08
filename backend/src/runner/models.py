@@ -428,6 +428,9 @@ class CaseProgress(Immutable):
     # Set when the market refresh could not show the request's markets fresh,
     # so no risk request was sent. A `PreRiskReason` value.
     pre_risk_refusal: Code | None = None
+    # A strategy declining to proceed this run, e.g. the early strategy's
+    # one-entry-per-run bound. Never a risk verdict and never a refusal of data.
+    strategy_refusal: Code | None = None
     fill_refusal: Code | None = None
     execution_id: UUID | None = None
     # A decisive call was cut off before it answered. It may have committed and
@@ -449,6 +452,18 @@ class PromotionReading(Immutable):
     refreshed: int = Field(default=0, ge=0)
     stop: Code | None = None
     cases_formed: int = Field(default=0, ge=0)
+
+
+class EarlyEntryReport(Immutable):
+    """PRE_VECTOR_EARLY_ENTRY_V1 in one run: counts and codes only."""
+
+    refreshed: int = Field(default=0, ge=0)
+    refresh_stop: Code | None = None
+    candidates_seen: int = Field(default=0, ge=0)
+    cases_opened: int = Field(default=0, ge=0)
+    intake_refusals: tuple[Code, ...] = Field(default=(), max_length=64)
+    intake_outcome_unknown: bool = Field(default=False, strict=True)
+    fills: int = Field(default=0, ge=0)
 
 
 class ExitReport(Immutable):
@@ -507,6 +522,8 @@ class RunSummary(Immutable):
     pre_risk_refusals: int = Field(default=0, ge=0)
     # Absent unless automatic PAPER exits are configured.
     exits: ExitReport | None = None
+    # Absent unless PRE_VECTOR_EARLY_ENTRY_V1 is enabled.
+    early: EarlyEntryReport | None = None
     # Technical faults, as codes. Never a provider message and never a traceback.
     errors: tuple[Code, ...] = Field(default=(), max_length=32)
 

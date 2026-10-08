@@ -67,6 +67,7 @@ from src.orchestration.commander.intake import IntakeRefusal
 from src.orchestration.exitpolicy.service import ExitSweep
 from src.orchestration.riskrequest.models import RiskRequestRefusal
 from src.orchestration.riskrequest.service import stale_source
+from src.orchestration.strategy.early import EARLY_ENTRY_V1, is_early
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
     SourceRefreshOutcome,
@@ -78,6 +79,7 @@ from src.runner.models import (
     AcquisitionStop,
     CaseProgress,
     ConfigurationRefused,
+    EarlyEntryReport,
     ExitReport,
     MarketAcquisition,
     PreRiskRefresh,
@@ -174,6 +176,9 @@ class Account:
     refreshed: dict[UUID, set[str]] = field(default_factory=dict)
     # What the automatic exit sweep did, when one is configured.
     exits: ExitSweep | None = None
+    # PRE_VECTOR_EARLY_ENTRY_V1, when enabled: what its refresh and intake did,
+    # and how many early entries this run has filled against its per-run bound.
+    early: EarlyEntryReport | None = None
     # Chain → provider network bindings validated during this pass. Created
     # with the account, so it lives exactly as long as one run: the run-start
     # acquisition fills it, and each pre-risk refresh reads it instead of
@@ -257,6 +262,8 @@ class BoundedPaperRun:
             await self._exit(account, deadline)
             await self._promote(account, deadline)
             await self._intake(account, deadline)
+            if not account.intake_unknown:
+                await self._early(account, deadline)
             if account.intake_unknown:
                 # The cycle committed an unknown number of cases, and this run
                 # cannot say which. Carrying on would hand the case budget out a
@@ -397,6 +404,72 @@ class BoundedPaperRun:
                 break
             account.cases_opened += 1
         await self._promoted(account, outcome.opened)
+
+    async def _early(self, account: Account, deadline: Deadline) -> None:
+        """PRE_VECTOR_EARLY_ENTRY_V1: re-observe young watches, then open early cases.
+
+        Composed only under the strategy's own consent. The same intake service
+        as the normal path, with the strategy's own source, workflow and bound;
+        an interrupted cycle is reported exactly as the normal one is.
+        """
+        intake = self.stack.early_intake
+        if intake is None:
+            return
+        report = EarlyEntryReport()
+        refresh = self.stack.early_promotion
+        if refresh is not None and not deadline.expired:
+            try:
+                refreshed, stop = await self._bounded(refresh.execute(), deadline)
+            except TimeoutError:
+                refreshed, stop = 0, "TIME_BUDGET_REACHED"
+            report = report.model_copy(update={"refreshed": refreshed, "refresh_stop": stop})
+        account.early = report
+        if not account.may_step(deadline):
+            return
+        account.steps += 1
+        try:
+            outcome = await self._bounded(
+                intake.run_cycle(limit=self.stack.limits.max_candidates), deadline
+            )
+        except (SystemPauseUnavailable, asyncio.CancelledError):
+            raise
+        except TimeoutError:
+            account.intake_unknown = True
+            account.stop = RunStop.TIME_BUDGET_REACHED
+            account.fail("INTAKE_OUTCOME_UNKNOWN")
+            account.early = report.model_copy(update={"intake_outcome_unknown": True})
+            return
+        except Exception:
+            account.intake_unknown = True
+            account.fail("INTAKE_OUTCOME_UNKNOWN")
+            account.early = report.model_copy(update={"intake_outcome_unknown": True})
+            return
+        opened = 0
+        for case in outcome.opened:
+            if not account.admits(case.id):
+                break
+            opened += 1
+        account.early = report.model_copy(
+            update={
+                "candidates_seen": len(outcome.opened) + len(outcome.refused),
+                "cases_opened": opened,
+                "intake_refusals": tuple(sorted({reason.value for _, reason in outcome.refused})),
+            }
+        )
+        if any(reason is IntakeRefusal.SYSTEM_PAUSED for _, reason in outcome.refused):
+            account.stop = RunStop.SYSTEM_STOPPED
+
+    def _early_entry_limited(self, case: Any, account: Account) -> bool:
+        """Whether this run already filled as many early entries as one run may."""
+        return (
+            is_early(case.strategy_policy_id)
+            and account.early is not None
+            and account.early.fills >= EARLY_ENTRY_V1.max_entries_per_run
+        )
+
+    def _early_filled(self, case: Any, account: Account) -> None:
+        if is_early(case.strategy_policy_id) and account.early is not None:
+            account.early = account.early.model_copy(update={"fills": account.early.fills + 1})
 
     async def _promote(self, account: Account, deadline: Deadline) -> None:
         """Re-observe PROMOTABLE watches by locator, when the early scout is on.
@@ -661,6 +734,20 @@ class BoundedPaperRun:
                 )
             )
             return
+        if self._early_entry_limited(case, account):
+            # The early strategy's own per-run bound: one new early entry per
+            # run. Checked before anything is asked, so no request is spent.
+            account.record(
+                CaseProgress(
+                    trade_case_id=trade_case_id,
+                    status=case.status.value,
+                    reason_code=_code(case.reason_code),
+                    strategy_refusal="EARLY_RUN_ENTRY_LIMIT_REACHED",
+                    refreshes=tuple(refreshes),
+                    market_refreshes=tuple(markets),
+                )
+            )
+            return
         # A new request is about to be made, so the markets it will read are
         # observed first. Not on `RISK_APPROVED`: that request was already made
         # and answered, and asking again replays the stored verdict — a new
@@ -769,6 +856,8 @@ class BoundedPaperRun:
                 )
             )
             return
+        if not fill.replayed:
+            self._early_filled(case, account)
         account.record(
             CaseProgress(
                 trade_case_id=trade_case_id,
@@ -1034,6 +1123,7 @@ class BoundedPaperRun:
                 refusals=tuple(sorted(account.exits.refusals)),
             ),
             errors=tuple(account.errors),
+            early=account.early,
         )
 
 

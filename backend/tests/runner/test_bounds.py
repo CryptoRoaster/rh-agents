@@ -365,6 +365,8 @@ def test_the_summary_carries_no_secret_and_no_payload(risk_db):
         # Counts and codes only; absent unless automatic PAPER exits are configured.
         "exits",
         "errors",
+        # Counts and codes only; absent unless PRE_VECTOR_EARLY_ENTRY_V1 is enabled.
+        "early",
     }
     assert summary.exit_code is ExitCode.COMPLETED
 

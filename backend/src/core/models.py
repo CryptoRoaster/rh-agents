@@ -64,6 +64,9 @@ class AgentRole(StrEnum):
     ANCHOR = "ANCHOR"
     FUSE = "FUSE"
     COMMANDER = "COMMANDER"
+    # Deterministic pre-VECTOR setup producer for PRE_VECTOR_EARLY_ENTRY_V1. No
+    # model; it exists only in the early workflow (`trade-case-early-v1`).
+    EARLY = "EARLY"
 
 
 class ExecutionTiming(Contract):
