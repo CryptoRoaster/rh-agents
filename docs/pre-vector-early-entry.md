@@ -101,9 +101,17 @@ units.
   fees: at 25 bps slippage and 30 bps fees one $10 entry books
   10.055075 USD. Four entries hold 40.22 USD, so a fifth (40.22 + 10 > 50) is
   refused by the exposure cap; with any positive cost the $50 exposure cap
-  binds before the five-position cap. That is the conservative reading of
-  $50 as a hard cost-basis cap. The check adds the nominal $10, not the cost
-  of the next entry.
+  binds before the five-position cap. $50 is a hard cost-basis cap.
+- Two exposure checks. The request and the start of the fill add the nominal
+  $10 (`cap_refusal`) — a conservative pre-filter. The authoritative one
+  (`booked_exposure_refusal`) runs inside the fill: the PAPER executor
+  simulates the fill, the ledger's own `apply_fill` computes the position it
+  would book, and before anything is written the added cost basis (gross +
+  fees + gas) must keep early exposure at or below $50. Otherwise the fill is
+  rolled back with `EARLY_STRATEGY_CAP_REACHED` / `EARLY_MAX_EXPOSURE_REACHED`.
+  Example: 40.00 held, nominal 40 + 10 = 50 passes the pre-filter, the fill
+  would book 10.055075 → 50.055075 > 50 → refused; at zero costs it books
+  exactly 50.00 and is allowed. Nothing is ever downsized to fit.
 - One new early entry per bounded run (`EARLY_RUN_ENTRY_LIMIT_REACHED`).
 - No re-entry: a closed early cycle is refused
   (`STRATEGY_REENTRY_NOT_PERMITTED`).

@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.core.clock import Clock, SystemClock
 from src.core.models import (
     ExecutionResult,
+    Position,
     RiskDecision,
     RiskLimits,
     Side,
@@ -55,7 +56,13 @@ from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
 from src.orchestration.riskrequest.service import OneSnapshot, risk_market, too_old_for
 from src.orchestration.sizing.context import base_asset_metadata, reference_price
-from src.orchestration.strategy.early import cap_refusal, early_ledger, is_early, limits_for
+from src.orchestration.strategy.early import (
+    booked_exposure_refusal,
+    cap_refusal,
+    early_ledger,
+    is_early,
+    limits_for,
+)
 from src.orchestration.valuation.models import (
     PortfolioValuation,
     unvaluable_reason,
@@ -446,6 +453,18 @@ class CaseFillService:
                     return "POSITION_VALUATION_STALE"
                 return too_old_for(market, at, case_limits)
 
+            def admit(before: Position, after: Position) -> str | None:
+                """The hard early exposure cap, on the cost basis about to be booked.
+
+                Synchronous and over the ledger already read under the account
+                lock: the position the ledger would book is the only new input.
+                """
+                if ledger is None:
+                    return None
+                return booked_exposure_refusal(
+                    ledger.at(now), after.cost_basis_usd - before.cost_basis_usd
+                )
+
             outcome = await self.paper.execute_in_session(
                 session,
                 account,
@@ -458,7 +477,20 @@ class CaseFillService:
                 cycle_id=cycle_id,
                 authorize=still_authorised,
                 limits=case_limits,
+                admit=admit if ledger is not None else None,
             )
+            if outcome.fill_refusal is not None:
+                # Approved, simulated, and one more early position would book
+                # past the strategy's exposure cap. Everything started is rolled
+                # back; nothing is downsized and no risk rejection is written.
+                raise _Abort(
+                    _refused(
+                        trade_case,
+                        ExecutionRefusal.EARLY_STRATEGY_CAP_REACHED,
+                        readiness,
+                        detail=outcome.fill_refusal,
+                    )
+                )
             if outcome.stop_reason is not None:
                 # Approved, and the world moved on before it could be acted on.
                 # Everything started is rolled back, and no artificial final

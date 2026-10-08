@@ -65,6 +65,10 @@ class PaperOutcome:
     # money on the day it mattered.
     trade: Trade | None = None
     position: Position | None = None
+    # Set when the simulated fill was refused by the caller's `admit` check on
+    # the position the ledger would have booked. Approved and not executed,
+    # exactly like `stop_reason`, and never a risk verdict.
+    fill_refusal: str | None = None
 
     @property
     def result(self) -> ExecutionResult | RiskDecision:
@@ -206,6 +210,7 @@ class PaperTradingService:
         cycle_id: UUID | None = None,
         authorize: Callable[[datetime], str | None] | None = None,
         limits: RiskLimits | None = None,
+        admit: Callable[[Position, Position], str | None] | None = None,
     ) -> PaperOutcome:
         """Risk-check, fill and book one order inside a transaction the caller owns.
 
@@ -305,10 +310,18 @@ class PaperTradingService:
         # Nothing between the boundary check above and this line touches the
         # database, so the checks and the fill describe one instant.
         fill = await self.executor.execute(order, market)
+        # What the ledger would book: the one accounting, applied before
+        # anything is written, so a caller's `admit` judges the real cost basis
+        # — fees, slippage and gas included — rather than a second formula.
+        updated, trade, cash = apply_fill(position, fill, account.cash_usd)
+        if admit is not None:
+            refusal = admit(position, updated)
+            if refusal is not None:
+                # Approved, simulated and not booked. The caller rolls back.
+                return PaperOutcome(decision=risk, state=state, fill_refusal=refusal)
         # ------------------------------------------------ boundary ends
         await append(session, order)
         await append(session, fill)
-        updated, trade, cash = apply_fill(position, fill, account.cash_usd)
         await save_position(session, updated)
         await append(session, trade)
         account.cash_usd = cash

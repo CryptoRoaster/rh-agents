@@ -213,6 +213,20 @@ def cap_refusal(book: EarlyBook, policy: EarlyEntryPolicy = EARLY_ENTRY_V1) -> s
     return None
 
 
+def booked_exposure_refusal(
+    book: EarlyBook, added_cost_basis_usd: Decimal, policy: EarlyEntryPolicy = EARLY_ENTRY_V1
+) -> str | None:
+    """The hard exposure cap, on the cost basis the ledger is about to book.
+
+    `cap_refusal` adds the nominal notional and is a conservative early filter;
+    this adds what the fill actually costs — slippage, fees and gas included —
+    and is the authoritative answer. Nothing is downsized to fit.
+    """
+    if book.exposure_usd + added_cost_basis_usd > policy.max_exposure_usd:
+        return "EARLY_MAX_EXPOSURE_REACHED"
+    return None
+
+
 def capacity_refusal(
     largest_tested_acceptable_notional_usd: Decimal | None,
     policy: EarlyEntryPolicy = EARLY_ENTRY_V1,

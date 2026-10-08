@@ -250,3 +250,91 @@ async def test_with_paper_costs_the_exposure_cap_binds_at_four_entries(risk_db, 
 
     assert result.kind == "risk_request_refused"
     assert result.detail == "EARLY_MAX_EXPOSURE_REACHED"
+
+
+# ------------------------------------------------- the hard cost-basis cap
+
+
+async def _held_at(sessions, now, entries):
+    """`entries` early positions at exactly $10 cost basis each (no costs)."""
+    seed = Book(sessions, now, costs=configured_costs(fee="0", slippage="0"))
+    for index in range(entries):
+        await seed.entered(index)
+    assert money((await seed.ledger()).exposure_usd) == money(10 * entries)
+
+
+@pytest.mark.parametrize(
+    ("fee", "slippage", "booked"),
+    [
+        # 10 * 1.0025 * 1.003: the nominal check sees 40 + 10 = 50 and passes.
+        ("30", "25", "10.055075"),
+        ("30", "0", "10.03"),
+        ("0", "25", "10.025"),
+    ],
+)
+async def test_a_fifth_entry_whose_costs_pass_fifty_is_never_booked(
+    risk_db, now, fee, slippage, booked
+):
+    _, sessions = risk_db
+    await _held_at(sessions, now, 4)
+    book = Book(sessions, now, costs=configured_costs(fee=fee, slippage=slippage))
+    trade_case = await book.approved(4, uuid4())
+
+    refused = await book.fill(trade_case, 4)
+
+    # 40 + booked > 50: refused at the fill, never downsized to fit.
+    assert Decimal(40) + Decimal(booked) > EARLY_ENTRY_V1.max_exposure_usd
+    assert refused.kind == "execution_refused", getattr(refused, "notional_usd", None)
+    assert refused.reason is ExecutionRefusal.EARLY_STRATEGY_CAP_REACHED
+    assert refused.detail == "EARLY_MAX_EXPOSURE_REACHED"
+    assert await executions_of(sessions, trade_case.id) == 0
+    ledger = await book.ledger()
+    assert ledger.open_positions == 4
+    assert money(ledger.exposure_usd) == money(40)
+    assert (await read_account(sessions)).paused is False
+
+
+async def test_a_costless_fifth_entry_lands_exactly_on_fifty(risk_db, now):
+    _, sessions = risk_db
+    await _held_at(sessions, now, 4)
+    book = Book(sessions, now, costs=configured_costs(fee="0", slippage="0"))
+    trade_case = await book.approved(4, uuid4())
+
+    filled = await book.fill(trade_case, 4)
+
+    assert filled.kind == "paper_fill_recorded", getattr(filled, "detail", None)
+    ledger = await book.ledger()
+    assert money(ledger.exposure_usd) == money(50)
+    assert_within_caps(ledger)
+
+
+async def test_the_same_entry_with_room_left_is_booked_at_full_size(risk_db, now):
+    _, sessions = risk_db
+    await _held_at(sessions, now, 3)
+    book = Book(sessions, now)
+    trade_case = await book.approved(3, uuid4())
+
+    filled = await book.fill(trade_case, 3)
+
+    assert filled.kind == "paper_fill_recorded", getattr(filled, "detail", None)
+    # Ten dollars of quantity, never fewer to fit.
+    assert money(filled.notional_usd) == money("10.025")
+    ledger = await book.ledger()
+    assert money(ledger.exposure_usd) == money("40.055075")
+    assert_within_caps(ledger)
+
+
+@pytest.mark.skipif(not os.environ.get("TEST_DATABASE_URL"), reason="PostgreSQL row locks required")
+async def test_racing_fills_with_costs_never_pass_fifty_together(risk_db, now):
+    _, sessions = risk_db
+    await _held_at(sessions, now, 3)
+    book = Book(sessions, now)
+    first = await book.approved(3, uuid4())
+    second = await book.approved(4, uuid4())
+
+    results = await asyncio.gather(book.fill(first, 3), book.fill(second, 4))
+
+    assert sorted(item.kind for item in results) == ["execution_refused", "paper_fill_recorded"]
+    ledger = await book.ledger()
+    assert ledger.open_positions == 4
+    assert ledger.exposure_usd <= EARLY_ENTRY_V1.max_exposure_usd
