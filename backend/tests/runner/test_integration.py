@@ -63,6 +63,8 @@ async def test_a_run_opens_a_case_from_a_recorded_candidate_and_stops(risk_db, n
         "PULSE",
         "ANCHOR",
         "FUSE",
+        # The early strategy's producer, reported off like every other role.
+        "EARLY",
     }
     assert all(item.reason == "ROLE_NOT_ENABLED" for item in summary.roles)
 

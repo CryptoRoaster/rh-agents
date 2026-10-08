@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.core.clock import Clock, SystemClock
 from src.core.models import (
     ExecutionResult,
+    Position,
     RiskDecision,
     RiskLimits,
     Side,
@@ -55,6 +56,13 @@ from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
 from src.orchestration.riskrequest.service import OneSnapshot, risk_market, too_old_for
 from src.orchestration.sizing.context import base_asset_metadata, reference_price
+from src.orchestration.strategy.early import (
+    booked_exposure_refusal,
+    cap_refusal,
+    early_ledger,
+    is_early,
+    limits_for,
+)
 from src.orchestration.valuation.models import (
     PortfolioValuation,
     unvaluable_reason,
@@ -182,6 +190,9 @@ class CaseFillService:
             except WorkflowFailure:
                 raise CaseFillUnavailable("TRADE_CASE_NOT_FOUND") from None
             trade_case = case_from_row(row)
+            # The limits this fill is re-checked against, by the case's own
+            # strategy — the same selection the risk request made.
+            case_limits = limits_for(trade_case.strategy_policy_id, self.limits)
 
             request = await session.scalar(
                 select(TradeCaseRiskRequestRow).where(
@@ -264,6 +275,13 @@ class CaseFillService:
                     readiness,
                 )
 
+            # The early strategy's book, read under the account lock every fill
+            # and every exit takes, so no other fill can change it before this
+            # transaction commits. Read before the clock like every other input.
+            ledger = (
+                await early_ledger(session) if is_early(trade_case.strategy_policy_id) else None
+            )
+
             # The last clock read, after the last input read. Everything from
             # here to the verdict is synchronous, so one instant governs
             # eligibility, the approval's own validity, every source age, the
@@ -311,6 +329,18 @@ class CaseFillService:
                 return _refused(trade_case, ExecutionRefusal.RISK_DATA_INCOMPLETE, readiness)
             if not readiness.is_current_at(now):
                 return _refused(trade_case, ExecutionRefusal.DECISION_BASIS_EXPIRED, readiness)
+            if ledger is not None:
+                # The approval reserved nothing: another early case approved
+                # against the same free slot may have filled since. Judged again
+                # on the ledger as it stands, before SENTINEL is asked again.
+                capped = cap_refusal(ledger.at(now))
+                if capped is not None:
+                    return _refused(
+                        trade_case,
+                        ExecutionRefusal.EARLY_STRATEGY_CAP_REACHED,
+                        readiness,
+                        detail=capped,
+                    )
 
             onchain = current.get(EvidenceType.ONCHAIN)
             anchor = current.get(EvidenceType.LIQUIDITY_EXECUTION)
@@ -340,7 +370,7 @@ class CaseFillService:
                 identity_key=f"{request.request_key}:fill",
                 side=Side.BUY,
             )
-            stale = too_old_for(market, now, self.limits)
+            stale = too_old_for(market, now, case_limits)
             if stale is not None:
                 return _refused(
                     trade_case,
@@ -421,7 +451,19 @@ class CaseFillService:
                     # prepared. Exposure would then rest on a moment that has
                     # passed, so the fill does not happen.
                     return "POSITION_VALUATION_STALE"
-                return too_old_for(market, at, self.limits)
+                return too_old_for(market, at, case_limits)
+
+            def admit(before: Position, after: Position) -> str | None:
+                """The hard early exposure cap, on the cost basis about to be booked.
+
+                Synchronous and over the ledger already read under the account
+                lock: the position the ledger would book is the only new input.
+                """
+                if ledger is None:
+                    return None
+                return booked_exposure_refusal(
+                    ledger.at(now), after.cost_basis_usd - before.cost_basis_usd
+                )
 
             outcome = await self.paper.execute_in_session(
                 session,
@@ -434,7 +476,21 @@ class CaseFillService:
                 market_identity=trade_case.market,
                 cycle_id=cycle_id,
                 authorize=still_authorised,
+                limits=case_limits,
+                admit=admit if ledger is not None else None,
             )
+            if outcome.fill_refusal is not None:
+                # Approved, simulated, and one more early position would book
+                # past the strategy's exposure cap. Everything started is rolled
+                # back; nothing is downsized and no risk rejection is written.
+                raise _Abort(
+                    _refused(
+                        trade_case,
+                        ExecutionRefusal.EARLY_STRATEGY_CAP_REACHED,
+                        readiness,
+                        detail=outcome.fill_refusal,
+                    )
+                )
             if outcome.stop_reason is not None:
                 # Approved, and the world moved on before it could be acted on.
                 # Everything started is rolled back, and no artificial final
@@ -608,7 +664,9 @@ class CaseFillService:
             # only way to learn what SENTINEL was shown would be to re-read
             # sources that have since moved.
             "market_snapshot": market.model_dump(mode="json"),
-            "risk_limits": self.limits.model_dump(mode="json"),
+            "risk_limits": limits_for(trade_case.strategy_policy_id, self.limits).model_dump(
+                mode="json"
+            ),
             "cost_assumptions": self.costs.model_dump(mode="json"),
             "intent": request.basis["intent"],
             # The whole valuation the re-check rested on: the holdings, their

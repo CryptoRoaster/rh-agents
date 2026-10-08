@@ -85,6 +85,18 @@ class SetupContextPort(Protocol):
     async def setup_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
 
 
+class EarlySetupContextPort(Protocol):
+    """EARLY input: one assembled view of a young market and its chain-side age.
+
+    The producer never holds a market provider client, an RPC client or a
+    session. Trusted infrastructure reads the recorded price, VECTOR's history
+    series and ATLAS's current evidence and hands over finished facts, so the
+    producer cannot choose what to query or reason from an unobserved price.
+    """
+
+    async def early_context(self, trade_case_id: UUID, task_id: UUID) -> object: ...
+
+
 class PulseContextPort(Protocol):
     """PULSE input: the authoritative setup and one current market observation.
 
@@ -182,6 +194,13 @@ class VectorCapabilities:
 
 
 @dataclass(frozen=True)
+class EarlyCapabilities:
+    lease: TaskLease
+    context: EarlySetupContextPort
+    submit: EvidenceSubmissionPort
+
+
+@dataclass(frozen=True)
 class PulseCapabilities:
     lease: TaskLease
     context: PulseContextPort
@@ -234,4 +253,5 @@ CAPABILITY_TYPES: dict[AgentRole, type] = {
     AgentRole.ANCHOR: AnchorCapabilities,
     AgentRole.FUSE: FuseCapabilities,
     AgentRole.COMMANDER: CommanderCapabilities,
+    AgentRole.EARLY: EarlyCapabilities,
 }

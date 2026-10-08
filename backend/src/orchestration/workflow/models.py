@@ -988,6 +988,45 @@ class RecordedMarketStructure(Immutable):
     structure_digest: Digest
 
 
+class EarlyEntryRecord(Immutable):
+    """Why a setup exists without VECTOR: the PRE_VECTOR_EARLY_ENTRY_V1 decision.
+
+    Present only on setups the deterministic EARLY producer wrote, and it is what
+    proves the case was opened pre-VECTOR on purpose rather than having lost its
+    VECTOR setup. Every figure is a recorded fact or a strategy constant; none
+    came from a model.
+    """
+
+    strategy_policy_id: Identifier
+    workflow_version: Identifier
+    policy_version: Identifier
+    # VECTOR's own `assess` over VECTOR's own request (48 hourly bars, 24
+    # closed): the verdict that says the pool is too young for VECTOR.
+    vector_sufficiency: Code
+    # The same `assess` with the bar minimum lowered to one, so a young series
+    # that has stopped arriving or is mostly gaps is still refused. Absent only
+    # when there were no bars to judge.
+    young_history_sufficiency: Code | None = None
+    closed_bars: int = Field(strict=True, ge=0)
+    history_provider: Identifier
+    history_timeframe: Identifier
+    history_aggregate: int = Field(strict=True, gt=0)
+    history_requested_bars: int = Field(strict=True, gt=0)
+    history_policy_version: Identifier
+    # Chain-side provenance of the token's age: ATLAS's record of the creation
+    # block's own header timestamp. Never the first-seen time.
+    creation_block: int = Field(strict=True, ge=0)
+    creation_timestamp: AwareDatetime
+    creation_time_source: Identifier
+    onchain_evidence_id: UUID
+    candidate_age_seconds: int = Field(strict=True, ge=0)
+    max_age_seconds: int = Field(strict=True, gt=0)
+    market_snapshot_id: UUID
+    price_observation_id: UUID
+    reference_price: MarketPrice
+    decision_at: AwareDatetime
+
+
 class TradeSetupDetail(Immutable):
     """The structured record behind a setup, for PULSE and a future FUSE.
 
@@ -1035,6 +1074,18 @@ class TradeSetupDetail(Immutable):
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
     latency_ms: int | None = Field(default=None, ge=0)
+    # PRE_VECTOR_EARLY_ENTRY_V1 only. Additive and optional, so every setup
+    # written before it, and every VECTOR setup, stays exactly as it was.
+    early_entry: EarlyEntryRecord | None = None
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        # Omitted entirely when absent, so a VECTOR setup serializes — and is
+        # fingerprinted — byte for byte as it did before this field existed.
+        emitted: dict[str, Any] = handler(self)
+        if self.early_entry is None:
+            emitted.pop("early_entry", None)
+        return emitted
 
 
 class TradeSetupPayload(AcceptancePayload):
@@ -1604,7 +1655,9 @@ class TradeCase(Immutable):
     id: UUID
     # The rules this case is evaluated under, fixed when it was opened. A case
     # keeps its version for life; no later default re-reads an old case.
-    workflow_version: Literal["trade-case-v1", "trade-case-v2"] = "trade-case-v1"
+    workflow_version: Literal["trade-case-v1", "trade-case-v2", "trade-case-early-v1"] = (
+        "trade-case-v1"
+    )
     market: MarketIdentity
     chain: str
     network: str

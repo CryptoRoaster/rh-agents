@@ -45,6 +45,7 @@ from src.data.tables import (
     PositionRow,
     TradeCaseExecutionRow,
     TradeCaseExitRow,
+    TradeCaseRow,
     TradeCycleRow,
 )
 from src.markets.models import MarketIdentity
@@ -57,6 +58,7 @@ from src.orchestration.reentry.models import (
     ReentryRefusal,
     ReentryRefused,
 )
+from src.orchestration.strategy.early import is_early
 from src.orchestration.workflow.models import TradeCaseStatus, WorkflowFailure
 from src.orchestration.workflow.service import TradeCaseService, case_from_row
 
@@ -135,6 +137,12 @@ class PaperReentryService:
                     ReentryRefusal.SUCCESSOR_ALREADY_EXISTS,
                     cycle_id=closed.cycle_id,
                 )
+
+            # PRE_VECTOR_EARLY_ENTRY_V1 has no re-entry. A market its one early
+            # cycle has closed is not re-entered through this contract.
+            predecessor = await session.get(TradeCaseRow, closed.trade_case_id)
+            if predecessor is not None and is_early(predecessor.strategy_policy_id):
+                return _refused(exit_id, ReentryRefusal.STRATEGY_REENTRY_NOT_PERMITTED)
 
             refusal = self._stops(exit_id, closed, account)
             if refusal is not None:

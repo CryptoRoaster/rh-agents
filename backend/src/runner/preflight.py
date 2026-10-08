@@ -319,6 +319,16 @@ class Preflight:
             for item in workflow.requirements
             if item.required
         }
+        versions = {role: workflow.version for role in required}
+        if self._settings.pre_vector_early_entry_enabled:
+            # The early strategy's own workflow is executed too, and every role
+            # it requires is as load-bearing for its cases as V2's are for theirs.
+            from src.orchestration.workflow.policy import TRADE_CASE_EARLY_V1
+
+            for item in TRADE_CASE_EARLY_V1.requirements:
+                if item.required and item.role.value not in required:
+                    required[item.role.value] = item.evidence_type.name
+                    versions[item.role.value] = TRADE_CASE_EARLY_V1.version
         found: list[Check] = []
         for role in stack.roles:
             name = f"ROLE_{role.role}"
@@ -337,7 +347,7 @@ class Preflight:
                     _blocked(
                         name,
                         REQUIRED_ROLE_DISABLED,
-                        f"Not enabled, and {workflow.version} requires its "
+                        f"Not enabled, and {versions[role.role]} requires its "
                         f"{required[role.role]} evidence before any case can reach risk.",
                     )
                 )

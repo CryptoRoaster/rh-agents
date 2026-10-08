@@ -365,9 +365,78 @@ TRADE_CASE_V2 = replace(
     ),
 )
 
+# TRADE_CASE_EARLY_V1: the PRE_VECTOR_EARLY_ENTRY_V1 strategy's workflow.
+#
+# A separate version, never a relaxation of V2. Every case opened under it is
+# opened deliberately by the early intake and carries the early strategy id; a
+# V2 case can never be read under these rules, because the evaluator always
+# judges a case by its own stored version.
+#
+# What differs from V2, and nothing else:
+#
+# * the TRADE_SETUP is produced by EARLY, a deterministic role, instead of
+#   VECTOR — only once VECTOR's own sufficiency check has said the pool is too
+#   young, and still safety-critical, so PULSE and ANCHOR bind to it exactly as
+#   they bind to a VECTOR setup;
+# * SIGNAL is not used at all: a pool a few hours old has no social record, and
+#   V2 already made SENTIMENT advisory;
+# * FUSE is not used: there is no model reading to synthesise.
+#
+# ORBIT, ATLAS, PULSE and ANCHOR are required exactly as in V2, with the same
+# tasks, the same trigger watch and the same refreshable sources.
+EARLY_SETUP_TASK = "DEFINE_EARLY_SETUP"
+
+TRADE_CASE_EARLY_V1 = WorkflowPolicy(
+    version="trade-case-early-v1",
+    requirements=(
+        EvidenceRequirement(
+            AgentRole.ORBIT, EvidenceType.DISCOVERY, "VERIFY_DISCOVERY", True, False, True
+        ),
+        EvidenceRequirement(
+            AgentRole.ATLAS, EvidenceType.ONCHAIN, "ASSESS_ONCHAIN_INTEGRITY", True, True, True
+        ),
+        EvidenceRequirement(
+            AgentRole.EARLY, EvidenceType.TRADE_SETUP, EARLY_SETUP_TASK, True, True, True
+        ),
+        EvidenceRequirement(
+            AgentRole.PULSE, EvidenceType.TRIGGER, "WAIT_FOR_TRIGGER", True, True, False
+        ),
+        EvidenceRequirement(
+            AgentRole.ANCHOR,
+            EvidenceType.LIQUIDITY_EXECUTION,
+            "ASSESS_EXECUTION",
+            True,
+            True,
+            False,
+        ),
+    ),
+    tasks=(
+        TaskDefinition(AgentRole.ORBIT, "VERIFY_DISCOVERY", True),
+        TaskDefinition(AgentRole.COMMANDER, "OPEN_TRADE_CASE", True, True),
+        TaskDefinition(AgentRole.ATLAS, "ASSESS_ONCHAIN_INTEGRITY", True),
+        # The setup needs ATLAS's chain-side creation time and a fresh recorded
+        # price, so it may wait for either. Anything that makes the market
+        # ineligible ends the task instead: the producer reports it as a
+        # permanent refusal with its own reason, never as a wait.
+        TaskDefinition(
+            AgentRole.EARLY,
+            EARLY_SETUP_TASK,
+            True,
+            wait=WaitPolicy(
+                interval=timedelta(seconds=60),
+                horizon=timedelta(hours=1),
+                reasons=frozenset({"ATLAS_EVIDENCE_PENDING", "MARKET_OBSERVATION_PENDING"}),
+            ),
+        ),
+        next(item for item in TRADE_CASE_V1.tasks if item.role is AgentRole.PULSE),
+        TaskDefinition(AgentRole.ANCHOR, "ASSESS_EXECUTION", True, after_trigger=True),
+    ),
+    refreshable_sources=TRADE_CASE_V1.refreshable_sources,
+)
+
 # Every workflow a stored case may carry, by the version it was opened under.
 WORKFLOW_POLICIES: dict[str, WorkflowPolicy] = {
-    policy.version: policy for policy in (TRADE_CASE_V1, TRADE_CASE_V2)
+    policy.version: policy for policy in (TRADE_CASE_V1, TRADE_CASE_V2, TRADE_CASE_EARLY_V1)
 }
 
 # The workflow new cases are opened under.

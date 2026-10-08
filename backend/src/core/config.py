@@ -355,6 +355,12 @@ class Settings(BaseSettings):
     # Every bound below is per scout run. None of them is a strategy: nothing
     # here ranks, floors or filters markets by size, volume or opinion.
     early_scout_enabled: bool = False
+    # PRE_VECTOR_EARLY_ENTRY_V1 (Issue #40): a bounded PAPER-only entry into
+    # very young Robinhood watches before VECTOR has 24 closed bars. Its own
+    # explicit consent, off by default and never implied by the scout, the
+    # funding graph or the normal intake. Every number of the strategy is a
+    # versioned constant in `orchestration/strategy/early.py`, not a setting.
+    pre_vector_early_entry_enabled: bool = False
     # Pools one new-pool read may bring back, per configured chain.
     early_scout_max_discovery_pools: int = Field(default=10, ge=1, le=20)
     # Discovery capacity is deliberately decoupled from model-review capacity.
@@ -423,6 +429,22 @@ class Settings(BaseSettings):
                 raise ValueError("Acquisition may not be allowed to outlast the run")
             if self.paper_runner_pre_risk_market_max_seconds > self.paper_runner_max_seconds:
                 raise ValueError("A pre-risk market refresh may not outlast the run")
+        return self
+
+    @model_validator(mode="after")
+    def pre_vector_early_entry_configuration(self) -> "Settings":
+        """The early strategy only makes sense where every input it needs exists."""
+        if not self.pre_vector_early_entry_enabled:
+            return self
+        if not self.paper_runner_enabled:
+            raise ValueError("PRE_VECTOR_EARLY_ENTRY_ENABLED requires the bounded paper run")
+        if not self.early_scout_enabled:
+            # The candidates are the scout's young watches.
+            raise ValueError("PRE_VECTOR_EARLY_ENTRY_ENABLED requires EARLY_SCOUT_ENABLED")
+        if not self.atlas_funding_graph_enabled:
+            # The authoritative age is ATLAS's chain-side creation timestamp,
+            # recorded with the funding graph's provenance.
+            raise ValueError("PRE_VECTOR_EARLY_ENTRY_ENABLED requires ATLAS_FUNDING_GRAPH_ENABLED")
         return self
 
     @model_validator(mode="after")

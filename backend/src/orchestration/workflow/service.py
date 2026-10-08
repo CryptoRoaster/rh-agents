@@ -58,6 +58,7 @@ from src.orchestration.workflow.models import (
 )
 from src.orchestration.workflow.policy import (
     CURRENT_WORKFLOW,
+    WORKFLOW_POLICIES,
     EvidenceRequirement,
     RefreshableSource,
     WorkflowPolicy,
@@ -253,6 +254,7 @@ class TradeCaseService:
         idempotency_key: str,
         expires_at: datetime,
         strategy_policy_id: str | None = None,
+        workflow: WorkflowPolicy | None = None,
     ) -> tuple[TradeCase, bool]:
         """Open a case inside a caller-owned transaction, saying whether it was new.
 
@@ -265,7 +267,14 @@ class TradeCaseService:
         idempotent by key, so a caller that only receives the case cannot tell a
         creation from a replay, and asking afterwards is a second unsynchronised
         read of exactly the state the transaction exists to pin down.
+
+        `workflow` selects the rules a *new* case is opened under; absent, it is
+        the service's own. It is stored on the case and fingerprinted, so a
+        case can never be re-read under a different version afterwards.
         """
+        policy = workflow if workflow is not None else self.policy
+        if policy.version not in WORKFLOW_POLICIES:
+            raise WorkflowFailure(WorkflowErrorCode.UNSUPPORTED_WORKFLOW_VERSION)
         market = MarketIdentity.model_validate_json(market.model_dump_json())
         now = self.clock.now()
         if expires_at.utcoffset() is None or expires_at <= now:
@@ -277,7 +286,7 @@ class TradeCaseService:
                 "correlation_id": str(correlation_id),
                 "expires_at": expires_at.isoformat(),
                 "strategy_policy_id": strategy_policy_id,
-                "workflow_version": self.policy.version,
+                "workflow_version": policy.version,
             }
         )
         existing = await session.scalar(
@@ -294,11 +303,18 @@ class TradeCaseService:
             idempotency_key=idempotency_key,
             fingerprint=fingerprint,
             strategy_policy_id=strategy_policy_id,
+            workflow_version=policy.version,
         )
         session.add(row)
         await session.flush()
         self._event(
-            session, row, "CASE_OPENED", "CASE_OPENED", {"workflow_version": self.policy.version}
+            session,
+            row,
+            "CASE_OPENED",
+            "CASE_OPENED",
+            {"workflow_version": policy.version, "strategy_policy_id": strategy_policy_id}
+            if strategy_policy_id is not None
+            else {"workflow_version": policy.version},
         )
         await self._create_tasks(session, row)
         await self._record_discovery(session, row)
@@ -316,10 +332,11 @@ class TradeCaseService:
         idempotency_key: str,
         fingerprint: str,
         strategy_policy_id: str | None,
+        workflow_version: str,
     ) -> TradeCaseRow:
         return TradeCaseRow(
             id=uuid5(NAMESPACE_URL, f"rh-agents:trade-case:{idempotency_key}"),
-            workflow_version=self.policy.version,
+            workflow_version=workflow_version,
             market_key=market.pair_id,
             chain=market.chain,
             network=market.network,

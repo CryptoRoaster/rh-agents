@@ -14,9 +14,10 @@ reference price before the quote stops being a sane offer, and how much provider
 traffic one assessment may generate.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from decimal import Decimal
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,10 @@ class AnchorExecutionPolicy:
     # decimals, about which token this is, or about the price of the payment
     # asset, and none of those produce a number worth comparing.
     max_usd_valuation_skew_bps: Decimal
+    # How a rung's USD target becomes a payment-asset amount. DOWN never tests
+    # more than intended; UP never tests less, which is what a strategy needs
+    # when the rung *is* the exact order it may place and nothing smaller.
+    rung_rounding: Literal["DOWN", "UP"] = "DOWN"
 
     def __post_init__(self) -> None:
         if self.max_quote_age <= timedelta(0):
@@ -139,3 +144,29 @@ ANCHOR_EXECUTION_V1 = AnchorExecutionPolicy(
     # percents. Live measurement put the two within four basis points.
     max_usd_valuation_skew_bps=Decimal(500),
 )
+
+
+# PRE_VECTOR_EARLY_ENTRY_V1's execution policy. Every integrity bound is the
+# normal policy's own; only the ladder is cut to the early notional, and its
+# rungs round up so the first one proves the full ten dollars rather than a
+# hair under them.
+EARLY_ANCHOR_EXECUTION_V1 = replace(
+    ANCHOR_EXECUTION_V1,
+    version="early-anchor-execution-v1",
+    ladder_notional=(Decimal(10), Decimal(25), Decimal(50), Decimal(100), Decimal(250)),
+    max_quote_requests=8,
+    rung_rounding="UP",
+)
+
+ANCHOR_POLICIES: dict[str, AnchorExecutionPolicy] = {
+    policy.version: policy for policy in (ANCHOR_EXECUTION_V1, EARLY_ANCHOR_EXECUTION_V1)
+}
+
+
+def anchor_policy_for(
+    workflow_version: str, default: AnchorExecutionPolicy
+) -> AnchorExecutionPolicy:
+    """The execution policy a case is assessed under, by its own workflow."""
+    from src.orchestration.strategy.early import EARLY_WORKFLOW_VERSION
+
+    return EARLY_ANCHOR_EXECUTION_V1 if workflow_version == EARLY_WORKFLOW_VERSION else default

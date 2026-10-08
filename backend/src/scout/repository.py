@@ -421,6 +421,30 @@ class WatchRepository:
             reviewed=int(states.get(OrbitState.REVIEWED.value, 0)),
         )
 
+    async def young_watching(
+        self, limit: int, *, seen_since: datetime, chain: str
+    ) -> tuple[DiscoveryWatch, ...]:
+        """WATCHING watches on one chain first seen no earlier than `seen_since`.
+
+        Youngest first. A necessary condition only: a pool first seen inside the
+        window may still be older on chain, which the early strategy decides
+        from the chain-side creation time. Never ranked by market size.
+        """
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(DiscoveryWatchRow)
+                    .where(
+                        DiscoveryWatchRow.status == WatchStatus.WATCHING.value,
+                        DiscoveryWatchRow.chain == chain,
+                        DiscoveryWatchRow.first_seen_at >= seen_since,
+                    )
+                    .order_by(DiscoveryWatchRow.first_seen_at.desc(), DiscoveryWatchRow.pair_id)
+                    .limit(limit)
+                )
+            ).all()
+            return tuple(_watch(row) for row in rows)
+
     async def promotable(self, limit: int) -> tuple[DiscoveryWatch, ...]:
         """PROMOTABLE watches in discovery order. Never ranked by market size."""
         async with self.sessions() as session:

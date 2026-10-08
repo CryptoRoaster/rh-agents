@@ -65,6 +65,14 @@ from src.orchestration.sizing.models import (
     SizingAssessment,
     SizingRefusal,
 )
+from src.orchestration.strategy.early import (
+    EARLY_ENTRY_V1,
+    cap_refusal,
+    capacity_refusal,
+    early_ledger,
+    is_early,
+    limits_for,
+)
 from src.orchestration.valuation.models import PortfolioValuation, unvaluable_reason
 from src.orchestration.valuation.service import PositionValuationReader
 from src.orchestration.workflow.engine import active_evidence
@@ -196,6 +204,10 @@ class RiskRequestService:
             except WorkflowFailure:
                 raise RiskRequestUnavailable("TRADE_CASE_NOT_FOUND") from None
             trade_case = case_from_row(row)
+            # The limits this case is judged against, by its own strategy. A
+            # normal case gets exactly `self.limits`; an early one gets the same
+            # object with only the minimum liquidity changed.
+            case_limits = limits_for(trade_case.strategy_policy_id, self.limits)
 
             stored = await session.scalar(
                 select(TradeCaseRiskRequestRow).where(
@@ -236,6 +248,11 @@ class RiskRequestService:
                     assessed.readiness,
                 )
             workflow = await self.cases.workflow_inputs_in_session(session, row)
+            # The early strategy's book, read before the clock like every other
+            # input; the day boundary is applied at the decision instant below.
+            ledger = (
+                await early_ledger(session) if is_early(trade_case.strategy_policy_id) else None
+            )
 
             # The last clock read, after the last input read. Everything from
             # here to the verdict is synchronous, so one instant governs
@@ -276,6 +293,33 @@ class RiskRequestService:
                     assessed.readiness,
                 )
 
+            if is_early(trade_case.strategy_policy_id):
+                # The strategy's own conditions, checked before SENTINEL is
+                # asked anything and under the account lock that orders fills:
+                # the fixed notional must be proven executable, and one more
+                # early position must fit inside every early cap.
+                execution = getattr(assessed.anchor.payload, "execution", None)
+                shortfall = capacity_refusal(
+                    None if execution is None else execution.largest_tested_acceptable_notional_usd
+                )
+                if shortfall is not None:
+                    return _refused(
+                        trade_case,
+                        RiskRequestRefusal.EARLY_EXECUTABLE_CAPACITY_INSUFFICIENT,
+                        assessed.readiness,
+                        detail=shortfall,
+                    )
+                capped = (
+                    cap_refusal(ledger.at(now)) if ledger is not None else "EARLY_LEDGER_UNREAD"
+                )
+                if capped is not None:
+                    return _refused(
+                        trade_case,
+                        RiskRequestRefusal.EARLY_STRATEGY_CAP_REACHED,
+                        assessed.readiness,
+                        detail=capped,
+                    )
+
             market = risk_market(
                 base_asset_id=assessed.sizing.base_asset_id,
                 price=assessed.sizing.reference_price,
@@ -288,7 +332,7 @@ class RiskRequestService:
                 identity_key=request_key,
                 side=Side.BUY,
             )
-            stale = too_old_for(market, now, self.limits)
+            stale = too_old_for(market, now, case_limits)
             if stale is not None:
                 # Present, provable and still older than SENTINEL's own bound.
                 # Asking anyway would come back as a terminal rejection of the
@@ -346,8 +390,8 @@ class RiskRequestService:
                 )
 
             intent = _trade_intent(assessed, market, trade_case, request_key, now)
-            limits = self.limits.model_copy(
-                update={"kill_switch": self.limits.kill_switch or bool(account.paused)}
+            limits = case_limits.model_copy(
+                update={"kill_switch": case_limits.kill_switch or bool(account.paused)}
             )
             decision = evaluate(intent, market, state.context, limits, now=now)
 
@@ -490,7 +534,13 @@ class RiskRequestService:
         sizing = await PaperSizingReader(
             cases=self.cases,
             markets=feed,
-            requested_notional_usd=self.requested_notional_usd,
+            # An early case asks for the strategy's fixed notional, never the
+            # operator's configured size; a normal case is unchanged.
+            requested_notional_usd=(
+                EARLY_ENTRY_V1.notional_usd
+                if is_early(trade_case.strategy_policy_id)
+                else self.requested_notional_usd
+            ),
             trading_mode=self.trading_mode,
             clock=self.clock,
             include_fixtures=self.include_fixtures,

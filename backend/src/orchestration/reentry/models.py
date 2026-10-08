@@ -50,6 +50,9 @@ class ReentryRefusal(StrEnum):
     # rejection, an abandoned entry and a lapsed case all end a cycle without
     # one, and none of them is a completed trade.
     PREDECESSOR_NOT_EXECUTED = "PREDECESSOR_NOT_EXECUTED"
+    # The predecessor belongs to a strategy without re-entry, such as
+    # PRE_VECTOR_EARLY_ENTRY_V1. Its one cycle is its only one.
+    STRATEGY_REENTRY_NOT_PERMITTED = "STRATEGY_REENTRY_NOT_PERMITTED"
     # ------------------------------------------------- the holding
     # The exit names a holding nothing can resolve. A row this system cannot
     # read is not a holding it has shown to be closed, and an absent record is

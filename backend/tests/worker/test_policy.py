@@ -18,7 +18,7 @@ from src.orchestration.worker.policy import (
     role_evidence_matrix,
 )
 from src.orchestration.workflow.models import EvidenceType
-from src.orchestration.workflow.policy import TRADE_CASE_V1
+from src.orchestration.workflow.policy import TRADE_CASE_V1, WORKFLOW_POLICIES
 
 EXPECTED_MATRIX = {
     AgentRole.ORBIT: EvidenceType.DISCOVERY,
@@ -28,6 +28,9 @@ EXPECTED_MATRIX = {
     AgentRole.PULSE: EvidenceType.TRIGGER,
     AgentRole.ANCHOR: EvidenceType.LIQUIDITY_EXECUTION,
     AgentRole.FUSE: EvidenceType.SYNTHESIS,
+    # The early workflow's deterministic setup producer. It submits the same
+    # evidence type VECTOR does, but never in the same workflow.
+    AgentRole.EARLY: EvidenceType.TRADE_SETUP,
 }
 
 
@@ -40,8 +43,10 @@ def test_role_evidence_matrix_is_exactly_the_workflow_requirements():
 def test_each_role_has_exactly_one_authorized_evidence_type(role, evidence):
     assert authorized_evidence_type(role) == evidence
     assert authorized_task_type(role) is not None
-    # Exactly one type, and no other role shares it.
-    assert [other for other in EXPECTED_MATRIX.values()].count(evidence) == 1
+    # Exactly one type, and within any one workflow no other role shares it.
+    for workflow in WORKFLOW_POLICIES.values():
+        producers = [item.role for item in workflow.requirements if item.evidence_type == evidence]
+        assert len(producers) <= 1, workflow.version
 
 
 def test_commander_has_no_evidence_authority():
@@ -86,6 +91,7 @@ def test_deterministic_services_are_not_worker_roles():
         "ANCHOR",
         "FUSE",
         "COMMANDER",
+        "EARLY",
     }
 
 

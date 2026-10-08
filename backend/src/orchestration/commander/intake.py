@@ -38,6 +38,7 @@ from src.orchestration.workflow.models import (
     TradeCaseStatus,
     WorkflowFailure,
 )
+from src.orchestration.workflow.policy import WorkflowPolicy
 from src.orchestration.workflow.service import TradeCaseService
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,12 @@ class CommanderIntakeService:
     kill_switch: bool = False
     # Supplied only by a deployment that also runs Phase 0 accounting.
     pause: SystemPausePort | None = None
+    # An explicit strategy this intake opens cases for, and the workflow they
+    # run under. Absent for the normal intake, whose keys and cases are exactly
+    # what they always were. Present only for an intake composed for one named
+    # strategy — never inferred from what a case lacks.
+    strategy_policy_id: str | None = None
+    workflow: WorkflowPolicy | None = None
 
     def intake_key(self, candidate: MarketCandidate, predecessor: UUID | None) -> str:
         """The deterministic identity of the case this candidate would open.
@@ -184,6 +191,13 @@ class CommanderIntakeService:
         display name, which are not identities and are not unique.
         """
         generation = "initial" if predecessor is None else str(predecessor)
+        if self.strategy_policy_id is not None:
+            # A strategy's cases have their own identity space, so a strategy
+            # case and a normal case for one market can never share a key.
+            return (
+                f"commander-intake:{self.policy.version}:{self.strategy_policy_id}:"
+                f"{candidate.pair_id}:{generation}"
+            )
         return f"commander-intake:{self.policy.version}:{candidate.pair_id}:{generation}"
 
     def intake_correlation(self, candidate: MarketCandidate, predecessor: UUID | None) -> UUID:
@@ -409,6 +423,8 @@ class CommanderIntakeService:
                 # compute the same expiry, or their open fingerprints differ and
                 # neither wins.
                 expires_at=candidate.observed_at + self.policy.case_lifetime,
+                strategy_policy_id=self.strategy_policy_id,
+                workflow=self.workflow,
             )
 
     @staticmethod
