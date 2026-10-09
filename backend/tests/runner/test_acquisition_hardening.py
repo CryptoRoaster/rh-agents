@@ -332,7 +332,10 @@ async def test_one_market_wanted_twice_still_costs_one(risk_db, now, trace):
     # the second need answered by that reading as the replay it is.
     asked = provider.multi_requests[0].rsplit("/", 1)[-1].split(",")
     assert asked == [POOL], asked
-    assert summary.acquisition.budget_spent == 1, summary.acquisition
+    # The holding's market is asked about in the position budget; the case on
+    # the same pool is answered by that reading and spends no case slot.
+    assert summary.acquisition.requested == 1, summary.acquisition
+    assert summary.acquisition.budget_spent == 0, summary.acquisition
     assert summary.acquisition.recorded == 1
     assert summary.acquisition.unchanged == 1
 

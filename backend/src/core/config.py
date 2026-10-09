@@ -322,6 +322,9 @@ class Settings(BaseSettings):
     # How many markets one run may have observed again. The single most
     # important bound here: every other cost is proportional to it.
     paper_runner_acquisition_max_markets: int = Field(default=4, ge=1, le=20)
+    # Open-position markets observed again per run, apart from the market budget
+    # above. One bounded provider request carries up to twenty.
+    paper_runner_acquisition_max_position_markets: int = Field(default=20, ge=1, le=20)
     # How many bounded discovery reads may be performed, across all configured
     # chains. Zero is meaningful and is not "no acquisition": it acquires only
     # the markets the existing cases and positions already depend on, and looks

@@ -150,6 +150,7 @@ def limits_from_settings(settings: Settings) -> RunLimits:
 def acquisition_limits_from_settings(settings: Settings) -> AcquisitionLimits:
     return AcquisitionLimits(
         max_markets=settings.paper_runner_acquisition_max_markets,
+        max_position_markets=settings.paper_runner_acquisition_max_position_markets,
         max_discovery_requests=settings.paper_runner_acquisition_max_discovery_requests,
         max_provider_requests=settings.paper_runner_acquisition_max_provider_requests,
         max_http_attempts=settings.paper_runner_acquisition_max_http_attempts,

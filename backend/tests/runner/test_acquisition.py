@@ -472,8 +472,13 @@ async def test_the_market_budget_is_applied_before_the_request(risk_db, now, tra
     assert len(await observations(sessions)) == 1, "nothing fetched was discarded"
 
 
-async def test_a_full_market_budget_leaves_the_rest_visibly_unattempted(risk_db, now, trace):
-    """A market the budget did not reach says so, rather than going silent."""
+async def test_a_holding_never_takes_the_case_s_market_slot(risk_db, now, trace):
+    """A holding's market has its own budget, so a case budget of one still fits the case.
+
+    Before the position budget existed, the holding took the only market slot
+    and the case's own market was left unattempted. A deficit in the position
+    budget itself is reported in `positions` (see test_position_refresh).
+    """
     _, sessions = risk_db
     model = ScriptedSpecialists()
     opening = MarketProvider(discovery=[traded(SPOT), payment()])
@@ -500,13 +505,15 @@ async def test_a_full_market_budget_leaves_the_rest_visibly_unattempted(risk_db,
         ports=acquiring_ports(later, model, provider),
     )
 
-    assert summary.acquisition.stop == AcquisitionStop.MARKET_BUDGET_REACHED.value
-    assert summary.acquisition.not_attempted == 1, summary.acquisition
-    left = entries(summary, outcome=AcquisitionOutcome.NOT_ATTEMPTED)
-    assert [(item.pair_id, item.reason) for item in left] == [(PAIR_ID, "MARKET_BUDGET_REACHED")], (
-        summary.acquisition
-    )
-    assert len(provider.multi_requests[0].rsplit("/", 1)[-1].split(",")) == 1
+    assert summary.acquisition.not_attempted == 0, summary.acquisition
+    held = entries(summary, need=AcquisitionNeed.POSITION_VALUATION)
+    case = entries(summary, need=AcquisitionNeed.CASE_MARKET)
+    assert [(item.pair_id, item.outcome) for item in held] == [
+        (PAYMENT_PAIR_ID, AcquisitionOutcome.RECORDED.value)
+    ], summary.acquisition
+    assert [item.pair_id for item in case] == [PAIR_ID], summary.acquisition
+    assert summary.acquisition.positions.complete is True
+    assert summary.acquisition.budget_spent == 1  # the case's slot, and only it
 
 
 async def test_the_provider_request_budget_is_the_lower_of_the_two(risk_db, now, trace):
