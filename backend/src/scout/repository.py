@@ -31,6 +31,7 @@ from src.data.tables import (
     MarketObservationRow,
 )
 from src.markets.models import MarketIdentity, MarketSnapshot
+from src.markets.scope import describes_market
 from src.scout.models import DiscoveryWatch, WatchAssessment
 from src.scout.policy import (
     EARLY_SCOUT_V2,
@@ -139,11 +140,7 @@ def _same_market(stored: MarketIdentity, observed: MarketIdentity) -> bool:
     the otherwise identical market completes the identity rather than
     contradicting it. Nothing else is reconciled.
     """
-    if stored == observed:
-        return True
-    return stored.pool_locator is None and stored == observed.model_copy(
-        update={"pool_locator": None}
-    )
+    return describes_market(observed, stored)
 
 
 @dataclass(frozen=True)

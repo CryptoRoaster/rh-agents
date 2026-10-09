@@ -47,6 +47,7 @@ from src.ledger.portfolio import (
 )
 from src.markets.models import Availability
 from src.markets.models import MarketSnapshot as RecordedMarket
+from src.markets.scope import MarketScope, latest_in
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
 from src.orchestration.riskdata.context import RiskDataReader
@@ -74,7 +75,7 @@ from src.orchestration.strategy.early import (
     limits_for,
 )
 from src.orchestration.valuation.models import PortfolioValuation, unvaluable_reason
-from src.orchestration.valuation.service import PositionValuationReader
+from src.orchestration.valuation.service import PositionValuationReader, held_market_identities
 from src.orchestration.workflow.engine import active_evidence
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
@@ -123,6 +124,7 @@ class OneSnapshot:
         self._markets = markets
         self._include_fixtures = include_fixtures
         self._seen: dict[str, RecordedMarket | None] = {}
+        self._scoped: dict[MarketScope, RecordedMarket | None] = {}
 
     async def latest(
         self, identity: str, *, include_fixtures: bool = False
@@ -132,6 +134,20 @@ class OneSnapshot:
                 identity, include_fixtures=include_fixtures or self._include_fixtures
             )
         return self._seen[identity]
+
+    async def latest_in(
+        self, scope: MarketScope, *, include_fixtures: bool = False
+    ) -> RecordedMarket | None:
+        """The scoped market's own reading, read once per scope like `latest`.
+
+        The mark and the sale of one holding ask with the same scope — the
+        case's full identity — so both describe the same observation.
+        """
+        if scope not in self._scoped:
+            self._scoped[scope] = await latest_in(
+                self._markets, scope, include_fixtures=include_fixtures or self._include_fixtures
+            )
+        return self._scoped[scope]
 
 
 @dataclass(frozen=True)
@@ -482,10 +498,12 @@ class RiskRequestService:
             positions = [
                 read_position(item) for item in (await session.scalars(select(PositionRow))).all()
             ]
+            identities = await held_market_identities(session, positions)
         return await PositionValuationReader(
             markets=feed,
             max_age_seconds=self.limits.max_snapshot_age_seconds,
             include_fixtures=self.include_fixtures,
+            identities=identities,
         ).value(positions, self.clock.now())
 
     async def _assess(

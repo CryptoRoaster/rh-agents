@@ -134,11 +134,33 @@ run in the bounded PAPER run right after the normal exit sweep. The normal
 `PAPER_EXIT_V1` sweep never closes an early position
 (`EARLY_POSITION_OWN_EXIT_POLICY`), and this sweep never closes a normal one.
 
-`PaperExitService` — the one exit boundary for normal and early exits — judges a
-sale only on a reading of the held market: the reading's `MarketIdentity` must
-equal the case's (provider, chain, network, pool, assets, venue, fixture flag;
-a case without a pool locator accepts one that adds it). Any other reading is
-refused as `EXIT_MARKET_IDENTITY_MISMATCH` before anything is written.
+Every PAPER exit reads the **held market's own stream** (`src/markets/scope.py`,
+Issue #75): `MarketReader.latest_in(MarketScope)` returns the newest current
+reading of the scoped provider's stream of the pool, with the same ranking and
+freshness as `latest`, and accepts it only if it is of that market. The mark
+(`PositionValuationReader`), the liquidity reads of both exit sweeps, the
+completeness check and the sale in `PaperExitService` all use it; another
+provider's newer reading of the same pool is never selected, and without an
+own current reading the answer is UNKNOWN/UNAVAILABLE, never a fallback.
+`latest(pair_id)` is unchanged for every other consumer.
+
+The scope is applied **before** the newest event is chosen: provider, chain,
+network and base asset as columns, quote asset, venue, fixture flag and (for a
+located market) the pool locator from the stored payload; the newest event is
+then ranked per full market. A newer reading of any other market under the
+same pool id cannot hide the held one, and an unavailable or stale newest own
+event is never replaced by an older one. The full identity comes from the case
+that bought the holding (`held_market_identities`: position → cycle → entry →
+case); a holding with only a partial scope (no quote or venue recorded) is
+answered only if exactly one current market fits it — two are ambiguous and
+UNKNOWN.
+
+`PaperExitService` — the one exit boundary for normal and early exits — still
+checks the selected reading once more before anything is priced or sold: its
+`MarketIdentity` must equal the case's (`describes_market`: provider, chain,
+network, pool, assets, venue, fixture flag; a case without a pool locator
+accepts one that adds it). Any other reading is refused as
+`EXIT_MARKET_IDENTITY_MISMATCH` before anything is written.
 
 Every exit is a **full** exit through the existing `PaperExitService`: whole
 holding, fresh ATLAS exit read, SENTINEL SELL check, one order per key, one

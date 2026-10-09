@@ -49,6 +49,7 @@ from src.core.models import Position, RiskLimits
 from src.data.repository import aware
 from src.data.tables import MarketObservationRow, TradeCaseExecutionRow, TradeCaseRow
 from src.markets.models import Availability, MarketSnapshot
+from src.markets.scope import MarketScope
 from src.orchestration.exitpolicy.policy import Immutable
 from src.orchestration.exitpolicy.service import ExitSweep, exit_request_key
 from src.orchestration.paperexit.models import PaperExitRecorded
@@ -59,7 +60,7 @@ from src.orchestration.paperexit.service import (
 )
 from src.orchestration.riskrequest.service import OneSnapshot
 from src.orchestration.strategy.early import EARLY_ENTRY_V1, PRE_VECTOR_EARLY_ENTRY_V1
-from src.orchestration.valuation.service import PositionValuationReader
+from src.orchestration.valuation.service import PositionValuationReader, held_market_identities
 from src.orchestration.valuation.service import _same_market as same_market
 
 EARLY_EXIT_VERSION: Literal["EARLY_PAPER_EXIT_V1"] = "EARLY_PAPER_EXIT_V1"
@@ -241,6 +242,7 @@ async def observed_peak(
         return ObservedPeak()
     window = [
         MarketObservationRow.pair_id == position.market_pair_id,
+        MarketObservationRow.asset_id == position.asset_id,
         MarketObservationRow.observed_at >= since,
         MarketObservationRow.observed_at <= until,
         MarketObservationRow.available.is_(True),
@@ -248,6 +250,10 @@ async def observed_peak(
     ]
     if position.market_provider is not None:
         window.append(MarketObservationRow.provider == position.market_provider)
+    if position.market_chain is not None:
+        window.append(MarketObservationRow.chain == position.market_chain)
+    if position.market_network is not None:
+        window.append(MarketObservationRow.network == position.market_network)
     if not include_fixtures:
         window.append(MarketObservationRow.is_fixture.is_(False))
     priced = _orderable_price(session)
@@ -390,15 +396,27 @@ class EarlyExitService:
         self, position: Position, entry: TradeCaseExecutionRow, now: datetime
     ) -> EarlyExitInputs:
         feed = OneSnapshot(self.markets, self.include_fixtures)
+        async with self.sessions() as session:
+            identities = await held_market_identities(session, [position])
         valuation = await PositionValuationReader(
             markets=feed,
             max_age_seconds=self.limits.max_snapshot_age_seconds,
             include_fixtures=self.include_fixtures,
+            identities=identities,
         ).value([position], now)
         mark = valuation.by_asset.get(position.asset_id)
         liquidity: Decimal | None = None
         if position.market_pair_id is not None:
-            snapshot = await feed.latest(position.market_pair_id)
+            held = MarketScope.held(position)
+            identity = identities.get(position.asset_id)
+            # The case's full identity when it agrees with the holding, so the
+            # liquidity is read from exactly the market the mark was.
+            scope = (
+                MarketScope.of(identity)
+                if held is not None and identity is not None and held.matches_identity(identity)
+                else held
+            )
+            snapshot = None if scope is None else await feed.latest_in(scope)
             if (
                 snapshot is not None
                 # The held market's own reading: same pool, and the same chain,

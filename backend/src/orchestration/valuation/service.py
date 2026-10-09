@@ -13,12 +13,16 @@ possibility of a position appearing in between, and the callers close it by
 comparing what was valued against what they find under the lock.
 """
 
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Protocol
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from src.core.models import Position
-from src.markets.models import Availability, MarketSnapshot
+from src.markets.models import Availability, MarketIdentity, MarketSnapshot
+from src.markets.scope import MarketScope, latest_in
 from src.orchestration.valuation.models import (
     PortfolioValuation,
     PositionMark,
@@ -44,6 +48,12 @@ class PositionValuationReader:
     # object SENTINEL uses, never a second tolerance chosen here.
     max_age_seconds: int
     include_fixtures: bool = False
+    # The full identity of each holding's market, by asset, where the case that
+    # bought it is known (`held_market_identities`). A position records its
+    # pool, chain, network, provider and asset but not its quote asset or
+    # venue; with the case's identity the mark is read from exactly that
+    # market's stream, without it from the position's partial scope.
+    identities: Mapping[str, MarketIdentity] = field(default_factory=dict)
 
     async def value(self, positions: list[Position], now: datetime) -> PortfolioValuation:
         """Mark every non-zero holding, or name the ones that could not be.
@@ -85,9 +95,27 @@ class PositionValuationReader:
             # one for it would resolve an ambiguity silently, in the one place
             # where being wrong misprices the whole portfolio.
             return ValuationRefusal.POSITION_MARKET_UNKNOWN
-        snapshot = await self.markets.latest(pair_id, include_fixtures=self.include_fixtures)
+        held = MarketScope.held(holding)
+        assert held is not None  # pair_id is known here
+        identity = self.identities.get(holding.asset_id)
+        if identity is not None and not held.matches_identity(identity):
+            # The case that bought this holding names another market than the
+            # holding records. One of the two is wrong; neither is guessed.
+            return ValuationRefusal.MARKET_IDENTITY_MISMATCH
+        scope = held if identity is None else MarketScope.of(identity)
+        # The held market's own reading: its provider's stream of its pool,
+        # never whichever source recorded the pool last.
+        snapshot = await latest_in(self.markets, scope, include_fixtures=self.include_fixtures)
         if snapshot is None:
-            return ValuationRefusal.MARKET_NOT_RECORDED
+            # Said precisely, without using it: is there no reading at all, or
+            # only another market's?
+            other = await self.markets.latest(pair_id, include_fixtures=self.include_fixtures)
+            if other is None:
+                return ValuationRefusal.MARKET_NOT_RECORDED
+            if replace(held, base_asset_id=None).matches(other):
+                # This market's own stream, pricing another asset.
+                return ValuationRefusal.PRICE_ASSET_MISMATCH
+            return ValuationRefusal.MARKET_IDENTITY_MISMATCH
         if snapshot.pair.pair_id != pair_id or not _same_market(snapshot, holding):
             return ValuationRefusal.MARKET_IDENTITY_MISMATCH
         price = snapshot.price
@@ -132,3 +160,29 @@ def _same_market(snapshot: Any, holding: Position) -> bool:
         if named is not None and recorded != named:
             return False
     return True
+
+
+async def held_market_identities(
+    session: AsyncSession, positions: Sequence[Position]
+) -> dict[str, MarketIdentity]:
+    """The full market identity of each holding, from the case that bought it.
+
+    Followed through the holding's own cycle to its case-bound entry and that
+    entry's case. A holding without a cycle or an entry has none, and is valued
+    from what it recorded.
+    """
+    from sqlalchemy import select
+
+    from src.data.tables import TradeCaseExecutionRow, TradeCaseRow
+
+    cycles = {item.cycle_id: item.asset_id for item in positions if item.cycle_id is not None}
+    if not cycles:
+        return {}
+    rows = (
+        await session.execute(
+            select(TradeCaseExecutionRow.cycle_id, TradeCaseRow.market_payload)
+            .join(TradeCaseRow, TradeCaseRow.id == TradeCaseExecutionRow.trade_case_id)
+            .where(TradeCaseExecutionRow.cycle_id.in_(list(cycles)))
+        )
+    ).all()
+    return {cycles[cycle]: MarketIdentity.model_validate(payload) for cycle, payload in rows}

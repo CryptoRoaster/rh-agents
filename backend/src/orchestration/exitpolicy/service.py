@@ -31,6 +31,7 @@ from src.core.models import Position, RiskLimits
 from src.data.repository import aware
 from src.data.tables import TradeCaseExecutionRow
 from src.markets.models import Availability
+from src.markets.scope import MarketScope
 from src.orchestration.exitpolicy.policy import (
     ExitInputs,
     ExitVerdict,
@@ -44,7 +45,7 @@ from src.orchestration.paperexit.service import (
     PaperExitUnavailable,
 )
 from src.orchestration.riskrequest.service import OneSnapshot
-from src.orchestration.valuation.service import PositionValuationReader
+from src.orchestration.valuation.service import PositionValuationReader, held_market_identities
 
 
 @dataclass
@@ -155,15 +156,29 @@ class AutoExitService:
     ) -> ExitInputs:
         """Entry fill, current mark and current liquidity — each only if it is fresh."""
         feed = OneSnapshot(self.markets, self.include_fixtures)
+        async with self.sessions() as session:
+            identities = await held_market_identities(session, [position])
         valuation = await PositionValuationReader(
             markets=feed,
             max_age_seconds=self.limits.max_snapshot_age_seconds,
             include_fixtures=self.include_fixtures,
+            identities=identities,
         ).value([position], now)
         mark = valuation.by_asset.get(position.asset_id)
         liquidity: Decimal | None = None
         if position.market_pair_id is not None:
-            snapshot = await feed.latest(position.market_pair_id)
+            held = MarketScope.held(position)
+            identity = identities.get(position.asset_id)
+            # The case's full identity when it agrees with the holding, so the
+            # liquidity is read from exactly the market the mark was.
+            scope = (
+                MarketScope.of(identity)
+                if held is not None and identity is not None and held.matches_identity(identity)
+                else held
+            )
+            # The held market's own reading only; another source's reading of
+            # the pool is not this position's liquidity.
+            snapshot = None if scope is None else await feed.latest_in(scope)
             if (
                 snapshot is not None
                 and snapshot.liquidity.status == Availability.AVAILABLE
