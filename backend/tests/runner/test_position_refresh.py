@@ -402,3 +402,209 @@ async def test_a_newer_recording_of_another_market_under_the_pool_does_not_redir
     [entry] = positions(summary)
     assert entry.outcome == AcquisitionOutcome.RECORDED.value, summary
     assert summary.positions.complete is True
+
+
+# ------------------------- one pool id, several full market identities
+
+
+class ManyMarkets:
+    """Several recorded markets, some sharing a pool id.
+
+    `latest` answers by pool id with the reading added last (what an unscoped
+    reader sees); `latest_in` answers by full scope, as the scoped reader does.
+    """
+
+    def __init__(self, *snapshots) -> None:
+        self.snapshots = list(snapshots)
+
+    def add(self, snapshot) -> None:
+        self.snapshots.append(snapshot)
+
+    async def latest(self, identity, *, include_fixtures=False):
+        for snapshot in reversed(self.snapshots):
+            if snapshot.pair.pair_id == identity:
+                return snapshot
+        return None
+
+    async def latest_in(self, scope, *, include_fixtures=False):
+        for snapshot in reversed(self.snapshots):
+            if scope.matches(snapshot):
+                return snapshot
+        return None
+
+
+POOL_ID = MARKETS[0].pair_id
+OTHER_BASE = "robinhood:mainnet:0x" + "c7" * 20
+OTHER_QUOTE = "0x" + "d8" * 20
+
+
+def variant(now, coordinate, *, label):
+    """A valid reading of pool `POOL_ID` for another full market."""
+    from src.markets.models import MarketSnapshot
+    from tests.riskrequest.conftest import fresh_snapshot
+
+    if coordinate == "base":
+        return fresh_snapshot(now, pair_id=POOL_ID, base_asset_id=OTHER_BASE, label=label)
+    snapshot = fresh_snapshot(
+        now, pair_id=POOL_ID, base_asset_id=MARKETS[0].base_asset_id, label=label
+    )
+    payload = snapshot.model_dump(mode="json")
+    old, new = {
+        "quote": (QUOTE, OTHER_QUOTE),
+        "venue": ("uniswap-v3", "another-venue"),
+    }[coordinate]
+
+    def swap(value):
+        if isinstance(value, dict):
+            return {key: swap(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [swap(item) for item in value]
+        if isinstance(value, str) and old in value:
+            return value.replace(old, new)
+        return value
+
+    return MarketSnapshot.model_validate(swap(payload))
+
+
+async def held_and_recorded(sessions, now):
+    """One real early holding on `POOL_ID`, and the case identity it was bought under."""
+    (held,) = await early_positions(sessions, now, 1)
+    assert held.pair_id == POOL_ID
+    async with sessions() as session:
+        from src.data.tables import TradeCaseRow
+        from src.markets.models import MarketIdentity
+
+        payload = await session.scalar(
+            select(TradeCaseRow.market_payload).where(TradeCaseRow.market_key == POOL_ID)
+        )
+    return MarketIdentity.model_validate(payload)
+
+
+async def test_two_case_bound_holdings_cannot_share_a_pool_id(risk_db, now):
+    """The ledger itself refuses a second cycle on one pool id: no such portfolio exists."""
+    import sqlalchemy
+
+    from tests.casefill.conftest import build_fill_service
+    from tests.early.test_sentinel import early_ready
+    from tests.riskrequest.conftest import build_service, fresh_snapshot
+
+    _, sessions = risk_db
+    await early_positions(sessions, now, 1)
+    other = variant(now, "base", label="second-market")
+    feed = ManyMarkets(
+        fresh_snapshot(now),
+        fresh_snapshot(now, pair_id=POOL_ID, base_asset_id=MARKETS[0].base_asset_id, label="a"),
+        other,
+    )
+    service = build_service(sessions, now, feed=feed, notional="500", costs=ZERO)
+    case = await early_ready(
+        service, sessions, now, uuid4(), key="second", identity=other.pair.market_identity
+    )
+    await service.request_risk_evaluation(case.id, request_key="second")
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        await build_fill_service(sessions, now, feed=feed, costs=ZERO).execute_case_fill(
+            case.id, request_key="second"
+        )
+
+
+async def test_holdings_on_one_pool_for_another_asset_are_never_counted_covered(
+    risk_db, now, trace
+):
+    """Holdings without a cycle: a reading of pool P for base A does not value asset B."""
+    from src.markets.recorder import MarketRecorder
+    from tests.riskrequest.conftest import fresh_snapshot
+    from tests.runner.test_acquisition import hold
+
+    _, sessions = risk_db
+    reading = fresh_snapshot(
+        now, pair_id=POOL_ID, base_asset_id=MARKETS[0].base_asset_id, label="pool"
+    )
+    await MarketRecorder(sessions, clock=FixedClock(now)).record(reading)
+    await hold(sessions, now, trace, pair_id=POOL_ID, asset_id=MARKETS[0].base_asset_id)
+    await hold(sessions, now, trace, pair_id=POOL_ID, asset_id=OTHER_BASE)
+    at = now + timedelta(minutes=5)
+    provider = MarketProvider(targeted=[answer(MARKETS[0])])
+
+    summary = await stage(sessions, at, provider).execute(Deadline())
+
+    coverage = summary.positions
+    assert coverage.open_positions == 2
+    assert (coverage.markets, coverage.answered, coverage.unaddressable) == (1, 1, 1), coverage
+    assert coverage.complete is False and coverage.deficit == 1
+    reasons = [item.reason for item in positions(summary) if item.reason]
+    assert reasons == ["POSITION_ASSET_NOT_MARKET_BASE"]
+    assert [len(item) for item in asked_pools(provider)] == [1]
+
+
+@pytest.mark.parametrize("coordinate", ["base", "quote", "venue"])
+async def test_a_case_on_another_market_under_the_pool_id_is_not_a_replay(risk_db, now, coordinate):
+    from src.orchestration.workflow.service import TradeCaseService
+    from tests.early.conftest import open_early_case
+
+    _, sessions = risk_db
+    held = await held_and_recorded(sessions, now)
+    other = variant(now, coordinate, label=f"case-{coordinate}").pair.market_identity
+    assert other.pair_id == held.pair_id and other != held
+    cases = TradeCaseService(sessions, clock=FixedClock(now))
+    await open_early_case(cases, sessions, now, uuid4(), key="live-other", identity=other)
+    at = now + timedelta(minutes=5)
+    provider = MarketProvider(targeted=[answer(MARKETS[0])])
+
+    summary = await stage(sessions, at, provider).execute(Deadline())
+
+    [position] = positions(summary)
+    assert position.outcome == AcquisitionOutcome.RECORDED.value
+    [case] = [i for i in summary.markets if i.need == AcquisitionNeed.CASE_MARKET.value]
+    assert (case.outcome, case.reason) == (
+        AcquisitionOutcome.REFUSED.value,
+        "MARKET_IDENTITY_MISMATCH",
+    ), summary
+    assert summary.unchanged == 0  # no false replay
+    assert [len(item) for item in asked_pools(provider)] == [1]
+    assert summary.positions.complete is True
+
+
+async def test_a_case_on_exactly_the_held_market_is_answered_by_its_reading(risk_db, now):
+    from src.orchestration.workflow.service import TradeCaseService
+    from tests.early.conftest import open_early_case
+    from tests.riskrequest.conftest import fresh_snapshot
+
+    _, sessions = risk_db
+    await held_and_recorded(sessions, now)
+    # The holding's market by its full identity, pool locator included — the
+    # identity the plan asks about.
+    located = fresh_snapshot(
+        now, pair_id=POOL_ID, base_asset_id=MARKETS[0].base_asset_id, label="same"
+    ).pair.market_identity
+    assert located.pool_locator is not None
+    cases = TradeCaseService(sessions, clock=FixedClock(now))
+    await open_early_case(cases, sessions, now, uuid4(), key="live-same", identity=located)
+    at = now + timedelta(minutes=5)
+    provider = MarketProvider(targeted=[answer(MARKETS[0])])
+
+    summary = await stage(sessions, at, provider).execute(Deadline())
+
+    [case] = [i for i in summary.markets if i.need == AcquisitionNeed.CASE_MARKET.value]
+    assert case.outcome == AcquisitionOutcome.UNCHANGED.value, summary
+    assert [len(item) for item in asked_pools(provider)] == [1]
+    assert summary.budget_spent == 0
+
+
+def test_one_pool_id_cannot_name_two_chains_or_networks():
+    """The pool id carries chain and network; the market contract enforces it."""
+    import pydantic
+
+    from src.markets.models import MarketSnapshot
+    from tests.riskrequest.conftest import fresh_snapshot
+
+    snapshot = fresh_snapshot(
+        Deadline
+        and __import__("datetime").datetime(2026, 9, 9, 12, tzinfo=__import__("datetime").UTC),
+        pair_id=POOL_ID,
+        base_asset_id=MARKETS[0].base_asset_id,
+    )
+    for field, value in (("chain", "bsc"), ("network", "testnet")):
+        payload = snapshot.model_dump(mode="json")
+        payload["pair"][field] = value
+        with pytest.raises(pydantic.ValidationError):
+            MarketSnapshot.model_validate(payload)

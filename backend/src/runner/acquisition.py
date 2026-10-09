@@ -419,6 +419,10 @@ class AcquisitionPlanner:
                 )
                 continue
             unusable = self._unusable(identity)
+            if unusable is None and identity.base_asset_id != asset_id:
+                # A reading of this market prices its base asset, not this
+                # holding: it cannot value it, so it never counts as covering it.
+                unusable = "POSITION_ASSET_NOT_MARKET_BASE"
             if unusable is not None:
                 unaddressable_positions += 1
                 refused.append(
@@ -929,8 +933,20 @@ class BoundedMarketAcquisition:
 
         One bounded `pools/multi` request per chain carries them all; the case
         budget is not touched, so neither a case nor discovery can take a
-        holding's slot. Returns, per pool asked about, the reading it got or
-        why it got none — or None when the pass must end here.
+        holding's slot.
+
+        Two keys, kept apart on purpose. The *transport address* — the pool id
+        a locator resolves to — is what the provider is asked by, and it can
+        answer one market per address. The *market identity* is what a holding
+        is: targets are distinct by full identity (the planner deduplicates
+        nothing else), and every target is recorded only if the answer is
+        exactly its identity (`record_observed`). Two identities under one
+        address therefore share one question and never one answer: the one the
+        provider did not answer for is refused as MARKET_IDENTITY_MISMATCH and
+        never counted as covered. Returns, per transport address, the answer
+        the provider gave (or why it gave none) — a case asking by that address
+        is held to its own identity in the same way — or None when the pass
+        must end here.
         """
         answered: dict[str, tuple[GeckoTerminalAdapter, MarketPair] | str] = {}
         for chain in chains:
@@ -941,6 +957,7 @@ class BoundedMarketAcquisition:
                 self._unattempted(batch, ledger, "TIME_BUDGET_REACHED")
                 ledger.stop = AcquisitionStop.TIME_BUDGET_REACHED
                 return None
+            # Transport addresses, one per pool id: what the provider is asked by.
             pools: dict[str, AcquisitionTarget] = {}
             for target in batch:
                 pools.setdefault(target.identity.pair_id, target)
