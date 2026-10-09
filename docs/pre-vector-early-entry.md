@@ -134,6 +134,12 @@ run in the bounded PAPER run right after the normal exit sweep. The normal
 `PAPER_EXIT_V1` sweep never closes an early position
 (`EARLY_POSITION_OWN_EXIT_POLICY`), and this sweep never closes a normal one.
 
+`PaperExitService` — the one exit boundary for normal and early exits — judges a
+sale only on a reading of the held market: the reading's `MarketIdentity` must
+equal the case's (provider, chain, network, pool, assets, venue, fixture flag;
+a case without a pool locator accepts one that adds it). Any other reading is
+refused as `EXIT_MARKET_IDENTITY_MISMATCH` before anything is written.
+
 Every exit is a **full** exit through the existing `PaperExitService`: whole
 holding, fresh ATLAS exit read, SENTINEL SELL check, one order per key, one
 exit per cycle enforced by the database, fill + ledger + exit record in one
@@ -171,10 +177,19 @@ the exit.
   loaded (pages of 20, at most 5); each candidate is re-read as the recorder's
   `MarketSnapshot` and its price checked exactly, so the ordering only
   proposes. No migration: the price is read through the portable JSON path
-  (`#>>` on PostgreSQL, `json_extract` on SQLite). A stored row that cannot be
-  read as a snapshot is skipped and marks the peak as a lower bound
-  (`peak.truncated = true`); a trailing exit on a lower bound is still correct,
-  a hold on one is reported as `EARLY_EXIT_PEAK_INCOMPLETE`.
+  (`#>>` on PostgreSQL, `json_extract` on SQLite). On PostgreSQL only text
+  shaped like a bounded number (digits, optional fraction, optional short
+  exponent — `Decimal`'s own forms, e.g. `4.5E-7`) is ever cast, so damaged
+  text cannot abort the query; SQLite's cast never raises.
+- **Damaged data is never a complete history.** Every row in the window that
+  claims an available price is counted, and so is every row whose price is a
+  positive number the ranking can use; any difference — non-numeric, empty,
+  missing, null, negative, NaN — marks the peak as a lower bound
+  (`peak.truncated = true`). So does a candidate that cannot be read as a
+  `MarketSnapshot` or whose price is at or above the ledger bound of 10^20 USD;
+  such a row is skipped, never the peak. A trailing exit on a lower bound is
+  still correct (the true peak, and so its trailing level, can only be
+  higher); a hold on one is reported as `EARLY_EXIT_PEAK_INCOMPLETE`.
 - **Missing or stale data:** an unknown mark fires no price trigger and is
   reported (`EARLY_EXIT_MARK_UNKNOWN`); unknown liquidity fires no
   invalidation. The time exit needs neither — but the sale still needs a

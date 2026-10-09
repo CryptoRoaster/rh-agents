@@ -642,3 +642,77 @@ async def test_liquidity_from_another_provider_never_invalidates_the_position(ri
 
     assert result.triggers.get("LIQUIDITY_INVALIDATION") is None, result
     assert result.executed == 0
+
+
+def _priced(row, value):
+    """A stored row whose recorded price field is `value` (or absent for ...)."""
+    broken = dict(row)
+    payload = dict(row["payload"])
+    price = dict(payload["price"])
+    if value is ...:
+        price.pop("value_usd", None)
+    else:
+        price["value_usd"] = value
+    payload["price"] = price
+    broken["payload"] = payload
+    return broken
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["unbekannt", "", ..., "1e40", "9" * 30, "-5", "NaN", None],
+    ids=["text", "empty", "missing", "exponent-huge", "huge", "negative", "nan", "null"],
+)
+async def test_a_damaged_price_never_breaks_or_becomes_the_peak(risk_db, now, value):
+    _, sessions = risk_db
+    await early_entry(sessions, now)
+    t1 = now + timedelta(minutes=1)
+    [damaged] = _rows([held_at(t1, "9.00", label=f"damaged-{value!r}")])
+    await bulk_observe(
+        sessions, [_priced(damaged, value), *_rows([held_at(t1, "3.00", label="valid-peak")])]
+    )
+    at = now + timedelta(hours=1)
+    await observe(sessions, at, price="1.50")
+
+    result = await swept(sessions, at)
+
+    # The valid 3.00 decides: 1.50 is exactly half of it.
+    assert result.triggers == {"TRAILING_STOP": 1}, result
+    [row] = await exit_rows(sessions)
+    peak = row.exit_trigger_basis["inputs"]["peak"]
+    assert Decimal(peak["price_usd"]) == Decimal("3.00")
+    # A damaged row in the window is never silently a complete history.
+    assert peak["truncated"] is True
+
+
+async def test_tiny_prices_in_exponent_form_are_ranked_not_called_damaged(risk_db, now):
+    """Meme prices are stored as e.g. '4.5E-7'; they are prices, and complete ones."""
+    from src.orchestration.exitpolicy.early import observed_peak
+
+    _, sessions = risk_db
+    await early_entry(sessions, now)
+    t1 = now + timedelta(minutes=1)
+    tiny = [
+        held_at(t1 + timedelta(seconds=index), price, label=f"tiny-{index}")
+        for index, price in enumerate(["0.0000001", "0.00000045", "0.000000012345"])
+    ]
+    rows = _rows(tiny)
+    assert {row["payload"]["price"]["value_usd"] for row in rows} == {"1E-7", "4.5E-7", "1.2345E-8"}
+    await bulk_observe(sessions, rows)
+    async with sessions() as session:
+        position = await session.scalar(
+            select(PositionRow).where(PositionRow.asset_id == HELD.base_asset_id)
+        )
+        peak = await observed_peak(
+            session, position_from(position), since=now, until=now + timedelta(hours=1)
+        )
+
+    assert peak.price_usd == Decimal("4.5E-7")
+    assert peak.observations == 3
+    assert peak.truncated is False
+
+
+def position_from(row):
+    from src.data.repository import read_position
+
+    return read_position(row)

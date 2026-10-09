@@ -77,6 +77,10 @@ class ExitRefusal(StrEnum):
     # A fresh input the sale needs is missing: market, price, token metadata,
     # cost basis or the holder measurement. Missing is never defaulted.
     EXIT_DATA_INCOMPLETE = "EXIT_DATA_INCOMPLETE"
+    # The market reading the sale would be judged on is not a reading of the
+    # held market: another provider, chain, network, pool or asset. Never priced,
+    # routed or sent to SENTINEL; nothing is written.
+    EXIT_MARKET_IDENTITY_MISMATCH = "EXIT_MARKET_IDENTITY_MISMATCH"
     DECISION_BASIS_EXPIRED = "DECISION_BASIS_EXPIRED"
     SOURCE_OLDER_THAN_RISK_LIMIT = "SOURCE_OLDER_THAN_RISK_LIMIT"
     PORTFOLIO_MARKS_UNAVAILABLE = "PORTFOLIO_MARKS_UNAVAILABLE"

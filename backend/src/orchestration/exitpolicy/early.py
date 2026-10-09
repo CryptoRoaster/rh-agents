@@ -41,7 +41,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, Field, ValidationError
-from sqlalchemy import Numeric, cast, func, select
+from sqlalchemy import Float, case, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.clock import Clock, SystemClock
@@ -191,6 +191,29 @@ def _price_status() -> Any:
     return MarketObservationRow.payload[("price", "status")].as_string()
 
 
+# A stored price the ranking may cast: digits, an optional fraction, an optional
+# short exponent — the shapes `Decimal` serialises to, bounded so no cast can
+# overflow. Anything else is never cast at all.
+_NUMERIC_TEXT = r"^[0-9]{1,40}([.][0-9]{1,40})?([eE][-+]?[0-9]{1,2})?$"
+# The ledger's own bound (`Numeric(38, 18)`): a price at or above it is damaged.
+MAX_PEAK_PRICE_USD = Decimal(10) ** 20
+
+
+def _orderable_price(session: AsyncSession) -> Any:
+    """The recorded price as a number the database can rank, or NULL.
+
+    PostgreSQL raises on a cast of non-numeric text, so the cast only happens
+    for text that matches a bounded number; everything else ranks as NULL and
+    is never a candidate. SQLite (lightweight tests only) casts any text
+    without raising. The ranking is approximate by design — every candidate is
+    re-read and compared exactly.
+    """
+    text = _price_text()
+    if session.get_bind().dialect.name == "postgresql":
+        return case((text.op("~")(_NUMERIC_TEXT), cast(text, Float)), else_=None)
+    return cast(text, Float)
+
+
 async def observed_peak(
     session: AsyncSession,
     position: Position,
@@ -222,20 +245,26 @@ async def observed_peak(
         MarketObservationRow.observed_at <= until,
         MarketObservationRow.available.is_(True),
         _price_status() == Availability.AVAILABLE.value,
-        _price_text().is_not(None),
     ]
     if position.market_provider is not None:
         window.append(MarketObservationRow.provider == position.market_provider)
     if not include_fixtures:
         window.append(MarketObservationRow.is_fixture.is_(False))
-    priced = cast(_price_text(), Numeric(38, 18))
+    priced = _orderable_price(session)
+    # Every row in the window claims an available price; only those whose
+    # stored text is a bounded, positive number can be ranked. Any difference
+    # is damaged data, and a peak read past damaged data is a lower bound.
+    claimed = (
+        await session.scalar(select(func.count()).select_from(MarketObservationRow).where(*window))
+    ) or 0
     counted = (
         await session.scalar(
             select(func.count()).select_from(MarketObservationRow).where(*window, priced > 0)
         )
     ) or 0
+    damaged = claimed > counted
     if counted == 0:
-        return ObservedPeak()
+        return ObservedPeak(observations=0, truncated=damaged)
     statement = (
         select(MarketObservationRow)
         .where(*window, priced > 0)
@@ -260,7 +289,9 @@ async def observed_peak(
             price = snapshot.price
             if price.status != Availability.AVAILABLE or price.value_usd is None:
                 continue
-            if price.value_usd <= 0:
+            if price.value_usd <= 0 or price.value_usd >= MAX_PEAK_PRICE_USD:
+                # Not a price the ledger could hold: damaged, never a peak.
+                unreadable = True
                 continue
             # Exact comparison within the page: the ordering only proposes.
             if best is None or price.value_usd > best[0]:
@@ -273,7 +304,7 @@ async def observed_peak(
                 observed_at=best[1],
                 observation_id=best[2],
                 observations=counted,
-                truncated=unreadable,
+                truncated=unreadable or damaged,
             )
         if len(rows) < page:
             break
