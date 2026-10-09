@@ -144,6 +144,17 @@ provider's newer reading of the same pool is never selected, and without an
 own current reading the answer is UNKNOWN/UNAVAILABLE, never a fallback.
 `latest(pair_id)` is unchanged for every other consumer.
 
+The scope is applied **before** the newest event is chosen: provider, chain,
+network and base asset as columns, quote asset, venue, fixture flag and (for a
+located market) the pool locator from the stored payload; the newest event is
+then ranked per full market. A newer reading of any other market under the
+same pool id cannot hide the held one, and an unavailable or stale newest own
+event is never replaced by an older one. The full identity comes from the case
+that bought the holding (`held_market_identities`: position → cycle → entry →
+case); a holding with only a partial scope (no quote or venue recorded) is
+answered only if exactly one current market fits it — two are ambiguous and
+UNKNOWN.
+
 `PaperExitService` — the one exit boundary for normal and early exits — still
 checks the selected reading once more before anything is priced or sold: its
 `MarketIdentity` must equal the case's (`describes_market`: provider, chain,

@@ -68,18 +68,21 @@ class MarketScope:
             base_asset_id=position.asset_id,
         )
 
-    def matches(self, snapshot: MarketSnapshot) -> bool:
-        observed = snapshot.pair.market_identity
+    def matches_identity(self, identity: MarketIdentity) -> bool:
+        """Whether a full identity agrees with every field this scope knows."""
         for recorded, named in (
-            (observed.pair_id, self.pair_id),
-            (observed.provider, self.provider),
-            (observed.chain, self.chain),
-            (observed.network, self.network),
-            (observed.base_asset_id, self.base_asset_id),
+            (identity.pair_id, self.pair_id),
+            (identity.provider, self.provider),
+            (identity.chain, self.chain),
+            (identity.network, self.network),
+            (identity.base_asset_id, self.base_asset_id),
         ):
             if named is not None and recorded != named:
                 return False
-        return self.identity is None or describes_market(observed, self.identity)
+        return self.identity is None or describes_market(identity, self.identity)
+
+    def matches(self, snapshot: MarketSnapshot) -> bool:
+        return self.matches_identity(snapshot.pair.market_identity)
 
 
 class ScopedMarketInput(Protocol):

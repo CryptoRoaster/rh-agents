@@ -75,7 +75,7 @@ from src.orchestration.strategy.early import (
     limits_for,
 )
 from src.orchestration.valuation.models import PortfolioValuation, unvaluable_reason
-from src.orchestration.valuation.service import PositionValuationReader
+from src.orchestration.valuation.service import PositionValuationReader, held_market_identities
 from src.orchestration.workflow.engine import active_evidence
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
@@ -138,19 +138,16 @@ class OneSnapshot:
     async def latest_in(
         self, scope: MarketScope, *, include_fixtures: bool = False
     ) -> RecordedMarket | None:
-        """The held market's own reading, read once per stream like `latest`.
+        """The scoped market's own reading, read once per scope like `latest`.
 
-        One read per provider's stream of a pool, however many scopes ask:
-        the valuation and the sale must describe the same observation. Each
-        scope then accepts the reading only if it is of its market.
+        The mark and the sale of one holding ask with the same scope — the
+        case's full identity — so both describe the same observation.
         """
-        stream = MarketScope(pair_id=scope.pair_id, provider=scope.provider)
-        if stream not in self._scoped:
-            self._scoped[stream] = await latest_in(
-                self._markets, stream, include_fixtures=include_fixtures or self._include_fixtures
+        if scope not in self._scoped:
+            self._scoped[scope] = await latest_in(
+                self._markets, scope, include_fixtures=include_fixtures or self._include_fixtures
             )
-        found = self._scoped[stream]
-        return found if found is not None and scope.matches(found) else None
+        return self._scoped[scope]
 
 
 @dataclass(frozen=True)
@@ -501,10 +498,12 @@ class RiskRequestService:
             positions = [
                 read_position(item) for item in (await session.scalars(select(PositionRow))).all()
             ]
+            identities = await held_market_identities(session, positions)
         return await PositionValuationReader(
             markets=feed,
             max_age_seconds=self.limits.max_snapshot_age_seconds,
             include_fixtures=self.include_fixtures,
+            identities=identities,
         ).value(positions, self.clock.now())
 
     async def _assess(

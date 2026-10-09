@@ -94,30 +94,76 @@ class MarketReader:
     ) -> MarketSnapshot | None:
         """The newest current reading of exactly the scoped market, or None.
 
-        `latest` answers for a pool across every provider that observed it;
-        this answers only from the scoped provider's own stream of that pool.
-        Same ranking and freshness as `markets`: the stream's newest event
-        decides, an unavailable or contradicting newest event is never replaced
-        by an older one, and no other provider's reading stands in for it.
+        `latest` answers for a pool across every source that observed it; this
+        answers only from the scoped market's own stream. Every identity field
+        the scope knows is applied *before* the newest event is chosen —
+        provider, chain, network and base asset as columns, quote asset, venue,
+        fixture flag and pool locator from the stored payload — so a newer
+        reading of any other market under the same pool id can never hide the
+        held one. Same freshness as `markets`: the stream's newest event
+        decides, and an unavailable, stale or contradicting newest event is
+        never replaced by an older one.
+
+        A scope that knows only part of the identity (a position recorded
+        before its quote and venue were) is answered only if exactly one market
+        fits it; two current markets under one partial scope are ambiguous, and
+        ambiguity is not an answer.
         """
         now = self._clock.now()
-        ranked = select(
-            Row.id,
-            func.row_number()
-            .over(
-                partition_by=(Row.provider, Row.pair_id, Row.is_fixture),
-                order_by=(Row.observed_at.desc(), Row.recorded_at.desc(), Row.id.desc()),
+        quote = Row.payload[("pair", "quote", "asset_id")].as_string()
+        venue = Row.payload[("pair", "venue")].as_string()
+        known = [Row.pair_id == scope.pair_id]
+        for column, value in (
+            (Row.provider, scope.provider),
+            (Row.chain, scope.chain),
+            (Row.network, scope.network),
+            (Row.asset_id, scope.base_asset_id),
+        ):
+            if value is not None:
+                known.append(column == value)
+        identity = scope.identity
+        if identity is not None:
+            known += [
+                quote == identity.quote_asset_id,
+                venue == identity.venue,
+                Row.is_fixture.is_(identity.is_fixture),
+            ]
+            if identity.pool_locator is not None:
+                # A located market is only ever read with its own locator; a
+                # market recorded without one accepts readings either way.
+                known += [
+                    Row.payload[("pair", "pool_locator", "value")].as_string()
+                    == identity.pool_locator.value,
+                    Row.payload[("pair", "pool_locator", "kind")].as_string()
+                    == identity.pool_locator.kind.value,
+                ]
+        ranked = (
+            select(
+                Row.id,
+                func.row_number()
+                .over(
+                    partition_by=(
+                        Row.provider,
+                        Row.pair_id,
+                        Row.is_fixture,
+                        Row.chain,
+                        Row.network,
+                        Row.asset_id,
+                        quote,
+                        venue,
+                    ),
+                    order_by=(Row.observed_at.desc(), Row.recorded_at.desc(), Row.id.desc()),
+                )
+                .label("rank"),
             )
-            .label("rank"),
-        ).where(Row.pair_id == scope.pair_id)
-        if scope.provider is not None:
-            ranked = ranked.where(Row.provider == scope.provider)
-        newest = ranked.subquery()
+            .where(*known)
+            .subquery()
+        )
         statement = (
             select(Row)
-            .join(newest, Row.id == newest.c.id)
+            .join(ranked, Row.id == ranked.c.id)
             .where(
-                newest.c.rank == 1,
+                ranked.c.rank == 1,
                 Row.available.is_(True),
                 Row.observed_at <= now,
                 Row.freshness_at >= now - self._max_age,
@@ -132,10 +178,21 @@ class MarketReader:
             rows = (await session.scalars(statement)).all()
             snapshots = [MarketSnapshot.model_validate(row.payload) for row in rows]
         checked_at = self._clock.now()
-        for snapshot in snapshots:
-            if snapshot.is_valid_at(checked_at, self._max_age) and scope.matches(snapshot):
-                return snapshot
-        return None
+        current = [
+            item
+            for item in snapshots
+            if item.is_valid_at(checked_at, self._max_age) and scope.matches(item)
+        ]
+        if not current:
+            return None
+        if identity is None:
+            markets = {
+                item.pair.market_identity.model_copy(update={"pool_locator": None})
+                for item in current
+            }
+            if len(markets) > 1:
+                return None
+        return current[0]
 
     async def identities(
         self,

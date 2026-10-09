@@ -60,7 +60,7 @@ from src.orchestration.paperexit.service import (
 )
 from src.orchestration.riskrequest.service import OneSnapshot
 from src.orchestration.strategy.early import EARLY_ENTRY_V1, PRE_VECTOR_EARLY_ENTRY_V1
-from src.orchestration.valuation.service import PositionValuationReader
+from src.orchestration.valuation.service import PositionValuationReader, held_market_identities
 from src.orchestration.valuation.service import _same_market as same_market
 
 EARLY_EXIT_VERSION: Literal["EARLY_PAPER_EXIT_V1"] = "EARLY_PAPER_EXIT_V1"
@@ -396,15 +396,26 @@ class EarlyExitService:
         self, position: Position, entry: TradeCaseExecutionRow, now: datetime
     ) -> EarlyExitInputs:
         feed = OneSnapshot(self.markets, self.include_fixtures)
+        async with self.sessions() as session:
+            identities = await held_market_identities(session, [position])
         valuation = await PositionValuationReader(
             markets=feed,
             max_age_seconds=self.limits.max_snapshot_age_seconds,
             include_fixtures=self.include_fixtures,
+            identities=identities,
         ).value([position], now)
         mark = valuation.by_asset.get(position.asset_id)
         liquidity: Decimal | None = None
         if position.market_pair_id is not None:
-            scope = MarketScope.held(position)
+            held = MarketScope.held(position)
+            identity = identities.get(position.asset_id)
+            # The case's full identity when it agrees with the holding, so the
+            # liquidity is read from exactly the market the mark was.
+            scope = (
+                MarketScope.of(identity)
+                if held is not None and identity is not None and held.matches_identity(identity)
+                else held
+            )
             snapshot = None if scope is None else await feed.latest_in(scope)
             if (
                 snapshot is not None

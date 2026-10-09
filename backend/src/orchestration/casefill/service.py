@@ -67,7 +67,7 @@ from src.orchestration.valuation.models import (
     PortfolioValuation,
     unvaluable_reason,
 )
-from src.orchestration.valuation.service import PositionValuationReader
+from src.orchestration.valuation.service import PositionValuationReader, held_market_identities
 from src.orchestration.workflow.engine import active_evidence
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
@@ -571,10 +571,12 @@ class CaseFillService:
         """Price every open holding from the market it was acquired in."""
         async with self.sessions() as session:
             positions = await self.paper.positions_in_session(session)
+            identities = await held_market_identities(session, positions)
         return await PositionValuationReader(
             markets=feed,
             max_age_seconds=self.limits.max_snapshot_age_seconds,
             include_fixtures=self.include_fixtures,
+            identities=identities,
         ).value(positions, self.clock.now())
 
     async def _cycle(self, session: AsyncSession, trade_case: TradeCase) -> TradeCycleRow:
