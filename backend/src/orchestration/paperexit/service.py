@@ -60,6 +60,7 @@ from src.data.tables import (
 )
 from src.ledger.portfolio import portfolio_basis, portfolio_state
 from src.markets.models import Availability, MarketIdentity
+from src.markets.models import MarketSnapshot as RecordedSnapshot
 from src.orchestration.casefill.models import notional_of
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
@@ -412,6 +413,14 @@ class PaperExitService:
                 trade_case_id=trade_case.id,
                 readiness=readiness,
             )
+        # The reading every check below would describe must be of the held
+        # market, before completeness or freshness is even asked about it.
+        if snapshot is not None and not _reading_of(snapshot, trade_case.market):
+            return _refused(
+                position_id,
+                ExitRefusal.EXIT_MARKET_IDENTITY_MISMATCH,
+                trade_case_id=trade_case.id,
+            )
 
         # The last clock read, after the last input read. Everything from
         # here to the verdict is synchronous, so one instant governs every
@@ -538,6 +547,12 @@ class PaperExitService:
             )
         if snapshot is None:
             return incomplete("MARKET_UNAVAILABLE")
+        if not _reading_of(snapshot, trade_case.market):
+            return _refused(
+                position_id,
+                ExitRefusal.EXIT_MARKET_IDENTITY_MISMATCH,
+                trade_case_id=trade_case.id,
+            )
         price = reference_price(snapshot)
         if price is None:
             return incomplete("REFERENCE_PRICE_UNAVAILABLE")
@@ -822,6 +837,24 @@ def _exit_intent(
         max_slippage_bps=costs.slippage_bps,
         mode=TradingMode.PAPER,
         timing=ExecutionTiming(detected_at=now, decision_at=now),
+    )
+
+
+def _reading_of(snapshot: RecordedSnapshot, market: MarketIdentity) -> bool:
+    """Whether a market reading describes exactly the market the case bought in.
+
+    The case's `MarketIdentity` is the authority — provider, chain, network,
+    pool, both assets, venue and fixture flag — and the reading's own identity
+    must equal it. One exception, the one the scout's watch identity allows: a
+    case opened before pool locators existed has none, and a reading that adds
+    one for the otherwise identical market completes it rather than
+    contradicting it.
+    """
+    observed = snapshot.pair.market_identity
+    if observed == market:
+        return True
+    return market.pool_locator is None and market == observed.model_copy(
+        update={"pool_locator": None}
     )
 
 

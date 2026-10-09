@@ -522,6 +522,8 @@ class RunSummary(Immutable):
     pre_risk_refusals: int = Field(default=0, ge=0)
     # Absent unless automatic PAPER exits are configured.
     exits: ExitReport | None = None
+    # The EARLY_PAPER_EXIT_V1 sweep; absent unless EARLY_PAPER_EXIT_ENABLED.
+    early_exits: ExitReport | None = None
     # Absent unless PRE_VECTOR_EARLY_ENTRY_V1 is enabled.
     early: EarlyEntryReport | None = None
     # Technical faults, as codes. Never a provider message and never a traceback.

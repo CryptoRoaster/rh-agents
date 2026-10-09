@@ -21,6 +21,7 @@ def early_settings(**overrides):
         "early_scout_enabled": True,
         "atlas_funding_graph_enabled": True,
         "pre_vector_early_entry_enabled": True,
+        "early_paper_exit_enabled": True,
         "paper_runner_max_candidates": 2,
         "paper_runner_max_new_cases": 2,
         "paper_runner_max_cases": 2,
@@ -85,3 +86,33 @@ def test_one_early_fill_per_run_is_checked_before_anything_is_asked():
     assert limited(None, early, spent) is True  # type: ignore[arg-type]
     assert limited(None, normal, spent) is False  # type: ignore[arg-type]
     assert limited(None, early, SimpleNamespace(early=None)) is False  # type: ignore[arg-type]
+
+
+def test_early_entries_require_the_early_exit_contract():
+    import pytest
+
+    with pytest.raises(ValueError, match="EARLY_PAPER_EXIT_ENABLED"):
+        early_settings(early_paper_exit_enabled=False)
+    # The exit may run alone, so open early positions can be wound down.
+    alone = runner_settings(early_paper_exit_enabled=True)
+    assert alone.early_paper_exit_enabled and not alone.pre_vector_early_entry_enabled
+    assert runner_settings().early_paper_exit_enabled is False
+    with pytest.raises(ValueError, match="EARLY_PAPER_EXIT_ENABLED requires"):
+        runner_settings(early_paper_exit_enabled=True, paper_runner_enabled=False)
+
+
+async def test_the_early_exit_sweep_is_composed_only_under_its_flag(risk_db):
+    _, sessions = risk_db
+    assert stack_for(sessions, runner_settings(), NOW).early_exits is None
+    stack = stack_for(sessions, runner_settings(early_paper_exit_enabled=True), NOW)
+    assert stack.early_exits is not None
+    assert stack.early_exits.policy.version == "EARLY_PAPER_EXIT_V1"
+
+
+async def test_a_run_reports_the_early_exit_sweep(risk_db):
+    _, sessions = risk_db
+    off = await run(sessions, runner_settings(), NOW)
+    assert off.early_exits is None
+    on = await run(sessions, runner_settings(early_paper_exit_enabled=True), NOW)
+    assert on.early_exits is not None
+    assert (on.early_exits.evaluated, on.early_exits.executed) == (0, 0)

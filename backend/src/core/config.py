@@ -361,6 +361,12 @@ class Settings(BaseSettings):
     # funding graph or the normal intake. Every number of the strategy is a
     # versioned constant in `orchestration/strategy/early.py`, not a setting.
     pre_vector_early_entry_enabled: bool = False
+    # EARLY_PAPER_EXIT_V1: the exit sweep for PRE_VECTOR_EARLY_ENTRY_V1 positions.
+    # Off by default. Early entries need it on — no early position may be opened
+    # without the contract that closes it — but it may run on its own, so open
+    # early positions can still be wound down after entries are switched off.
+    # Its numbers are versioned constants in `orchestration/exitpolicy/early.py`.
+    early_paper_exit_enabled: bool = False
     # Pools one new-pool read may bring back, per configured chain.
     early_scout_max_discovery_pools: int = Field(default=10, ge=1, le=20)
     # Discovery capacity is deliberately decoupled from model-review capacity.
@@ -445,6 +451,15 @@ class Settings(BaseSettings):
             # The authoritative age is ATLAS's chain-side creation timestamp,
             # recorded with the funding graph's provenance.
             raise ValueError("PRE_VECTOR_EARLY_ENTRY_ENABLED requires ATLAS_FUNDING_GRAPH_ENABLED")
+        if not self.early_paper_exit_enabled:
+            # No early position may be opened without the contract that closes it.
+            raise ValueError("PRE_VECTOR_EARLY_ENTRY_ENABLED requires EARLY_PAPER_EXIT_ENABLED")
+        return self
+
+    @model_validator(mode="after")
+    def early_paper_exit_configuration(self) -> "Settings":
+        if self.early_paper_exit_enabled and not self.paper_runner_enabled:
+            raise ValueError("EARLY_PAPER_EXIT_ENABLED requires the bounded paper run")
         return self
 
     @model_validator(mode="after")

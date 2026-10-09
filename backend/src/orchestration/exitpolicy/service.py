@@ -21,7 +21,7 @@ second sale of the same holding.
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -62,7 +62,12 @@ class ExitSweep:
         self.refusals[code] = self.refusals.get(code, 0) + 1
 
 
-def exit_request_key(policy: PaperExitPolicy, cycle_id: Any, now: datetime) -> str:
+class VersionedPolicy(Protocol):
+    @property
+    def version(self) -> str: ...
+
+
+def exit_request_key(policy: VersionedPolicy, cycle_id: Any, now: datetime) -> str:
     return f"auto-exit:{policy.version}:{cycle_id}:{now.strftime('%Y%m%dT%H%M')}"
 
 
@@ -86,11 +91,17 @@ class AutoExitService:
                 if item.quantity > 0 and item.cycle_id is not None
             ]
             entries = await self._entries(session, positions)
+            early = await _early_cycles(session, list(entries.values()))
         for position in sorted(positions, key=lambda item: str(item.id)):
             entry = entries.get(position.cycle_id)
             if entry is None:
                 # No case-bound entry: not a position this policy may close.
                 result.refused("POSITION_ORIGIN_UNKNOWN")
+                continue
+            if position.cycle_id in early:
+                # PRE_VECTOR_EARLY_ENTRY_V1 has its own exit contract,
+                # EARLY_PAPER_EXIT_V1. This policy never closes its positions.
+                result.refused("EARLY_POSITION_OWN_EXIT_POLICY")
                 continue
             now = self.clock.now()
             inputs = await self._inputs(position, entry, now)
@@ -169,6 +180,27 @@ class AutoExitService:
             min_liquidity_usd=self.limits.min_liquidity_usd,
             now=now,
         )
+
+
+async def _early_cycles(session: AsyncSession, entries: list[TradeCaseExecutionRow]) -> set[Any]:
+    """Which of these entries an early case made."""
+    from src.data.tables import TradeCaseRow
+    from src.orchestration.strategy.early import PRE_VECTOR_EARLY_ENTRY_V1
+
+    cases = [item.trade_case_id for item in entries]
+    if not cases:
+        return set()
+    early = set(
+        (
+            await session.scalars(
+                select(TradeCaseRow.id).where(
+                    TradeCaseRow.id.in_(cases),
+                    TradeCaseRow.strategy_policy_id == PRE_VECTOR_EARLY_ENTRY_V1,
+                )
+            )
+        ).all()
+    )
+    return {item.cycle_id for item in entries if item.trade_case_id in early}
 
 
 def _basis(policy: PaperExitPolicy, inputs: ExitInputs, verdict: ExitVerdict) -> dict[str, Any]:
