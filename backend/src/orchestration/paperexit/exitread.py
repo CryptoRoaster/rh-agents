@@ -26,6 +26,7 @@ from src.agents.atlas.policy import ATLAS_EXIT_POLICY_V2, AtlasPolicy, evaluate_
 from src.core.clock import Clock, SystemClock
 from src.markets.models import MarketIdentity
 from src.orchestration.workflow.models import OnchainPayload
+from src.runtime.models import RuntimeFailure
 
 
 class ExitReadUnavailable(Exception):
@@ -82,6 +83,13 @@ class AtlasExitRead:
             snapshot = await self.builder.build(trade_case_id, task_id, market)
         except AtlasContextUnavailable as error:
             raise ExitReadUnavailable(error.reason_code) from None
+        except RuntimeFailure as failure:
+            # The chain RPC's own typed failure — timeout, connectivity, rate
+            # limit, outage, a mismatched chain. A read that could not be taken
+            # is unavailable for this one sale, by name, and asked again next
+            # time; it must never end the sweep. Anything else is a defect and
+            # still surfaces.
+            raise ExitReadUnavailable(f"ONCHAIN_RPC_{failure.code.value}") from None
         decision = evaluate_snapshot(snapshot, self.clock.now(), self.policy)
         return ExitOnchainRead(
             trade_case_id=trade_case_id,
