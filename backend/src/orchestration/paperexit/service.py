@@ -61,6 +61,7 @@ from src.data.tables import (
 from src.ledger.portfolio import portfolio_basis, portfolio_state
 from src.markets.models import Availability, MarketIdentity
 from src.markets.models import MarketSnapshot as RecordedSnapshot
+from src.markets.scope import HeldMarketFeed, MarketScope, describes_market
 from src.orchestration.casefill.models import notional_of
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
@@ -393,15 +394,19 @@ class PaperExitService:
         on-chain evidence ages past SENTINEL's bound within seconds of the fill,
         so this basis refuses almost every later exit, fail closed.
         """
+        # Every read of the held pool in this basis — the completeness check's
+        # included — is of the held market: its provider, chain, network,
+        # pool and assets. Another source's reading is never selected.
+        held_market = HeldMarketFeed(feed, MarketScope.of(trade_case.market))
         readiness = await RiskDataReader(
             cases=self.cases,
-            markets=feed,
+            markets=held_market,
             costs=self.costs,
             clock=self.clock,
             pause=self.pause,
             include_fixtures=self.include_fixtures,
         ).readiness(trade_case.id)
-        snapshot = await feed.latest(trade_case.market.pair_id)
+        snapshot = await held_market.latest(trade_case.market.pair_id)
         current = active_evidence(await self.cases.evidence(trade_case.id))
         appeared = valuation.unconsidered(held)
         if appeared:
@@ -512,7 +517,11 @@ class PaperExitService:
         holder measurement means no sale. What remains is SENTINEL's to judge,
         with the SELL semantics it owns.
         """
-        snapshot = await feed.latest(trade_case.market.pair_id)
+        # Every read of the held pool in this basis — the completeness check's
+        # included — is of the held market: its provider, chain, network,
+        # pool and assets. Another source's reading is never selected.
+        held_market = HeldMarketFeed(feed, MarketScope.of(trade_case.market))
+        snapshot = await held_market.latest(trade_case.market.pair_id)
         appeared = valuation.unconsidered(held)
         if appeared:
             return _refused(
@@ -843,19 +852,10 @@ def _exit_intent(
 def _reading_of(snapshot: RecordedSnapshot, market: MarketIdentity) -> bool:
     """Whether a market reading describes exactly the market the case bought in.
 
-    The case's `MarketIdentity` is the authority — provider, chain, network,
-    pool, both assets, venue and fixture flag — and the reading's own identity
-    must equal it. One exception, the one the scout's watch identity allows: a
-    case opened before pool locators existed has none, and a reading that adds
-    one for the otherwise identical market completes it rather than
-    contradicting it.
+    Kept as the last check before anything is priced or sold, independent of
+    how the reading was selected: the one identity rule, `describes_market`.
     """
-    observed = snapshot.pair.market_identity
-    if observed == market:
-        return True
-    return market.pool_locator is None and market == observed.model_copy(
-        update={"pool_locator": None}
-    )
+    return describes_market(snapshot.pair.market_identity, market)
 
 
 def _same_market(position: Position, market: MarketIdentity) -> bool:

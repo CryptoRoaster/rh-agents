@@ -31,6 +31,7 @@ from src.core.models import Position, RiskLimits
 from src.data.repository import aware
 from src.data.tables import TradeCaseExecutionRow
 from src.markets.models import Availability
+from src.markets.scope import MarketScope
 from src.orchestration.exitpolicy.policy import (
     ExitInputs,
     ExitVerdict,
@@ -163,7 +164,10 @@ class AutoExitService:
         mark = valuation.by_asset.get(position.asset_id)
         liquidity: Decimal | None = None
         if position.market_pair_id is not None:
-            snapshot = await feed.latest(position.market_pair_id)
+            scope = MarketScope.held(position)
+            # The held market's own reading only; another source's reading of
+            # the pool is not this position's liquidity.
+            snapshot = None if scope is None else await feed.latest_in(scope)
             if (
                 snapshot is not None
                 and snapshot.liquidity.status == Availability.AVAILABLE

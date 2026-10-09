@@ -49,6 +49,7 @@ from src.core.models import Position, RiskLimits
 from src.data.repository import aware
 from src.data.tables import MarketObservationRow, TradeCaseExecutionRow, TradeCaseRow
 from src.markets.models import Availability, MarketSnapshot
+from src.markets.scope import MarketScope
 from src.orchestration.exitpolicy.policy import Immutable
 from src.orchestration.exitpolicy.service import ExitSweep, exit_request_key
 from src.orchestration.paperexit.models import PaperExitRecorded
@@ -241,6 +242,7 @@ async def observed_peak(
         return ObservedPeak()
     window = [
         MarketObservationRow.pair_id == position.market_pair_id,
+        MarketObservationRow.asset_id == position.asset_id,
         MarketObservationRow.observed_at >= since,
         MarketObservationRow.observed_at <= until,
         MarketObservationRow.available.is_(True),
@@ -248,6 +250,10 @@ async def observed_peak(
     ]
     if position.market_provider is not None:
         window.append(MarketObservationRow.provider == position.market_provider)
+    if position.market_chain is not None:
+        window.append(MarketObservationRow.chain == position.market_chain)
+    if position.market_network is not None:
+        window.append(MarketObservationRow.network == position.market_network)
     if not include_fixtures:
         window.append(MarketObservationRow.is_fixture.is_(False))
     priced = _orderable_price(session)
@@ -398,7 +404,8 @@ class EarlyExitService:
         mark = valuation.by_asset.get(position.asset_id)
         liquidity: Decimal | None = None
         if position.market_pair_id is not None:
-            snapshot = await feed.latest(position.market_pair_id)
+            scope = MarketScope.held(position)
+            snapshot = None if scope is None else await feed.latest_in(scope)
             if (
                 snapshot is not None
                 # The held market's own reading: same pool, and the same chain,

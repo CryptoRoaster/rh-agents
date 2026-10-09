@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.core.clock import Clock, SystemClock
 from src.data.tables import MarketObservationRow as Row
 from src.markets.models import MarketCandidate, MarketIdentity, MarketSnapshot
+from src.markets.scope import MarketScope
 
 
 class MarketReader:
@@ -87,6 +88,54 @@ class MarketReader:
             identity=identity, include_fixtures=include_fixtures, limit=1
         )
         return snapshots[0] if snapshots else None
+
+    async def latest_in(
+        self, scope: MarketScope, *, include_fixtures: bool = False
+    ) -> MarketSnapshot | None:
+        """The newest current reading of exactly the scoped market, or None.
+
+        `latest` answers for a pool across every provider that observed it;
+        this answers only from the scoped provider's own stream of that pool.
+        Same ranking and freshness as `markets`: the stream's newest event
+        decides, an unavailable or contradicting newest event is never replaced
+        by an older one, and no other provider's reading stands in for it.
+        """
+        now = self._clock.now()
+        ranked = select(
+            Row.id,
+            func.row_number()
+            .over(
+                partition_by=(Row.provider, Row.pair_id, Row.is_fixture),
+                order_by=(Row.observed_at.desc(), Row.recorded_at.desc(), Row.id.desc()),
+            )
+            .label("rank"),
+        ).where(Row.pair_id == scope.pair_id)
+        if scope.provider is not None:
+            ranked = ranked.where(Row.provider == scope.provider)
+        newest = ranked.subquery()
+        statement = (
+            select(Row)
+            .join(newest, Row.id == newest.c.id)
+            .where(
+                newest.c.rank == 1,
+                Row.available.is_(True),
+                Row.observed_at <= now,
+                Row.freshness_at >= now - self._max_age,
+            )
+        )
+        if not include_fixtures:
+            statement = statement.where(Row.is_fixture.is_(False))
+        statement = statement.order_by(
+            Row.observed_at.desc(), Row.recorded_at.desc(), Row.id.desc()
+        )
+        async with self._sessions() as session:
+            rows = (await session.scalars(statement)).all()
+            snapshots = [MarketSnapshot.model_validate(row.payload) for row in rows]
+        checked_at = self._clock.now()
+        for snapshot in snapshots:
+            if snapshot.is_valid_at(checked_at, self._max_age) and scope.matches(snapshot):
+                return snapshot
+        return None
 
     async def identities(
         self,

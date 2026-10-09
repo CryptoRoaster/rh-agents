@@ -47,6 +47,7 @@ from src.ledger.portfolio import (
 )
 from src.markets.models import Availability
 from src.markets.models import MarketSnapshot as RecordedMarket
+from src.markets.scope import MarketScope, latest_in
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
 from src.orchestration.riskdata.context import RiskDataReader
@@ -123,6 +124,7 @@ class OneSnapshot:
         self._markets = markets
         self._include_fixtures = include_fixtures
         self._seen: dict[str, RecordedMarket | None] = {}
+        self._scoped: dict[MarketScope, RecordedMarket | None] = {}
 
     async def latest(
         self, identity: str, *, include_fixtures: bool = False
@@ -132,6 +134,23 @@ class OneSnapshot:
                 identity, include_fixtures=include_fixtures or self._include_fixtures
             )
         return self._seen[identity]
+
+    async def latest_in(
+        self, scope: MarketScope, *, include_fixtures: bool = False
+    ) -> RecordedMarket | None:
+        """The held market's own reading, read once per stream like `latest`.
+
+        One read per provider's stream of a pool, however many scopes ask:
+        the valuation and the sale must describe the same observation. Each
+        scope then accepts the reading only if it is of its market.
+        """
+        stream = MarketScope(pair_id=scope.pair_id, provider=scope.provider)
+        if stream not in self._scoped:
+            self._scoped[stream] = await latest_in(
+                self._markets, stream, include_fixtures=include_fixtures or self._include_fixtures
+            )
+        found = self._scoped[stream]
+        return found if found is not None and scope.matches(found) else None
 
 
 @dataclass(frozen=True)

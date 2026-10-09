@@ -13,12 +13,13 @@ possibility of a position appearing in between, and the callers close it by
 comparing what was valued against what they find under the lock.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Protocol
 
 from src.core.models import Position
 from src.markets.models import Availability, MarketSnapshot
+from src.markets.scope import MarketScope, latest_in
 from src.orchestration.valuation.models import (
     PortfolioValuation,
     PositionMark,
@@ -85,9 +86,21 @@ class PositionValuationReader:
             # one for it would resolve an ambiguity silently, in the one place
             # where being wrong misprices the whole portfolio.
             return ValuationRefusal.POSITION_MARKET_UNKNOWN
-        snapshot = await self.markets.latest(pair_id, include_fixtures=self.include_fixtures)
+        scope = MarketScope.held(holding)
+        assert scope is not None  # pair_id is known here
+        # The held market's own reading: its provider's stream of its pool,
+        # never whichever source recorded the pool last.
+        snapshot = await latest_in(self.markets, scope, include_fixtures=self.include_fixtures)
         if snapshot is None:
-            return ValuationRefusal.MARKET_NOT_RECORDED
+            # Said precisely, without using it: is there no reading at all, or
+            # only another market's?
+            other = await self.markets.latest(pair_id, include_fixtures=self.include_fixtures)
+            if other is None:
+                return ValuationRefusal.MARKET_NOT_RECORDED
+            if replace(scope, base_asset_id=None).matches(other):
+                # This market's own stream, pricing another asset.
+                return ValuationRefusal.PRICE_ASSET_MISMATCH
+            return ValuationRefusal.MARKET_IDENTITY_MISMATCH
         if snapshot.pair.pair_id != pair_id or not _same_market(snapshot, holding):
             return ValuationRefusal.MARKET_IDENTITY_MISMATCH
         price = snapshot.price

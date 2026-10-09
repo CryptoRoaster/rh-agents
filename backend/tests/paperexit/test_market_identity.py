@@ -118,7 +118,18 @@ async def test_a_reading_of_another_market_never_legitimises_a_sale(
     )
 
     assert result.kind == "exit_refused", result
-    assert result.reason is ExitRefusal.EXIT_MARKET_IDENTITY_MISMATCH
+    # The foreign reading is never selected: without the held market's own
+    # reading there is no market for the sale at all.
+    if fresh:
+        assert (result.reason, result.detail) == (
+            ExitRefusal.EXIT_DATA_INCOMPLETE,
+            "MARKET_UNAVAILABLE",
+        )
+    else:
+        assert result.reason in (
+            ExitRefusal.RISK_DATA_INCOMPLETE,
+            ExitRefusal.PORTFOLIO_MARKS_UNAVAILABLE,
+        ), result
     await nothing_written(sessions, cash)
 
 
@@ -148,7 +159,7 @@ async def test_a_refused_foreign_reading_is_retried_once_the_own_reading_exists(
     refused = await seller(
         sessions, at, Answering(foreign(reading(at), provider="another-provider"))
     ).execute_position_exit(position.id, request_key="retry")
-    assert refused.reason is ExitRefusal.EXIT_MARKET_IDENTITY_MISMATCH
+    assert refused.kind == "exit_refused"
 
     later = at + timedelta(minutes=1)
     own = market_feed(later, price=Decimal("0.90"))
@@ -215,3 +226,17 @@ async def test_the_normal_sweep_books_nothing_on_a_foreign_reading(risk_db, now,
 
     assert result.executed == 0, result
     await nothing_written(sessions, cash)
+
+
+def test_the_last_check_before_a_sale_still_refuses_another_market():
+    """Independent of how a reading was selected, the boundary checks it again."""
+    from src.orchestration.paperexit.service import _reading_of
+    from tests.riskdata.conftest import IDENTITY
+
+    at = LATER
+    from datetime import UTC, datetime
+
+    own = reading(datetime(2026, 9, 9, 12, tzinfo=UTC) + at)
+    assert _reading_of(own, IDENTITY)
+    for difference in ({"provider": "another-provider"}, {"network": "testnet"}, {"chain": "bsc"}):
+        assert not _reading_of(foreign(own, **difference), IDENTITY)
