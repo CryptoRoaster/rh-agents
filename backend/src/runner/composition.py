@@ -528,6 +528,33 @@ def build_stack(
         pause=supplied.pause,
         clock=tick,
     )
+    acquisition = None
+    pre_risk = None
+    if settings.paper_runner_market_acquisition_enabled:
+        # Composed from settings and nothing else, like every other port here.
+        # Its own transport is built when it runs and closed when it finishes,
+        # so a run that never reaches the stage opens no connection at all.
+        acquisition = BoundedMarketAcquisition(
+            settings,
+            sessions,
+            markets,
+            acquisition_limits_from_settings(settings),
+            pause=supplied.pause,
+            clock=tick,
+            http=supplied.market_http,
+        )
+        pre_risk = PreRiskMarketRefresh(
+            settings,
+            sessions,
+            markets,
+            paper.limits,
+            PreRiskLimits(
+                max_requests=settings.paper_runner_pre_risk_market_max_requests,
+                max_seconds=settings.paper_runner_pre_risk_market_max_seconds,
+            ),
+            clock=tick,
+            http=supplied.market_http,
+        )
     exits = None
     if settings.paper_auto_exit_enabled:
         # The one exit path, driven by a deterministic policy. Built only when
@@ -559,6 +586,11 @@ def build_stack(
             limits=paper.limits,
             max_exits=settings.paper_exit_max_per_run,
             clock=tick,
+            # The held market observed again after each exit's chain read, by
+            # the same bounded, exact-locator stage a risk request uses. Absent
+            # without market acquisition: then the trigger is judged again on
+            # what is recorded, under the same final freshness checks.
+            refresh=pre_risk,
         )
     early_exits = None
     if settings.early_paper_exit_enabled:
@@ -582,35 +614,9 @@ def build_stack(
             limits=paper.limits,
             max_exits=settings.paper_exit_max_per_run,
             clock=tick,
+            refresh=pre_risk,
         )
     runners, roles = _runners(settings, sessions, runtime, markets, supplied, tick)
-    acquisition = None
-    pre_risk = None
-    if settings.paper_runner_market_acquisition_enabled:
-        # Composed from settings and nothing else, like every other port here.
-        # Its own transport is built when it runs and closed when it finishes,
-        # so a run that never reaches the stage opens no connection at all.
-        acquisition = BoundedMarketAcquisition(
-            settings,
-            sessions,
-            markets,
-            acquisition_limits_from_settings(settings),
-            pause=supplied.pause,
-            clock=tick,
-            http=supplied.market_http,
-        )
-        pre_risk = PreRiskMarketRefresh(
-            settings,
-            sessions,
-            markets,
-            paper.limits,
-            PreRiskLimits(
-                max_requests=settings.paper_runner_pre_risk_market_max_requests,
-                max_seconds=settings.paper_runner_pre_risk_market_max_seconds,
-            ),
-            clock=tick,
-            http=supplied.market_http,
-        )
     return RunnerStack(
         settings=settings,
         sessions=sessions,

@@ -189,6 +189,41 @@ Every summary now carries `mode` (`FULL` / `EXITS_ONLY`), `lock`
 (`ACQUIRED`, `ALREADY_RUNNING`, or `NOT_SUPPORTED` on the SQLite test engine)
 and `duration_seconds` (monotonic). No scheduler is installed by any of this.
 
+### Pre-exit refresh (both exit sweeps, both jobs)
+
+A trigger is decided on the marks recorded at the start of the run, and each
+exit's own ATLAS chain read then takes its time. So every triggered automatic
+exit is judged again before it is sold, in this order:
+
+1. the exit's ATLAS read (no lock held);
+2. if its holder measurement is already older than SENTINEL's bound, the sale is
+   refused (`SOURCE_OLDER_THAN_RISK_LIMIT`, detail
+   `HOLDERS_OLDER_THAN_RISK_LIMIT`) and no provider is asked;
+3. one bounded refresh of the held market — and of every other open holding
+   SENTINEL values — by the stored pool locator, through the same stage, budget
+   (`PAPER_RUNNER_PRE_RISK_MARKET_MAX_REQUESTS`/`_MAX_SECONDS`) and identity
+   checks as the pre-risk refresh; no discovery, one attempt, no retry;
+4. the policy evaluated again on that reading — `EARLY_PAPER_EXIT_V1` with its
+   peak over the whole window since entry — and the sale recorded under the
+   trigger it is now, the first trigger kept beside it in the basis;
+5. under the account lock the held market's reading must be the one judged
+   (else `EXIT_EVIDENCE_CHANGED`), and SENTINEL's bound applies at the decision
+   and again at the execution boundary.
+
+Refusals: `PRE_EXIT_REFRESH_FAILED` (detail: the refresh's reason, e.g.
+`PROVIDER_FAILED`, `TIME_BUDGET_REACHED`, `MARKET_IDENTITY_MISMATCH`,
+`PRE_EXIT_REFRESH_BUDGET_REACHED`, or `MARK_UNAVAILABLE` when no current mark of
+the held market exists), `EXIT_TRIGGER_CLEARED`, `EXIT_EVIDENCE_CHANGED`. A stop
+in force asks no provider. Refresh attempts per sweep are bounded by
+`PAPER_EXIT_MAX_PER_RUN`. Without market acquisition there is no refresh stage;
+the trigger is then judged again on what is recorded.
+
+Each exit sweep in the summary adds `refresh_attempts`, `refresh_failures`,
+`refresh_provider_requests`, `triggers_cleared`, `triggers_changed`,
+`reevaluated_triggers`, `max_refresh_seconds`, `max_atlas_read_seconds`,
+`max_mark_age_at_trigger_seconds` and `max_mark_age_at_final_seconds`; a booked
+exit stores the same per sale under `basis.pre_exit`. No migration.
+
 ## 3. The preflight
 
 ```sh

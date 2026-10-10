@@ -27,8 +27,31 @@ deliberately does not exist yet. The exit is recorded beside the case instead.
 **Nothing here is an emergency.** A kill switch, `OBSERVE`, an unreadable stop
 and a durable pause all refuse the exit exactly as they refuse an entry. A
 position that cannot be sold within the limits is not sold.
+
+**An automatic trigger is judged again, on fresh evidence.** A sweep decides a
+trigger on the marks recorded when it started, and the exit's own on-chain read
+then takes seconds — tens of them on a slow chain. By the time the sale is
+judged, the mark the trigger saw can be older than SENTINEL's bound, and the
+price that fired a stop may have recovered. So a sweep passes a `confirm` step,
+and the order of work is fixed:
+
+1. the exit's own on-chain read (slow, before any lock);
+2. if what it measured is already older than SENTINEL's bound, nothing more is
+   asked: the sale cannot pass the final check, and no provider is called for it;
+3. `confirm`: the held market observed again — one bounded, exact-locator
+   refresh — and the policy evaluated again on that reading, with its historical
+   peak; a trigger that has gone is no sale, a changed one is recorded as changed;
+4. the portfolio valued on what was just recorded, then the locks;
+5. under the locks, the held market's reading must be exactly the one `confirm`
+   judged, and SENTINEL's bound is applied at the decision and again at the
+   execution boundary — a reading that aged past it in between is not booked.
+
+No lock is held across the chain read or the refresh, a stop in force asks no
+provider, and nothing a refresh failed to show fresh is replaced by older data.
 """
 
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -72,6 +95,7 @@ from src.orchestration.paperexit.exitread import (
     ExitReadUnavailable,
 )
 from src.orchestration.paperexit.models import (
+    ExitFreshness,
     ExitReading,
     ExitRefusal,
     ExitRefused,
@@ -124,6 +148,65 @@ class ExitTriggerRecord:
     basis: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ExitConfirmation:
+    """A trigger judged again on the held market observed after the slow read.
+
+    `trigger` is the policy's answer on that evidence: `None` means the trigger
+    has gone. `refusal` means nothing could be judged — the refresh failed or
+    its budget ended — and names why. `snapshot_id` is the held market's reading
+    the answer rests on; the sale is bound to exactly that reading.
+    """
+
+    trigger: ExitTriggerRecord | None
+    snapshot_id: UUID | None = None
+    refusal: str | None = None
+    original_trigger: str | None = None
+    refresh_attempts: int = 0
+    refresh_provider_requests: int = 0
+    refresh_seconds: float | None = None
+    refresh_reason: str | None = None
+    mark_age_seconds: float | None = None
+
+
+ExitConfirm = Callable[[TradeCase], Awaitable[ExitConfirmation]]
+
+
+@dataclass
+class _Trace:
+    """What one attempt measured about its own evidence. Counts and ages only."""
+
+    atlas_read_seconds: float | None = None
+    confirmation: ExitConfirmation | None = None
+    mark_age_at_final_seconds: float | None = None
+    skipped: str | None = None
+
+    def freshness(self, trigger: ExitTriggerRecord | None) -> ExitFreshness | None:
+        confirmation = self.confirmation
+        if confirmation is None and trigger is None:
+            return None
+        if confirmation is None:
+            return ExitFreshness(
+                original_trigger=_code_or_none(trigger.trigger if trigger else None),
+                atlas_read_seconds=self.atlas_read_seconds,
+                refresh_reason=_code_or_none(self.skipped),
+                mark_age_at_final_seconds=self.mark_age_at_final_seconds,
+            )
+        reevaluated = None if confirmation.trigger is None else confirmation.trigger.trigger
+        return ExitFreshness(
+            original_trigger=_code_or_none(confirmation.original_trigger),
+            reevaluated_trigger=_code_or_none(reevaluated),
+            trigger_cleared=confirmation.refusal is None and confirmation.trigger is None,
+            atlas_read_seconds=self.atlas_read_seconds,
+            refresh_attempts=min(1, confirmation.refresh_attempts),
+            refresh_provider_requests=confirmation.refresh_provider_requests,
+            refresh_seconds=confirmation.refresh_seconds,
+            refresh_reason=_code_or_none(confirmation.refresh_reason),
+            mark_age_at_reevaluation_seconds=confirmation.mark_age_seconds,
+            mark_age_at_final_seconds=self.mark_age_at_final_seconds,
+        )
+
+
 class PaperExitUnavailable(Exception):
     """The call could not be attempted at all. Safe reason code only."""
 
@@ -161,23 +244,46 @@ class PaperExitService:
         return self.paper.limits
 
     async def execute_position_exit(
-        self, position_id: UUID, *, request_key: str, trigger: ExitTriggerRecord | None = None
+        self,
+        position_id: UUID,
+        *,
+        request_key: str,
+        trigger: ExitTriggerRecord | None = None,
+        confirm: ExitConfirm | None = None,
     ) -> ExitReading:
         """Sell the whole open holding of one position, once, or say why not.
 
         `trigger` is recorded with the exit when an automatic policy asked for
         it. It authorises nothing: every check below runs exactly as for a
         direct request, SENTINEL's SELL verdict included.
+
+        `confirm`, supplied by an automatic policy, observes the held market
+        again after the exit's own on-chain read and judges the trigger again on
+        that reading. Its answer replaces `trigger`; no answer, no sale.
         """
+        trace = _Trace()
         try:
-            return await self._attempt(position_id, request_key=request_key, trigger=trigger)
+            reading = await self._attempt(
+                position_id, request_key=request_key, trigger=trigger, confirm=confirm, trace=trace
+            )
         except _Abort as abort:
             # The transaction has rolled back; the answer survives it.
-            return abort.refusal
+            reading = abort.refusal
+        freshness = trace.freshness(trigger)
+        if freshness is None or reading.replayed:
+            return reading
+        return reading.model_copy(update={"freshness": freshness})
 
     async def _attempt(
-        self, position_id: UUID, *, request_key: str, trigger: ExitTriggerRecord | None
+        self,
+        position_id: UUID,
+        *,
+        request_key: str,
+        trigger: ExitTriggerRecord | None,
+        confirm: ExitConfirm | None = None,
+        trace: _Trace | None = None,
     ) -> ExitReading:
+        trace = trace if trace is not None else _Trace()
         feed = OneSnapshot(self.markets, self.include_fixtures)
         intent_id = _intent_identity(request_key)
         # History needs no current prices. Checked before anything is valued, so
@@ -193,7 +299,13 @@ class PaperExitService:
                 # the account lock across one is a latency every other writer
                 # pays for. What it read is bound to the case again under the
                 # lock.
+                started = time.monotonic()
                 fresh = await self._fresh_read(position_id, request_key)
+                trace.atlas_read_seconds = round(time.monotonic() - started, 3)
+            if confirm is not None:
+                # After the slow read, never before it: an observation taken
+                # first would age by exactly the read's duration.
+                trace.confirmation = await self._confirm(position_id, fresh, confirm, trace)
             # Every open holding is priced before the account lock is taken.
             # Holding a portfolio-wide lock across an injected port is a latency
             # somebody else pays for; what that costs is the chance of a
@@ -252,20 +364,30 @@ class PaperExitService:
             refusal = self._stops(position_id, trade_case, account)
             if refusal is not None:
                 return refusal
+            confirmation = trace.confirmation
+            if confirm is not None:
+                # The trigger as judged on fresh evidence, after every stop: a
+                # stop in force is reported as the stop, whatever the trigger.
+                answer = self._confirmed(position_id, trade_case, trace)
+                if isinstance(answer, ExitRefused):
+                    return answer
+                trigger = answer
 
             positions = await self.paper.positions_in_session(session)
             held = {item.asset_id for item in positions if item.quantity != 0}
+            bound = None if confirmation is None else _Bound(confirmation.snapshot_id)
             if self.exit_read is not None:
                 basis = await self._fresh_basis(
-                    feed, position_id, trade_case, fresh, request_key, valuation, held
+                    feed, position_id, trade_case, fresh, request_key, valuation, held, bound
                 )
             else:
                 basis = await self._entry_basis(
-                    feed, position_id, trade_case, request_key, valuation, held
+                    feed, position_id, trade_case, request_key, valuation, held, bound
                 )
             if isinstance(basis, ExitRefused):
                 return basis
             market, readiness, now = basis
+            trace.mark_age_at_final_seconds = _age(now, market.observed_at)
             stale = too_old_for(market, now, self.limits)
             if stale is not None:
                 # Present, provable and still older than SENTINEL's own bound.
@@ -325,6 +447,7 @@ class PaperExitService:
                 Synchronous and over inputs already loaded under the locks, so
                 nothing between this answer and the fill touches the database.
                 """
+                trace.mark_age_at_final_seconds = _age(at, market.observed_at)
                 if readiness is not None and not readiness.is_current_at(at):
                     return "DECISION_BASIS_EXPIRED"
                 if valuation.stale_at(at, self.limits.max_snapshot_age_seconds):
@@ -375,6 +498,7 @@ class PaperExitService:
                 request_key,
                 trigger,
                 fresh if isinstance(fresh, ExitOnchainRead) else None,
+                trace,
             )
 
     # ------------------------------------------------------------ the basis
@@ -387,6 +511,7 @@ class PaperExitService:
         request_key: str,
         valuation: PortfolioValuation,
         held: set[str],
+        bound: "_Bound | None" = None,
     ) -> "tuple[MarketSnapshot, RiskDataReadiness | None, datetime] | ExitRefused":
         """The sale judged on the entry's own evidence, while it is current.
 
@@ -425,6 +550,10 @@ class PaperExitService:
                 position_id,
                 ExitRefusal.EXIT_MARKET_IDENTITY_MISMATCH,
                 trade_case_id=trade_case.id,
+            )
+        if bound is not None and not bound.holds(snapshot):
+            return _refused(
+                position_id, ExitRefusal.EXIT_EVIDENCE_CHANGED, trade_case_id=trade_case.id
             )
 
         # The last clock read, after the last input read. Everything from
@@ -509,6 +638,7 @@ class PaperExitService:
         request_key: str,
         valuation: PortfolioValuation,
         held: set[str],
+        bound: "_Bound | None" = None,
     ) -> "tuple[MarketSnapshot, RiskDataReadiness | None, datetime] | ExitRefused":
         """The sale judged on a fresh read: the held market now, the chain now.
 
@@ -562,6 +692,12 @@ class PaperExitService:
                 ExitRefusal.EXIT_MARKET_IDENTITY_MISMATCH,
                 trade_case_id=trade_case.id,
             )
+        if bound is not None and not bound.holds(snapshot):
+            # Not the reading the trigger was judged again on. A newer one may
+            # say something else, and it was never asked.
+            return _refused(
+                position_id, ExitRefusal.EXIT_EVIDENCE_CHANGED, trade_case_id=trade_case.id
+            )
         price = reference_price(snapshot)
         if price is None:
             return incomplete("REFERENCE_PRICE_UNAVAILABLE")
@@ -598,6 +734,109 @@ class PaperExitService:
             side=Side.SELL,
         )
         return market, None, now
+
+    # ------------------------------------------------------------- the trigger
+
+    async def _confirm(
+        self,
+        position_id: UUID,
+        fresh: ExitOnchainRead | str | None,
+        confirm: ExitConfirm,
+        trace: _Trace,
+    ) -> ExitConfirmation | None:
+        """Observe the held market again and judge the trigger again, or don't.
+
+        Nothing is asked of a provider when the sale is already known to fail:
+        a stop in force, a chain read that was not taken, or a chain read whose
+        holder measurement is already past SENTINEL's bound. Each of those is
+        refused under the lock by its own, authoritative name.
+        """
+        if not isinstance(fresh, ExitOnchainRead) and self.exit_read is not None:
+            trace.skipped = "EXIT_READ_NOT_TAKEN"
+            return None
+        if await self._stop_in_force():
+            trace.skipped = "STOP_IN_FORCE"
+            return None
+        if isinstance(fresh, ExitOnchainRead):
+            intelligence = fresh.payload.intelligence
+            holders = None if intelligence is None else intelligence.holders
+            if holders is None:
+                trace.skipped = "HOLDER_FACTS_UNAVAILABLE"
+                return None
+            age = _age(self.clock.now(), holders.observed_at)
+            if age is None or age > self.limits.max_snapshot_age_seconds:
+                # The chain read itself outlived the bound. A market refresh
+                # now could not make this sale pass the final check.
+                trace.skipped = "HOLDERS_OLDER_THAN_RISK_LIMIT"
+                return None
+        async with self.sessions() as session:
+            row = await session.get(PositionRow, position_id)
+            entry = None if row is None else await self._entry(session, read_position(row))
+        if entry is None or isinstance(entry, ExitRefusal):
+            trace.skipped = "POSITION_NOT_PLACEABLE"
+            return None
+        try:
+            trade_case = await self.cases.get_trade_case(entry.trade_case_id)
+        except WorkflowFailure:
+            trace.skipped = "TRADE_CASE_NOT_FOUND"
+            return None
+        return await confirm(trade_case)
+
+    def _confirmed(
+        self, position_id: UUID, trade_case: TradeCase, trace: _Trace
+    ) -> ExitTriggerRecord | ExitRefused:
+        """The trigger to sell on, as judged again — or why there is none."""
+        confirmation = trace.confirmation
+        if confirmation is None:
+            skipped = trace.skipped or "PRE_EXIT_REFRESH_NOT_TAKEN"
+            if skipped == "HOLDERS_OLDER_THAN_RISK_LIMIT":
+                return _refused(
+                    position_id,
+                    ExitRefusal.SOURCE_OLDER_THAN_RISK_LIMIT,
+                    trade_case_id=trade_case.id,
+                    detail=skipped,
+                )
+            if skipped == "EXIT_READ_NOT_TAKEN" or skipped == "HOLDER_FACTS_UNAVAILABLE":
+                # Refused below by the basis, by its own name.
+                return _refused(
+                    position_id,
+                    ExitRefusal.EXIT_READ_UNAVAILABLE
+                    if skipped == "EXIT_READ_NOT_TAKEN"
+                    else ExitRefusal.EXIT_DATA_INCOMPLETE,
+                    trade_case_id=trade_case.id,
+                    detail=skipped,
+                )
+            return _refused(
+                position_id,
+                ExitRefusal.PRE_EXIT_REFRESH_FAILED,
+                trade_case_id=trade_case.id,
+                detail=skipped,
+            )
+        if confirmation.refusal is not None:
+            return _refused(
+                position_id,
+                ExitRefusal.PRE_EXIT_REFRESH_FAILED,
+                trade_case_id=trade_case.id,
+                detail=_code_or_none(confirmation.refusal) or "PRE_EXIT_REFRESH_FAILED",
+            )
+        if confirmation.trigger is None:
+            return _refused(
+                position_id,
+                ExitRefusal.EXIT_TRIGGER_CLEARED,
+                trade_case_id=trade_case.id,
+                detail=_code_or_none(confirmation.original_trigger),
+            )
+        return confirmation.trigger
+
+    async def _stop_in_force(self) -> bool:
+        """Whether a stop already refuses this sale. Unlocked: a hint, never the verdict."""
+        if self.kill_switch or self.limits.kill_switch:
+            return True
+        if self.trading_mode is not TradingMode.PAPER or self.pause is None:
+            return True
+        async with self.sessions() as session:
+            paused = await session.scalar(select(AccountRow.paused).where(AccountRow.id == 1))
+        return paused is None or bool(paused)
 
     # ------------------------------------------------------------------ reads
 
@@ -734,6 +973,7 @@ class PaperExitService:
         request_key: str,
         trigger: "ExitTriggerRecord | None" = None,
         fresh: ExitOnchainRead | None = None,
+        trace: _Trace | None = None,
     ) -> PaperExitRecorded:
         """Bind the sale to the holding, the entry and the decision behind it."""
         fill, order, trade = outcome.fill, outcome.order, outcome.trade
@@ -796,6 +1036,11 @@ class PaperExitService:
                 # read, or the entry's evidence while that was still current.
                 "exit_basis": "ENTRY_EVIDENCE" if fresh is None else "FRESH_EXIT_READ",
                 "exit_onchain": None if fresh is None else fresh.basis(),
+                # How fresh the evidence was when the trigger was judged again
+                # and when the sale was booked. Counts, codes and ages only.
+                "pre_exit": None
+                if trace is None or (freshness := trace.freshness(trigger)) is None
+                else freshness.model_dump(mode="json"),
             },
             exit_trigger=None if trigger is None else trigger.trigger,
             exit_policy_version=None if trigger is None else trigger.policy_version,
@@ -849,6 +1094,30 @@ def _exit_intent(
         mode=TradingMode.PAPER,
         timing=ExecutionTiming(detected_at=now, decision_at=now),
     )
+
+
+@dataclass(frozen=True)
+class _Bound:
+    """The held market's reading a re-judged trigger rests on."""
+
+    snapshot_id: UUID | None
+
+    def holds(self, snapshot: RecordedSnapshot | None) -> bool:
+        return (None if snapshot is None else snapshot.id) == self.snapshot_id
+
+
+def _age(now: datetime, instant: datetime | None) -> float | None:
+    if instant is None:
+        return None
+    return round((now - instant).total_seconds(), 3)
+
+
+def _code_or_none(value: str | None) -> str | None:
+    """A reason code only when it really is one; anything else is dropped."""
+    if value is None:
+        return None
+    safe = value.strip().upper()[:80]
+    return safe if safe[:1].isalpha() and safe.replace("_", "").isalnum() else None
 
 
 def _reading_of(snapshot: RecordedSnapshot, market: MarketIdentity) -> bool:
