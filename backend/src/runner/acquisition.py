@@ -104,6 +104,7 @@ from src.markets.geckoterminal.transport import GeckoTerminalTransport
 from src.markets.models import MarketIdentity, MarketPair, PoolLocatorIdentity
 from src.markets.reader import MarketReader
 from src.markets.recorder import MarketRecorder, ObservationConflict, record_pair_reporting
+from src.markets.scope import MarketScope, describes_market
 from src.orchestration.commander.context import SystemPausePort, SystemPauseUnavailable
 from src.orchestration.workflow.models import TERMINAL_CASE_STATUSES
 from src.runner.models import (
@@ -115,6 +116,7 @@ from src.runner.models import (
     DiscoveryRead,
     DiscoveryRejection,
     MarketAcquisition,
+    PositionCoverage,
 )
 
 # The provider this stage can compose. Stated rather than assumed: a market
@@ -194,6 +196,12 @@ class AcquisitionPlan:
     targets: tuple[AcquisitionTarget, ...] = ()
     discovery: tuple[Chain, ...] = ()
     refused: tuple[AcquiredMarket, ...] = ()
+    # Every open holding's market, one target per distinct full identity, in
+    # their own budget; and the ones beyond it, reported rather than dropped.
+    positions: tuple[AcquisitionTarget, ...] = ()
+    position_overflow: tuple[AcquisitionTarget, ...] = ()
+    open_positions: int = 0
+    unaddressable_positions: int = 0
 
 
 def _provider_code(error: ProviderError) -> str:
@@ -232,55 +240,79 @@ def unaddressable(identity: MarketIdentity, chains: "dict[str, Chain]") -> str |
 
 
 async def position_markets(
-    sessions: async_sessionmaker[AsyncSession], markets: MarketReader, limit: int
+    sessions: async_sessionmaker[AsyncSession], markets: MarketReader, limit: int | None
 ) -> list[tuple[str, str | None, MarketIdentity | None, str | None]]:
-    """Every open holding's own market, by the identity that was recorded.
+    """Every open holding's own market, by its full identity.
 
-    A position names its market by pair, chain, network and provider, and the
-    full canonical identity — venue and pool locator included — lives on the
-    recorded observation. So the observation is what is looked up, and the
-    position's own four fields are then checked against it: two providers
-    observing one pool are two sources, and an address means nothing across
-    chains. Bounded by `limit`; shared by acquisition and the pre-risk refresh.
+    The authority is the case that bought the holding — position, cycle,
+    entry, case — whose `MarketIdentity` names provider, chain, network, pool,
+    both assets, venue and pool locator. The holding's own recorded fields must
+    agree with it. A holding without a case-bound entry (one booked before
+    cycles existed) falls back to the identity recorded for its pool, held to
+    the holding's chain, network and provider. Ordered by asset; bounded by
+    `limit` when one is given. Shared by acquisition and the pre-risk refresh.
     """
+    from src.data.repository import read_position
+    from src.orchestration.valuation.service import held_market_identities
+
     async with sessions() as session:
-        rows = (
-            await session.scalars(
-                select(PositionRow)
-                .where(PositionRow.quantity != 0)
-                .order_by(PositionRow.asset_id)
-                .limit(limit)
-            )
-        ).all()
-    holdings = [
-        (
-            row.asset_id,
-            row.market_pair_id,
-            row.market_chain,
-            row.market_network,
-            row.market_provider,
+        statement = (
+            select(PositionRow).where(PositionRow.quantity != 0).order_by(PositionRow.asset_id)
         )
-        for row in rows
+        if limit is not None:
+            statement = statement.limit(limit)
+        rows = (await session.scalars(statement)).all()
+        held = [read_position(row) for row in rows]
+        from_cases = await held_market_identities(session, held)
+    # Recorded identities are needed for holdings without a case, and to
+    # complete a case identity recorded before pool locators existed.
+    legacy = [
+        item.market_pair_id
+        for item in held
+        if item.market_pair_id is not None
+        and (item.asset_id not in from_cases or from_cases[item.asset_id].pool_locator is None)
     ]
-    wanted = [item[1] for item in holdings if item[1] is not None]
-    recorded = {
-        identity.pair_id: identity for identity in await markets.identities(wanted, limit=100)
-    }
+    recorded = (
+        {identity.pair_id: identity for identity in await markets.identities(legacy, limit=100)}
+        if legacy
+        else {}
+    )
     found: list[tuple[str, str | None, MarketIdentity | None, str | None]] = []
-    for asset_id, pair_id, chain, network, provider in holdings:
+    for holding in held:
+        pair_id = holding.market_pair_id
         if pair_id is None:
             # The holding never recorded which market it came from. Choosing
             # one for it would resolve an ambiguity silently.
-            found.append((asset_id, None, None, "POSITION_MARKET_UNKNOWN"))
+            found.append((holding.asset_id, None, None, "POSITION_MARKET_UNKNOWN"))
             continue
-        identity = recorded.get(pair_id)
+        identity = from_cases.get(holding.asset_id)
+        observed = recorded.get(pair_id)
         if identity is None:
-            found.append((asset_id, pair_id, None, "MARKET_NEVER_RECORDED"))
+            # No case-bound entry: the identity recorded for the pool, held to
+            # the holding's own chain, network and provider exactly as before.
+            if observed is None:
+                found.append((holding.asset_id, pair_id, None, "MARKET_NEVER_RECORDED"))
+                continue
+            if (observed.chain, observed.network, observed.provider) != (
+                holding.market_chain,
+                holding.market_network,
+                holding.market_provider,
+            ):
+                found.append((holding.asset_id, pair_id, None, "MARKET_IDENTITY_MISMATCH"))
+                continue
+            found.append((holding.asset_id, pair_id, observed, None))
             continue
-        if (identity.chain, identity.network, identity.provider) != (chain, network, provider):
-            found.append((asset_id, pair_id, None, "MARKET_IDENTITY_MISMATCH"))
+        if identity.pool_locator is None and observed is not None:
+            # A case opened before pool locators existed names no locator. The
+            # recorded identity may complete it — the scout's own rule — and
+            # only if it is otherwise exactly this market; nothing is derived.
+            if describes_market(observed, identity):
+                identity = observed
+        scope = MarketScope.held(holding)
+        if scope is None or not scope.matches_identity(identity):
+            found.append((holding.asset_id, pair_id, None, "MARKET_IDENTITY_MISMATCH"))
             continue
-        found.append((asset_id, pair_id, identity, None))
+        found.append((holding.asset_id, pair_id, identity, None))
     return found
 
 
@@ -371,8 +403,12 @@ class AcquisitionPlanner:
                 AcquisitionTarget(identity=identity, need=need, chain=self._chains[identity.chain])
             )
 
-        for asset_id, pair_id, identity, reason in await self._position_markets():
+        holdings = await self._position_markets()
+        held: list[AcquisitionTarget] = []
+        unaddressable_positions = 0
+        for asset_id, pair_id, identity, reason in holdings:
             if identity is None:
+                unaddressable_positions += 1
                 refused.append(
                     _refusal(
                         pair_id or asset_id,
@@ -382,7 +418,33 @@ class AcquisitionPlanner:
                     )
                 )
                 continue
-            admit(identity, AcquisitionNeed.POSITION_VALUATION)
+            unusable = self._unusable(identity)
+            if unusable is None and identity.base_asset_id != asset_id:
+                # A reading of this market prices its base asset, not this
+                # holding: it cannot value it, so it never counts as covering it.
+                unusable = "POSITION_ASSET_NOT_MARKET_BASE"
+            if unusable is not None:
+                unaddressable_positions += 1
+                refused.append(
+                    _refusal(
+                        identity.pair_id,
+                        identity.chain,
+                        AcquisitionNeed.POSITION_VALUATION,
+                        unusable,
+                    )
+                )
+                continue
+            if any(item.identity == identity for item in held):
+                # Several holdings, one market: one observation answers all.
+                continue
+            held.append(
+                AcquisitionTarget(
+                    identity=identity,
+                    need=AcquisitionNeed.POSITION_VALUATION,
+                    chain=self._chains[identity.chain],
+                )
+            )
+        capacity = self._limits.max_position_markets
 
         # A case needs its own pool and nothing else: a version-3 observation of
         # it carries both the base and the quote asset's USD price, so ANCHOR
@@ -394,6 +456,10 @@ class AcquisitionPlanner:
             targets=tuple(targets),
             discovery=tuple(self._chains.values())[: self._limits.max_discovery_requests],
             refused=tuple(refused),
+            positions=tuple(held[:capacity]),
+            position_overflow=tuple(held[capacity:]),
+            open_positions=len(holdings),
+            unaddressable_positions=unaddressable_positions,
         )
 
     def _unusable(self, identity: MarketIdentity) -> str | None:
@@ -402,13 +468,14 @@ class AcquisitionPlanner:
     async def _position_markets(
         self,
     ) -> list[tuple[str, str | None, MarketIdentity | None, str | None]]:
-        """Every open holding's market, bounded by the market budget.
+        """Every open holding's market, all of them.
 
-        A portfolio larger than that budget is not fully valuable from this pass
-        alone, and SENTINEL refuses on the holdings it cannot mark rather than
-        this stage pretending it covered them.
+        Not bounded by the case budget: a holding that is not observed again
+        cannot be marked, and an exit cannot be judged without its mark. The
+        plan applies the position budget afterwards and reports what lies
+        beyond it.
         """
-        return await position_markets(self._sessions, self._markets, self._limits.max_markets)
+        return await position_markets(self._sessions, self._markets, None)
 
     async def _case_markets(self) -> list[MarketIdentity]:
         """The markets the live cases are about, oldest case first.
@@ -460,6 +527,13 @@ class Ledger:
     # would let one market's budget buy a second request.
     spent: int = 0
     asked: set[str] = field(default_factory=set)
+    # What the plan said about the open portfolio, once there is a plan.
+    planned: bool = False
+    open_positions: int = 0
+    position_markets: int = 0
+    unaddressable_positions: int = 0
+    # Holding markets put into a provider request, counted as it goes out.
+    position_asked: int = 0
 
     def note(
         self,
@@ -636,7 +710,15 @@ class BoundedMarketAcquisition:
                 return self._summary(ledger, transport)
             plan = await self._plan(chains, window)
             ledger.entries.extend(plan.refused)
-            if not plan.targets and not plan.discovery:
+            ledger.planned = True
+            ledger.open_positions = plan.open_positions
+            ledger.position_markets = len(plan.positions) + len(plan.position_overflow)
+            ledger.unaddressable_positions = plan.unaddressable_positions
+            for target in plan.position_overflow:
+                # Beyond what one bounded request may carry: visibly not asked
+                # about, so the coverage below cannot read as complete.
+                ledger.note(target, AcquisitionOutcome.NOT_ATTEMPTED, "POSITION_CAPACITY_EXCEEDED")
+            if not plan.targets and not plan.discovery and not plan.positions:
                 ledger.stop = AcquisitionStop.NOTHING_TO_ACQUIRE
                 return self._summary(ledger, transport)
             transport = GeckoTerminalTransport(
@@ -765,8 +847,20 @@ class BoundedMarketAcquisition:
         applied to a response would mean paying for observations and discarding
         them, which is worse than never having asked.
         """
+        held = await self._positions(chains, plan, adapter, recorder, ledger, window)
+        if held is None:
+            return False
         for chain in chains:
             wanted = [item for item in plan.targets if item.identity.chain == chain.name]
+            # A case on a holding's market is answered by the holding's reading
+            # — one market, one observation — and asks nothing further.
+            for target in [item for item in wanted if item.identity.pair_id in held]:
+                prior = held[target.identity.pair_id]
+                if isinstance(prior, str):
+                    ledger.note(target, AcquisitionOutcome.REFUSED, prior)
+                elif not await self._record(prior[0], prior[1], target, recorder, ledger, window):
+                    return False
+            wanted = [item for item in wanted if item.identity.pair_id not in held]
             if not wanted:
                 continue
             spent = self._affordable(ledger, window)
@@ -825,6 +919,83 @@ class BoundedMarketAcquisition:
                 if not await self._record(built, pair, target, recorder, ledger, window):
                     return False
         return True
+
+    async def _positions(
+        self,
+        chains: tuple[Chain, ...],
+        plan: AcquisitionPlan,
+        adapter: Callable[[Chain, int], GeckoTerminalAdapter],
+        recorder: MarketRecorder,
+        ledger: Ledger,
+        window: Window,
+    ) -> "dict[str, tuple[GeckoTerminalAdapter, MarketPair] | str] | None":
+        """Every open holding's market, asked about first and in its own budget.
+
+        One bounded `pools/multi` request per chain carries them all; the case
+        budget is not touched, so neither a case nor discovery can take a
+        holding's slot.
+
+        Two keys, kept apart on purpose. The *transport address* — the pool id
+        a locator resolves to — is what the provider is asked by, and it can
+        answer one market per address. The *market identity* is what a holding
+        is: targets are distinct by full identity (the planner deduplicates
+        nothing else), and every target is recorded only if the answer is
+        exactly its identity (`record_observed`). Two identities under one
+        address therefore share one question and never one answer: the one the
+        provider did not answer for is refused as MARKET_IDENTITY_MISMATCH and
+        never counted as covered. Returns, per transport address, the answer
+        the provider gave (or why it gave none) — a case asking by that address
+        is held to its own identity in the same way — or None when the pass
+        must end here.
+        """
+        answered: dict[str, tuple[GeckoTerminalAdapter, MarketPair] | str] = {}
+        for chain in chains:
+            batch = [item for item in plan.positions if item.identity.chain == chain.name]
+            if not batch:
+                continue
+            if window.expired:
+                self._unattempted(batch, ledger, "TIME_BUDGET_REACHED")
+                ledger.stop = AcquisitionStop.TIME_BUDGET_REACHED
+                return None
+            # Transport addresses, one per pool id: what the provider is asked by.
+            pools: dict[str, AcquisitionTarget] = {}
+            for target in batch:
+                pools.setdefault(target.identity.pair_id, target)
+            # Counted before the request leaves, like every other request here.
+            ledger.asked.update(pools)
+            ledger.requested += len(pools)
+            ledger.position_asked += len(batch)
+            built = adapter(chain, self._settings.geckoterminal_pools_per_chain)
+            try:
+                confirmed = await asyncio.wait_for(
+                    built.observe(tuple(item.locator for item in pools.values())),
+                    timeout=max(0.001, window.remaining),
+                )
+            except TimeoutError:
+                self._failed(batch, ledger, "TIME_BUDGET_REACHED")
+                ledger.stop = AcquisitionStop.TIME_BUDGET_REACHED
+                return None
+            except ProviderError as error:
+                code = _provider_code(error)
+                self._failed(batch, ledger, code)
+                answered.update(dict.fromkeys(pools, code))
+                if isinstance(error, UnsupportedNetworkError):
+                    continue
+                ledger.stop = AcquisitionStop.PROVIDER_FAILED
+                return None
+            returned = {pair.pair_id: pair for pair in confirmed}
+            for target in batch:
+                pair = returned.get(target.identity.pair_id)
+                if pair is None:
+                    # Asked about and not returned: left exactly as it was,
+                    # never answered with something older or something else.
+                    ledger.note(target, AcquisitionOutcome.REFUSED, "MARKET_NOT_RETURNED")
+                    answered[target.identity.pair_id] = "MARKET_NOT_RETURNED"
+                    continue
+                answered[target.identity.pair_id] = (built, pair)
+                if not await self._record(built, pair, target, recorder, ledger, window):
+                    return None
+        return answered
 
     async def _discovery(
         self,
@@ -987,6 +1158,30 @@ class BoundedMarketAcquisition:
             # made of the answer. Reported apart from the totals above, which
             # mix discovery with the targeted reads and cannot be split back up.
             discovery=tuple(ledger.reads[:4]),
+            positions=self._coverage(ledger) if ledger.planned else None,
+        )
+
+    @staticmethod
+    def _coverage(ledger: Ledger) -> PositionCoverage:
+        held = [
+            item for item in ledger.entries if item.need == AcquisitionNeed.POSITION_VALUATION.value
+        ]
+
+        def count(*outcomes: AcquisitionOutcome) -> int:
+            values = {item.value for item in outcomes}
+            return len([item for item in held if item.outcome in values])
+
+        return PositionCoverage(
+            open_positions=ledger.open_positions,
+            markets=ledger.position_markets,
+            unaddressable=ledger.unaddressable_positions,
+            asked=ledger.position_asked,
+            answered=count(AcquisitionOutcome.RECORDED, AcquisitionOutcome.UNCHANGED),
+            # Planning refusals are counted as unaddressable, not here.
+            refused=max(0, count(AcquisitionOutcome.REFUSED) - ledger.unaddressable_positions),
+            failed=count(AcquisitionOutcome.FAILED),
+            unknown=count(AcquisitionOutcome.UNKNOWN),
+            not_attempted=count(AcquisitionOutcome.NOT_ATTEMPTED),
         )
 
 

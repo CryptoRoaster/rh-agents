@@ -64,7 +64,8 @@ not consenting to that run calling a public API.
 | Setting | Meaning |
 | --- | --- |
 | `PAPER_RUNNER_MARKET_ACQUISITION_ENABLED=true` | Requires `PAPER_RUNNER_ENABLED=true` and `MARKET_PROVIDER=geckoterminal`. |
-| `PAPER_RUNNER_ACQUISITION_MAX_MARKETS` | Distinct markets one run may observe again. |
+| `PAPER_RUNNER_ACQUISITION_MAX_MARKETS` | Distinct case and discovery markets one run may observe again. Open positions do not use it. |
+| `PAPER_RUNNER_ACQUISITION_MAX_POSITION_MARKETS=20` | Distinct open-position markets observed again first, in their own budget (one bounded `pools/multi` request carries up to 20). |
 | `…_MAX_DISCOVERY_REQUESTS` | Bounded discovery reads. `0` acquires only what open work depends on. |
 | `…_MAX_PROVIDER_REQUESTS`, `…_MAX_HTTP_ATTEMPTS` | Applied to the provider's own budgets, so they can only tighten them. |
 | `…_MAX_SECONDS` | The stage, additionally bounded by the run's remaining time. |
@@ -82,6 +83,20 @@ adapter `considered` and `returned`, and how many it `rejected` under which
 fixed codes. A read that did not return says `completed=false` with a reason and
 reports no counters, because it never finished counting. How many pools the
 provider's document carried is not counted anywhere and is not inferred.
+
+**Reading the position coverage.** `acquisition.positions` says how much of
+the open portfolio this pass observed again: `open_positions`, the distinct
+full market identities behind them (`markets`), the holdings whose market
+cannot be asked about at all (`unaddressable`: never recorded, no pool locator,
+another provider or chain), and of the rest how many were `asked`, `answered`
+(the provider answered and the recorder accepted it, new or replayed),
+`refused` (not returned, or naming another market), `failed`, `unknown` and
+`not_attempted` (`POSITION_CAPACITY_EXCEEDED`, a budget or time stop). It is
+coverage, not freshness: an answered reading that is unavailable or old is
+still unusable for every reader that judges age. The identity asked for is the
+case's — position, cycle, entry, case — so a newer reading of another market
+under the same pool id can never redirect the request. Positions are observed
+before anything else and the exit sweeps run after the stage.
 
 ### Pre-risk market refresh (with acquisition)
 

@@ -224,6 +224,13 @@ class AcquisitionLimits(Immutable):
     # Distinct markets this run may have observed again. Duplicated needs cost
     # nothing: one market is one observation however many things wanted it.
     max_markets: int = Field(ge=1, le=20)
+    # Distinct open-position markets this run may observe again, apart from the
+    # budget above: a holding's market is what every exit and every valuation
+    # is judged on, so cases and discovery never compete with it for a slot.
+    # Bounded by one `pools/multi` request (twenty pools); a portfolio with
+    # more distinct markets is reported as a coverage deficit, never truncated
+    # silently.
+    max_position_markets: int = Field(default=20, ge=1, le=20)
     # Bounded discovery reads across all configured chains. Zero is a real and
     # useful setting: acquire exactly what the open work depends on, and look
     # for nothing new.
@@ -314,6 +321,38 @@ class DiscoveryRead(Immutable):
     reason: Code | None = None
 
 
+class PositionCoverage(Immutable):
+    """How much of the open portfolio this pass observed again.
+
+    Coverage, not freshness: `answered` counts markets the provider answered
+    for and the recorder accepted (new or replayed). Whether that reading is
+    current is still decided by every reader's own age bound, and an answer
+    that is unavailable or old stays unusable there.
+    """
+
+    # Open holdings, and the distinct full market identities behind them.
+    open_positions: int = Field(default=0, ge=0)
+    markets: int = Field(default=0, ge=0)
+    # Holdings whose market cannot be asked about at all (never recorded, no
+    # locator, another provider or chain): counted, never guessed.
+    unaddressable: int = Field(default=0, ge=0)
+    asked: int = Field(default=0, ge=0)
+    answered: int = Field(default=0, ge=0)
+    refused: int = Field(default=0, ge=0)
+    failed: int = Field(default=0, ge=0)
+    unknown: int = Field(default=0, ge=0)
+    not_attempted: int = Field(default=0, ge=0)
+
+    @property
+    def deficit(self) -> int:
+        """Distinct holding markets this pass did not get an answer for."""
+        return max(0, self.markets + self.unaddressable - self.answered)
+
+    @property
+    def complete(self) -> bool:
+        return self.deficit == 0
+
+
 class MarketAcquisition(Immutable):
     """What one run asked the market provider for, and what it got.
 
@@ -362,6 +401,9 @@ class MarketAcquisition(Immutable):
     # that may or may not have produced some, and the counts above deliberately
     # cannot be split back into per-read facts.
     discovery: tuple[DiscoveryRead, ...] = Field(default=(), max_length=4)
+    # How much of the open portfolio was observed again; absent when the stage
+    # did not run.
+    positions: PositionCoverage | None = None
 
     @property
     def outcome_unknown(self) -> bool:
