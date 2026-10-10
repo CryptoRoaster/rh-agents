@@ -343,6 +343,10 @@ def test_the_summary_carries_no_secret_and_no_payload(risk_db):
         "run_id",
         "started_at",
         "finished_at",
+        # Which job, whether it held its job lock, and its monotonic duration.
+        "mode",
+        "lock",
+        "duration_seconds",
         "stop",
         "limits",
         "roles",

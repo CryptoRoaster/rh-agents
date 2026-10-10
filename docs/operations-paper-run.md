@@ -166,6 +166,29 @@ each case's `market_refreshes` — one entry per pre-risk refresh, marked
 and the canonical pair ids. The run summary adds `pre_risk_market_refreshes`
 and `pre_risk_refusals`. Counts and codes only, never a provider payload.
 
+### The exit job (`--exits-once`) and run locks
+
+`python -m src.runner.main --exits-once` is one bounded pass of the **exit job**:
+the market acquisition restricted to open positions' markets (no case market,
+no discovery read), then the `PAPER_EXIT_V1` and `EARLY_PAPER_EXIT_V1` sweeps,
+and nothing else — no promotion, intake, worker step, risk request or BUY. It
+runs only in PAPER, refuses with `NO_EXIT_SWEEP_CONFIGURED` when neither exit
+policy is configured, and is held to `PAPER_EXIT_RUN_MAX_SECONDS` (default 60).
+`--once` is the **entry job** and is otherwise unchanged.
+
+Each job holds its own PostgreSQL session-level advisory lock for the whole run
+(`rh-agents:paper-exit-job`, `rh-agents:paper-entry-job`), taken without
+waiting. A second start of the same job ends with `stop=ALREADY_RUNNING`,
+`lock=ALREADY_RUNNING`, asks nobody and writes nothing. A crashed process drops
+its connection and PostgreSQL releases the lock; there is no lease row. The two
+jobs do not exclude each other: every fill and exit takes the paper account
+row first, orders are keyed and the database allows one exit per cycle, so a
+second lock would only add a lock order and let an entry run delay a stop.
+
+Every summary now carries `mode` (`FULL` / `EXITS_ONLY`), `lock`
+(`ACQUIRED`, `ALREADY_RUNNING`, or `NOT_SUPPORTED` on the SQLite test engine)
+and `duration_seconds` (monotonic). No scheduler is installed by any of this.
+
 ## 3. The preflight
 
 ```sh

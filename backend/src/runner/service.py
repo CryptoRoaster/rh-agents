@@ -75,6 +75,7 @@ from src.orchestration.workflow.models import (
 )
 from src.runner.acquisition import disabled as no_acquisition
 from src.runner.composition import RunnerStack
+from src.runner.locks import LockOutcome, RunJob, job_lock
 from src.runner.models import (
     AcquisitionStop,
     CaseProgress,
@@ -85,6 +86,7 @@ from src.runner.models import (
     PreRiskRefresh,
     PromotionReading,
     RunLimits,
+    RunMode,
     RunReading,
     RunStop,
     RunSummary,
@@ -231,8 +233,13 @@ class BoundedPaperRun:
         *,
         run_id: UUID | None = None,
         deadline: Deadline | None = None,
+        mode: RunMode = RunMode.FULL,
     ) -> None:
         self.stack = stack
+        # Which job this pass is. FULL is every run before the exit job existed.
+        self.mode = mode
+        self._lock: LockOutcome | None = None
+        self._started_monotonic = time.monotonic()
         # Observability only. Never an order, case, request or fill identity.
         self.run_id = run_id if run_id is not None else uuid4()
         # The seam a test uses to hand the run a deadline that has already
@@ -245,6 +252,58 @@ class BoundedPaperRun:
         refusal = refuse(stack.settings)
         if refusal is not None:
             return refusal
+        if self.mode is RunMode.EXITS_ONLY and stack.exits is None and stack.early_exits is None:
+            # An exit job with no exit policy configured would only spend
+            # provider requests on markets nobody is going to judge.
+            return ConfigurationRefused(reason="NO_EXIT_SWEEP_CONFIGURED")
+        job = RunJob.PAPER_EXIT_JOB if self.mode is RunMode.EXITS_ONLY else RunJob.PAPER_ENTRY_JOB
+        self._started_monotonic = time.monotonic()
+        async with job_lock(stack.sessions, job) as lock:
+            self._lock = lock
+            if lock is LockOutcome.ALREADY_RUNNING:
+                # Another run of this job is going. Not a fault and not work:
+                # nothing is asked, read for trading or written.
+                started = stack.clock.now()
+                account = Account(limits=stack.limits)
+                account.stop = RunStop.ALREADY_RUNNING
+                return self._summary(started, account)
+            if self.mode is RunMode.EXITS_ONLY:
+                return await self._exits_only()
+            return await self._full()
+
+    async def _exits_only(self) -> RunReading:
+        """The exit job: open positions' markets, then both exit sweeps. Nothing else.
+
+        No discovery, no intake, no promotion, no worker step, no risk request
+        and no fill: nothing in this pass can open a case or buy. Bounded by its
+        own runtime, which never exceeds what it was configured to be.
+        """
+        stack = self.stack
+        started = stack.clock.now()
+        account = Account(limits=stack.limits)
+        deadline = (
+            self._deadline
+            if self._deadline is not None
+            else Deadline(stack.settings.paper_exit_run_max_seconds)
+        )
+        try:
+            if not await self._acquire(account, deadline, positions_only=True):
+                return self._summary(started, account)
+            await self._exit(account, deadline)
+            await self._early_exit(account, deadline)
+        except SystemPauseUnavailable:
+            account.stop = RunStop.SYSTEM_STOPPED
+            account.fail("SYSTEM_STOP_UNREADABLE")
+        except TimeoutError:
+            account.stop = RunStop.TIME_BUDGET_REACHED
+        except (SQLAlchemyError, OSError):
+            account.fail("DATABASE_UNAVAILABLE")
+        except asyncio.CancelledError:
+            raise
+        return self._summary(started, account)
+
+    async def _full(self) -> RunReading:
+        stack = self.stack
         started = stack.clock.now()
         account = Account(limits=stack.limits)
         deadline = (
@@ -293,7 +352,9 @@ class BoundedPaperRun:
 
     # ------------------------------------------------------------- the pass
 
-    async def _acquire(self, account: Account, deadline: Deadline) -> bool:
+    async def _acquire(
+        self, account: Account, deadline: Deadline, *, positions_only: bool = False
+    ) -> bool:
         """Observe the markets the open work depends on, and say whether to go on.
 
         The stage is absent unless an operator switched it on, and an absent one
@@ -312,7 +373,9 @@ class BoundedPaperRun:
         if stage is None:
             account.acquisition = no_acquisition()
             return True
-        account.acquisition = await stage.execute(deadline, networks=account.networks)
+        account.acquisition = await stage.execute(
+            deadline, networks=account.networks, positions_only=positions_only
+        )
         stop = account.acquisition.stop
         if stop == AcquisitionStop.SYSTEM_STOP_UNREADABLE.value:
             # A safety question this deployment cannot answer. Unknown is not
@@ -1109,6 +1172,9 @@ class BoundedPaperRun:
             started_at=started.isoformat(),
             finished_at=self.stack.clock.now().isoformat(),
             stop=account.stop,
+            mode=self.mode,
+            lock=None if self._lock is None else self._lock.value,
+            duration_seconds=round(max(0.0, time.monotonic() - self._started_monotonic), 3),
             limits=self.stack.limits,
             roles=self.stack.roles,
             acquisition=account.acquisition,

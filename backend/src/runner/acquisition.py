@@ -374,11 +374,17 @@ class AcquisitionPlanner:
         markets: MarketReader,
         chains: tuple[Chain, ...],
         limits: AcquisitionLimits,
+        *,
+        positions_only: bool = False,
     ) -> None:
         self._sessions = sessions
         self._markets = markets
         self._chains = {chain.name: chain for chain in chains}
         self._limits = limits
+        # The exit job: open positions' markets only — no case market and no
+        # discovery read, so it can neither feed intake nor spend a request on
+        # anything a stop does not need.
+        self._positions_only = positions_only
 
     async def plan(self) -> AcquisitionPlan:
         targets: list[AcquisitionTarget] = []
@@ -449,12 +455,17 @@ class AcquisitionPlanner:
         # A case needs its own pool and nothing else: a version-3 observation of
         # it carries both the base and the quote asset's USD price, so ANCHOR
         # no longer needs a second market for the payment asset.
-        for identity in await self._case_markets():
-            admit(identity, AcquisitionNeed.CASE_MARKET)
+        if not self._positions_only:
+            for identity in await self._case_markets():
+                admit(identity, AcquisitionNeed.CASE_MARKET)
 
         return AcquisitionPlan(
             targets=tuple(targets),
-            discovery=tuple(self._chains.values())[: self._limits.max_discovery_requests],
+            discovery=(
+                ()
+                if self._positions_only
+                else tuple(self._chains.values())[: self._limits.max_discovery_requests]
+            ),
             refused=tuple(refused),
             positions=tuple(held[:capacity]),
             position_overflow=tuple(held[capacity:]),
@@ -680,7 +691,11 @@ class BoundedMarketAcquisition:
         )
 
     async def execute(
-        self, deadline: RunDeadline, *, networks: VerifiedNetworkRegistry | None = None
+        self,
+        deadline: RunDeadline,
+        *,
+        networks: VerifiedNetworkRegistry | None = None,
+        positions_only: bool = False,
     ) -> MarketAcquisition:
         """Acquire what the open work needs, then hand back an honest account.
 
@@ -708,7 +723,7 @@ class BoundedMarketAcquisition:
                 ledger.stop = halted
                 ledger.detail = detail
                 return self._summary(ledger, transport)
-            plan = await self._plan(chains, window)
+            plan = await self._plan(chains, window, positions_only)
             ledger.entries.extend(plan.refused)
             ledger.planned = True
             ledger.open_positions = plan.open_positions
@@ -785,8 +800,12 @@ class BoundedMarketAcquisition:
             )
         return (AcquisitionStop.SYSTEM_STOPPED if paused else None), None
 
-    async def _plan(self, chains: tuple[Chain, ...], window: Window) -> AcquisitionPlan:
-        planner = AcquisitionPlanner(self._sessions, self._markets, chains, self._limits)
+    async def _plan(
+        self, chains: tuple[Chain, ...], window: Window, positions_only: bool = False
+    ) -> AcquisitionPlan:
+        planner = AcquisitionPlanner(
+            self._sessions, self._markets, chains, self._limits, positions_only=positions_only
+        )
         return await asyncio.wait_for(planner.plan(), timeout=max(0.001, window.remaining))
 
     async def _acquire(
