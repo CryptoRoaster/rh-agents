@@ -1,6 +1,8 @@
 """One bounded PAPER run, one scout run, or one look at whether it could happen.
 
     python -m src.runner.main --once        perform exactly one bounded pass
+    python -m src.runner.main --exits-once  one pass of the exit job: positions' markets
+                                            and the exit sweeps only; never buys
     python -m src.runner.main --scout-once  one early-discovery scout run; never trades
     python -m src.runner.main --preflight   check this configuration, change nothing
 
@@ -54,6 +56,7 @@ from src.data.database import connect
 from src.runner.composition import RunnerPorts, RunnerStack, runner_stack
 from src.runner.models import (
     ConfigurationRefused,
+    RunMode,
     RunReading,
     TechnicalFailure,
 )
@@ -63,6 +66,20 @@ from src.runner.preflight import unavailable as preflight_unavailable
 from src.runner.service import BoundedPaperRun
 from src.scout.models import ScoutSummary
 from src.scout.service import run_scout
+
+
+async def run_exits_once(settings: Settings, *, ports: RunnerPorts | None = None) -> RunReading:
+    """One pass of the exit job: open positions' markets, then both exit sweeps.
+
+    Never opens a case, requests risk or buys. The engine is owned here, as for
+    `run_once`, so a pass that raises still releases its connections.
+    """
+    engine, sessions = connect(settings.database_url)
+    try:
+        async with runner_stack(settings, sessions, ports=ports) as stack:
+            return await BoundedPaperRun(stack, mode=RunMode.EXITS_ONLY).execute()
+    finally:
+        await engine.dispose()
 
 
 async def run_once(settings: Settings, *, ports: RunnerPorts | None = None) -> RunReading:
@@ -128,6 +145,14 @@ def main() -> int:
         help="Perform exactly one bounded pass. The only executing mode.",
     )
     mode.add_argument(
+        "--exits-once",
+        action="store_true",
+        help=(
+            "One bounded pass of the exit job: open positions' markets and the "
+            "PAPER exit sweeps only. Never opens a case or buys."
+        ),
+    )
+    mode.add_argument(
         "--preflight",
         action="store_true",
         help="Report what this configuration could do. Writes nothing and calls nobody.",
@@ -156,7 +181,9 @@ def main() -> int:
     if arguments.scout_once:
         return _scout(settings)
     try:
-        reading = asyncio.run(run_once(settings))
+        reading = asyncio.run(
+            run_exits_once(settings) if arguments.exits_once else run_once(settings)
+        )
     except KeyboardInterrupt:
         # Whatever had committed stays committed; the interrupted step follows
         # its own contract, and a lease left behind expires for recovery.

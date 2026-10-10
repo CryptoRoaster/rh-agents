@@ -66,7 +66,14 @@ async def test_two_concurrent_acquiring_runs_converge_on_one_case_and_one_fill(r
         return_exceptions=True,
     )
 
-    summaries = [item for item in outcomes if not isinstance(item, Exception)]
+    finished = [item for item in outcomes if not isinstance(item, Exception)]
+    assert len(finished) == 2, outcomes
+    # The entry job's lock lets at most one of them run at once; a start that
+    # finds it held ends as ALREADY_RUNNING having asked and written nothing.
+    # If the two did not overlap, both ran — the invariants below hold either way.
+    skipped = [item for item in finished if item.stop.value == "ALREADY_RUNNING"]
+    assert all(item.acquisition is None and item.fills == 0 for item in skipped), skipped
+    summaries = [item for item in finished if item.stop.value != "ALREADY_RUNNING"]
     assert summaries, outcomes
     # Nothing raised on a conflicting event identity: every recording either
     # wrote its own event or found one already stored.

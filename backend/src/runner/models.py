@@ -75,6 +75,21 @@ class RunStop(StrEnum):
     CASE_BUDGET_REACHED = "CASE_BUDGET_REACHED"
     # A stop was in force. The run did not attempt to work around it.
     SYSTEM_STOPPED = "SYSTEM_STOPPED"
+    # Another run of the same job holds its lock. Nothing was asked or written.
+    ALREADY_RUNNING = "ALREADY_RUNNING"
+
+
+class RunMode(StrEnum):
+    """Which job one pass is.
+
+    FULL is the entry job: acquisition, both exit sweeps, intake, the workers,
+    risk and fills — every run before this contract. EXITS_ONLY is the fast
+    exit job: acquisition of open positions' markets only, then both exit
+    sweeps, and nothing that could open a case, request risk or buy.
+    """
+
+    FULL = "FULL"
+    EXITS_ONLY = "EXITS_ONLY"
 
 
 class RunLimits(Immutable):
@@ -532,6 +547,11 @@ class RunSummary(Immutable):
     started_at: str
     finished_at: str
     stop: RunStop
+    # Which job this pass was, whether it held its job lock, and how long it
+    # ran by the monotonic clock (wall-clock instants above can move).
+    mode: RunMode = RunMode.FULL
+    lock: Code | None = None
+    duration_seconds: float = Field(default=0, ge=0)
     limits: RunLimits
     roles: tuple[RoleAvailability, ...] = Field(default=(), max_length=16)
     # Considered by intake, and the subset that became cases. Reported apart

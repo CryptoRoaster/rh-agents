@@ -309,6 +309,10 @@ class Settings(BaseSettings):
     # bounds the run regardless of what any individual step does.
     paper_runner_max_seconds: int = Field(default=300, ge=5, le=3600)
     paper_runner_step_timeout_seconds: int = Field(default=60, ge=1, le=300)
+    # The exit job's own hard runtime (`--exits-once`): position acquisition and
+    # both exit sweeps, nothing else. Short on purpose; a stop must not wait on
+    # anything the entry job does.
+    paper_exit_run_max_seconds: int = Field(default=60, ge=5, le=600)
     # Phase 2N-C bounded market acquisition. Disabled by default and separate
     # from `paper_runner_enabled`, because consenting to a run is not consenting
     # to that run calling a public market provider. With this off, a run behaves
