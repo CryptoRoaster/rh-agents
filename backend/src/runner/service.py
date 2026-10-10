@@ -425,7 +425,9 @@ class BoundedPaperRun:
         stage = self.stack.exits
         if stage is None:
             return
-        account.exits = await self._bounded(stage.sweep(), deadline)
+        account.exits = await self._bounded(
+            stage.sweep(deadline=deadline, networks=account.networks), deadline
+        )
 
     async def _early_exit(self, account: Account, deadline: Deadline) -> None:
         """One bounded EARLY_PAPER_EXIT_V1 sweep, when configured.
@@ -436,7 +438,9 @@ class BoundedPaperRun:
         stage = self.stack.early_exits
         if stage is None:
             return
-        account.early_exits = await self._bounded(stage.sweep(), deadline)
+        account.early_exits = await self._bounded(
+            stage.sweep(deadline=deadline, networks=account.networks), deadline
+        )
 
     async def _intake(self, account: Account, deadline: Deadline) -> None:
         """One bounded intake cycle, through the existing control plane.
@@ -1208,6 +1212,16 @@ def _exit_report(sweep: ExitSweep | None) -> ExitReport | None:
         held=sweep.held,
         triggers=tuple(sorted(sweep.triggers)),
         refusals=tuple(sorted(sweep.refusals)),
+        refresh_attempts=sweep.refresh_attempts,
+        refresh_failures=sweep.refresh_failures,
+        refresh_provider_requests=sweep.refresh_provider_requests,
+        triggers_cleared=sweep.triggers_cleared,
+        triggers_changed=sweep.triggers_changed,
+        reevaluated_triggers=tuple(sorted(sweep.reevaluated)),
+        max_refresh_seconds=sweep.max_refresh_seconds,
+        max_atlas_read_seconds=sweep.max_atlas_read_seconds,
+        max_mark_age_at_trigger_seconds=sweep.max_mark_age_at_trigger_seconds,
+        max_mark_age_at_final_seconds=sweep.max_mark_age_at_final_seconds,
     )
 
 

@@ -239,7 +239,7 @@ class Gated:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def sweep(self) -> ExitSweep:
+    async def sweep(self, **_: object) -> ExitSweep:
         self.entered.set()
         await self.release.wait()
         return ExitSweep()
@@ -274,7 +274,7 @@ async def test_a_second_start_of_the_same_job_is_already_running(risk_db, now, m
 
 
 class _Done:
-    async def sweep(self) -> ExitSweep:
+    async def sweep(self, **_: object) -> ExitSweep:
         return ExitSweep()
 
 

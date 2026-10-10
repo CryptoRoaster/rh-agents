@@ -102,6 +102,44 @@ class ExitRefusal(StrEnum):
     # those writes takes real time. Everything started is rolled back, and no
     # risk rejection is written in its place.
     EXECUTION_WINDOW_EXPIRED = "EXECUTION_WINDOW_EXPIRED"
+    # ---------------------------------------------------- the trigger, again
+    # An automatic exit is judged again on the held market observed after the
+    # slow on-chain read. The observation could not be taken or shown fresh:
+    # the detail names the refresh's own reason. Nothing older stands in.
+    PRE_EXIT_REFRESH_FAILED = "PRE_EXIT_REFRESH_FAILED"
+    # Judged again on that fresh evidence, the policy no longer names a trigger.
+    # A trigger that has gone is not a sale.
+    EXIT_TRIGGER_CLEARED = "EXIT_TRIGGER_CLEARED"
+    # The held market's reading under the lock is not the one the trigger was
+    # judged again on: a newer observation arrived in between. The sale is not
+    # decided on evidence its trigger was never checked against.
+    EXIT_EVIDENCE_CHANGED = "EXIT_EVIDENCE_CHANGED"
+
+
+class ExitFreshness(Immutable):
+    """How fresh an automatic exit's evidence was, and what judging it again did.
+
+    Durations are wall-clock seconds of this process; ages are measured against
+    the service clock, on the source's own instants. Counts, codes and numbers
+    only — never a payload, an address or a URL.
+    """
+
+    # The trigger the sweep first saw, and the trigger judged on fresh evidence.
+    original_trigger: Code | None = None
+    reevaluated_trigger: Code | None = None
+    trigger_cleared: bool = Field(default=False, strict=True)
+    # How long the exit's own on-chain read took.
+    atlas_read_seconds: float | None = Field(default=None, ge=0)
+    # The held market observed again, after that read: attempts (at most one
+    # per exit), provider requests spent, and how long it took.
+    refresh_attempts: int = Field(default=0, ge=0, le=1)
+    refresh_provider_requests: int = Field(default=0, ge=0)
+    refresh_seconds: float | None = Field(default=None, ge=0)
+    refresh_reason: Code | None = None
+    # The mark's age when the trigger was judged again, and at the final
+    # check — the execution boundary when the sale got that far.
+    mark_age_at_reevaluation_seconds: float | None = None
+    mark_age_at_final_seconds: float | None = None
 
 
 class PaperExitRecorded(Immutable):
@@ -132,6 +170,8 @@ class PaperExitRecorded(Immutable):
     exit_policy_version: Identifier | None = None
     # True when this call found the stored exit rather than performing one.
     replayed: bool = Field(strict=True)
+    # Present when an automatic policy's trigger was judged again before the sale.
+    freshness: ExitFreshness | None = None
 
     @property
     def is_simulated(self) -> bool:
@@ -164,6 +204,7 @@ class ExitRefused(Immutable):
     # True when the refusal is a stored verdict returned unchanged rather than
     # one reached now. History, never a fresh decision.
     replayed: bool = Field(default=False, strict=True)
+    freshness: ExitFreshness | None = None
 
 
 ExitReading = PaperExitRecorded | ExitRefused

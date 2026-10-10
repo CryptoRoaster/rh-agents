@@ -532,6 +532,22 @@ class ExitReport(Immutable):
     held: int = Field(default=0, ge=0)
     triggers: tuple[Code, ...] = Field(default=(), max_length=8)
     refusals: tuple[Code, ...] = Field(default=(), max_length=32)
+    # Each trigger judged again on the held market observed after the exit's
+    # own chain read: refresh attempts (at most one per exit) and failures,
+    # provider requests they spent, triggers that had gone or changed, and the
+    # triggers the sales were actually decided on.
+    refresh_attempts: int = Field(default=0, ge=0)
+    refresh_failures: int = Field(default=0, ge=0)
+    refresh_provider_requests: int = Field(default=0, ge=0)
+    triggers_cleared: int = Field(default=0, ge=0)
+    triggers_changed: int = Field(default=0, ge=0)
+    reevaluated_triggers: tuple[Code, ...] = Field(default=(), max_length=8)
+    # The slowest refresh and chain read, and the oldest mark when a trigger
+    # fired and at the final check. Seconds; absent when nothing was measured.
+    max_refresh_seconds: float | None = Field(default=None, ge=0)
+    max_atlas_read_seconds: float | None = Field(default=None, ge=0)
+    max_mark_age_at_trigger_seconds: float | None = None
+    max_mark_age_at_final_seconds: float | None = None
 
 
 class RunSummary(Immutable):

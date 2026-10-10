@@ -26,6 +26,12 @@ copy of state that could disagree with them, and every exit's basis names the
 observation it rested on. A gap in recording is a gap in the peak, never an
 invented price.
 
+**Judged again before the sale.** After the exit's own on-chain read the held
+market is observed again and all four conditions are evaluated again, on the
+new mark and liquidity and on the peak over the whole window since entry — the
+fresh observation included. A stop whose price recovered sells nothing; a
+trailing stop is never judged on the current price alone.
+
 **Unknown is not a breach.** An unknown or stale mark fires no price trigger
 and an unknown liquidity no invalidation; the time exit needs neither. Whatever
 fires, the sale still goes through `PaperExitService` and its own SENTINEL
@@ -48,12 +54,27 @@ from src.core.clock import Clock, SystemClock
 from src.core.models import Position, RiskLimits
 from src.data.repository import aware
 from src.data.tables import MarketObservationRow, TradeCaseExecutionRow, TradeCaseRow
+from src.markets.geckoterminal.networks import VerifiedNetworkRegistry
 from src.markets.models import Availability, MarketSnapshot
 from src.markets.scope import MarketScope
 from src.orchestration.exitpolicy.policy import Immutable
-from src.orchestration.exitpolicy.service import ExitSweep, exit_request_key
+from src.orchestration.exitpolicy.refresh import (
+    PreExitMarketRefresh,
+    RefreshBudget,
+    RefreshContext,
+    RefreshDeadline,
+    Unbounded,
+)
+from src.orchestration.exitpolicy.service import (
+    ExitSweep,
+    confirmation,
+    exit_request_key,
+    mark_age,
+    refused_confirmation,
+)
 from src.orchestration.paperexit.models import PaperExitRecorded
 from src.orchestration.paperexit.service import (
+    ExitConfirmation,
     ExitTriggerRecord,
     PaperExitService,
     PaperExitUnavailable,
@@ -62,6 +83,7 @@ from src.orchestration.riskrequest.service import OneSnapshot
 from src.orchestration.strategy.early import EARLY_ENTRY_V1, PRE_VECTOR_EARLY_ENTRY_V1
 from src.orchestration.valuation.service import PositionValuationReader, held_market_identities
 from src.orchestration.valuation.service import _same_market as same_market
+from src.orchestration.workflow.models import TradeCase
 
 EARLY_EXIT_VERSION: Literal["EARLY_PAPER_EXIT_V1"] = "EARLY_PAPER_EXIT_V1"
 BPS = Decimal(10000)
@@ -330,9 +352,27 @@ class EarlyExitService:
     max_exits: int = 5
     clock: Clock = SystemClock()
     include_fixtures: bool = False
+    # The held market observed again after the exit's on-chain read. Absent,
+    # the trigger is still judged again — on what is recorded.
+    refresh: PreExitMarketRefresh | None = None
+    # Refresh attempts per sweep. `None` is one per exit this sweep may book.
+    max_refreshes: int | None = None
 
-    async def sweep(self) -> ExitSweep:
+    async def sweep(
+        self,
+        *,
+        deadline: RefreshDeadline | None = None,
+        networks: VerifiedNetworkRegistry | None = None,
+    ) -> ExitSweep:
         result = ExitSweep()
+        context = RefreshContext(
+            port=self.refresh,
+            budget=RefreshBudget(
+                self.max_refreshes if self.max_refreshes is not None else self.max_exits
+            ),
+            deadline=deadline if deadline is not None else Unbounded(),
+            networks=networks,
+        )
         async with self.sessions() as session:
             positions = [
                 item
@@ -346,7 +386,7 @@ class EarlyExitService:
                 # Not an early cycle: another policy's position, never this one's.
                 continue
             now = self.clock.now()
-            inputs = await self._inputs(position, entry, now)
+            inputs, _ = await self._inputs(position, entry, now)
             verdict = evaluate_early(self.policy, inputs)
             result.evaluated += 1
             if verdict.trigger is None:
@@ -360,6 +400,7 @@ class EarlyExitService:
             result.triggered += 1
             code = verdict.trigger.value
             result.triggers[code] = result.triggers.get(code, 0) + 1
+            result.triggered_at(mark_age(inputs.mark_observed_at, now))
             if result.executed >= self.max_exits:
                 result.refused("EXIT_BUDGET_REACHED")
                 continue
@@ -370,17 +411,15 @@ class EarlyExitService:
                     trigger=ExitTriggerRecord(
                         trigger=code,
                         policy_version=self.policy.version,
-                        basis={
-                            "policy": self.policy.model_dump(mode="json"),
-                            "inputs": inputs.model_dump(mode="json"),
-                            "verdict": verdict.model_dump(mode="json"),
-                        },
+                        basis=self._basis(inputs, verdict),
                     ),
+                    confirm=self._confirmer(position, entry, code, inputs, verdict, context),
                 )
             except PaperExitUnavailable as failure:
                 # Nothing was sold; the trigger still holds and the next sweep asks again.
                 result.refused(str(failure))
                 continue
+            result.measured(reading)
             if isinstance(reading, PaperExitRecorded):
                 if reading.replayed:
                     # Another sweep already sold it under this key: the sale
@@ -392,9 +431,67 @@ class EarlyExitService:
                 result.refused(reading.reason.value)
         return result
 
+    def _basis(self, inputs: EarlyExitInputs, verdict: EarlyExitVerdict) -> dict[str, Any]:
+        return {
+            "policy": self.policy.model_dump(mode="json"),
+            "inputs": inputs.model_dump(mode="json"),
+            "verdict": verdict.model_dump(mode="json"),
+        }
+
+    def _confirmer(
+        self,
+        position: Position,
+        entry: TradeCaseExecutionRow,
+        original: str,
+        first: EarlyExitInputs,
+        first_verdict: EarlyExitVerdict,
+        context: RefreshContext,
+    ) -> Any:
+        """All four conditions judged again, after the chain read, on fresh evidence."""
+
+        async def confirm(trade_case: TradeCase) -> ExitConfirmation:
+            observed = await context.observe(trade_case)
+            if observed[0] is not None:
+                return refused_confirmation(original, observed)
+            now = self.clock.now()
+            # The peak is read again over the whole window to this instant: the
+            # history since entry, and the observation just recorded.
+            inputs, snapshot_id = await self._inputs(position, entry, now)
+            verdict = evaluate_early(self.policy, inputs)
+            trigger = None if verdict.trigger is None else verdict.trigger.value
+            if trigger is None and inputs.mark_price_usd is None:
+                # No current mark of the held market: neither a breach nor a
+                # recovery is known. Refused by name, never read as cleared.
+                return refused_confirmation(original, ("MARK_UNAVAILABLE", *observed[1:]))
+            record = (
+                None
+                if trigger is None
+                else ExitTriggerRecord(
+                    trigger=trigger,
+                    policy_version=self.policy.version,
+                    basis={
+                        **self._basis(inputs, verdict),
+                        "original": {
+                            "inputs": first.model_dump(mode="json"),
+                            "verdict": first_verdict.model_dump(mode="json"),
+                        },
+                    },
+                )
+            )
+            return confirmation(
+                trigger,
+                record,
+                original=original,
+                snapshot_id=snapshot_id,
+                observed=observed,
+                mark_age_seconds=mark_age(inputs.mark_observed_at, now),
+            )
+
+        return confirm
+
     async def _inputs(
         self, position: Position, entry: TradeCaseExecutionRow, now: datetime
-    ) -> EarlyExitInputs:
+    ) -> tuple[EarlyExitInputs, Any]:
         feed = OneSnapshot(self.markets, self.include_fixtures)
         async with self.sessions() as session:
             identities = await held_market_identities(session, [position])
@@ -406,6 +503,7 @@ class EarlyExitService:
         ).value([position], now)
         mark = valuation.by_asset.get(position.asset_id)
         liquidity: Decimal | None = None
+        snapshot_id: Any = None
         if position.market_pair_id is not None:
             held = MarketScope.held(position)
             identity = identities.get(position.asset_id)
@@ -417,6 +515,7 @@ class EarlyExitService:
                 else held
             )
             snapshot = None if scope is None else await feed.latest_in(scope)
+            snapshot_id = None if snapshot is None else snapshot.id
             if (
                 snapshot is not None
                 # The held market's own reading: same pool, and the same chain,
@@ -439,7 +538,7 @@ class EarlyExitService:
                 until=now,
                 include_fixtures=self.include_fixtures,
             )
-        return EarlyExitInputs(
+        inputs = EarlyExitInputs(
             entry_cost_per_unit_usd=position.cost_basis_usd / position.quantity,
             entered_at=entered_at,
             mark_price_usd=None if mark is None else mark.price_usd,
@@ -448,6 +547,7 @@ class EarlyExitService:
             liquidity_usd=liquidity,
             now=now,
         )
+        return inputs, snapshot_id
 
 
 async def early_entries(

@@ -55,6 +55,7 @@ from src.markets.geckoterminal.transport import GeckoTerminalTransport
 from src.markets.models import MarketIdentity
 from src.markets.reader import MarketReader
 from src.markets.recorder import MarketRecorder
+from src.markets.scope import describes_market
 from src.orchestration.workflow.models import TradeCase
 from src.runner.acquisition import (
     RunDeadline,
@@ -245,7 +246,14 @@ class PreRiskMarketRefresh:
                 tally.refused += 1
                 tally.fail(PreRiskReason.MARKET_IDENTITY_UNKNOWN)
                 continue
-            needed.setdefault(identity.pair_id, identity)
+            known = needed.get(identity.pair_id)
+            if known is None:
+                needed[identity.pair_id] = identity
+            elif known.pool_locator is None and describes_market(identity, known):
+                # A case recorded before pool locators existed, completed by the
+                # holding's own identity — the same market, now addressable by
+                # its stored locator. Nothing else about it may differ.
+                needed[identity.pair_id] = identity
         return list(needed.values())
 
     async def _observe(
