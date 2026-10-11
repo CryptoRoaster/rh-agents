@@ -20,6 +20,9 @@ from src.core.numbers import quantize
 BPS = Decimal("10000")
 # The order safety checks report in, unchanged from when they were one mapping.
 ORDER = {"TOKEN": 0, "ROUTING": 1, "HOLDERS": 2, "ACCOUNTING": 3}
+# The reason a BUY refused at the daily loss limit carries, and the one its
+# caller turns into the automatic entry halt.
+DAILY_LOSS_LIMIT = "DAILY_LOSS_LIMIT"
 
 
 def _additional_buy_notional(
@@ -150,9 +153,19 @@ def evaluate(
         )
     ):
         reasons.append("PORTFOLIO_DATA_UNKNOWN")
-    if context.daily_loss_usd is not None and context.daily_loss_usd >= limits.daily_loss_limit_usd:
-        reasons.append("DAILY_LOSS_LIMIT")
-        pause = True
+    # The daily loss limit binds a purchase, never a sale. A sale reduces risk
+    # and is exactly what a loss-limited book still needs to be able to do;
+    # every check that says whether a sale is possible and correctly valued
+    # still binds it above. For a purchase it is a refusal, not a system-wide
+    # stop: the caller records it as the persistent automatic entry halt
+    # (`src.orchestration.entryhalt`), which stops every further BUY and no
+    # SELL. Only the kill switch pauses the system.
+    if (
+        buying
+        and context.daily_loss_usd is not None
+        and context.daily_loss_usd >= limits.daily_loss_limit_usd
+    ):
+        reasons.append(DAILY_LOSS_LIMIT)
     if intent.side == Side.BUY:
         if context.cash_usd is not None and worst_cost > context.cash_usd:
             reasons.append("INSUFFICIENT_CASH")

@@ -309,7 +309,7 @@ Two persistent halts on the paper account, set and lifted apart:
 
 | Halt | Set by | Lifted by |
 |---|---|---|
-| automatic (`entry_halt_auto`) | the system, for one UTC loss day (SENTINEL's accounting; wired in a later change — in this one nothing sets it automatically yet) | an operator only, once that loss day is over **and** today's realised loss is below SENTINEL's daily limit, both read under the account lock |
+| automatic (`entry_halt_auto`) | the system, for one UTC loss day: SENTINEL refusing a BUY at the daily loss limit (`actor_kind=SENTINEL`, with the decision id), or a booked SELL taking the day's realised loss to the limit (`actor_kind=LEDGER`) — each in the same transaction as the verdict or the booking | an operator only, once that loss day is over **and** today's realised loss is below SENTINEL's daily limit, both read under the account lock |
 | manual (`entry_halt_manual`) | an operator | an operator |
 
 Either halt stops every new BUY, on every path, under the paper account lock:
@@ -318,7 +318,15 @@ SENTINEL is asked and spends nothing, a fill is refused even for an approval
 granted before the halt, re-entry opens no successor, and the paper executor
 refuses a BUY that reached it anyway. A fill already booked is replayed as it
 was. **No SELL is stopped by a halt.** The durable pause (`paused`) and the kill
-switch stay full stops, unchanged; `DAILY_LOSS_LIMIT` is unchanged as well.
+switch stay full stops, unchanged.
+
+**The daily loss limit** binds a BUY only. A BUY at or past it is refused
+(`REJECT`, reason `DAILY_LOSS_LIMIT` — no longer `PAUSE_SYSTEM`) and sets the
+automatic halt; a SELL is never refused for it, and every other SELL check still
+applies. A sale may take the day's loss to or past the limit; when its booking
+does, the automatic halt is set in that booking's transaction — a sale that is
+not booked halts nothing. Only the kill switch returns `PAUSE_SYSTEM`. An
+existing `paused=true` is never lifted by any of this.
 
 The entry job (`--once`) still runs its exits, then stops with
 `stop=ENTRY_HALTED` and starts nothing that could lead to a BUY. Every summary

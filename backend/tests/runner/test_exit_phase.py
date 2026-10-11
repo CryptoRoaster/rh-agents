@@ -109,9 +109,10 @@ async def exit_rows(sessions):
 def falling(held):
     """Every early holding at its stop; every normal one past its target.
 
-    Normal sales are taken at a profit on purpose: a loss on each of four
-    larger normal holdings would reach SENTINEL's daily loss limit, whose
-    `PAUSE_SYSTEM` (unchanged here) then stops every later sale in the run.
+    Normal sales are taken at a profit on purpose: these tests are about the
+    exit budget, and a loss on four larger normal holdings would reach the
+    daily loss limit and set the entry halt — which stops no sale, but is not
+    what these tests are about.
     """
     return MarketProvider(
         targeted=[answer(item, price="2.00" if item in NORMAL else "0.40") for item in held]

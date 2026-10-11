@@ -13,7 +13,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import func, select
 
-from src.core.models import RiskLimits, RiskOutcome, Side
+from src.core.models import RiskLimits, Side
 from src.data.tables import ExecutionRow, PositionRow, TradeRow
 from src.orchestration.paperexit.models import ExitRefusal
 from tests.paperexit.conftest import (
@@ -403,8 +403,12 @@ async def test_a_paused_account_blocks_the_exit(risk_db, now, trace):
     assert allowed.kind == "paper_exit_recorded"
 
 
-async def test_a_pause_verdict_at_exit_time_is_stored_with_its_rejection(risk_db, now, trace):
-    """The stop lands atomically with the verdict it came with, and no sale."""
+async def test_a_sale_past_the_daily_loss_limit_is_booked_and_halts_entries(risk_db, now, trace):
+    """The daily loss limit never refuses a sale; the booked loss halts entries.
+
+    Every other SELL check still applies. The halt and its audit event commit
+    in the sale's own transaction; the system is not paused.
+    """
     _, sessions = risk_db
     feed = market_feed(now)
     _, _, position = await entered(sessions, now, trace, feed=feed)
@@ -414,12 +418,12 @@ async def test_a_pause_verdict_at_exit_time_is_stored_with_its_rejection(risk_db
         position.id, request_key="exit-pause"
     )
 
-    assert result.reason is ExitRefusal.EXIT_RISK_REFUSED
-    assert result.outcome is RiskOutcome.PAUSE_SYSTEM
-    assert "DAILY_LOSS_LIMIT" in result.reason_codes
-    assert (await read_account(sessions)).paused is True
-    assert (await position_of(sessions)).quantity == position.quantity
-    assert await exits(sessions) == []
+    assert result.kind == "paper_exit_recorded", getattr(result, "reason", None)
+    account = await read_account(sessions)
+    assert account.paused is False
+    assert (account.entry_halt_auto, account.entry_halt_auto_reason) == (True, "DAILY_LOSS_LIMIT")
+    assert (await position_of(sessions)).quantity == 0
+    assert len(await exits(sessions)) == 1
 
 
 async def test_a_stale_market_is_a_typed_stop(risk_db, now, trace):

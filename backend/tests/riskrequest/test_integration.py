@@ -201,11 +201,12 @@ async def test_a_measured_danger_is_rejected_terminally(risk_db, now, trace):
     assert after.status is TradeCaseStatus.RISK_REJECTED
 
 
-async def test_a_pause_verdict_stops_the_system_in_the_same_transaction(risk_db, now, trace):
-    """The stop this flow could previously only observe.
+async def test_a_daily_loss_verdict_halts_entries_in_the_same_transaction(risk_db, now, trace):
+    """The daily loss limit refuses the BUY and halts every further entry.
 
     Recorded with the rejection it came with, so no window exists where the
-    verdict stands and the pause does not. Nothing here ever clears it.
+    verdict stands and the halt does not. The system is not paused: sales go on.
+    Nothing here ever clears the halt.
     """
     _, sessions = risk_db
     service = build_service(sessions, now)
@@ -217,10 +218,13 @@ async def test_a_pause_verdict_stops_the_system_in_the_same_transaction(risk_db,
 
     result = await service.request_risk_evaluation(case.id, request_key="rr-pause")
 
-    assert result.outcome is RiskOutcome.PAUSE_SYSTEM
+    assert result.outcome is RiskOutcome.REJECT
     assert result.authorization is RiskAuthorization.REJECTED
     assert "DAILY_LOSS_LIMIT" in result.reason_codes
-    assert (await read_account(sessions)).paused is True
+    account = await read_account(sessions)
+    assert account.paused is False
+    assert account.entry_halt_auto is True
+    assert account.entry_halt_auto_decision_id is not None
     assert (await counts(sessions)) == (1, 1)
 
 

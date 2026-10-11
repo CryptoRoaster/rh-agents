@@ -31,6 +31,7 @@ from src.ledger.accounting import apply_fill, calculate_pnl
 from src.ledger.portfolio import PortfolioState, portfolio_state, roll_loss_day
 from src.markets.models import MarketIdentity
 from src.orchestration.entryhalt.models import entry_halt
+from src.orchestration.entryhalt.service import halt_on_daily_loss, halt_on_realized_loss
 from src.orchestration.valuation.models import PositionMark
 from src.risk.engine import evaluate
 
@@ -300,6 +301,9 @@ class PaperTradingService:
         if risk.outcome != RiskOutcome.APPROVE:
             if risk.outcome == RiskOutcome.PAUSE_SYSTEM:
                 account.paused = True
+            # A BUY refused at the daily loss limit: the automatic entry halt,
+            # in this transaction, beside the verdict.
+            await halt_on_daily_loss(session, account, risk, limits=governing, at=now)
             return PaperOutcome(decision=risk, state=state)
 
         # ------------------------------------------------ execution boundary
@@ -355,6 +359,13 @@ class PaperTradingService:
         # would be a third instant nobody checked anything at.
         roll_loss_day(account, fill.created_at)
         account.realized_loss_today_usd += max(Decimal("0"), -trade.realized_pnl_usd)
+        if intent.side == Side.SELL:
+            # The sale may take the day's loss to the limit; SENTINEL no longer
+            # refuses it for that. What it does instead is halt entries — in
+            # this booking's transaction, so a sale rolled back halts nothing.
+            await halt_on_realized_loss(
+                session, account, limits=governing, at=fill.created_at, decision_id=risk.id
+            )
         positions = [p for p in positions if p.asset_id != updated.asset_id] + [updated]
         pnl = calculate_pnl(
             positions, prices, cash=cash, fees_paid=account.fees_paid_usd, fill=fill

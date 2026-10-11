@@ -114,13 +114,57 @@ def test_unknown_accounting_rejects(intent, market, context, now):
     )
 
 
-@pytest.mark.parametrize("kill,loss", [(True, "0"), (False, "500")])
-def test_pause_conditions(intent, market, context, now, kill, loss):
-    context = context.model_copy(update={"daily_loss_usd": Decimal(loss)})
+def test_only_the_kill_switch_pauses_the_system(intent, market, context, now):
     assert (
-        evaluate(intent, market, context, RiskLimits(kill_switch=kill), now=now).outcome
+        evaluate(intent, market, context, RiskLimits(kill_switch=True), now=now).outcome
         == RiskOutcome.PAUSE_SYSTEM
     )
+
+
+@pytest.mark.parametrize("loss", ["500", "500.000000000000000001", "900"])
+def test_the_daily_loss_limit_refuses_a_buy_without_pausing(intent, market, context, now, loss):
+    """At or past the limit: a refused purchase, never a system-wide stop."""
+    context = context.model_copy(update={"daily_loss_usd": Decimal(loss)})
+
+    risk = evaluate(intent, market, context, RiskLimits(), now=now)
+
+    assert risk.outcome == RiskOutcome.REJECT
+    assert "DAILY_LOSS_LIMIT" in risk.reason_codes
+    assert risk.max_additional_notional_usd == 0
+
+
+def test_a_buy_just_under_the_daily_loss_limit_is_not_refused_for_it(intent, market, context, now):
+    context = context.model_copy(update={"daily_loss_usd": Decimal("499.99")})
+    assert (
+        "DAILY_LOSS_LIMIT"
+        not in evaluate(intent, market, context, RiskLimits(), now=now).reason_codes
+    )
+
+
+@pytest.mark.parametrize("loss", ["500", "900"])
+def test_the_daily_loss_limit_never_refuses_a_sale(intent, market, context, now, loss):
+    """A sale reduces risk; every other check that binds a sale still does."""
+    sale = intent.model_copy(update={"side": Side.SELL})
+    context = context.model_copy(
+        update={"daily_loss_usd": Decimal(loss), "position_quantity": sale.quantity}
+    )
+
+    risk = evaluate(sale, market, context, RiskLimits(), now=now)
+
+    assert risk.outcome == RiskOutcome.APPROVE, risk.reason_codes
+    assert "DAILY_LOSS_LIMIT" not in risk.reason_codes
+
+
+def test_a_kill_switch_still_pauses_a_sale_at_the_daily_loss_limit(intent, market, context, now):
+    sale = intent.model_copy(update={"side": Side.SELL})
+    context = context.model_copy(
+        update={"daily_loss_usd": Decimal("900"), "position_quantity": sale.quantity}
+    )
+
+    risk = evaluate(sale, market, context, RiskLimits(kill_switch=True), now=now)
+
+    assert risk.outcome == RiskOutcome.PAUSE_SYSTEM
+    assert risk.reason_codes == ("KILL_SWITCH",)
 
 
 @pytest.mark.parametrize("mode", [TradingMode.OBSERVE, TradingMode.LIVE_AUTONOMOUS])
