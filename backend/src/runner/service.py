@@ -193,6 +193,8 @@ class Account:
     exits: ExitSweep | None = None
     early_exits: ExitSweep | None = None
     exit_phase: ExitBudget | None = None
+    # The entry-only halt as this run read it, after its exits.
+    entry_halt: str | None = None
     # PRE_VECTOR_EARLY_ENTRY_V1, when enabled: what its refresh and intake did,
     # and how many early entries this run has filled against its per-run bound.
     early: EarlyEntryReport | None = None
@@ -307,6 +309,7 @@ class BoundedPaperRun:
             if not await self._acquire(account, deadline, positions_only=True, window=window):
                 return self._summary(started, account)
             await self._exit_phase(account, deadline)
+            await self._entry_halted(account, report_only=True)
         except SystemPauseUnavailable:
             account.stop = RunStop.SYSTEM_STOPPED
             account.fail("SYSTEM_STOP_UNREADABLE")
@@ -336,6 +339,11 @@ class BoundedPaperRun:
             # Exits first: closing what the policy says to close reduces risk
             # before any new case is opened, and needs nothing intake produces.
             await self._exit_phase(account, deadline)
+            if await self._entry_halted(account):
+                # Exits ran; nothing that could lead to a BUY starts. Every BUY
+                # path refuses a halted entry under the account lock anyway —
+                # this only spares the work that would be refused.
+                return self._summary(started, account)
             await self._promote(account, deadline)
             await self._intake(account, deadline)
             if not account.intake_unknown:
@@ -481,6 +489,30 @@ class BoundedPaperRun:
         ):
             # Positions were left unjudged or unattempted for want of time.
             account.stop = RunStop.TIME_BUDGET_REACHED
+
+    async def _entry_halted(self, account: Account, *, report_only: bool = False) -> bool:
+        """Read the entry-only halt, report it, and say whether entries are halted.
+
+        A view, never the gate: the gate is every BUY path's own check under the
+        account lock. An unreadable halt is reported as such and halts entries;
+        the exit job only reports it.
+        """
+        pause = self.stack.pause
+        if pause is None:
+            return False
+        try:
+            halted = await pause.entry_halt()
+        except SystemPauseUnavailable:
+            if report_only:
+                account.entry_halt = "UNREADABLE"
+                return True
+            raise
+        account.entry_halt = halted
+        if halted is None:
+            return False
+        if not report_only:
+            account.stop = RunStop.ENTRY_HALTED
+        return True
 
     async def _intake(self, account: Account, deadline: Deadline) -> None:
         """One bounded intake cycle, through the existing control plane.
@@ -1238,6 +1270,7 @@ class BoundedPaperRun:
             exits=_exit_report(account.exits),
             early_exits=_exit_report(account.early_exits),
             exit_phase=_exit_phase_report(account.exit_phase),
+            entry_halt=account.entry_halt,
             errors=tuple(account.errors),
             early=account.early,
         )

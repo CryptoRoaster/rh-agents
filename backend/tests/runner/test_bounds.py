@@ -372,6 +372,8 @@ def test_the_summary_carries_no_secret_and_no_payload(risk_db):
         "early_exits",
         # Counts and bounds only; both sweeps' shared budget, absent without one.
         "exit_phase",
+        # A code only: which entry-only halt this run read, absent when none.
+        "entry_halt",
         "errors",
         # Counts and codes only; absent unless PRE_VECTOR_EARLY_ENTRY_V1 is enabled.
         "early",

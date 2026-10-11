@@ -87,6 +87,10 @@ class SystemPaused(Exception):
     """A stop was in force when the opening transaction reached it."""
 
 
+class EntryHalted(Exception):
+    """An entry-only halt was in force when the opening transaction reached it."""
+
+
 class IntakeRefusal(StrEnum):
     """Why a candidate did not open a case. Typed, so the answer is auditable."""
 
@@ -110,6 +114,8 @@ class IntakeRefusal(StrEnum):
     POSITION_OPENED_FOR_MARKET = "POSITION_OPENED_FOR_MARKET"
     CYCLE_LIMIT_REACHED = "CYCLE_LIMIT_REACHED"
     SYSTEM_PAUSED = "SYSTEM_PAUSED"
+    # An entry-only halt is in force: no case that could lead to a BUY opens.
+    ENTRY_HALTED = "ENTRY_HALTED"
     # The open was refused by the workflow itself. Recorded per candidate so one
     # bad candidate cannot abort a whole cycle.
     OPEN_REFUSED = "OPEN_REFUSED"
@@ -225,6 +231,10 @@ class CommanderIntakeService:
             raise ValueError("One intake cycle must read between one and fifty candidates")
         if await self._halted():
             return IntakeOutcome(refused=(("*", IntakeRefusal.SYSTEM_PAUSED),))
+        if self.pause is not None and await self.pause.entry_halt() is not None:
+            # A hint that saves reading candidates; the open itself checks again
+            # under the account lock.
+            return IntakeOutcome(refused=(("*", IntakeRefusal.ENTRY_HALTED),))
 
         now = self.clock.now()
         opened: list[TradeCase] = []
@@ -248,6 +258,9 @@ class CommanderIntakeService:
             except SystemPaused:
                 # The stop was in force when the transaction reached it.
                 refused.append((candidate.pair_id, IntakeRefusal.SYSTEM_PAUSED))
+                continue
+            except EntryHalted:
+                refused.append((candidate.pair_id, IntakeRefusal.ENTRY_HALTED))
                 continue
             except WorkflowFailure:
                 # One candidate the workflow declined must not end the cycle.
@@ -410,6 +423,10 @@ class CommanderIntakeService:
                 raise SystemPaused
             if await self.pause.locked_paused(session):
                 raise SystemPaused
+            # The entry-only halt, under the same lock: a case opened here is a
+            # case that could become a BUY.
+            if await self.pause.locked_entry_halt(session) is not None:
+                raise EntryHalted
             await self._serialize_on_key(session, self.intake_key(candidate, predecessor))
             return await self.cases.open_trade_case_in_session(
                 session,

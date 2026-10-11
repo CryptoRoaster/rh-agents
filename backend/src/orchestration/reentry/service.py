@@ -51,6 +51,7 @@ from src.data.tables import (
 from src.markets.models import MarketIdentity
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.cycles import cycle_of
+from src.orchestration.entryhalt.models import entry_halt
 from src.orchestration.paper import PaperTradingService
 from src.orchestration.reentry.models import (
     ReentryOpened,
@@ -283,6 +284,10 @@ class PaperReentryService:
             return _refused(exit_id, ReentryRefusal.SYSTEM_STOP_UNREADABLE, cycle_id=cycle_id)
         if bool(account.paused):
             return _refused(exit_id, ReentryRefusal.SYSTEM_PAUSED, cycle_id=cycle_id)
+        halted = entry_halt(account)
+        if halted is not None:
+            # A successor cycle is a case that could become a BUY.
+            return _refused(exit_id, ReentryRefusal.ENTRY_HALTED, cycle_id=cycle_id, detail=halted)
         return None
 
 

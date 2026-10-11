@@ -303,6 +303,61 @@ already existed under its key — never counted as `executed`), `timed_out`,
 `refreshes`, `provider_requests`, `reserve_seconds`, `deferred`,
 `deferred_reasons` and `unknown`. No migration.
 
+### The entry-only halt (migration 0023)
+
+Two persistent halts on the paper account, set and lifted apart:
+
+| Halt | Set by | Lifted by |
+|---|---|---|
+| automatic (`entry_halt_auto`) | the system, for one UTC loss day (SENTINEL's accounting; wired in a later change — in this one nothing sets it automatically yet) | an operator only, once that loss day is over **and** today's realised loss is below SENTINEL's daily limit, both read under the account lock |
+| manual (`entry_halt_manual`) | an operator | an operator |
+
+Either halt stops every new BUY, on every path, under the paper account lock:
+intake opens no case (`ENTRY_HALTED`), a risk request is refused before
+SENTINEL is asked and spends nothing, a fill is refused even for an approval
+granted before the halt, re-entry opens no successor, and the paper executor
+refuses a BUY that reached it anyway. A fill already booked is replayed as it
+was. **No SELL is stopped by a halt.** The durable pause (`paused`) and the kill
+switch stay full stops, unchanged; `DAILY_LOSS_LIMIT` is unchanged as well.
+
+The entry job (`--once`) still runs its exits, then stops with
+`stop=ENTRY_HALTED` and starts nothing that could lead to a BUY. Every summary
+carries `entry_halt` (`MANUAL`, `AUTO`, `MANUAL_AND_AUTO`, `UNREADABLE`, or
+absent). The read-only portfolio view shows both halts.
+
+```sh
+cd backend
+uv run python -m src.runner.control --status
+uv run python -m src.runner.control --events --limit 20
+uv run python -m src.runner.control --halt-entries      --reason OPERATOR_REVIEW --actor kai
+uv run python -m src.runner.control --clear-manual-halt --reason REVIEW_DONE     --actor kai
+uv run python -m src.runner.control --clear-auto-halt   --reason LOSS_DAY_OVER   --actor kai \
+  --confirm-loss-day 2026-10-11
+```
+
+A reason code (`UPPER_SNAKE_CASE`) is required for every change. Exit codes:
+`0` done, `1` technical failure, `2` refused or invalid. A refused request is
+recorded too.
+
+**Who may do this.** Whoever can run that module against the database — the
+same host, shell and `DATABASE_URL` access that applies migrations. Nothing
+authenticates a person: `--actor` is recorded as given and never verified. There
+is no web route and no agent tool that sets or lifts a halt.
+
+**Audit.** Every change and every refused request is one row in
+`paper_control_events`, written in the same transaction as the change.
+PostgreSQL enforces it: the table is append-only by trigger, and a deferred
+constraint trigger refuses at commit any change of a halt field that no event of
+the same transaction accounts for (same halt, the state it ended in, the same
+reason). This makes every change *recorded*; it does not make it *authorised* —
+a role that may write the account may also write a matching event.
+
+**Migration 0023** adds the columns (both halts cleared), the event table and
+its triggers, and changes nothing else: an existing `paused=true` stays true. Its
+downgrade refuses while a halt is in force or any event exists. Apply it only
+with every job stopped; the runtime database is migrated only after a separate
+approval.
+
 ## 3. The preflight
 
 ```sh

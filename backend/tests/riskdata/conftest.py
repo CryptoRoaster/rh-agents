@@ -99,14 +99,21 @@ class RecordedMarkets:
 class RunningSystem:
     """A configured stop source that reports no stop."""
 
-    def __init__(self, paused: bool = False) -> None:
+    def __init__(self, paused: bool = False, halted: str | None = None) -> None:
         self.paused = paused
+        self.halted = halted
 
     async def system_paused(self) -> bool:
         return self.paused
 
     async def locked_paused(self, session) -> bool:
         return self.paused
+
+    async def entry_halt(self):
+        return self.halted
+
+    async def locked_entry_halt(self, session):
+        return self.halted
 
 
 def recorded_snapshot(

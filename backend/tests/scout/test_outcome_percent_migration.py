@@ -11,7 +11,6 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from src.data.schema import expected_revision
 from tests.markets.test_quote_price_migration import THROUGH_0020
 from tests.reentry.test_migration import load
 from tests.scout.test_outcome_migration import SAMPLE
@@ -32,9 +31,10 @@ LABEL = (
 )
 
 
-def test_the_chain_ends_at_0022():
-    assert expected_revision() == "0022"
+def test_0022_follows_0021_and_is_followed_by_0023():
+    # The chain's head is asserted by the newest migration's own test.
     assert load(MODULE).down_revision == "0021"
+    assert load("0023_persistent_entry_halt").down_revision == "0022"
 
 
 @pytest.fixture

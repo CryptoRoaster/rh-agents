@@ -392,6 +392,12 @@ class HangingPause:
     async def locked_paused(self, session) -> bool:
         return await self.system_paused()
 
+    async def entry_halt(self):
+        return None
+
+    async def locked_entry_halt(self, session):
+        return None
+
 
 class CountingPause:
     """A stop source that answers, and says how often it was asked."""
@@ -405,6 +411,12 @@ class CountingPause:
 
     async def locked_paused(self, session) -> bool:
         return False
+
+    async def entry_halt(self):
+        return None
+
+    async def locked_entry_halt(self, session):
+        return None
 
 
 async def test_an_expired_deadline_never_asks_the_stop_source(risk_db, now, trace):

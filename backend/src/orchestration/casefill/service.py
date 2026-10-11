@@ -51,6 +51,7 @@ from src.orchestration.casefill.models import (
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
 from src.orchestration.cycles import cycle_of
+from src.orchestration.entryhalt.models import entry_halt
 from src.orchestration.paper import PaperOutcome, PaperTradingService
 from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
@@ -627,6 +628,12 @@ class CaseFillService:
             return _refused(trade_case, ExecutionRefusal.SYSTEM_STOP_UNREADABLE)
         if bool(account.paused):
             return _refused(trade_case, ExecutionRefusal.SYSTEM_PAUSED)
+        halted = entry_halt(account)
+        if halted is not None:
+            # After the replay above, before anything is asked: a fill that was
+            # booked stays what it was, and an approval granted before the halt
+            # buys nothing now. Not recorded — the case's request stays as it is.
+            return _refused(trade_case, ExecutionRefusal.ENTRY_HALTED, detail=halted)
         return None
 
     def _record(

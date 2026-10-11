@@ -607,6 +607,12 @@ def _running():
         async def locked_paused(self, session) -> bool:
             return False
 
+        async def entry_halt(self):
+            return None
+
+        async def locked_entry_halt(self, session):
+            return None
+
     return Running()
 
 

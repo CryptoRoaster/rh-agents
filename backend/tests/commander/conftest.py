@@ -30,8 +30,10 @@ class RunningSystem:
     deployment has to do.
     """
 
-    def __init__(self, paused: bool = False) -> None:
+    def __init__(self, paused: bool = False, halted: str | None = None) -> None:
         self.paused = paused
+        # The entry-only halt's detail code (`MANUAL`, `AUTO`, ...), or None.
+        self.halted = halted
 
     async def system_paused(self) -> bool:
         return self.paused
@@ -45,6 +47,12 @@ class RunningSystem:
         transaction, so every other test runs through the real code path.
         """
         return self.paused
+
+    async def entry_halt(self):
+        return self.halted
+
+    async def locked_entry_halt(self, session):
+        return self.halted
 
 
 def build_stack(sessions, instant, *, kill_switch=False, pause=None, mode="PAPER"):
@@ -200,7 +208,12 @@ async def commander_db():
     try:
         versions = Path(__file__).parents[2] / "migrations/versions"
         modules = []
-        for name in ("0001_foundation", "0005_trade_case_workflow", "0006_worker_runtime"):
+        for name in (
+            "0001_foundation",
+            "0005_trade_case_workflow",
+            "0006_worker_runtime",
+            "0023_persistent_entry_halt",
+        ):
             spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)

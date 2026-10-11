@@ -77,6 +77,9 @@ class RunStop(StrEnum):
     SYSTEM_STOPPED = "SYSTEM_STOPPED"
     # Another run of the same job holds its lock. Nothing was asked or written.
     ALREADY_RUNNING = "ALREADY_RUNNING"
+    # An entry-only halt is in force: the exits ran, and nothing that could lead
+    # to a BUY was started. Not a fault.
+    ENTRY_HALTED = "ENTRY_HALTED"
 
 
 class RunMode(StrEnum):
@@ -645,6 +648,10 @@ class RunSummary(Immutable):
     early_exits: ExitReport | None = None
     # Both sweeps' shared budget; absent when no exit policy is configured.
     exit_phase: ExitPhaseReport | None = None
+    # The entry-only halt as this run read it (`MANUAL`, `AUTO`,
+    # `MANUAL_AND_AUTO`, or `UNREADABLE`); absent when none was in force or the
+    # run never got as far as reading it.
+    entry_halt: Code | None = None
     # Absent unless PRE_VECTOR_EARLY_ENTRY_V1 is enabled.
     early: EarlyEntryReport | None = None
     # Technical faults, as codes. Never a provider message and never a traceback.
