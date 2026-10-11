@@ -22,7 +22,30 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.sql.functions import FunctionElement
+
+
+class CurrentTransaction(FunctionElement[int]):
+    """The writing transaction's id, as a column default: `txid_current()` on PostgreSQL.
+
+    The light SQLite suite has no transaction ids and no audit trigger to read
+    them, so there it renders as `0`.
+    """
+
+    type = BigInteger()
+    inherit_cache = True
+
+
+@compiles(CurrentTransaction)
+def _current_transaction(element: CurrentTransaction, compiler: Any, **kw: Any) -> str:
+    return "txid_current()"
+
+
+@compiles(CurrentTransaction, "sqlite")
+def _current_transaction_sqlite(element: CurrentTransaction, compiler: Any, **kw: Any) -> str:
+    return "0"
 
 
 class Base(DeclarativeBase):
@@ -143,6 +166,23 @@ class AccountRow(Base):
     __table_args__ = (
         CheckConstraint("id = 1", name="single_paper_account"),
         CheckConstraint("cash_usd >= 0", name="account_cash_nonnegative"),
+        # A halt in force names why, when and — for the automatic one — which
+        # UTC loss day; a halt not in force carries none of it (migration 0023).
+        CheckConstraint(
+            "(entry_halt_auto AND entry_halt_auto_reason IS NOT NULL"
+            " AND entry_halt_auto_at IS NOT NULL AND entry_halt_auto_loss_day IS NOT NULL)"
+            " OR (NOT entry_halt_auto AND entry_halt_auto_reason IS NULL"
+            " AND entry_halt_auto_at IS NULL AND entry_halt_auto_loss_day IS NULL"
+            " AND entry_halt_auto_decision_id IS NULL)",
+            name="entry_halt_auto_consistent",
+        ),
+        CheckConstraint(
+            "(entry_halt_manual AND entry_halt_manual_reason IS NOT NULL"
+            " AND entry_halt_manual_at IS NOT NULL)"
+            " OR (NOT entry_halt_manual AND entry_halt_manual_reason IS NULL"
+            " AND entry_halt_manual_at IS NULL)",
+            name="entry_halt_manual_consistent",
+        ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     cash_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
@@ -151,6 +191,74 @@ class AccountRow(Base):
     loss_day: Mapped[date] = mapped_column(Date)
     realized_loss_today_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18))
     paused: Mapped[bool] = mapped_column(default=False)
+    # The persistent entry-only halt (src.orchestration.entryhalt). Two halts,
+    # set and cleared apart: an automatic one SENTINEL's accounting may set, and
+    # a manual one only an operator sets. Either stops every new BUY and no
+    # SELL. Changed only together with a `paper_control_events` row.
+    entry_halt_auto: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    entry_halt_auto_reason: Mapped[str | None] = mapped_column(String(64), default=None)
+    entry_halt_auto_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    entry_halt_auto_loss_day: Mapped[date | None] = mapped_column(Date, default=None)
+    entry_halt_auto_decision_id: Mapped[UUID | None] = mapped_column(Uuid, default=None)
+    entry_halt_manual: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    entry_halt_manual_reason: Mapped[str | None] = mapped_column(String(64), default=None)
+    entry_halt_manual_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
+
+class PaperControlEventRow(Base):
+    """One change — or refused change — of an entry halt. Append-only (0023).
+
+    Written in the same transaction as the account row it describes. On
+    PostgreSQL the database also records the writing transaction (`txid`, not
+    mapped here) and refuses, at commit, any change of a halt field that no
+    event of that transaction accounts for.
+    """
+
+    __tablename__ = "paper_control_events"
+    __table_args__ = (
+        CheckConstraint(
+            "control IN ('ENTRY_HALT_AUTO', 'ENTRY_HALT_MANUAL')",
+            name="paper_control_event_control",
+        ),
+        CheckConstraint("action IN ('SET', 'CLEAR', 'REFUSED')", name="paper_control_event_action"),
+        CheckConstraint(
+            "actor_kind IN ('OPERATOR', 'SENTINEL', 'LEDGER')", name="paper_control_event_actor"
+        ),
+        CheckConstraint(
+            "(action = 'REFUSED') = (refusal_code IS NOT NULL)",
+            name="paper_control_event_refusal",
+        ),
+        Index("ix_paper_control_events_time", "occurred_at", "sequence"),
+    )
+    sequence: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    event_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    # The writing transaction, always the database's own; never set by a writer.
+    txid: Mapped[int] = mapped_column(BigInteger, server_default=CurrentTransaction(), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    control: Mapped[str] = mapped_column(String(32))
+    action: Mapped[str] = mapped_column(String(16))
+    reason_code: Mapped[str] = mapped_column(String(64))
+    refusal_code: Mapped[str | None] = mapped_column(String(64), default=None)
+    actor_kind: Mapped[str] = mapped_column(String(16))
+    # Whatever the caller named itself. Recorded, never verified (see the CLI).
+    actor_ref: Mapped[str | None] = mapped_column(String(64), default=None)
+    halted_before: Mapped[bool] = mapped_column(Boolean)
+    halted_after: Mapped[bool] = mapped_column(Boolean)
+    loss_day: Mapped[date | None] = mapped_column(Date, default=None)
+    realized_loss_today_usd: Mapped[Decimal | None] = mapped_column(Numeric(38, 18), default=None)
+    daily_loss_limit_usd: Mapped[Decimal | None] = mapped_column(Numeric(38, 18), default=None)
+    risk_decision_id: Mapped[UUID | None] = mapped_column(Uuid, default=None)
+    run_id: Mapped[UUID | None] = mapped_column(Uuid, default=None)
 
 
 class RuntimeAuditRow(Base):

@@ -50,6 +50,7 @@ from src.markets.models import MarketSnapshot as RecordedMarket
 from src.markets.scope import MarketScope, latest_in
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
+from src.orchestration.entryhalt.models import entry_halt
 from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
 from src.orchestration.riskrequest.models import (
@@ -243,6 +244,8 @@ class RiskRequestService:
                 # unsynchronised snapshot read, and any check-then-act on one
                 # leaves a window a concurrent pause can commit inside.
                 paused=bool(account.paused),
+                # The entry-only halt, from the same locked row.
+                entry_halted=entry_halt(account),
             )
             if isinstance(assessed, RiskRequestRefused):
                 return assessed
@@ -514,6 +517,7 @@ class RiskRequestService:
         expected_digest: str | None,
         *,
         paused: bool,
+        entry_halted: str | None = None,
     ) -> CanonicalInputs | RiskRequestRefused:
         """Every precondition, checked before SENTINEL is asked anything."""
         readiness = await RiskDataReader(
@@ -534,6 +538,10 @@ class RiskRequestService:
             return _refused(trade_case, RiskRequestRefusal.SYSTEM_STOP_UNREADABLE, readiness)
         if paused:
             return _refused(trade_case, RiskRequestRefusal.SYSTEM_PAUSED, readiness)
+        if entry_halted is not None:
+            return _refused(
+                trade_case, RiskRequestRefusal.ENTRY_HALTED, readiness, detail=entry_halted
+            )
 
         if trade_case.status in TERMINAL_CASE_STATUSES:
             return _refused(trade_case, RiskRequestRefusal.TRADE_CASE_TERMINAL, readiness)

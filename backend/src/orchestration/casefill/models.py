@@ -85,6 +85,8 @@ class ExecutionRefusal(StrEnum):
     # rather than judged on a partial picture, which would look like a figure.
     PORTFOLIO_CHANGED_DURING_VALUATION = "PORTFOLIO_CHANGED_DURING_VALUATION"
     SYSTEM_PAUSED = "SYSTEM_PAUSED"
+    # An entry-only halt is in force: no new BUY, whatever was approved before.
+    ENTRY_HALTED = "ENTRY_HALTED"
     SYSTEM_STOP_UNREADABLE = "SYSTEM_STOP_UNREADABLE"
     KILL_SWITCH_ENGAGED = "KILL_SWITCH_ENGAGED"
     # SENTINEL, asked again immediately before the fill, did not approve. The

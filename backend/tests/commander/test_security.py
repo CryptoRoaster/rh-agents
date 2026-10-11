@@ -359,5 +359,12 @@ def test_the_pause_reader_reads_and_never_writes():
 
     assert {item.name for item in fields(AccountPauseReader)} == {"sessions", "account_id"}
     surface = {name for name in dir(AccountPauseReader) if not name.startswith("_")}
-    # Two reads and no setter: a snapshot for a view, a locked read for a gate.
-    assert surface == {"account_id", "system_paused", "locked_paused"}
+    # Reads and no setter, for the pause and for the entry-only halt: a
+    # snapshot for a view, a locked read for a gate.
+    assert surface == {
+        "account_id",
+        "system_paused",
+        "locked_paused",
+        "entry_halt",
+        "locked_entry_halt",
+    }

@@ -213,9 +213,10 @@ def test_a_pause_port_can_only_be_observed_never_lifted():
         for name in dir(SystemPausePort)
         if not name.startswith("_") and callable(getattr(SystemPausePort, name, None))
     }
-    # Two reads and no setter: a snapshot for building a view, and a
-    # transactional read for gating a write.
-    assert methods == {"system_paused", "locked_paused"}
+    # Reads only, never a setter: for the pause and for the entry-only halt,
+    # a snapshot for building a view and a transactional read for gating a
+    # write. Lifting either is not something a control plane can do.
+    assert methods == {"system_paused", "locked_paused", "entry_halt", "locked_entry_halt"}
 
 
 # --------------------------------- H, K, R: risk verdicts and terminal cases

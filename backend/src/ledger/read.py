@@ -6,6 +6,7 @@ ledger has no P&L snapshot, the answer is "none recorded", never an estimate.
 """
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
@@ -32,6 +33,12 @@ class AccountView(Immutable):
     fees_paid_usd: Decimal
     realized_loss_today_usd: Decimal
     paused: bool
+    # The entry-only halts, read-only here: no route sets or lifts them.
+    entry_halt_manual: bool = False
+    entry_halt_manual_reason: Identifier | None = None
+    entry_halt_auto: bool = False
+    entry_halt_auto_reason: Identifier | None = None
+    entry_halt_auto_loss_day: date | None = None
 
 
 class PositionView(Immutable):
@@ -139,6 +146,11 @@ class PaperReadService:
                 fees_paid_usd=account.fees_paid_usd,
                 realized_loss_today_usd=account.realized_loss_today_usd,
                 paused=account.paused,
+                entry_halt_manual=account.entry_halt_manual,
+                entry_halt_manual_reason=account.entry_halt_manual_reason,
+                entry_halt_auto=account.entry_halt_auto,
+                entry_halt_auto_reason=account.entry_halt_auto_reason,
+                entry_halt_auto_loss_day=account.entry_halt_auto_loss_day,
             ),
             positions=tuple(
                 PositionView(

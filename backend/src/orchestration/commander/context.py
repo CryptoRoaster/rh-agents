@@ -34,6 +34,7 @@ from src.orchestration.commander.models import (
     TaskState,
 )
 from src.orchestration.commander.policy import COMMANDER_CONTROL_V1, CommanderControlPolicy
+from src.orchestration.entryhalt.models import halt_detail
 from src.orchestration.workflow.engine import (
     TradeCaseEvaluator,
     active_evidence,
@@ -70,6 +71,14 @@ class SystemPausePort(Protocol):
     async def system_paused(self) -> bool: ...
 
     async def locked_paused(self, session: AsyncSession) -> bool: ...
+
+    async def entry_halt(self) -> str | None:
+        """Which entry-only halt is in force (`MANUAL`, `AUTO`, `MANUAL_AND_AUTO`), as a view."""
+        ...
+
+    async def locked_entry_halt(self, session: AsyncSession) -> str | None:
+        """The same, under the account lock in the caller's transaction."""
+        ...
 
 
 class SystemPauseUnavailable(Exception):
@@ -123,6 +132,38 @@ class AccountPauseReader:
         if paused is None:
             raise SystemPauseUnavailable("PAUSE_STATE_UNAVAILABLE")
         return bool(paused)
+
+    async def entry_halt(self) -> str | None:
+        """Which entry-only halt is in force, as a snapshot. Never a gate on a write."""
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(AccountRow.entry_halt_manual, AccountRow.entry_halt_auto).where(
+                        AccountRow.id == self.account_id
+                    )
+                )
+            ).first()
+        if row is None:
+            raise SystemPauseUnavailable("PAUSE_STATE_UNAVAILABLE")
+        return halt_detail(row[0], row[1])
+
+    async def locked_entry_halt(self, session: AsyncSession) -> str | None:
+        """Which entry-only halt is in force, read under the account lock.
+
+        The lock every BUY and every halt change takes first, so a halt
+        committed before this read is seen, and one committed after it waits
+        for this transaction. A missing row is unreadable, never "no halt".
+        """
+        row = (
+            await session.execute(
+                select(AccountRow.entry_halt_manual, AccountRow.entry_halt_auto)
+                .where(AccountRow.id == self.account_id)
+                .with_for_update()
+            )
+        ).first()
+        if row is None:
+            raise SystemPauseUnavailable("PAUSE_STATE_UNAVAILABLE")
+        return halt_detail(row[0], row[1])
 
 
 class CommanderContextUnavailable(Exception):

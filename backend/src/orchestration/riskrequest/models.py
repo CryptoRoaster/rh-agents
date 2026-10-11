@@ -84,6 +84,9 @@ class RiskRequestRefusal(StrEnum):
     # rather than judged on a partial picture, which would look like a figure.
     PORTFOLIO_CHANGED_DURING_VALUATION = "PORTFOLIO_CHANGED_DURING_VALUATION"
     SYSTEM_PAUSED = "SYSTEM_PAUSED"
+    # An entry-only halt is in force. Refused before SENTINEL is asked, so the
+    # case's one request is not spent on a verdict nothing may act on.
+    ENTRY_HALTED = "ENTRY_HALTED"
     SYSTEM_STOP_UNREADABLE = "SYSTEM_STOP_UNREADABLE"
     KILL_SWITCH_ENGAGED = "KILL_SWITCH_ENGAGED"
     # The case already has its one canonical trade request under another key.

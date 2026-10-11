@@ -19,6 +19,7 @@ from src.core.models import (
     RiskDecision,
     RiskLimits,
     RiskOutcome,
+    Side,
     Trade,
     TradeIntent,
     TradingMode,
@@ -29,6 +30,7 @@ from src.execution.paper import PaperExecutor
 from src.ledger.accounting import apply_fill, calculate_pnl
 from src.ledger.portfolio import PortfolioState, portfolio_state, roll_loss_day
 from src.markets.models import MarketIdentity
+from src.orchestration.entryhalt.models import entry_halt
 from src.orchestration.valuation.models import PositionMark
 from src.risk.engine import evaluate
 
@@ -87,6 +89,14 @@ class PaperExecutionExpired(Exception):
     def __init__(self, reason_code: str) -> None:
         self.reason_code = reason_code
         super().__init__(reason_code)
+
+
+class EntryHaltedError(Exception):
+    """A BUY reached the paper executor while an entry-only halt was in force."""
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(f"ENTRY_HALTED:{detail}")
 
 
 def approval_window(decision: RiskDecision, at: datetime) -> str | None:
@@ -241,6 +251,13 @@ class PaperTradingService:
         """
         if self.mode != TradingMode.PAPER:
             raise ValueError("Paper execution must be explicitly enabled")
+        if intent.side == Side.BUY:
+            halted = entry_halt(account)
+            if halted is not None:
+                # The last line, on the locked account row every BUY reaches.
+                # Every caller refuses a halted BUY by name before this point;
+                # arriving here means one did not, and nothing is written.
+                raise EntryHaltedError(halted)
         # A case-bound caller may name the limits its case is judged against —
         # the early strategy's profile — and gets exactly those; anyone else
         # gets this service's own. The engine is the same either way.
