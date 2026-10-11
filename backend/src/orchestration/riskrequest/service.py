@@ -51,6 +51,7 @@ from src.markets.scope import MarketScope, latest_in
 from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
 from src.orchestration.entryhalt.models import entry_halt
+from src.orchestration.entryhalt.service import halt_on_daily_loss
 from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
 from src.orchestration.riskrequest.models import (
@@ -429,6 +430,9 @@ class RiskRequestService:
                 # exists where the verdict stands and the pause does not.
                 # Nothing here ever clears it.
                 account.paused = True
+            # A BUY refused at the daily loss limit halts every further entry,
+            # in this transaction, beside the verdict that caused it.
+            await halt_on_daily_loss(session, account, decision, limits=case_limits, at=now)
 
             basis = _basis(
                 request_key,

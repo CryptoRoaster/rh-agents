@@ -385,8 +385,11 @@ async def test_an_unreadable_stop_is_not_permission(risk_db, now, trace):
     assert (await counts(sessions)) == (0, 0)
 
 
-async def test_a_pause_verdict_at_fill_time_stops_the_system_without_filling(risk_db, now, trace):
-    """The re-check may pause the system, and does so with its own rejection."""
+async def test_a_daily_loss_verdict_at_fill_time_halts_entries_without_filling(risk_db, now, trace):
+    """The re-check refuses the BUY at the daily loss limit and halts entries — not the system.
+
+    The automatic entry halt and its audit event commit with the rejection.
+    """
     _, sessions = risk_db
     case, _, feed = await approved_case(sessions, now, trace)
     await set_account(sessions, realized_loss_today_usd=Decimal("600"), loss_day=now.date())
@@ -396,9 +399,11 @@ async def test_a_pause_verdict_at_fill_time_stops_the_system_without_filling(ris
 
     assert result.kind == "execution_refused"
     assert result.reason is ExecutionRefusal.RISK_RECHECK_REFUSED
-    assert result.outcome.value == "PAUSE_SYSTEM"
+    assert result.outcome.value == "REJECT"
     assert "DAILY_LOSS_LIMIT" in result.reason_codes
-    assert (await read_account(sessions)).paused is True
+    account = await read_account(sessions)
+    assert account.paused is False
+    assert (account.entry_halt_auto, account.entry_halt_auto_reason) == (True, "DAILY_LOSS_LIMIT")
     assert (await counts(sessions)) == (0, 0)
 
 

@@ -30,7 +30,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.clock import Clock, SystemClock
-from src.core.models import RiskLimits
+from src.core.models import RiskDecision, RiskLimits
 from src.data.tables import AccountRow, PaperControlEventRow
 from src.ledger.portfolio import loss_day, roll_loss_day
 from src.orchestration.entryhalt.models import (
@@ -45,6 +45,7 @@ from src.orchestration.entryhalt.models import (
     entry_halt,
     reason_code,
 )
+from src.risk.engine import DAILY_LOSS_LIMIT
 
 # The longest an operator's self-chosen name may be. Recorded, never verified.
 ACTOR_LENGTH = 64
@@ -148,6 +149,60 @@ async def halt_entries_automatically(
     account.entry_halt_auto_decision_id = decision_id
     await session.flush()
     return True
+
+
+async def halt_on_daily_loss(
+    session: AsyncSession,
+    account: AccountRow,
+    decision: RiskDecision,
+    *,
+    limits: RiskLimits,
+    at: datetime,
+) -> bool:
+    """Set the automatic halt when SENTINEL refused a BUY at the daily loss limit.
+
+    In the caller's transaction, beside the verdict it comes from, so the halt
+    and the refusal that caused it commit together or not at all.
+    """
+    if DAILY_LOSS_LIMIT not in decision.reason_codes:
+        return False
+    return await halt_entries_automatically(
+        session,
+        account,
+        reason=DAILY_LOSS_LIMIT,
+        at=at,
+        actor_kind=ActorKind.SENTINEL,
+        limits=limits,
+        decision_id=decision.id,
+    )
+
+
+async def halt_on_realized_loss(
+    session: AsyncSession,
+    account: AccountRow,
+    *,
+    limits: RiskLimits,
+    at: datetime,
+    decision_id: UUID | None = None,
+) -> bool:
+    """Set the automatic halt when a booked sale took the day's realised loss to the limit.
+
+    Called after the sale's loss has been added to the account, in the booking's
+    own transaction: a sale that is not booked leaves no halt behind. Measured on
+    the realised loss alone — what the ledger now knows for certain; the next
+    BUY is still judged on realised and unrealised loss together by SENTINEL.
+    """
+    if account.realized_loss_today_usd < limits.daily_loss_limit_usd:
+        return False
+    return await halt_entries_automatically(
+        session,
+        account,
+        reason=DAILY_LOSS_LIMIT,
+        at=at,
+        actor_kind=ActorKind.LEDGER,
+        limits=limits,
+        decision_id=decision_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -387,4 +442,10 @@ def _event(row: Any) -> ControlEvent:
     )
 
 
-__all__ = ["EntryHaltService", "actor_reference", "halt_entries_automatically"]
+__all__ = [
+    "EntryHaltService",
+    "actor_reference",
+    "halt_entries_automatically",
+    "halt_on_daily_loss",
+    "halt_on_realized_loss",
+]

@@ -92,6 +92,10 @@ under water trips `DAILY_LOSS_LIMIT` on its *unrealised* loss and pauses the
 system instead of being sold. That is the existing contract, and **an emergency
 exit with special rights is deliberately not in this phase**.
 
+> **Superseded (issue #77, PR-B):** `DAILY_LOSS_LIMIT` now binds BUY only and
+> sets the persistent automatic entry halt instead of pausing the system; a
+> sale is no longer refused for it. See `docs/operations-paper-run.md`.
+
 ## System stops
 
 `OBSERVE`, a configured kill switch, an unreadable stop source and the durable
