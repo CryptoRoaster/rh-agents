@@ -297,11 +297,12 @@ async def test_racing_sweeps_beside_a_foreign_source_book_once(risk_db, now, tra
     at = now + LATER
     await record(sessions, held(at - timedelta(seconds=20), price="0.90"), other(at, price="5.00"))
 
-    await asyncio.gather(*(sweeper(sessions, at).sweep() for _ in range(3)))
+    results = await asyncio.gather(*(sweeper(sessions, at).sweep() for _ in range(3)))
 
-    # One sale in the ledger. (The normal sweep counts a replay of its own key
-    # as executed; the database holds exactly one exit for the cycle.)
+    # One sale in the ledger, and counted once: a replay of the same key is
+    # `replayed`, never `executed`; the database holds exactly one exit.
     assert await exit_count(sessions) == 1
+    assert sum(item.executed for item in results) == 1, results
 
 
 # ------------------------------------------------------------ early exits

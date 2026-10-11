@@ -62,6 +62,11 @@ def settings_refusal(messages: "list[str]") -> str:
     return SETTINGS_INVALID
 
 
+# How long the exit phase keeps back to settle an attempt cut off by its bound:
+# one indexed read of the exit row under the attempt's key.
+EXIT_SETTLE_SECONDS = 5
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="../.env", extra="ignore", hide_input_in_errors=True)
     database_url: str = Field(min_length=1)
@@ -313,6 +318,23 @@ class Settings(BaseSettings):
     # both exit sweeps, nothing else. Short on purpose; a stop must not wait on
     # anything the entry job does.
     paper_exit_run_max_seconds: int = Field(default=60, ge=5, le=600)
+    # The exit phase's own bounds, shared by every exit policy in a run (the
+    # normal and the early one together). `paper_exit_max_per_run` above bounds
+    # the sales booked; these bound what may be spent trying.
+    #
+    # Attempts: every started attempt is one on-chain (ATLAS) read, whatever it
+    # ends as, so repeated refusals cannot become unbounded reads.
+    paper_exit_max_attempts_per_run: int = Field(default=5, ge=1, le=50)
+    # One attempt — chain read, pre-exit refresh, booking. The read has no total
+    # bound of its own (a series of RPC and holder-source calls, each with its
+    # own timeout), so this is the bound. A chain read older than SENTINEL's
+    # 30-second snapshot bound cannot pass the sale anyway.
+    paper_exit_attempt_max_seconds: int = Field(default=25, ge=5, le=300)
+    # Provider requests all pre-exit refreshes of one run may spend together.
+    paper_exit_max_provider_requests_per_run: int = Field(default=15, ge=1, le=200)
+    # The exit job's market acquisition, capped so it can never spend the time
+    # the exit phase needs for even one attempt.
+    paper_exit_acquisition_max_seconds: int = Field(default=20, ge=1, le=600)
     # Phase 2N-C bounded market acquisition. Disabled by default and separate
     # from `paper_runner_enabled`, because consenting to a run is not consenting
     # to that run calling a public market provider. With this off, a run behaves
@@ -467,6 +489,23 @@ class Settings(BaseSettings):
     def early_paper_exit_configuration(self) -> "Settings":
         if self.early_paper_exit_enabled and not self.paper_runner_enabled:
             raise ValueError("EARLY_PAPER_EXIT_ENABLED requires the bounded paper run")
+        return self
+
+    @model_validator(mode="after")
+    def exit_run_budget(self) -> "Settings":
+        """An exit job whose acquisition could leave no room for one sale is no exit job."""
+        if not (self.paper_auto_exit_enabled or self.early_paper_exit_enabled):
+            return self
+        needed = (
+            self.paper_exit_acquisition_max_seconds
+            + self.paper_exit_attempt_max_seconds
+            + EXIT_SETTLE_SECONDS
+        )
+        if needed > self.paper_exit_run_max_seconds:
+            raise ValueError(
+                "PAPER_EXIT_RUN_MAX_SECONDS must cover PAPER_EXIT_ACQUISITION_MAX_SECONDS, "
+                "one PAPER_EXIT_ATTEMPT_MAX_SECONDS and five seconds to settle it"
+            )
         return self
 
     @model_validator(mode="after")

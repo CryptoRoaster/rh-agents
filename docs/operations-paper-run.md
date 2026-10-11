@@ -173,7 +173,8 @@ the market acquisition restricted to open positions' markets (no case market,
 no discovery read), then the `PAPER_EXIT_V1` and `EARLY_PAPER_EXIT_V1` sweeps,
 and nothing else — no promotion, intake, worker step, risk request or BUY. It
 runs only in PAPER, refuses with `NO_EXIT_SWEEP_CONFIGURED` when neither exit
-policy is configured, and is held to `PAPER_EXIT_RUN_MAX_SECONDS` (default 60).
+policy is configured, and is held to `PAPER_EXIT_RUN_MAX_SECONDS` (default 60), of which its acquisition
+may spend at most `PAPER_EXIT_ACQUISITION_MAX_SECONDS` (default 20).
 `--once` is the **entry job** and is otherwise unchanged.
 
 Each job holds its own PostgreSQL session-level advisory lock for the whole run
@@ -214,15 +215,93 @@ Refusals: `PRE_EXIT_REFRESH_FAILED` (detail: the refresh's reason, e.g.
 `PROVIDER_FAILED`, `TIME_BUDGET_REACHED`, `MARKET_IDENTITY_MISMATCH`,
 `PRE_EXIT_REFRESH_BUDGET_REACHED`, or `MARK_UNAVAILABLE` when no current mark of
 the held market exists), `EXIT_TRIGGER_CLEARED`, `EXIT_EVIDENCE_CHANGED`. A stop
-in force asks no provider. Refresh attempts per sweep are bounded by
-`PAPER_EXIT_MAX_PER_RUN`. Without market acquisition there is no refresh stage;
-the trigger is then judged again on what is recorded.
+in force asks no provider. Refresh attempts per run are bounded by
+`PAPER_EXIT_MAX_ATTEMPTS_PER_RUN` (one per attempt). Without market acquisition
+there is no refresh stage; the trigger is then judged again on what is recorded.
 
 Each exit sweep in the summary adds `refresh_attempts`, `refresh_failures`,
 `refresh_provider_requests`, `triggers_cleared`, `triggers_changed`,
 `reevaluated_triggers`, `max_refresh_seconds`, `max_atlas_read_seconds`,
 `max_mark_age_at_trigger_seconds` and `max_mark_age_at_final_seconds`; a booked
 exit stores the same per sale under `basis.pre_exit`. No migration.
+
+### The exit phase: one budget, one order (both jobs)
+
+Both exit policies first judge their positions from what is recorded (database
+reads only, no provider) and name the triggered ones. The sales are then asked
+for in **one** order and under **one** budget shared by `PAPER_EXIT_V1` and
+`EARLY_PAPER_EXIT_V1` — neither sweep runs to completion before the other may
+start, and neither has a budget of its own.
+
+| Bound | Setting | Default |
+|---|---|---|
+| Attempts per run (each one ATLAS chain read, whatever it ends as) | `PAPER_EXIT_MAX_ATTEMPTS_PER_RUN` | 5 |
+| Sales booked per run | `PAPER_EXIT_MAX_PER_RUN` | 5 |
+| Pre-exit refreshes per run | = attempts | 5 |
+| Provider requests of all pre-exit refreshes together | `PAPER_EXIT_MAX_PROVIDER_REQUESTS_PER_RUN` | 15 |
+| One attempt (chain read, refresh, booking) | `PAPER_EXIT_ATTEMPT_MAX_SECONDS` | 25 |
+| Exit-job acquisition | `PAPER_EXIT_ACQUISITION_MAX_SECONDS` | 20 |
+
+A refresh starts only while the most requests one refresh may spend
+(`PAPER_RUNNER_PRE_RISK_MARKET_MAX_REQUESTS`) still fits under the request
+ceiling; otherwise the sale is refused `PRE_EXIT_REFRESH_FAILED` with detail
+`PRE_EXIT_PROVIDER_BUDGET_REACHED`. With an exit policy enabled, settings
+validation requires `PAPER_EXIT_ACQUISITION_MAX_SECONDS +
+PAPER_EXIT_ATTEMPT_MAX_SECONDS + 5 <= PAPER_EXIT_RUN_MAX_SECONDS`, so the exit
+job always keeps time for one attempt.
+
+**Why one attempt needs its own bound.** The ATLAS exit read has no total
+timeout: it is a series of chain RPC calls (`EVM_TIMEOUT_SECONDS`, 15 s each)
+and holder/origin source calls (`ATLAS_SOURCE_TIMEOUT_SECONDS`, 10 s each). The
+pre-exit refresh is held to `PAPER_RUNNER_PRE_RISK_MARKET_MAX_SECONDS` (15 s).
+A chain read older than SENTINEL's snapshot bound (30 s) cannot pass the sale
+anyway, so an attempt is bounded to 25 s by default.
+
+**Admission.** A new attempt starts only while the sales budget, the attempt
+budget and the remaining time allow it; the time check keeps back one whole
+attempt plus five seconds to settle it. A triggered position that is not
+attempted is **deferred**, by reason: `EXIT_BUDGET_REACHED` (sales),
+`EXIT_ATTEMPT_LIMIT_REACHED`, or `EXIT_DEFERRED_RUN_BUDGET` (time; the run then
+stops with `TIME_BUDGET_REACHED`). Positions the run's time did not even reach
+to judge are counted as `unevaluated`.
+
+**Planning shares.** Judging (`plan`, database reads only) may take what the
+run has left less one attempt's reserve and one more settling margin — or, with
+less than that left, what remains, so the positions are still judged and
+reported while admission defers every attempt. Each policy gets an equal, fixed
+share of that time. A policy whose judgement hangs is cut off at its own share
+(`plan_stop = EXIT_PLAN_TIMED_OUT`), or stops between positions when its share
+is spent (`EXIT_PLAN_TIME_BUDGET_REACHED`); either way it keeps every count it
+made and every candidate it already named, and the other policy is still judged
+on its own share. Positions not reached stay `unevaluated` — never `held` and
+never `deferred` — and the run stops with `TIME_BUDGET_REACHED`.
+
+**One attempt cut off.** An attempt that outlives its bound is cancelled — before
+the lock nothing was written; inside the transaction the cancellation rolls it
+back — and its outcome is settled by looking up the exit row under its key. A
+row means the sale was booked and it is counted as booked; no row means
+`EXIT_OUTCOME_UNKNOWN` (`unknown`), never "failed": a commit cut off in flight
+may still land. The run goes on with the next position if time admits one. A
+later run asks again under a new key, and the database's one exit per cycle
+keeps that from ever booking a second sale.
+
+**Stops before the chain.** A kill switch, a mode other than PAPER, a durable
+pause or a stop that cannot be read is checked before the ATLAS read, so a sale
+that must be refused costs no chain read and no refresh. The deciding check is
+still the one under the account lock; nothing about what a stop means changed.
+
+**Order.** Each policy's triggered positions are permuted by a digest of the UTC
+minute and the position, and the policies alternate, starting with the one the
+same digest picks. Deterministic within a minute; unrelated to identity, so no
+position is systematically last under a tight budget. This is **not** a
+fairness guarantee across runs or restarts — nothing is persisted.
+
+**Counting.** Each sweep's report adds `attempts`, `replayed` (a sale that
+already existed under its key — never counted as `executed`), `timed_out`,
+`unknown`, `deferred`, `deferred_reasons`, `unevaluated` and `plan_stop`. The summary's
+`exit_phase` reports the shared budget: limits, `attempts`, `exits`,
+`refreshes`, `provider_requests`, `reserve_seconds`, `deferred`,
+`deferred_reasons` and `unknown`. No migration.
 
 ## 3. The preflight
 

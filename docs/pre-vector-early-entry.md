@@ -219,8 +219,8 @@ the exit.
   safely is refused by name, not booked, and asked again every sweep.
 - **Retries and parallel sweeps:** the request key is
   `auto-exit:EARLY_PAPER_EXIT_V1:<cycle>:<UTC minute>`; a replay of the same
-  key returns the recorded sale (reported as `EXIT_ALREADY_RECORDED`, never
-  counted twice), and any other key for the same cycle is refused by the
+  key returns the recorded sale (counted as `replayed`, never as `executed`),
+  and any other key for the same cycle is refused by the
   one-exit-per-cycle constraint.
 - **Early ledger:** each exit's realised result is the exit row's
   `realized_pnl_usd`; losses since the UTC day start count toward the $30

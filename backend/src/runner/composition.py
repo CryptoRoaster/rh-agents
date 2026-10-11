@@ -61,6 +61,7 @@ from src.orchestration.commander.context import AccountPauseReader, SystemPauseP
 from src.orchestration.commander.intake import CommanderIntakeService
 from src.orchestration.commander.policy import COMMANDER_CONTROL_V1
 from src.orchestration.costs.models import PaperCostReading, paper_cost_assumptions
+from src.orchestration.exitpolicy.drive import ExitLimits
 from src.orchestration.exitpolicy.early import EarlyExitService
 from src.orchestration.exitpolicy.policy import PaperExitPolicy
 from src.orchestration.exitpolicy.service import AutoExitService
@@ -155,6 +156,22 @@ def acquisition_limits_from_settings(settings: Settings) -> AcquisitionLimits:
         max_provider_requests=settings.paper_runner_acquisition_max_provider_requests,
         max_http_attempts=settings.paper_runner_acquisition_max_http_attempts,
         max_seconds=settings.paper_runner_acquisition_max_seconds,
+    )
+
+
+def exit_limits_from_settings(settings: Settings) -> ExitLimits:
+    """One run's exit phase: every exit policy's attempts, sales and refreshes together.
+
+    One refresh per attempt at most, and every refresh admitted only while the
+    most it may spend still fits under the phase's provider request ceiling.
+    """
+    return ExitLimits(
+        max_attempts=settings.paper_exit_max_attempts_per_run,
+        max_exits=settings.paper_exit_max_per_run,
+        max_refreshes=settings.paper_exit_max_attempts_per_run,
+        max_provider_requests=settings.paper_exit_max_provider_requests_per_run,
+        per_refresh_requests=settings.paper_runner_pre_risk_market_max_requests,
+        attempt_seconds=float(settings.paper_exit_attempt_max_seconds),
     )
 
 

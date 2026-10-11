@@ -293,6 +293,14 @@ class PaperExitService:
         fresh: ExitOnchainRead | str | None = None
         if await self._already_decided(intent_id):
             valuation = PortfolioValuation()
+        elif await self._stop_in_force():
+            # A stop already known — kill switch, a mode that is not PAPER, a
+            # durable pause, or a stop that cannot be read — is known before any
+            # chain read or refresh is paid for. A hint only: the stop that
+            # decides is read again under the lock below, and refuses there by
+            # its own name.
+            trace.skipped = "STOP_IN_FORCE"
+            valuation = PortfolioValuation()
         else:
             if self.exit_read is not None:
                 # Before any lock: a chain read is a network call, and holding
