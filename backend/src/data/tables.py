@@ -22,7 +22,30 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.sql.functions import FunctionElement
+
+
+class CurrentTransaction(FunctionElement[int]):
+    """The writing transaction's id, as a column default: `txid_current()` on PostgreSQL.
+
+    The light SQLite suite has no transaction ids and no audit trigger to read
+    them, so there it renders as `0`.
+    """
+
+    type = BigInteger()
+    inherit_cache = True
+
+
+@compiles(CurrentTransaction)
+def _current_transaction(element: CurrentTransaction, compiler: Any, **kw: Any) -> str:
+    return "txid_current()"
+
+
+@compiles(CurrentTransaction, "sqlite")
+def _current_transaction_sqlite(element: CurrentTransaction, compiler: Any, **kw: Any) -> str:
+    return "0"
 
 
 class Base(DeclarativeBase):
@@ -219,6 +242,8 @@ class PaperControlEventRow(Base):
         BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
     )
     event_id: Mapped[UUID] = mapped_column(Uuid, unique=True)
+    # The writing transaction, always the database's own; never set by a writer.
+    txid: Mapped[int] = mapped_column(BigInteger, server_default=CurrentTransaction(), index=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     control: Mapped[str] = mapped_column(String(32))
     action: Mapped[str] = mapped_column(String(16))
