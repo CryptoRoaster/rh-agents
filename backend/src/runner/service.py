@@ -64,7 +64,13 @@ from src.data.tables import TradeCaseRow
 from src.markets.geckoterminal.networks import VerifiedNetworkRegistry
 from src.orchestration.commander.context import SystemPauseUnavailable
 from src.orchestration.commander.intake import IntakeRefusal
-from src.orchestration.exitpolicy.service import ExitSweep
+from src.orchestration.exitpolicy.drive import (
+    DEFERRED_RUN_BUDGET,
+    ExitBudget,
+    ExitSweep,
+    attempt_exits,
+    exit_order,
+)
 from src.orchestration.riskrequest.models import RiskRequestRefusal
 from src.orchestration.riskrequest.service import stale_source
 from src.orchestration.strategy.early import EARLY_ENTRY_V1, is_early
@@ -74,13 +80,14 @@ from src.orchestration.workflow.models import (
     TradeCaseStatus,
 )
 from src.runner.acquisition import disabled as no_acquisition
-from src.runner.composition import RunnerStack
+from src.runner.composition import RunnerStack, exit_limits_from_settings
 from src.runner.locks import LockOutcome, RunJob, job_lock
 from src.runner.models import (
     AcquisitionStop,
     CaseProgress,
     ConfigurationRefused,
     EarlyEntryReport,
+    ExitPhaseReport,
     ExitReport,
     MarketAcquisition,
     PreRiskRefresh,
@@ -146,6 +153,10 @@ class Deadline:
         """The longest a single wait may last: whichever bound is nearer."""
         return max(0.0, min(ceiling, self.remaining))
 
+    def capped(self, seconds: float) -> "Deadline":
+        """A deadline for one stage: never later than this one, nor than `seconds` from now."""
+        return Deadline(max(0.0, min(seconds, self.remaining)))
+
 
 @dataclass
 class Account:
@@ -176,9 +187,11 @@ class Account:
     # them would have this process alternating between the two gaps, which is
     # retry-until-pass wearing a second name.
     refreshed: dict[UUID, set[str]] = field(default_factory=dict)
-    # What the automatic exit sweep did, when one is configured.
+    # What the automatic exit sweeps did, when configured, and the one budget
+    # both of them spent from.
     exits: ExitSweep | None = None
     early_exits: ExitSweep | None = None
+    exit_phase: ExitBudget | None = None
     # PRE_VECTOR_EARLY_ENTRY_V1, when enabled: what its refresh and intake did,
     # and how many early entries this run has filled against its per-run bound.
     early: EarlyEntryReport | None = None
@@ -287,10 +300,12 @@ class BoundedPaperRun:
             else Deadline(stack.settings.paper_exit_run_max_seconds)
         )
         try:
-            if not await self._acquire(account, deadline, positions_only=True):
+            # The acquisition's share of the run is capped, so however slow the
+            # provider is, the exit phase keeps time for at least one attempt.
+            window = deadline.capped(stack.settings.paper_exit_acquisition_max_seconds)
+            if not await self._acquire(account, deadline, positions_only=True, window=window):
                 return self._summary(started, account)
-            await self._exit(account, deadline)
-            await self._early_exit(account, deadline)
+            await self._exit_phase(account, deadline)
         except SystemPauseUnavailable:
             account.stop = RunStop.SYSTEM_STOPPED
             account.fail("SYSTEM_STOP_UNREADABLE")
@@ -319,8 +334,7 @@ class BoundedPaperRun:
                 return self._summary(started, account)
             # Exits first: closing what the policy says to close reduces risk
             # before any new case is opened, and needs nothing intake produces.
-            await self._exit(account, deadline)
-            await self._early_exit(account, deadline)
+            await self._exit_phase(account, deadline)
             await self._promote(account, deadline)
             await self._intake(account, deadline)
             if not account.intake_unknown:
@@ -353,7 +367,12 @@ class BoundedPaperRun:
     # ------------------------------------------------------------- the pass
 
     async def _acquire(
-        self, account: Account, deadline: Deadline, *, positions_only: bool = False
+        self,
+        account: Account,
+        deadline: Deadline,
+        *,
+        positions_only: bool = False,
+        window: Deadline | None = None,
     ) -> bool:
         """Observe the markets the open work depends on, and say whether to go on.
 
@@ -374,7 +393,9 @@ class BoundedPaperRun:
             account.acquisition = no_acquisition()
             return True
         account.acquisition = await stage.execute(
-            deadline, networks=account.networks, positions_only=positions_only
+            window if window is not None else deadline,
+            networks=account.networks,
+            positions_only=positions_only,
         )
         stop = account.acquisition.stop
         if stop == AcquisitionStop.SYSTEM_STOP_UNREADABLE.value:
@@ -416,31 +437,47 @@ class BoundedPaperRun:
         """
         return await asyncio.wait_for(work, timeout=max(0.001, deadline.remaining))
 
-    async def _exit(self, account: Account, deadline: Deadline) -> None:
-        """One bounded sweep of automatic PAPER exits, when configured.
+    async def _exit_phase(self, account: Account, deadline: Deadline) -> None:
+        """Every configured exit policy's sales, under one budget, when any is configured.
 
-        Every exit goes through PaperExitService with its own SENTINEL SELL
-        check; the sweep only decides when to ask, by PAPER_EXIT_V1.
+        Each policy first judges its positions from what is recorded — database
+        reads only — and names its triggered ones. The sales are then asked for
+        in one interleaved order and under one shared budget of attempts, sales,
+        refreshes and provider requests (`src.orchestration.exitpolicy.drive`):
+        neither policy goes first by construction, neither has a budget of its
+        own, and no attempt starts without time for a whole one.
+
+        Every exit still goes through PaperExitService and its own SENTINEL SELL
+        check; the policies only decide when to ask. The tallies live on the
+        account from the start, so a phase that ends on an exception or the
+        deadline keeps everything it already counted.
         """
-        stage = self.stack.exits
-        if stage is None:
+        stack = self.stack
+        stages: list[tuple[Any, ExitSweep]] = []
+        if stack.exits is not None:
+            account.exits = ExitSweep()
+            stages.append((stack.exits, account.exits))
+        if stack.early_exits is not None:
+            account.early_exits = ExitSweep()
+            stages.append((stack.early_exits, account.early_exits))
+        if not stages:
             return
-        account.exits = await self._bounded(
-            stage.sweep(deadline=deadline, networks=account.networks), deadline
+        budget = ExitBudget(exit_limits_from_settings(stack.settings))
+        account.exit_phase = budget
+        plans = [
+            await self._bounded(stage.plan(result, deadline=deadline), deadline)
+            for stage, result in stages
+        ]
+        await attempt_exits(
+            exit_order(plans, stack.clock.now()),
+            budget,
+            sessions=stack.sessions,
+            deadline=deadline,
+            networks=account.networks,
         )
-
-    async def _early_exit(self, account: Account, deadline: Deadline) -> None:
-        """One bounded EARLY_PAPER_EXIT_V1 sweep, when configured.
-
-        The same one exit path and SENTINEL SELL check; only the policy that
-        decides when to ask is the early strategy's own.
-        """
-        stage = self.stack.early_exits
-        if stage is None:
-            return
-        account.early_exits = await self._bounded(
-            stage.sweep(deadline=deadline, networks=account.networks), deadline
-        )
+        if budget.deferred.get(DEFERRED_RUN_BUDGET):
+            # Triggered positions were left for the next run for want of time.
+            account.stop = RunStop.TIME_BUDGET_REACHED
 
     async def _intake(self, account: Account, deadline: Deadline) -> None:
         """One bounded intake cycle, through the existing control plane.
@@ -1197,6 +1234,7 @@ class BoundedPaperRun:
             pre_risk_refusals=len([item for item in cases if item.pre_risk_refusal is not None]),
             exits=_exit_report(account.exits),
             early_exits=_exit_report(account.early_exits),
+            exit_phase=_exit_phase_report(account.exit_phase),
             errors=tuple(account.errors),
             early=account.early,
         )
@@ -1212,6 +1250,13 @@ def _exit_report(sweep: ExitSweep | None) -> ExitReport | None:
         held=sweep.held,
         triggers=tuple(sorted(sweep.triggers)),
         refusals=tuple(sorted(sweep.refusals)),
+        attempts=sweep.attempts,
+        replayed=sweep.replayed,
+        timed_out=sweep.timed_out,
+        unknown=sweep.unknown,
+        deferred=sum(sweep.deferred.values()),
+        deferred_reasons=tuple(sorted(sweep.deferred)),
+        unevaluated=sweep.unevaluated,
         refresh_attempts=sweep.refresh_attempts,
         refresh_failures=sweep.refresh_failures,
         refresh_provider_requests=sweep.refresh_provider_requests,
@@ -1222,6 +1267,27 @@ def _exit_report(sweep: ExitSweep | None) -> ExitReport | None:
         max_atlas_read_seconds=sweep.max_atlas_read_seconds,
         max_mark_age_at_trigger_seconds=sweep.max_mark_age_at_trigger_seconds,
         max_mark_age_at_final_seconds=sweep.max_mark_age_at_final_seconds,
+    )
+
+
+def _exit_phase_report(budget: ExitBudget | None) -> ExitPhaseReport | None:
+    if budget is None:
+        return None
+    limits = budget.limits
+    return ExitPhaseReport(
+        max_attempts=limits.max_attempts,
+        attempts=budget.attempts,
+        max_exits=limits.max_exits,
+        exits=budget.exits,
+        max_refreshes=limits.max_refreshes,
+        refreshes=budget.refresh.attempts,
+        max_provider_requests=limits.max_provider_requests,
+        provider_requests=budget.refresh.provider_requests,
+        attempt_max_seconds=limits.attempt_seconds,
+        reserve_seconds=limits.reserve_seconds,
+        deferred=sum(budget.deferred.values()),
+        deferred_reasons=tuple(sorted(budget.deferred)),
+        unknown=budget.unknown,
     )
 
 

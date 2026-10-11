@@ -228,7 +228,8 @@ async def test_the_per_run_exit_budget_bounds_the_refreshes_too(risk_db, now):
 
     report = summary.early_exits
     assert (report.triggered, report.executed, report.refresh_attempts) == (5, 2, 2), report
-    assert "EXIT_BUDGET_REACHED" in report.refusals
+    assert "EXIT_BUDGET_REACHED" in report.deferred_reasons
+    assert (report.attempts, report.deferred) == (2, 3)
     assert len(provider.multi_requests) == 1 + 2
     assert await count(sessions, TradeCaseExitRow) == 2
 

@@ -233,16 +233,16 @@ def test_the_cli_offers_the_exit_job_as_its_own_exclusive_mode(monkeypatch):
 
 
 class Gated:
-    """An exit sweep that waits until released, so a second run can collide."""
+    """An exit policy that waits until released, so a second run can collide."""
 
     def __init__(self) -> None:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def sweep(self, **_: object) -> ExitSweep:
+    async def plan(self, result: ExitSweep, **_: object) -> list:
         self.entered.set()
         await self.release.wait()
-        return ExitSweep()
+        return []
 
 
 async def _collide(sessions, now, mode):
@@ -274,8 +274,8 @@ async def test_a_second_start_of_the_same_job_is_already_running(risk_db, now, m
 
 
 class _Done:
-    async def sweep(self, **_: object) -> ExitSweep:
-        return ExitSweep()
+    async def plan(self, result: ExitSweep, **_: object) -> list:
+        return []
 
 
 @POSTGRES

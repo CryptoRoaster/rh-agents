@@ -291,7 +291,10 @@ async def test_the_exit_budget_bounds_a_run(risk_db, now, trace):
     at = now + LATER
     result = await sweeper(sessions, at, observed(at, price=Decimal("0.9")), max_exits=0).sweep()
     assert result.triggered == 1 and result.executed == 0
-    assert result.refusals == {"EXIT_BUDGET_REACHED": 1}
+    # Not attempted, and said so: deferred by the sales budget, not refused.
+    assert result.refusals == {}
+    assert result.deferred == {"EXIT_BUDGET_REACHED": 1}
+    assert result.attempts == 0
     assert await exits(sessions) == []
 
 

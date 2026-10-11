@@ -532,6 +532,18 @@ class ExitReport(Immutable):
     held: int = Field(default=0, ge=0)
     triggers: tuple[Code, ...] = Field(default=(), max_length=8)
     refusals: tuple[Code, ...] = Field(default=(), max_length=32)
+    # Attempts started (each one a chain read, whatever it ended as); sales that
+    # already existed under their key and were not made again; attempts cut off
+    # by their bound, and of those the ones whose booking stays unknown.
+    attempts: int = Field(default=0, ge=0)
+    replayed: int = Field(default=0, ge=0)
+    timed_out: int = Field(default=0, ge=0)
+    unknown: int = Field(default=0, ge=0)
+    # Triggered positions this run did not attempt, and why; and positions the
+    # run's time did not even reach to judge.
+    deferred: int = Field(default=0, ge=0)
+    deferred_reasons: tuple[Code, ...] = Field(default=(), max_length=8)
+    unevaluated: int = Field(default=0, ge=0)
     # Each trigger judged again on the held market observed after the exit's
     # own chain read: refresh attempts (at most one per exit) and failures,
     # provider requests they spent, triggers that had gone or changed, and the
@@ -548,6 +560,32 @@ class ExitReport(Immutable):
     max_atlas_read_seconds: float | None = Field(default=None, ge=0)
     max_mark_age_at_trigger_seconds: float | None = None
     max_mark_age_at_final_seconds: float | None = None
+
+
+class ExitPhaseReport(Immutable):
+    """The run's exit phase as one budget: every exit policy together.
+
+    The per-policy reports say what each policy's positions came to; this says
+    what the phase as a whole was allowed and what it spent, so no policy can
+    have spent a budget of its own beside it.
+    """
+
+    max_attempts: int = Field(ge=0)
+    attempts: int = Field(default=0, ge=0)
+    max_exits: int = Field(ge=0)
+    exits: int = Field(default=0, ge=0)
+    max_refreshes: int = Field(ge=0)
+    refreshes: int = Field(default=0, ge=0)
+    max_provider_requests: int | None = Field(default=None, ge=0)
+    provider_requests: int = Field(default=0, ge=0)
+    # One attempt's ceiling, and what must remain for a new one to start.
+    attempt_max_seconds: float | None = Field(default=None, ge=0)
+    reserve_seconds: float = Field(default=0, ge=0)
+    # Triggered positions not attempted, by reason, and attempts whose booking
+    # could not be confirmed either way.
+    deferred: int = Field(default=0, ge=0)
+    deferred_reasons: tuple[Code, ...] = Field(default=(), max_length=8)
+    unknown: int = Field(default=0, ge=0)
 
 
 class RunSummary(Immutable):
@@ -602,6 +640,8 @@ class RunSummary(Immutable):
     exits: ExitReport | None = None
     # The EARLY_PAPER_EXIT_V1 sweep; absent unless EARLY_PAPER_EXIT_ENABLED.
     early_exits: ExitReport | None = None
+    # Both sweeps' shared budget; absent when no exit policy is configured.
+    exit_phase: ExitPhaseReport | None = None
     # Absent unless PRE_VECTOR_EARLY_ENTRY_V1 is enabled.
     early: EarlyEntryReport | None = None
     # Technical faults, as codes. Never a provider message and never a traceback.

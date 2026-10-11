@@ -39,6 +39,7 @@ SELL check, which may refuse it — then nothing is booked and the next sweep
 asks again.
 """
 
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -57,27 +58,32 @@ from src.data.tables import MarketObservationRow, TradeCaseExecutionRow, TradeCa
 from src.markets.geckoterminal.networks import VerifiedNetworkRegistry
 from src.markets.models import Availability, MarketSnapshot
 from src.markets.scope import MarketScope
+from src.orchestration.exitpolicy.drive import (
+    DEFERRED_RUN_BUDGET,
+    ExitCandidate,
+    ExitSweep,
+    alone,
+    attempt_exits,
+    exit_order,
+)
 from src.orchestration.exitpolicy.policy import Immutable
 from src.orchestration.exitpolicy.refresh import (
     PreExitMarketRefresh,
-    RefreshBudget,
     RefreshContext,
     RefreshDeadline,
     Unbounded,
 )
 from src.orchestration.exitpolicy.service import (
-    ExitSweep,
     confirmation,
     exit_request_key,
     mark_age,
     refused_confirmation,
 )
-from src.orchestration.paperexit.models import PaperExitRecorded
+from src.orchestration.paperexit.models import ExitReading
 from src.orchestration.paperexit.service import (
     ExitConfirmation,
     ExitTriggerRecord,
     PaperExitService,
-    PaperExitUnavailable,
 )
 from src.orchestration.riskrequest.service import OneSnapshot
 from src.orchestration.strategy.early import EARLY_ENTRY_V1, PRE_VECTOR_EARLY_ENTRY_V1
@@ -357,6 +363,8 @@ class EarlyExitService:
     refresh: PreExitMarketRefresh | None = None
     # Refresh attempts per sweep. `None` is one per exit this sweep may book.
     max_refreshes: int | None = None
+    # Attempts (chain reads) per sweep on its own. `None` is one per exit it may book.
+    max_attempts: int | None = None
 
     async def sweep(
         self,
@@ -364,15 +372,34 @@ class EarlyExitService:
         deadline: RefreshDeadline | None = None,
         networks: VerifiedNetworkRegistry | None = None,
     ) -> ExitSweep:
+        """This policy's exits on their own, under this service's own budget.
+
+        A run never calls this: its exit phase plans every policy and asks for
+        the sales under one shared budget (`src.orchestration.exitpolicy.drive`).
+        """
         result = ExitSweep()
-        context = RefreshContext(
-            port=self.refresh,
-            budget=RefreshBudget(
-                self.max_refreshes if self.max_refreshes is not None else self.max_exits
+        candidates = await self.plan(result, deadline=deadline)
+        await attempt_exits(
+            exit_order([candidates], self.clock.now()),
+            alone(
+                max_exits=self.max_exits,
+                max_attempts=self.max_attempts,
+                max_refreshes=self.max_refreshes,
             ),
-            deadline=deadline if deadline is not None else Unbounded(),
+            sessions=self.sessions,
+            deadline=deadline,
             networks=networks,
         )
+        return result
+
+    async def plan(
+        self, result: ExitSweep, *, deadline: RefreshDeadline | None = None
+    ) -> list[ExitCandidate]:
+        """Judge every open early position by EARLY_PAPER_EXIT_V1; return the triggered.
+
+        Database reads only — nothing here calls a provider or sells.
+        """
+        bound = deadline if deadline is not None else Unbounded()
         async with self.sessions() as session:
             positions = [
                 item
@@ -380,11 +407,19 @@ class EarlyExitService:
                 if item.quantity > 0 and item.cycle_id is not None
             ]
             entries = await early_entries(session, positions)
-        for position in sorted(positions, key=lambda item: str(item.id)):
-            entry = entries.get(position.cycle_id)
-            if entry is None:
-                # Not an early cycle: another policy's position, never this one's.
-                continue
+        own = [
+            item
+            for item in sorted(positions, key=lambda item: str(item.id))
+            if item.cycle_id in entries
+        ]
+        candidates: list[ExitCandidate] = []
+        for index, position in enumerate(own):
+            # Only early cycles are here: another policy's position is never this one's.
+            entry = entries[position.cycle_id]
+            if bound.expired:
+                result.unevaluated += len(own) - index
+                result.defer(DEFERRED_RUN_BUDGET)
+                break
             now = self.clock.now()
             inputs, _ = await self._inputs(position, entry, now)
             verdict = evaluate_early(self.policy, inputs)
@@ -401,35 +436,40 @@ class EarlyExitService:
             code = verdict.trigger.value
             result.triggers[code] = result.triggers.get(code, 0) + 1
             result.triggered_at(mark_age(inputs.mark_observed_at, now))
-            if result.executed >= self.max_exits:
-                result.refused("EXIT_BUDGET_REACHED")
-                continue
-            try:
-                reading = await self.exits.execute_position_exit(
-                    position.id,
-                    request_key=exit_request_key(self.policy, position.cycle_id, now),
-                    trigger=ExitTriggerRecord(
-                        trigger=code,
-                        policy_version=self.policy.version,
-                        basis=self._basis(inputs, verdict),
-                    ),
-                    confirm=self._confirmer(position, entry, code, inputs, verdict, context),
-                )
-            except PaperExitUnavailable as failure:
-                # Nothing was sold; the trigger still holds and the next sweep asks again.
-                result.refused(str(failure))
-                continue
-            result.measured(reading)
-            if isinstance(reading, PaperExitRecorded):
-                if reading.replayed:
-                    # Another sweep already sold it under this key: the sale
-                    # exists once, and this sweep did not make it.
-                    result.refused("EXIT_ALREADY_RECORDED")
-                else:
-                    result.executed += 1
-            else:
-                result.refused(reading.reason.value)
-        return result
+            candidates.append(self._candidate(result, position, entry, code, inputs, verdict, now))
+        return candidates
+
+    def _candidate(
+        self,
+        result: ExitSweep,
+        position: Position,
+        entry: TradeCaseExecutionRow,
+        code: str,
+        inputs: EarlyExitInputs,
+        verdict: EarlyExitVerdict,
+        now: datetime,
+    ) -> ExitCandidate:
+        key = exit_request_key(self.policy, position.cycle_id, now)
+
+        def start(context: RefreshContext) -> Awaitable[ExitReading]:
+            return self.exits.execute_position_exit(
+                position.id,
+                request_key=key,
+                trigger=ExitTriggerRecord(
+                    trigger=code,
+                    policy_version=self.policy.version,
+                    basis=self._basis(inputs, verdict),
+                ),
+                confirm=self._confirmer(position, entry, code, inputs, verdict, context),
+            )
+
+        return ExitCandidate(
+            position_id=position.id,
+            request_key=key,
+            result=result,
+            port=self.refresh,
+            start=start,
+        )
 
     def _basis(self, inputs: EarlyExitInputs, verdict: EarlyExitVerdict) -> dict[str, Any]:
         return {

@@ -9,9 +9,11 @@ pre-risk refresh observes, by the case's stored pool locator, through the same
 identity checks and recorder. No discovery, no symbol search, no substitution.
 
 **Bounded.** One attempt per exit, no retry inside it, the refresh stage's own
-request and time budget, the run's remaining time, and at most `max_refreshes`
-attempts per sweep. A refresh that cannot show the market fresh is a typed
-refusal for that one sale; the next run asks again.
+request and time budget, the run's remaining time, at most `limit` attempts
+per exit phase, and — when set — a provider request ceiling for the whole phase
+that a refresh is admitted under only while its own maximum still fits. A
+refresh that cannot show the market fresh is a typed refusal for that one sale;
+the next run asks again.
 """
 
 import math
@@ -71,14 +73,30 @@ class Unbounded:
 
 @dataclass
 class RefreshBudget:
-    """One sweep's refresh attempts, counted and capped."""
+    """One exit phase's refresh attempts and provider requests, counted and capped.
+
+    Requests are admitted before a refresh starts, never corrected after: one is
+    begun only while the largest number of requests a single refresh may spend
+    still fits, so the phase can never end above its request ceiling.
+    """
 
     limit: int
     attempts: int = 0
+    # The phase's provider request ceiling; `None` leaves only each refresh's own.
+    max_provider_requests: int | None = None
+    # The most requests one refresh may spend — the refresh stage's own bound.
+    per_refresh_requests: int = 0
+    provider_requests: int = 0
 
     @property
     def exhausted(self) -> bool:
         return self.attempts >= self.limit
+
+    @property
+    def requests_exhausted(self) -> bool:
+        if self.max_provider_requests is None:
+            return False
+        return self.provider_requests + self.per_refresh_requests > self.max_provider_requests
 
 
 @dataclass
@@ -101,12 +119,15 @@ class RefreshContext:
             return None, 0, 0, None
         if self.budget.exhausted:
             return "PRE_EXIT_REFRESH_BUDGET_REACHED", 0, 0, None
+        if self.budget.requests_exhausted:
+            return "PRE_EXIT_PROVIDER_BUDGET_REACHED", 0, 0, None
         if self.deadline.expired:
             return "TIME_BUDGET_REACHED", 0, 0, None
         self.budget.attempts += 1
         started = time.monotonic()
         reading = await self.port.refresh(trade_case, self.deadline, networks=self.networks)
         seconds = round(time.monotonic() - started, 3)
+        self.budget.provider_requests += reading.provider_requests
         if not reading.ready:
             return reading.reason or "PROVIDER_FAILED", 1, reading.provider_requests, seconds
         return None, 1, reading.provider_requests, seconds

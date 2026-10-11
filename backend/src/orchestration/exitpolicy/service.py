@@ -1,11 +1,13 @@
 """The automatic exit sweep: evaluate every open PAPER position, exit through the one path.
 
 For each open, case-bound PAPER position the sweep reads the entry fill, the
-current mark and the held market's current liquidity, asks `PAPER_EXIT_V1`
-for a trigger, and — only when one fires — calls the existing
-`PaperExitService.execute_position_exit`. That service does everything an
-exit has always done: whole holding, fresh SENTINEL SELL check, one order per
-key, one exit per cycle, fill + ledger + exit record in one transaction. The
+current mark and the held market's current liquidity and asks `PAPER_EXIT_V1`
+for a trigger (`plan`). Only for a position where one fires is the existing
+`PaperExitService.execute_position_exit` called, in the order and under the
+budget `exitpolicy.drive` decides — shared, in a run, with the early policy.
+That service does everything an exit has always done: whole holding, fresh
+SENTINEL SELL check, one order per key, one exit per cycle, fill + ledger +
+exit record in one transaction. The
 sweep adds only *why*: the trigger, the policy version and the numbers are
 stored on that same exit record.
 
@@ -25,7 +27,8 @@ database, so a later run that tries again after a refusal can never produce a
 second sale of the same holding.
 """
 
-from dataclasses import dataclass, field
+from collections.abc import Awaitable
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
@@ -40,6 +43,14 @@ from src.data.tables import TradeCaseExecutionRow
 from src.markets.geckoterminal.networks import VerifiedNetworkRegistry
 from src.markets.models import Availability
 from src.markets.scope import MarketScope
+from src.orchestration.exitpolicy.drive import (
+    DEFERRED_RUN_BUDGET,
+    ExitCandidate,
+    alone,
+    attempt_exits,
+    exit_order,
+)
+from src.orchestration.exitpolicy.drive import ExitSweep as ExitSweep
 from src.orchestration.exitpolicy.policy import (
     ExitInputs,
     ExitVerdict,
@@ -48,82 +59,19 @@ from src.orchestration.exitpolicy.policy import (
 )
 from src.orchestration.exitpolicy.refresh import (
     PreExitMarketRefresh,
-    RefreshBudget,
     RefreshContext,
     RefreshDeadline,
     Unbounded,
 )
-from src.orchestration.paperexit.models import ExitReading, PaperExitRecorded
+from src.orchestration.paperexit.models import ExitReading
 from src.orchestration.paperexit.service import (
     ExitConfirmation,
     ExitTriggerRecord,
     PaperExitService,
-    PaperExitUnavailable,
 )
 from src.orchestration.riskrequest.service import OneSnapshot
 from src.orchestration.valuation.service import PositionValuationReader, held_market_identities
 from src.orchestration.workflow.models import TradeCase
-
-
-@dataclass
-class ExitSweep:
-    """What one sweep did. Counts and codes only."""
-
-    evaluated: int = 0
-    triggered: int = 0
-    executed: int = 0
-    held: int = 0
-    triggers: dict[str, int] = field(default_factory=dict)
-    refusals: dict[str, int] = field(default_factory=dict)
-    # The pre-exit refresh and the second judgement of each trigger.
-    refresh_attempts: int = 0
-    refresh_failures: int = 0
-    refresh_provider_requests: int = 0
-    triggers_cleared: int = 0
-    triggers_changed: int = 0
-    reevaluated: dict[str, int] = field(default_factory=dict)
-    max_refresh_seconds: float | None = None
-    max_atlas_read_seconds: float | None = None
-    max_mark_age_at_trigger_seconds: float | None = None
-    max_mark_age_at_final_seconds: float | None = None
-
-    def refused(self, code: str) -> None:
-        self.refusals[code] = self.refusals.get(code, 0) + 1
-
-    def triggered_at(self, mark_age: float | None) -> None:
-        self.max_mark_age_at_trigger_seconds = _larger(
-            self.max_mark_age_at_trigger_seconds, mark_age
-        )
-
-    def measured(self, reading: ExitReading) -> None:
-        """Fold one exit's freshness into the sweep's. Numbers and codes only."""
-        freshness = reading.freshness
-        if freshness is None:
-            return
-        self.refresh_attempts += freshness.refresh_attempts
-        self.refresh_provider_requests += freshness.refresh_provider_requests
-        if freshness.refresh_attempts and freshness.refresh_reason is not None:
-            self.refresh_failures += 1
-        if freshness.trigger_cleared:
-            self.triggers_cleared += 1
-        reevaluated = freshness.reevaluated_trigger
-        if reevaluated is not None:
-            self.reevaluated[reevaluated] = self.reevaluated.get(reevaluated, 0) + 1
-            if reevaluated != freshness.original_trigger:
-                self.triggers_changed += 1
-        self.max_refresh_seconds = _larger(self.max_refresh_seconds, freshness.refresh_seconds)
-        self.max_atlas_read_seconds = _larger(
-            self.max_atlas_read_seconds, freshness.atlas_read_seconds
-        )
-        self.max_mark_age_at_final_seconds = _larger(
-            self.max_mark_age_at_final_seconds, freshness.mark_age_at_final_seconds
-        )
-
-
-def _larger(current: float | None, value: float | None) -> float | None:
-    if value is None:
-        return current
-    return value if current is None else max(current, value)
 
 
 def mark_age(observed_at: datetime | None, now: datetime) -> float | None:
@@ -192,6 +140,8 @@ class AutoExitService:
     refresh: PreExitMarketRefresh | None = None
     # Refresh attempts per sweep. `None` is one per exit this sweep may book.
     max_refreshes: int | None = None
+    # Attempts (chain reads) per sweep on its own. `None` is one per exit it may book.
+    max_attempts: int | None = None
 
     async def sweep(
         self,
@@ -199,15 +149,36 @@ class AutoExitService:
         deadline: RefreshDeadline | None = None,
         networks: VerifiedNetworkRegistry | None = None,
     ) -> ExitSweep:
+        """This policy's exits on their own, under this service's own budget.
+
+        A run never calls this: its exit phase plans every policy and asks for
+        the sales under one shared budget (`src.orchestration.exitpolicy.drive`).
+        """
         result = ExitSweep()
-        context = RefreshContext(
-            port=self.refresh,
-            budget=RefreshBudget(
-                self.max_refreshes if self.max_refreshes is not None else self.max_exits
+        candidates = await self.plan(result, deadline=deadline)
+        await attempt_exits(
+            exit_order([candidates], self.clock.now()),
+            alone(
+                max_exits=self.max_exits,
+                max_attempts=self.max_attempts,
+                max_refreshes=self.max_refreshes,
             ),
-            deadline=deadline if deadline is not None else Unbounded(),
+            sessions=self.sessions,
+            deadline=deadline,
             networks=networks,
         )
+        return result
+
+    async def plan(
+        self, result: ExitSweep, *, deadline: RefreshDeadline | None = None
+    ) -> list[ExitCandidate]:
+        """Judge every open position by PAPER_EXIT_V1 and return the triggered ones.
+
+        Database reads only — nothing here calls a provider or sells. Counts
+        are written into `result` as they are made; a position the run's time
+        did not reach is reported as unevaluated rather than as held.
+        """
+        bound = deadline if deadline is not None else Unbounded()
         async with self.sessions() as session:
             positions = [
                 item
@@ -216,7 +187,8 @@ class AutoExitService:
             ]
             entries = await self._entries(session, positions)
             early = await _early_cycles(session, list(entries.values()))
-        for position in sorted(positions, key=lambda item: str(item.id)):
+        candidates: list[ExitCandidate] = []
+        for index, position in enumerate(sorted(positions, key=lambda item: str(item.id))):
             entry = entries.get(position.cycle_id)
             if entry is None:
                 # No case-bound entry: not a position this policy may close.
@@ -227,6 +199,10 @@ class AutoExitService:
                 # EARLY_PAPER_EXIT_V1. This policy never closes its positions.
                 result.refused("EARLY_POSITION_OWN_EXIT_POLICY")
                 continue
+            if bound.expired:
+                result.unevaluated += len(positions) - index
+                result.defer(DEFERRED_RUN_BUDGET)
+                break
             now = self.clock.now()
             inputs, _ = await self._inputs(position, entry, now)
             verdict = evaluate(self.policy, inputs)
@@ -238,30 +214,40 @@ class AutoExitService:
             code = verdict.trigger.value
             result.triggers[code] = result.triggers.get(code, 0) + 1
             result.triggered_at(mark_age(inputs.mark_observed_at, now))
-            if result.executed >= self.max_exits:
-                result.refused("EXIT_BUDGET_REACHED")
-                continue
-            try:
-                reading = await self.exits.execute_position_exit(
-                    position.id,
-                    request_key=exit_request_key(self.policy, position.cycle_id, now),
-                    trigger=ExitTriggerRecord(
-                        trigger=code,
-                        policy_version=self.policy.version,
-                        basis=_basis(self.policy, inputs, verdict),
-                    ),
-                    confirm=self._confirmer(position, entry, code, inputs, verdict, context),
-                )
-            except PaperExitUnavailable as failure:
-                # Unknown is not permission: nothing was sold, the next run asks again.
-                result.refused(str(failure))
-                continue
-            result.measured(reading)
-            if isinstance(reading, PaperExitRecorded):
-                result.executed += 1
-            else:
-                result.refused(reading.reason.value)
-        return result
+            candidates.append(self._candidate(result, position, entry, code, inputs, verdict, now))
+        return candidates
+
+    def _candidate(
+        self,
+        result: ExitSweep,
+        position: Position,
+        entry: TradeCaseExecutionRow,
+        code: str,
+        inputs: ExitInputs,
+        verdict: ExitVerdict,
+        now: datetime,
+    ) -> ExitCandidate:
+        key = exit_request_key(self.policy, position.cycle_id, now)
+
+        def start(context: RefreshContext) -> Awaitable[ExitReading]:
+            return self.exits.execute_position_exit(
+                position.id,
+                request_key=key,
+                trigger=ExitTriggerRecord(
+                    trigger=code,
+                    policy_version=self.policy.version,
+                    basis=_basis(self.policy, inputs, verdict),
+                ),
+                confirm=self._confirmer(position, entry, code, inputs, verdict, context),
+            )
+
+        return ExitCandidate(
+            position_id=position.id,
+            request_key=key,
+            result=result,
+            port=self.refresh,
+            start=start,
+        )
 
     def _confirmer(
         self,
