@@ -59,7 +59,7 @@ from src.markets.geckoterminal.networks import VerifiedNetworkRegistry
 from src.markets.models import Availability, MarketSnapshot
 from src.markets.scope import MarketScope
 from src.orchestration.exitpolicy.drive import (
-    DEFERRED_RUN_BUDGET,
+    PLAN_TIME_BUDGET,
     ExitCandidate,
     ExitSweep,
     alone,
@@ -393,13 +393,20 @@ class EarlyExitService:
         return result
 
     async def plan(
-        self, result: ExitSweep, *, deadline: RefreshDeadline | None = None
+        self,
+        result: ExitSweep,
+        *,
+        deadline: RefreshDeadline | None = None,
+        candidates: list[ExitCandidate] | None = None,
     ) -> list[ExitCandidate]:
-        """Judge every open early position by EARLY_PAPER_EXIT_V1; return the triggered.
+        """Judge every open early position by EARLY_PAPER_EXIT_V1; name the triggered.
 
-        Database reads only — nothing here calls a provider or sells.
+        Database reads only — nothing here calls a provider or sells. Counts
+        and candidates are kept as they are made, so a judgement cut off
+        part-way keeps both; positions not reached stay `unevaluated`.
         """
         bound = deadline if deadline is not None else Unbounded()
+        found = candidates if candidates is not None else []
         async with self.sessions() as session:
             positions = [
                 item
@@ -407,22 +414,22 @@ class EarlyExitService:
                 if item.quantity > 0 and item.cycle_id is not None
             ]
             entries = await early_entries(session, positions)
+        # Only early cycles: another policy's position is never this one's.
         own = [
             item
             for item in sorted(positions, key=lambda item: str(item.id))
             if item.cycle_id in entries
         ]
-        candidates: list[ExitCandidate] = []
-        for index, position in enumerate(own):
-            # Only early cycles are here: another policy's position is never this one's.
-            entry = entries[position.cycle_id]
+        result.unevaluated += len(own)
+        for position in own:
             if bound.expired:
-                result.unevaluated += len(own) - index
-                result.defer(DEFERRED_RUN_BUDGET)
+                result.plan_stop = PLAN_TIME_BUDGET
                 break
+            entry = entries[position.cycle_id]
             now = self.clock.now()
             inputs, _ = await self._inputs(position, entry, now)
             verdict = evaluate_early(self.policy, inputs)
+            result.unevaluated -= 1
             result.evaluated += 1
             if verdict.trigger is None:
                 result.held += 1
@@ -436,8 +443,8 @@ class EarlyExitService:
             code = verdict.trigger.value
             result.triggers[code] = result.triggers.get(code, 0) + 1
             result.triggered_at(mark_age(inputs.mark_observed_at, now))
-            candidates.append(self._candidate(result, position, entry, code, inputs, verdict, now))
-        return candidates
+            found.append(self._candidate(result, position, entry, code, inputs, verdict, now))
+        return found
 
     def _candidate(
         self,

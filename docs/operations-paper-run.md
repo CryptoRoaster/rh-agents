@@ -265,6 +265,17 @@ attempted is **deferred**, by reason: `EXIT_BUDGET_REACHED` (sales),
 stops with `TIME_BUDGET_REACHED`). Positions the run's time did not even reach
 to judge are counted as `unevaluated`.
 
+**Planning shares.** Judging (`plan`, database reads only) may take what the
+run has left less one attempt's reserve and one more settling margin — or, with
+less than that left, what remains, so the positions are still judged and
+reported while admission defers every attempt. Each policy gets an equal, fixed
+share of that time. A policy whose judgement hangs is cut off at its own share
+(`plan_stop = EXIT_PLAN_TIMED_OUT`), or stops between positions when its share
+is spent (`EXIT_PLAN_TIME_BUDGET_REACHED`); either way it keeps every count it
+made and every candidate it already named, and the other policy is still judged
+on its own share. Positions not reached stay `unevaluated` — never `held` and
+never `deferred` — and the run stops with `TIME_BUDGET_REACHED`.
+
 **One attempt cut off.** An attempt that outlives its bound is cancelled — before
 the lock nothing was written; inside the transaction the cancellation rolls it
 back — and its outcome is settled by looking up the exit row under its key. A
@@ -287,7 +298,7 @@ fairness guarantee across runs or restarts — nothing is persisted.
 
 **Counting.** Each sweep's report adds `attempts`, `replayed` (a sale that
 already existed under its key — never counted as `executed`), `timed_out`,
-`unknown`, `deferred`, `deferred_reasons` and `unevaluated`. The summary's
+`unknown`, `deferred`, `deferred_reasons`, `unevaluated` and `plan_stop`. The summary's
 `exit_phase` reports the shared budget: limits, `attempts`, `exits`,
 `refreshes`, `provider_requests`, `reserve_seconds`, `deferred`,
 `deferred_reasons` and `unknown`. No migration.

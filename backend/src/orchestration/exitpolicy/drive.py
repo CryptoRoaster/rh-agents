@@ -37,10 +37,11 @@ restarts — nothing here is persisted — only the absence of a systematic lose
 
 import asyncio
 import hashlib
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID
 
 from sqlalchemy import select
@@ -66,6 +67,10 @@ DEFERRED_ATTEMPT_LIMIT = "EXIT_ATTEMPT_LIMIT_REACHED"
 DEFERRED_EXIT_BUDGET = "EXIT_BUDGET_REACHED"
 # An attempt cut off by its bound whose booking could not be confirmed either way.
 OUTCOME_UNKNOWN = "EXIT_OUTCOME_UNKNOWN"
+# Why a policy's judgement stopped short: its share of the run's time ran out
+# between two positions, or a read inside it outlived the share and was cut off.
+PLAN_TIME_BUDGET = "EXIT_PLAN_TIME_BUDGET_REACHED"
+PLAN_TIMED_OUT = "EXIT_PLAN_TIMED_OUT"
 # Looking up a cut-off attempt's exit row: one indexed read by its unique key.
 SETTLE_SECONDS = float(EXIT_SETTLE_SECONDS)
 
@@ -88,10 +93,11 @@ class ExitSweep:
     replayed: int = 0
     timed_out: int = 0
     unknown: int = 0
-    # Triggered positions not attempted, by reason; positions not even judged
-    # because the run's time was gone.
+    # Triggered positions not attempted, by reason; positions of this policy not
+    # judged at all, and why the judgement stopped short (`PLAN_*`), if it did.
     deferred: dict[str, int] = field(default_factory=dict)
     unevaluated: int = 0
+    plan_stop: str | None = None
     # The pre-exit refresh and the second judgement of each trigger.
     refresh_attempts: int = 0
     refresh_failures: int = 0
@@ -219,6 +225,72 @@ class ExitBudget:
     def defer(self, candidate: ExitCandidate, code: str) -> None:
         candidate.result.defer(code)
         self.deferred[code] = self.deferred.get(code, 0) + 1
+
+
+class _Window:
+    """A monotonic deadline of its own, never later than the one it was cut from."""
+
+    def __init__(self, seconds: float) -> None:
+        self._expires = time.monotonic() + max(0.0, seconds)
+
+    @property
+    def remaining(self) -> float:
+        return self._expires - time.monotonic()
+
+    @property
+    def expired(self) -> bool:
+        return self.remaining <= 0
+
+
+class ExitPlanner(Protocol):
+    async def plan(
+        self,
+        result: ExitSweep,
+        *,
+        deadline: RefreshDeadline | None = None,
+        candidates: list[ExitCandidate] | None = None,
+    ) -> list[ExitCandidate]: ...
+
+
+async def plan_exits(
+    stages: Sequence[tuple[ExitPlanner, ExitSweep]],
+    budget: ExitBudget,
+    deadline: RefreshDeadline,
+) -> list[list[ExitCandidate]]:
+    """Every policy's judgement, each on its own share of the time planning may take.
+
+    Planning may take what the run has left less one attempt's reserve and one
+    more settling margin, so a phase that can still sell keeps the time to;
+    with less than that left it may take what remains, to be judged and
+    reported, and admission then defers every attempt. Each policy is given an
+    equal, fixed share of that: a policy whose judgement hangs is cut off at its
+    own share and can never take the other's, and time a fast one leaves unused
+    stays with the attempts.
+
+    A cut-off judgement keeps every count it made and every candidate it named
+    (they are written as they are made), and says it stopped: `PLAN_TIMED_OUT`
+    when a read inside it was cut, `PLAN_TIME_BUDGET` when it stopped between
+    positions. Database reads only: nothing here calls a provider or sells.
+    """
+    limits = budget.limits
+    pool = deadline.remaining - limits.reserve_seconds - limits.settle_seconds
+    seconds = (pool if pool > 0 else max(0.0, deadline.remaining)) / max(1, len(stages))
+    plans: list[list[ExitCandidate]] = []
+    for stage, result in stages:
+        share = _Window(min(seconds, deadline.remaining))
+        found: list[ExitCandidate] = []
+        plans.append(found)
+        if share.expired:
+            result.plan_stop = PLAN_TIME_BUDGET
+            continue
+        try:
+            await asyncio.wait_for(
+                stage.plan(result, deadline=share, candidates=found),
+                timeout=max(0.001, share.remaining),
+            )
+        except TimeoutError:
+            result.plan_stop = PLAN_TIMED_OUT
+    return plans
 
 
 def exit_order(plans: Sequence[Sequence[ExitCandidate]], at: datetime) -> list[ExitCandidate]:
@@ -352,12 +424,16 @@ __all__ = [
     "DEFERRED_EXIT_BUDGET",
     "DEFERRED_RUN_BUDGET",
     "OUTCOME_UNKNOWN",
+    "PLAN_TIMED_OUT",
+    "PLAN_TIME_BUDGET",
     "SETTLE_SECONDS",
     "ExitBudget",
     "ExitCandidate",
     "ExitLimits",
+    "ExitPlanner",
     "ExitSweep",
     "alone",
     "attempt_exits",
     "exit_order",
+    "plan_exits",
 ]

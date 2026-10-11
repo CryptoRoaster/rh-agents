@@ -544,6 +544,9 @@ class ExitReport(Immutable):
     deferred: int = Field(default=0, ge=0)
     deferred_reasons: tuple[Code, ...] = Field(default=(), max_length=8)
     unevaluated: int = Field(default=0, ge=0)
+    # Why this policy's judgement stopped short, if it did: its share of the
+    # run's time ran out between positions, or a read was cut off inside it.
+    plan_stop: Code | None = None
     # Each trigger judged again on the held market observed after the exit's
     # own chain read: refresh attempts (at most one per exit) and failures,
     # provider requests they spent, triggers that had gone or changed, and the

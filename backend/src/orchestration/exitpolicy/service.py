@@ -44,7 +44,7 @@ from src.markets.geckoterminal.networks import VerifiedNetworkRegistry
 from src.markets.models import Availability
 from src.markets.scope import MarketScope
 from src.orchestration.exitpolicy.drive import (
-    DEFERRED_RUN_BUDGET,
+    PLAN_TIME_BUDGET,
     ExitCandidate,
     alone,
     attempt_exits,
@@ -170,15 +170,21 @@ class AutoExitService:
         return result
 
     async def plan(
-        self, result: ExitSweep, *, deadline: RefreshDeadline | None = None
+        self,
+        result: ExitSweep,
+        *,
+        deadline: RefreshDeadline | None = None,
+        candidates: list[ExitCandidate] | None = None,
     ) -> list[ExitCandidate]:
-        """Judge every open position by PAPER_EXIT_V1 and return the triggered ones.
+        """Judge every open position by PAPER_EXIT_V1 and name the triggered ones.
 
         Database reads only — nothing here calls a provider or sells. Counts
-        are written into `result` as they are made; a position the run's time
-        did not reach is reported as unevaluated rather than as held.
+        are written into `result` and candidates appended to `candidates` as
+        they are made, so a judgement cut off part-way keeps both. Positions not
+        reached stay counted as `unevaluated`, never as held.
         """
         bound = deadline if deadline is not None else Unbounded()
+        found = candidates if candidates is not None else []
         async with self.sessions() as session:
             positions = [
                 item
@@ -187,25 +193,27 @@ class AutoExitService:
             ]
             entries = await self._entries(session, positions)
             early = await _early_cycles(session, list(entries.values()))
-        candidates: list[ExitCandidate] = []
-        for index, position in enumerate(sorted(positions, key=lambda item: str(item.id))):
-            entry = entries.get(position.cycle_id)
-            if entry is None:
+        own = []
+        for position in sorted(positions, key=lambda item: str(item.id)):
+            if position.cycle_id not in entries:
                 # No case-bound entry: not a position this policy may close.
                 result.refused("POSITION_ORIGIN_UNKNOWN")
-                continue
-            if position.cycle_id in early:
+            elif position.cycle_id in early:
                 # PRE_VECTOR_EARLY_ENTRY_V1 has its own exit contract,
                 # EARLY_PAPER_EXIT_V1. This policy never closes its positions.
                 result.refused("EARLY_POSITION_OWN_EXIT_POLICY")
-                continue
+            else:
+                own.append(position)
+        result.unevaluated += len(own)
+        for position in own:
             if bound.expired:
-                result.unevaluated += len(positions) - index
-                result.defer(DEFERRED_RUN_BUDGET)
+                result.plan_stop = PLAN_TIME_BUDGET
                 break
+            entry = entries[position.cycle_id]
             now = self.clock.now()
             inputs, _ = await self._inputs(position, entry, now)
             verdict = evaluate(self.policy, inputs)
+            result.unevaluated -= 1
             result.evaluated += 1
             if verdict.trigger is None:
                 result.held += 1
@@ -214,8 +222,8 @@ class AutoExitService:
             code = verdict.trigger.value
             result.triggers[code] = result.triggers.get(code, 0) + 1
             result.triggered_at(mark_age(inputs.mark_observed_at, now))
-            candidates.append(self._candidate(result, position, entry, code, inputs, verdict, now))
-        return candidates
+            found.append(self._candidate(result, position, entry, code, inputs, verdict, now))
+        return found
 
     def _candidate(
         self,

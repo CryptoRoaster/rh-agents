@@ -70,6 +70,7 @@ from src.orchestration.exitpolicy.drive import (
     ExitSweep,
     attempt_exits,
     exit_order,
+    plan_exits,
 )
 from src.orchestration.riskrequest.models import RiskRequestRefusal
 from src.orchestration.riskrequest.service import stale_source
@@ -464,10 +465,10 @@ class BoundedPaperRun:
             return
         budget = ExitBudget(exit_limits_from_settings(stack.settings))
         account.exit_phase = budget
-        plans = [
-            await self._bounded(stage.plan(result, deadline=deadline), deadline)
-            for stage, result in stages
-        ]
+        # Each policy judged on its own share of the time: one whose judgement
+        # hangs is cut off at its share, keeps what it counted and named, and
+        # leaves the other its own chance (`plan_exits`).
+        plans = await plan_exits(stages, budget, deadline)
         await attempt_exits(
             exit_order(plans, stack.clock.now()),
             budget,
@@ -475,8 +476,10 @@ class BoundedPaperRun:
             deadline=deadline,
             networks=account.networks,
         )
-        if budget.deferred.get(DEFERRED_RUN_BUDGET):
-            # Triggered positions were left for the next run for want of time.
+        if budget.deferred.get(DEFERRED_RUN_BUDGET) or any(
+            result.plan_stop is not None for _, result in stages
+        ):
+            # Positions were left unjudged or unattempted for want of time.
             account.stop = RunStop.TIME_BUDGET_REACHED
 
     async def _intake(self, account: Account, deadline: Deadline) -> None:
@@ -1257,6 +1260,7 @@ def _exit_report(sweep: ExitSweep | None) -> ExitReport | None:
         deferred=sum(sweep.deferred.values()),
         deferred_reasons=tuple(sorted(sweep.deferred)),
         unevaluated=sweep.unevaluated,
+        plan_stop=sweep.plan_stop,
         refresh_attempts=sweep.refresh_attempts,
         refresh_failures=sweep.refresh_failures,
         refresh_provider_requests=sweep.refresh_provider_requests,

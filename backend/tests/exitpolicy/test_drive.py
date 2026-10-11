@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 from pydantic import ValidationError
@@ -49,7 +49,9 @@ def candidate(name: str, result: ExitSweep | None = None) -> ExitCandidate:
         raise AssertionError
 
     return ExitCandidate(
-        position_id=uuid4(),
+        # Named, not random: the order is a function of the minute and the
+        # position, and a test of it must be deterministic.
+        position_id=uuid5(NAMESPACE_URL, f"rh-agents:test-position:{name}"),
         request_key=name,
         result=result if result is not None else ExitSweep(),
         port=None,
@@ -282,3 +284,17 @@ def test_an_exit_run_must_leave_room_for_one_attempt_after_acquisition():
     # Without an exit policy there is no exit phase to leave room for.
     runner_settings(paper_exit_acquisition_max_seconds=40, paper_exit_attempt_max_seconds=25)
     assert runner_settings(early_paper_exit_enabled=True).paper_exit_run_max_seconds == 60
+
+
+async def test_a_judgement_stopped_between_positions_leaves_them_unevaluated_not_deferred(
+    risk_db, now, trace
+):
+    _, sessions = risk_db
+    at, feed = await falling(sessions, now, trace)
+    result = ExitSweep()
+
+    planned = await sweeper(sessions, at, feed).plan(result, deadline=Deadline(0))
+
+    assert planned == []
+    assert (result.evaluated, result.unevaluated, result.deferred) == (0, 1, {}), result
+    assert result.plan_stop == "EXIT_PLAN_TIME_BUDGET_REACHED"
