@@ -405,6 +405,13 @@ class Settings(BaseSettings):
     # early positions can still be wound down after entries are switched off.
     # Its numbers are versioned constants in `orchestration/exitpolicy/early.py`.
     early_paper_exit_enabled: bool = False
+    # Early-only operation: the bounded PAPER run may enter through
+    # PRE_VECTOR_EARLY_ENTRY_V1 and nothing else. Off by default, and off nothing
+    # changes. On, the normal intake and its promotion refresh are skipped, the
+    # run works on early cases only (an older normal case is left as it is and
+    # takes no case budget), and a risk request for any other case is refused
+    # before SENTINEL. Exits — normal and early — and every gate are untouched.
+    paper_early_only: bool = False
     # Pools one new-pool read may bring back, per configured chain.
     early_scout_max_discovery_pools: int = Field(default=10, ge=1, le=20)
     # Discovery capacity is deliberately decoupled from model-review capacity.
@@ -492,6 +499,14 @@ class Settings(BaseSettings):
         if not self.early_paper_exit_enabled:
             # No early position may be opened without the contract that closes it.
             raise ValueError("PRE_VECTOR_EARLY_ENTRY_ENABLED requires EARLY_PAPER_EXIT_ENABLED")
+        return self
+
+    @model_validator(mode="after")
+    def early_only_configuration(self) -> "Settings":
+        if self.paper_early_only and not self.pre_vector_early_entry_enabled:
+            # Early-only without the early strategy is a run that may enter
+            # through nothing at all; that is a mistake, not a mode.
+            raise ValueError("PAPER_EARLY_ONLY requires PRE_VECTOR_EARLY_ENTRY_ENABLED")
         return self
 
     @model_validator(mode="after")

@@ -90,7 +90,11 @@ from src.orchestration.jobruns.service import (
 )
 from src.orchestration.riskrequest.models import RiskRequestRefusal
 from src.orchestration.riskrequest.service import stale_source
-from src.orchestration.strategy.early import EARLY_ENTRY_V1, is_early
+from src.orchestration.strategy.early import (
+    EARLY_ENTRY_V1,
+    PRE_VECTOR_EARLY_ENTRY_V1,
+    is_early,
+)
 from src.orchestration.workflow.models import (
     TERMINAL_CASE_STATUSES,
     SourceRefreshOutcome,
@@ -766,7 +770,11 @@ class BoundedPaperRun:
         The candidate budget is already inside the policy this service was built
         with, so nothing is opened beyond it and nothing has to be discarded
         afterwards.
+
+        Early-only operation skips it entirely: no normal case may open.
         """
+        if self.stack.settings.paper_early_only:
+            return
         if not account.may_step(deadline):
             return
         account.steps += 1
@@ -980,17 +988,25 @@ class BoundedPaperRun:
                 break
         return frozenset(account.touched)
 
+    def _case_filter(self) -> tuple[Any, ...]:
+        """Which cases a pass may work on: every live one, or only early ones.
+
+        Early-only operation leaves every other case exactly as it is — not
+        worked, not expired, not asked about — so an older normal case can never
+        take the case budget an early case needs.
+        """
+        live = TradeCaseRow.status.notin_([item.value for item in TERMINAL_CASE_STATUSES])
+        if self.stack.settings.paper_early_only:
+            return (live, TradeCaseRow.strategy_policy_id == PRE_VECTOR_EARLY_ENTRY_V1)
+        return (live,)
+
     async def _open_cases(self, deadline: Deadline) -> tuple[UUID, ...]:
         async def read() -> tuple[UUID, ...]:
             async with self.stack.sessions() as session:
                 rows = (
                     await session.scalars(
                         select(TradeCaseRow.id)
-                        .where(
-                            TradeCaseRow.status.notin_(
-                                [item.value for item in TERMINAL_CASE_STATUSES]
-                            )
-                        )
+                        .where(*self._case_filter())
                         .order_by(TradeCaseRow.opened_at, TradeCaseRow.id)
                         .limit(self.stack.limits.max_cases)
                     )
@@ -1061,11 +1077,7 @@ class BoundedPaperRun:
                 rows = (
                     await session.scalars(
                         select(TradeCaseRow.id)
-                        .where(
-                            TradeCaseRow.status.notin_(
-                                [item.value for item in TERMINAL_CASE_STATUSES]
-                            )
-                        )
+                        .where(*self._case_filter())
                         .order_by(TradeCaseRow.opened_at, TradeCaseRow.id)
                         .limit(self.stack.limits.max_cases * 2)
                     )

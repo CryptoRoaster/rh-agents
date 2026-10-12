@@ -193,6 +193,8 @@ class RiskRequestService:
     # Split operation only: no request is asked unless the exit job's latest
     # evidence covers the BUY it could lead to. Absent, never consulted.
     exit_liveness: ExitLivenessGate | None = None
+    # Early-only operation: only an early case may ask. Off, never consulted.
+    early_only: bool = False
 
     async def request_risk_evaluation(
         self,
@@ -568,6 +570,8 @@ class RiskRequestService:
             return _refused(
                 trade_case, RiskRequestRefusal.ENTRY_HALTED, readiness, detail=entry_halted
             )
+        if self.early_only and not is_early(trade_case.strategy_policy_id):
+            return _refused(trade_case, RiskRequestRefusal.NORMAL_ENTRY_DISABLED, readiness)
 
         if trade_case.status in TERMINAL_CASE_STATUSES:
             return _refused(trade_case, RiskRequestRefusal.TRADE_CASE_TERMINAL, readiness)

@@ -201,6 +201,7 @@ class Preflight:
         checks.extend(self._roles(stack))
         checks.extend(self._holder_sources(stack))
         checks.extend(self._scout(stack))
+        checks.extend(self._early_only(stack))
         checks.append(await self._schema(errors))
         checks.append(await self._pause(errors))
         checks.extend(self._unverifiable())
@@ -320,6 +321,12 @@ class Preflight:
             if item.required
         }
         versions = {role: workflow.version for role in required}
+        early_only = self._settings.paper_early_only
+        if early_only:
+            # Early-only executes the early workflow and nothing else: a role
+            # only the normal workflow needs is not load-bearing for any case
+            # this run may work on. The early workflow's roles are added below.
+            required, versions = {}, {}
         if self._settings.pre_vector_early_entry_enabled:
             # The early strategy's own workflow is executed too, and every role
             # it requires is as load-bearing for its cases as V2's are for theirs.
@@ -330,6 +337,9 @@ class Preflight:
                     required[item.role.value] = item.evidence_type.name
                     versions[item.role.value] = TRADE_CASE_EARLY_V1.version
         found: list[Check] = []
+        normal_only = {item.role.value for item in workflow.requirements if item.required} - set(
+            required
+        )
         for role in stack.roles:
             name = f"ROLE_{role.role}"
             if role.available:
@@ -351,9 +361,69 @@ class Preflight:
                         f"{required[role.role]} evidence before any case can reach risk.",
                     )
                 )
+            elif early_only and role.role in normal_only:
+                found.append(
+                    _satisfied(name, "Not enabled; early-only operation does not require it.")
+                )
             else:
                 found.append(_satisfied(name, "Deliberately not enabled."))
         return found
+
+    def _early_only(self, stack: RunnerStack) -> list[Check]:
+        """Every input early-only operation depends on, by name, only in that mode.
+
+        The settings already refuse early-only without the early strategy, its
+        scout, its funding graph and its exit contract; the roles are checked
+        against the early workflow above. What is left is what composes without
+        complaint and would still leave every early case unable to reach risk,
+        or a BUY with nothing to rest on: a history source, a quote source,
+        market acquisition and the exit-job liveness gate.
+        """
+        settings = self._settings
+        if not settings.paper_early_only:
+            return []
+        wanted = (
+            (
+                "EARLY_ONLY_INTAKE",
+                stack.early_intake is not None,
+                "EARLY_ONLY_INTAKE_NOT_COMPOSED",
+                "The early intake is composed; the normal intake is skipped.",
+            ),
+            (
+                "EARLY_ONLY_EXIT_POLICY",
+                stack.early_exits is not None,
+                "EARLY_ONLY_EXIT_POLICY_MISSING",
+                "EARLY_PAPER_EXIT_V1 is composed.",
+            ),
+            (
+                "EARLY_ONLY_HISTORY",
+                settings.vector_history_provider != "disabled",
+                "EARLY_ONLY_HISTORY_NOT_CONFIGURED",
+                "A market history source is configured for the early setup.",
+            ),
+            (
+                "EARLY_ONLY_QUOTES",
+                settings.execution_quote_provider != "disabled",
+                "EARLY_ONLY_QUOTES_NOT_CONFIGURED",
+                "An execution quote source is configured for ANCHOR.",
+            ),
+            (
+                "EARLY_ONLY_ACQUISITION",
+                stack.acquisition is not None,
+                "EARLY_ONLY_ACQUISITION_DISABLED",
+                "Market acquisition is composed.",
+            ),
+            (
+                "EARLY_ONLY_LIVENESS",
+                stack.exit_liveness is not None,
+                "EARLY_ONLY_LIVENESS_GATE_DISABLED",
+                "Every BUY requires recent exit-job evidence.",
+            ),
+        )
+        return [
+            _satisfied(name, note) if met else _blocked(name, reason, "Early-only requires it.")
+            for name, met, reason, note in wanted
+        ]
 
     def _holder_sources(self, stack: RunnerStack) -> list[Check]:
         """ATLAS's holder source for every chain it reads, built as a run builds it.
