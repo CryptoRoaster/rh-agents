@@ -454,7 +454,13 @@ def build_stack(
         slippage_bps=settings.paper_slippage_bps,
         trading_mode=settings.trading_mode,
     )
-    paper = PaperTradingService(sessions, RiskLimits(), settings.trading_mode, clock=tick)
+    paper = PaperTradingService(
+        sessions,
+        RiskLimits(),
+        settings.trading_mode,
+        clock=tick,
+        early_only=settings.paper_early_only,
+    )
     limits = limits_from_settings(settings)
     # Split operation: every BUY path asks for the exit job's evidence first.
     exit_liveness = (
@@ -565,6 +571,7 @@ def build_stack(
         pause=supplied.pause,
         clock=tick,
         exit_liveness=exit_liveness,
+        early_only=settings.paper_early_only,
     )
     acquisition = None
     pre_risk = None

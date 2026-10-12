@@ -137,6 +137,11 @@ entries:
   expired and takes no case budget, so it can never starve an early case;
 - a risk request for a non-early case is refused before SENTINEL
   (`NORMAL_ENTRY_DISABLED`);
+- the case fill refuses a non-early case under the account lock
+  (`NORMAL_ENTRY_DISABLED`), so an approval stored before the switch buys
+  nothing; a fill already booked still replays as recorded. The paper executor
+  raises `NormalEntryDisabledError` for any BUY that is not an early case's,
+  including its standalone path. Sales are never affected;
 - both exit sweeps, the entry halt, the kill switch, SENTINEL and the
   `EXIT_JOB_STALE` gate are unchanged.
 
