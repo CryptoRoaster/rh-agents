@@ -65,6 +65,7 @@ from src.orchestration.exitpolicy.drive import ExitLimits
 from src.orchestration.exitpolicy.early import EarlyExitService
 from src.orchestration.exitpolicy.policy import PaperExitPolicy
 from src.orchestration.exitpolicy.service import AutoExitService
+from src.orchestration.jobruns.models import ExitLivenessGate
 from src.orchestration.paper import PaperTradingService
 from src.orchestration.paperexit.exitread import (
     AtlasExitRead,
@@ -337,6 +338,9 @@ class RunnerStack:
     # Why no model can be asked, or None when one can. Read by preflight for the
     # scout, which needs ORBIT's model whether or not the ORBIT worker is on.
     reasoning_unavailable: str | None = None
+    # Split operation's liveness gate, the same one the risk request and the
+    # fill hold. Absent, `--entries-once` refuses to start.
+    exit_liveness: ExitLivenessGate | None = None
     closers: tuple[Closer, ...] = ()
 
     @property
@@ -452,6 +456,15 @@ def build_stack(
     )
     paper = PaperTradingService(sessions, RiskLimits(), settings.trading_mode, clock=tick)
     limits = limits_from_settings(settings)
+    # Split operation: every BUY path asks for the exit job's evidence first.
+    exit_liveness = (
+        ExitLivenessGate(
+            max_age_seconds=settings.paper_exit_liveness_max_age_seconds,
+            run_max_seconds=settings.paper_exit_run_max_seconds,
+        )
+        if settings.paper_entry_requires_exit_job
+        else None
+    )
     watches: WatchRepository | None = None
     promotion: PromotionRefresh | None = None
     candidates: MarketReader | PromotedWatchCandidates = markets
@@ -533,6 +546,7 @@ def build_stack(
         kill_switch=settings.commander_kill_switch,
         pause=supplied.pause,
         clock=tick,
+        exit_liveness=exit_liveness,
     )
     fills = CaseFillService(
         sessions=sessions,
@@ -544,6 +558,7 @@ def build_stack(
         kill_switch=settings.commander_kill_switch,
         pause=supplied.pause,
         clock=tick,
+        exit_liveness=exit_liveness,
     )
     acquisition = None
     pre_risk = None
@@ -657,6 +672,7 @@ def build_stack(
         early_exits=early_exits,
         early_intake=early_intake,
         early_promotion=early_promotion,
+        exit_liveness=exit_liveness,
         reasoning_unavailable=None
         if supplied.reasoning is not None
         else supplied.reasoning_unavailable,

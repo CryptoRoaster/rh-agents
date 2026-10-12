@@ -26,7 +26,13 @@ from src.orchestration.valuation.models import PortfolioValuation, PositionMark
 from src.orchestration.workflow.models import TradeCaseStatus
 from tests.casefill.conftest import MultiMarkets, approved_case, build_fill_service
 from tests.riskdata.conftest import BASE_ASSET, market_for, recorded_snapshot
-from tests.riskrequest.conftest import FRESH, build_service, read_account, set_account
+from tests.riskrequest.conftest import (
+    FRESH,
+    build_service,
+    lift_pause,
+    read_account,
+    set_account,
+)
 
 # A second coherent market, so "a holding elsewhere" is a real market rather
 # than a renamed copy of the one the case runs in.
@@ -385,7 +391,7 @@ async def test_existing_stops_and_bookings_still_apply(risk_db, now, trace):
         await service.execute_case_fill(case.id, request_key="stops-req")
     ).reason is ExecutionRefusal.SYSTEM_PAUSED
 
-    await set_account(sessions, paused=False)
+    await lift_pause(sessions)
     filled = await service.execute_case_fill(case.id, request_key="stops-req")
     assert filled.kind == "paper_fill_recorded"
     replay = await service.execute_case_fill(case.id, request_key="stops-req")

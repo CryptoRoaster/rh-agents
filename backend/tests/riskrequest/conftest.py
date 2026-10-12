@@ -105,6 +105,7 @@ async def risk_db():
                 "0021_market_snapshot_quote_price",
                 "0022_stream_outcome_percent_type",
                 "0023_persistent_entry_halt",
+                "0024_paper_job_runs",
             ):
                 spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
                 module = importlib.util.module_from_spec(spec)
@@ -282,3 +283,26 @@ async def read_account(sessions):
 @pytest.fixture
 def request_key():
     return f"risk-request-{uuid4()}"
+
+
+async def lift_pause(sessions, at=None):
+    """Lift the durable pause as only an operator may: with its audit event (0024)."""
+    from datetime import UTC, datetime
+
+    from src.data.tables import PaperControlEventRow
+
+    async with sessions.begin() as session:
+        account = await session.scalar(select(AccountRow).where(AccountRow.id == 1))
+        session.add(
+            PaperControlEventRow(
+                event_id=uuid4(),
+                occurred_at=at or datetime.now(UTC),
+                control="SYSTEM_PAUSE",
+                action="CLEAR",
+                reason_code="TEST_RECOVERY",
+                actor_kind="OPERATOR",
+                halted_before=True,
+                halted_after=False,
+            )
+        )
+        account.paused = False

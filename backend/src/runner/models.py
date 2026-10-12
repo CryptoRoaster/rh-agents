@@ -80,19 +80,27 @@ class RunStop(StrEnum):
     # An entry-only halt is in force: the exits ran, and nothing that could lead
     # to a BUY was started. Not a fault.
     ENTRY_HALTED = "ENTRY_HALTED"
+    # The entry job (`--entries-once`) found no recent evidence that the exit
+    # job works, and started nothing that could lead to a BUY. Not a fault of
+    # this run; every BUY path refuses on the same evidence under the lock.
+    EXIT_JOB_STALE = "EXIT_JOB_STALE"
 
 
 class RunMode(StrEnum):
     """Which job one pass is.
 
-    FULL is the entry job: acquisition, both exit sweeps, intake, the workers,
-    risk and fills — every run before this contract. EXITS_ONLY is the fast
-    exit job: acquisition of open positions' markets only, then both exit
+    FULL is the combined job: acquisition, both exit sweeps, intake, the
+    workers, risk and fills — every run before this contract. EXITS_ONLY is the
+    fast exit job: acquisition of open positions' markets only, then both exit
     sweeps, and nothing that could open a case, request risk or buy.
+    ENTRIES_ONLY is the entry job of split operation: everything FULL does but
+    the exit sweeps, which it leaves to the exit job — and only while that job
+    has recently shown that it works (`EXIT_JOB_STALE` otherwise).
     """
 
     FULL = "FULL"
     EXITS_ONLY = "EXITS_ONLY"
+    ENTRIES_ONLY = "ENTRIES_ONLY"
 
 
 class RunLimits(Immutable):
@@ -542,6 +550,13 @@ class ExitReport(Immutable):
     replayed: int = Field(default=0, ge=0)
     timed_out: int = Field(default=0, ge=0)
     unknown: int = Field(default=0, ge=0)
+    # Attempts that could not be carried out at all, and positions held only
+    # because no mark was known for them.
+    failed: int = Field(default=0, ge=0)
+    # Triggered exits refused for anything but a trigger that had gone or a
+    # holding already closed: sales that should have happened and did not.
+    blocked: int = Field(default=0, ge=0)
+    mark_unknown: int = Field(default=0, ge=0)
     # Triggered positions this run did not attempt, and why; and positions the
     # run's time did not even reach to judge.
     deferred: int = Field(default=0, ge=0)
@@ -654,6 +669,16 @@ class RunSummary(Immutable):
     entry_halt: Code | None = None
     # Absent unless PRE_VECTOR_EARLY_ENTRY_V1 is enabled.
     early: EarlyEntryReport | None = None
+    # True for the entry job of split operation: this run ran no exit sweep by
+    # design, and left every exit to the exit job.
+    exits_delegated: bool = Field(default=False, strict=True)
+    # The exit job's liveness as this run read it before starting: `READY`, or
+    # the `EXIT_JOB_STALE` detail. Absent where no liveness gate applies.
+    exit_liveness: Code | None = None
+    # For the exit job: whether this run is evidence that exits work, and if
+    # not, why — exactly what was recorded in `paper_job_runs`.
+    exit_ready: bool | None = None
+    exit_ready_reason: Code | None = None
     # Technical faults, as codes. Never a provider message and never a traceback.
     errors: tuple[Code, ...] = Field(default=(), max_length=32)
 

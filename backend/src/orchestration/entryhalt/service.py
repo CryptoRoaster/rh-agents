@@ -45,6 +45,7 @@ from src.orchestration.entryhalt.models import (
     entry_halt,
     reason_code,
 )
+from src.orchestration.entryhalt.pause import PauseOrigin, PauseOriginKind, pause_origin
 from src.risk.engine import DAILY_LOSS_LIMIT
 
 # The longest an operator's self-chosen name may be. Recorded, never verified.
@@ -214,6 +215,9 @@ class EntryHaltService:
     # (`runner.composition`: `PaperTradingService(..., RiskLimits(), ...)`).
     limits: RiskLimits = field(default_factory=RiskLimits)
     clock: Clock = SystemClock()
+    # The kill switch as this process is configured. Lifting a pause while it
+    # is engaged is refused: the switch would pause the next verdict again.
+    kill_switch: bool = False
 
     # ------------------------------------------------------------------ reads
 
@@ -359,6 +363,90 @@ class EntryHaltService:
             account.entry_halt_auto_decision_id = None
             await session.flush()
             return self._changed(HaltControl.AUTO, ControlAction.CLEAR, account)
+
+    async def pause_origin(self) -> PauseOrigin:
+        """Where the current durable pause came from. A reading; it lifts nothing."""
+        async with self.sessions() as session:
+            account = await session.scalar(select(AccountRow).where(AccountRow.id == 1))
+            if account is None:
+                raise EntryHaltUnavailable("PAPER_ACCOUNT_NOT_INITIALISED")
+            return await pause_origin(session, paused=account.paused is not False)
+
+    async def clear_pause(
+        self, *, reason: str, actor: str | None, confirm_origin: UUID
+    ) -> ControlOutcome:
+        """Lift a durable pause — only the pre-#85 daily loss pause, and only into a halt.
+
+        Everything is read under the account lock: the pause, the kill switch
+        as configured here, the pause's origin and the record after it, and the
+        entry halt. Lifted only when the origin is a `PAUSE_SYSTEM` verdict for
+        the daily loss limit alone, nothing recorded since contradicts one
+        uninterrupted pause, the operator named exactly that verdict, and an
+        entry halt is already in force — so lifting the pause reopens sales,
+        never purchases. Anything else is refused and recorded. Nothing here
+        ever sets the pause, and nothing lifts it on its own.
+        """
+        code, ref = reason_code(reason), actor_reference(actor)
+        async with self.sessions.begin() as session:
+            account = await _locked(session)
+            now = self.clock.now()
+            paused = account.paused is not False
+            origin = await pause_origin(session, paused=paused)
+            refusal: ControlRefusal | None = None
+            if not paused:
+                refusal = ControlRefusal.NOT_PAUSED
+            elif self.kill_switch:
+                refusal = ControlRefusal.KILL_SWITCH_ENGAGED
+            elif origin.kind is PauseOriginKind.INCONSISTENT:
+                refusal = ControlRefusal.PAUSE_HISTORY_INCONSISTENT
+            elif origin.kind is PauseOriginKind.KILL_SWITCH:
+                refusal = ControlRefusal.PAUSE_ORIGIN_KILL_SWITCH
+            elif origin.kind is not PauseOriginKind.LEGACY_DAILY_LOSS_LIMIT:
+                refusal = ControlRefusal.PAUSE_ORIGIN_UNKNOWN
+            elif confirm_origin != origin.decision_id:
+                refusal = ControlRefusal.PAUSE_ORIGIN_NOT_CONFIRMED
+            elif entry_halt(account) is None:
+                refusal = ControlRefusal.ENTRY_HALT_REQUIRED
+            if refusal is not None:
+                _record(
+                    session,
+                    account,
+                    control=HaltControl.PAUSE,
+                    action=ControlAction.REFUSED,
+                    reason=code,
+                    actor_kind=ActorKind.OPERATOR,
+                    actor_ref=ref,
+                    before=paused,
+                    after=paused,
+                    at=now,
+                    limits=self.limits,
+                    refusal=refusal,
+                    decision_id=origin.decision_id,
+                )
+                return ControlOutcome(
+                    kind="entry_halt_refused",
+                    control=HaltControl.PAUSE,
+                    action=ControlAction.REFUSED,
+                    refusal=refusal,
+                    status=self._status(account),
+                )
+            _record(
+                session,
+                account,
+                control=HaltControl.PAUSE,
+                action=ControlAction.CLEAR,
+                reason=code,
+                actor_kind=ActorKind.OPERATOR,
+                actor_ref=ref,
+                before=True,
+                after=False,
+                at=now,
+                limits=self.limits,
+                decision_id=origin.decision_id,
+            )
+            account.paused = False
+            await session.flush()
+            return self._changed(HaltControl.PAUSE, ControlAction.CLEAR, account)
 
     # --------------------------------------------------------------- helpers
 

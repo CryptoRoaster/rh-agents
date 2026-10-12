@@ -58,7 +58,7 @@ from src.orchestration.exitpolicy.refresh import (
     RefreshDeadline,
     Unbounded,
 )
-from src.orchestration.paperexit.models import ExitReading, PaperExitRecorded
+from src.orchestration.paperexit.models import ExitReading, ExitRefusal, PaperExitRecorded
 from src.orchestration.paperexit.service import PaperExitUnavailable
 
 # What a position that was not attempted is reported as, by reason.
@@ -71,6 +71,16 @@ OUTCOME_UNKNOWN = "EXIT_OUTCOME_UNKNOWN"
 # between two positions, or a read inside it outlived the share and was cut off.
 PLAN_TIME_BUDGET = "EXIT_PLAN_TIME_BUDGET_REACHED"
 PLAN_TIMED_OUT = "EXIT_PLAN_TIMED_OUT"
+# Refusals that leave nothing to sell: the trigger has gone on fresh evidence,
+# or the holding was closed or removed meanwhile. Every other refusal of a
+# triggered exit is an exit that did not happen.
+SETTLED = frozenset(
+    {
+        ExitRefusal.EXIT_TRIGGER_CLEARED,
+        ExitRefusal.POSITION_ALREADY_CLOSED,
+        ExitRefusal.POSITION_NOT_FOUND,
+    }
+)
 # Looking up a cut-off attempt's exit row: one indexed read by its unique key.
 SETTLE_SECONDS = float(EXIT_SETTLE_SECONDS)
 
@@ -93,6 +103,14 @@ class ExitSweep:
     replayed: int = 0
     timed_out: int = 0
     unknown: int = 0
+    # Attempts that could not be carried out at all (`PaperExitUnavailable`),
+    # and judged positions held only because their mark was unknown.
+    failed: int = 0
+    mark_unknown: int = 0
+    # Attempts answered with a refusal that leaves the triggered position held
+    # for a reason other than the trigger being gone or the position being
+    # closed already: an exit that should have happened and did not.
+    blocked: int = 0
     # Triggered positions not attempted, by reason; positions of this policy not
     # judged at all, and why the judgement stopped short (`PLAN_*`), if it did.
     deferred: dict[str, int] = field(default_factory=dict)
@@ -361,6 +379,7 @@ async def _attempt(
         reading = await (work if ceiling is None else asyncio.wait_for(work, timeout=ceiling))
     except PaperExitUnavailable as failure:
         # Unknown is not permission: nothing was sold, the next run asks again.
+        result.failed += 1
         result.refused(str(failure))
         return
     except TimeoutError:
@@ -384,6 +403,8 @@ async def _attempt(
             budget.exits += 1
     else:
         result.refused(reading.reason.value)
+        if reading.reason not in SETTLED:
+            result.blocked += 1
 
 
 async def _booked(

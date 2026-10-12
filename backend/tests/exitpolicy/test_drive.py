@@ -298,3 +298,34 @@ async def test_a_judgement_stopped_between_positions_leaves_them_unevaluated_not
     assert planned == []
     assert (result.evaluated, result.unevaluated, result.deferred) == (0, 1, {}), result
     assert result.plan_stop == "EXIT_PLAN_TIME_BUDGET_REACHED"
+
+
+# ------------------------------------------------- what a refusal counts as
+
+
+@pytest.mark.parametrize(
+    ("reason", "blocked"),
+    [
+        ("EXIT_TRIGGER_CLEARED", 0),
+        ("POSITION_ALREADY_CLOSED", 0),
+        ("POSITION_NOT_FOUND", 0),
+        ("EXIT_READ_UNAVAILABLE", 1),
+        ("EXIT_RISK_REFUSED", 1),
+        ("PRE_EXIT_REFRESH_FAILED", 1),
+        ("SYSTEM_PAUSED", 1),
+    ],
+)
+async def test_a_refused_triggered_exit_is_blocked_unless_nothing_is_left_to_sell(reason, blocked):
+    """Only a gone trigger or a gone holding leaves nothing to sell; anything else is blocked."""
+    from src.orchestration.paperexit.models import ExitRefusal, ExitRefused
+
+    sweep = ExitSweep()
+    one = candidate("refused", sweep)
+
+    async def start(context: RefreshContext) -> Any:
+        return ExitRefused(reason=ExitRefusal(reason), position_id=one.position_id)
+
+    await attempt_exits([replace(one, start=start)], budget(), sessions=None)
+
+    assert (sweep.attempts, sweep.blocked, sweep.refusals) == (1, blocked, {reason: 1})
+    assert sweep.failed == 0

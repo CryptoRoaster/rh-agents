@@ -30,6 +30,8 @@ REASON_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 class HaltControl(StrEnum):
     AUTO = "ENTRY_HALT_AUTO"
     MANUAL = "ENTRY_HALT_MANUAL"
+    # The durable pause (`paused`): only ever lifted here, never set (0024).
+    PAUSE = "SYSTEM_PAUSE"
 
 
 class ControlAction(StrEnum):
@@ -53,6 +55,19 @@ class ControlRefusal(StrEnum):
     DAILY_LOSS_LIMIT_REACHED = "DAILY_LOSS_LIMIT_REACHED"
     # The operator named a loss day that is not the halt's own.
     LOSS_DAY_NOT_CONFIRMED = "LOSS_DAY_NOT_CONFIRMED"
+    # Lifting the durable pause (`src.orchestration.entryhalt.pause`).
+    NOT_PAUSED = "NOT_PAUSED"
+    KILL_SWITCH_ENGAGED = "KILL_SWITCH_ENGAGED"
+    # No SENTINEL verdict explains the pause: set by hand, or its record is gone.
+    PAUSE_ORIGIN_UNKNOWN = "PAUSE_ORIGIN_UNKNOWN"
+    # The pause came from the kill switch: not lifted by this tool.
+    PAUSE_ORIGIN_KILL_SWITCH = "PAUSE_ORIGIN_KILL_SWITCH"
+    # The record does not read as one uninterrupted pause since its origin.
+    PAUSE_HISTORY_INCONSISTENT = "PAUSE_HISTORY_INCONSISTENT"
+    # The operator named a verdict that is not the pause's origin.
+    PAUSE_ORIGIN_NOT_CONFIRMED = "PAUSE_ORIGIN_NOT_CONFIRMED"
+    # Lifting the pause would reopen entries: an entry halt must already stand.
+    ENTRY_HALT_REQUIRED = "ENTRY_HALT_REQUIRED"
 
 
 class EntryHaltUnavailable(Exception):

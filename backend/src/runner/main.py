@@ -3,6 +3,10 @@
     python -m src.runner.main --once        perform exactly one bounded pass
     python -m src.runner.main --exits-once  one pass of the exit job: positions' markets
                                             and the exit sweeps only; never buys
+    python -m src.runner.main --entries-once  one pass of the entry job: everything
+                                            `--once` does but the exit sweeps; only
+                                            with PAPER_ENTRY_REQUIRES_EXIT_JOB, and
+                                            only while the exit job is live
     python -m src.runner.main --scout-once  one early-discovery scout run; never trades
     python -m src.runner.main --preflight   check this configuration, change nothing
 
@@ -82,6 +86,24 @@ async def run_exits_once(settings: Settings, *, ports: RunnerPorts | None = None
         await engine.dispose()
 
 
+async def run_entries_once(settings: Settings, *, ports: RunnerPorts | None = None) -> RunReading:
+    """One pass of the entry job: no exit sweep, and nothing at all while exits are stale.
+
+    Refused unless `PAPER_ENTRY_REQUIRES_EXIT_JOB` is set — the gate every BUY
+    path then applies under the account lock. The engine is owned here, as for
+    `run_once`.
+    """
+    engine, sessions = connect(settings.database_url)
+    try:
+        async with runner_stack(settings, sessions, ports=ports) as stack:
+            refused = _misconfigured(stack)
+            if refused is not None:
+                return refused
+            return await BoundedPaperRun(stack, mode=RunMode.ENTRIES_ONLY).execute()
+    finally:
+        await engine.dispose()
+
+
 async def run_once(settings: Settings, *, ports: RunnerPorts | None = None) -> RunReading:
     """Execute one pass and dispose of the engine it opened.
 
@@ -153,6 +175,15 @@ def main() -> int:
         ),
     )
     mode.add_argument(
+        "--entries-once",
+        action="store_true",
+        help=(
+            "One bounded pass of the entry job: everything --once does but the "
+            "exit sweeps. Requires PAPER_ENTRY_REQUIRES_EXIT_JOB; buys nothing "
+            "while the exit job's evidence is stale."
+        ),
+    )
+    mode.add_argument(
         "--preflight",
         action="store_true",
         help="Report what this configuration could do. Writes nothing and calls nobody.",
@@ -181,9 +212,13 @@ def main() -> int:
     if arguments.scout_once:
         return _scout(settings)
     try:
-        reading = asyncio.run(
-            run_exits_once(settings) if arguments.exits_once else run_once(settings)
-        )
+        if arguments.exits_once:
+            job = run_exits_once(settings)
+        elif arguments.entries_once:
+            job = run_entries_once(settings)
+        else:
+            job = run_once(settings)
+        reading = asyncio.run(job)
     except KeyboardInterrupt:
         # Whatever had committed stays committed; the interrupted step follows
         # its own contract, and a lease left behind expires for recovery.

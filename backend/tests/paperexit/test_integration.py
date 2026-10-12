@@ -26,6 +26,7 @@ from tests.paperexit.conftest import (
     read_account,
     set_account,
 )
+from tests.riskrequest.conftest import lift_pause
 
 BPS = Decimal("10000")
 
@@ -396,7 +397,7 @@ async def test_a_paused_account_blocks_the_exit(risk_db, now, trace):
     assert result.reason is ExitRefusal.SYSTEM_PAUSED
     assert await exits(sessions) == []
 
-    await set_account(sessions, paused=False)
+    await lift_pause(sessions)
     allowed = await build_exit_service(sessions, now, feed=feed).execute_position_exit(
         position.id, request_key="exit-paused-2"
     )

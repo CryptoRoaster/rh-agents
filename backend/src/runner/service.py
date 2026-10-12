@@ -72,6 +72,22 @@ from src.orchestration.exitpolicy.drive import (
     exit_order,
     plan_exits,
 )
+from src.orchestration.jobruns.models import (
+    Coverage,
+    ExitAssessment,
+    ExitRunFacts,
+    JobName,
+    JobOutcome,
+    PolicyClass,
+    SweepFacts,
+    assess_exit_run,
+)
+from src.orchestration.jobruns.service import (
+    JobRunFinish,
+    JobRunRecorder,
+    coverage,
+    exit_liveness,
+)
 from src.orchestration.riskrequest.models import RiskRequestRefusal
 from src.orchestration.riskrequest.service import stale_source
 from src.orchestration.strategy.early import EARLY_ENTRY_V1, is_early
@@ -102,6 +118,10 @@ from src.runner.models import (
 )
 
 T = TypeVar("T")
+
+# The longest recording a run's start or finish may take. Recording is never a
+# reason to hold up a sale, and a row left unfinished fails closed.
+RECORD_SECONDS = 5.0
 
 # The one key one case's order is addressed by, in both directions. The risk
 # request stores it and the fill is refused unless it matches, so the two are
@@ -195,6 +215,11 @@ class Account:
     exit_phase: ExitBudget | None = None
     # The entry-only halt as this run read it, after its exits.
     entry_halt: str | None = None
+    # The entry job: the exit job's liveness as read before anything started.
+    exit_liveness: str | None = None
+    # The exit job: open positions by the contract that closes them, read after
+    # its exit phase.
+    coverage: Coverage | None = None
     # PRE_VECTOR_EARLY_ENTRY_V1, when enabled: what its refresh and intake did,
     # and how many early entries this run has filled against its per-run bound.
     early: EarlyEntryReport | None = None
@@ -255,6 +280,8 @@ class BoundedPaperRun:
         # Which job this pass is. FULL is every run before the exit job existed.
         self.mode = mode
         self._lock: LockOutcome | None = None
+        # The account of this pass, kept for recording its finish.
+        self._account: Account | None = None
         self._started_monotonic = time.monotonic()
         # Observability only. Never an order, case, request or fill identity.
         self.run_id = run_id if run_id is not None else uuid4()
@@ -272,22 +299,190 @@ class BoundedPaperRun:
             # An exit job with no exit policy configured would only spend
             # provider requests on markets nobody is going to judge.
             return ConfigurationRefused(reason="NO_EXIT_SWEEP_CONFIGURED")
-        job = RunJob.PAPER_EXIT_JOB if self.mode is RunMode.EXITS_ONLY else RunJob.PAPER_ENTRY_JOB
+        if self.mode is RunMode.ENTRIES_ONLY and stack.exit_liveness is None:
+            # An entry job that runs no exit sweep and asks nobody whether one
+            # runs elsewhere would open positions nothing is watching.
+            return ConfigurationRefused(reason="EXIT_JOB_GATE_NOT_ENABLED")
+        exits = self.mode is RunMode.EXITS_ONLY
+        job = RunJob.PAPER_EXIT_JOB if exits else RunJob.PAPER_ENTRY_JOB
+        name = JobName.EXIT if exits else JobName.ENTRY
         self._started_monotonic = time.monotonic()
         async with job_lock(stack.sessions, job) as lock:
             self._lock = lock
             if lock is LockOutcome.ALREADY_RUNNING:
                 # Another run of this job is going. Not a fault and not work:
-                # nothing is asked, read for trading or written.
+                # nothing is asked or read for trading, and the start is
+                # recorded as what it was — never as evidence of anything.
                 started = stack.clock.now()
                 account = Account(limits=stack.limits)
                 account.stop = RunStop.ALREADY_RUNNING
-                return self._summary(started, account)
-            if self.mode is RunMode.EXITS_ONLY:
-                return await self._exits_only()
-            return await self._full()
+                summary = self._summary(started, account)
+                recorded = await self._recording(
+                    JobRunRecorder(stack.sessions).already_running(
+                        self.run_id, name, self.mode.value, started
+                    )
+                )
+                return summary if recorded else _unrecorded(summary)
+            recorded = await self._recording(
+                JobRunRecorder(stack.sessions).start(
+                    self.run_id, name, self.mode.value, stack.clock.now()
+                )
+            )
+            if exits:
+                summary = await self._exits_only()
+            elif self.mode is RunMode.ENTRIES_ONLY:
+                summary = await self._entries_only()
+            else:
+                summary = await self._full()
+            return await self._finish(summary, recorded=recorded)
 
-    async def _exits_only(self) -> RunReading:
+    async def _recording(self, work: Coroutine[Any, Any, Any]) -> bool:
+        """Record a run's start or finish, bounded; whether it was recorded.
+
+        Never raised: a run that cannot be recorded still does its work, and
+        says so as an error. A row that was never finished reads as a run that
+        never finished, which no gate takes for evidence.
+        """
+        try:
+            result = await asyncio.wait_for(work, timeout=RECORD_SECONDS)
+        except (SQLAlchemyError, OSError, TimeoutError):
+            return False
+        return result is not False
+
+    async def _finish(self, summary: RunSummary, *, recorded: bool) -> RunSummary:
+        """Finish this run's row with what it ended as; for the exit job, its health."""
+        account = self._account
+        assessment: ExitAssessment | None = None
+        if self.mode is RunMode.EXITS_ONLY and account is not None:
+            assessment = assess_exit_run(self._exit_facts(summary, account))
+            summary = summary.model_copy(
+                update={
+                    "exit_ready": assessment.ready,
+                    "exit_ready_reason": None
+                    if assessment.reason is None
+                    else assessment.reason.value,
+                }
+            )
+        if not recorded:
+            return _unrecorded(summary)
+        finished = await self._recording(
+            JobRunRecorder(self.stack.sessions).finish(
+                self.run_id, self._run_finish(summary, account, assessment)
+            )
+        )
+        return summary if finished else _unrecorded(summary)
+
+    def _policies(self) -> frozenset[PolicyClass]:
+        found = set()
+        if self.stack.exits is not None:
+            found.add(PolicyClass.NORMAL)
+        if self.stack.early_exits is not None:
+            found.add(PolicyClass.EARLY)
+        return frozenset(found)
+
+    def _exit_facts(self, summary: RunSummary, account: "Account") -> ExitRunFacts:
+        acquisition = summary.acquisition
+        held = acquisition.positions if acquisition is not None else None
+        if held is not None:
+            shortfall = held.deficit
+        else:
+            # The stage did not report on the portfolio at all: every open
+            # position is one it did not observe.
+            shortfall = 0 if account.coverage is None else account.coverage.total
+        sweeps = tuple(
+            SweepFacts(
+                unevaluated=sweep.unevaluated,
+                plan_stopped=sweep.plan_stop is not None,
+                unknown=sweep.unknown,
+                failed=sweep.failed,
+                blocked=sweep.blocked,
+                timed_out=sweep.timed_out,
+                deferred=sum(sweep.deferred.values()),
+                mark_unknown=sweep.mark_unknown,
+            )
+            for sweep in (account.exits, account.early_exits)
+            if sweep is not None
+        )
+        return ExitRunFacts(
+            lock=summary.lock,
+            stop=summary.stop.value,
+            errors=summary.errors,
+            policies=self._policies(),
+            coverage=account.coverage,
+            acquisition_enabled=acquisition is not None and acquisition.enabled,
+            acquisition_stop=None if acquisition is None else acquisition.stop,
+            acquisition_shortfall=shortfall,
+            sweeps=sweeps,
+        )
+
+    def _run_finish(
+        self,
+        summary: RunSummary,
+        account: "Account | None",
+        assessment: ExitAssessment | None,
+    ) -> JobRunFinish:
+        if assessment is not None:
+            outcome = assessment.outcome
+        elif summary.errors:
+            outcome = JobOutcome.TECHNICAL_FAILURE
+        elif summary.stop is RunStop.TIME_BUDGET_REACHED:
+            outcome = JobOutcome.TIMED_OUT
+        elif summary.stop in (
+            RunStop.SYSTEM_STOPPED,
+            RunStop.ENTRY_HALTED,
+            RunStop.EXIT_JOB_STALE,
+        ):
+            outcome = JobOutcome.REFUSED
+        else:
+            outcome = JobOutcome.SUCCEEDED
+        acquisition = summary.acquisition
+        phase = summary.exit_phase
+        metrics = {
+            "duration_ms": int(summary.duration_seconds * 1000),
+            "cases_opened": summary.cases_opened,
+            "risk_requests": summary.risk_requests,
+            "fills": summary.fills,
+        }
+        codes: list[str] = list(summary.errors)
+        for report in (summary.exits, summary.early_exits):
+            if report is None:
+                continue
+            codes += list(report.refusals) + list(report.deferred_reasons)
+            for key in ("evaluated", "triggered", "executed", "attempts", "unknown"):
+                metrics[f"exit_{key}"] = metrics.get(f"exit_{key}", 0) + getattr(report, key)
+            metrics["exit_failed"] = metrics.get("exit_failed", 0) + report.failed
+            metrics["exit_blocked"] = metrics.get("exit_blocked", 0) + report.blocked
+            metrics["exit_deferred"] = metrics.get("exit_deferred", 0) + report.deferred
+            metrics["exit_mark_unknown"] = metrics.get("exit_mark_unknown", 0) + report.mark_unknown
+        if account is not None and account.coverage is not None:
+            metrics["open_positions"] = account.coverage.total
+            metrics["uncovered_positions"] = account.coverage.uncovered(self._policies())
+        if acquisition is not None:
+            metrics["provider_requests"] = acquisition.provider_requests
+            if acquisition.positions is not None:
+                metrics["acquisition_deficit"] = acquisition.positions.deficit
+        if phase is not None:
+            metrics["exit_provider_requests"] = phase.provider_requests
+        return JobRunFinish(
+            outcome=outcome,
+            finished_at=self.stack.clock.now(),
+            stop_code=summary.stop.value,
+            exit_code=int(summary.exit_code),
+            lock_status=summary.lock,
+            acquisition_status=None if acquisition is None else acquisition.stop,
+            exit_phase_status=_phase_status(summary),
+            exit_ready=assessment is not None and assessment.ready,
+            exit_ready_reason=None
+            if assessment is None or assessment.reason is None
+            else assessment.reason.value,
+            policy_classes=tuple(sorted(item.value for item in self._policies()))
+            if self.mode is RunMode.EXITS_ONLY
+            else (),
+            result_codes=tuple(codes),
+            metrics=metrics,
+        )
+
+    async def _exits_only(self) -> RunSummary:
         """The exit job: open positions' markets, then both exit sweeps. Nothing else.
 
         No discovery, no intake, no promotion, no worker step, no risk request
@@ -297,6 +492,7 @@ class BoundedPaperRun:
         stack = self.stack
         started = stack.clock.now()
         account = Account(limits=stack.limits)
+        self._account = account
         deadline = (
             self._deadline
             if self._deadline is not None
@@ -310,6 +506,9 @@ class BoundedPaperRun:
                 return self._summary(started, account)
             await self._exit_phase(account, deadline)
             await self._entry_halted(account, report_only=True)
+            # What is left open, and whether a configured policy closes each:
+            # read after the sales, so it describes the book the next BUY meets.
+            account.coverage = await self._coverage()
         except SystemPauseUnavailable:
             account.stop = RunStop.SYSTEM_STOPPED
             account.fail("SYSTEM_STOP_UNREADABLE")
@@ -321,28 +520,48 @@ class BoundedPaperRun:
             raise
         return self._summary(started, account)
 
-    async def _full(self) -> RunReading:
+    async def _full(self) -> RunSummary:
+        return await self._entry_job(with_exits=True)
+
+    async def _entries_only(self) -> RunSummary:
+        """The entry job of split operation: everything `--once` does but the exits.
+
+        No exit sweep runs here — the exit job (`--exits-once`) owns every sale.
+        Before anything else, and before a single provider request, the exit
+        job's latest evidence is read; without recent proof that exits work,
+        the pass ends as `EXIT_JOB_STALE`. That is a courtesy, not the gate:
+        every risk request and every fill judges the same evidence again under
+        the paper account lock, at its own instant.
+        """
+        return await self._entry_job(with_exits=False)
+
+    async def _entry_job(self, *, with_exits: bool) -> RunSummary:
         stack = self.stack
         started = stack.clock.now()
         account = Account(limits=stack.limits)
+        self._account = account
         deadline = (
             self._deadline
             if self._deadline is not None
             else Deadline(stack.limits.max_runtime_seconds)
         )
         try:
+            if not with_exits and not await self._exits_live(account):
+                return self._summary(started, account)
             if not await self._acquire(account, deadline):
                 # Either a stop was in force before anything was asked, or an
                 # observation may or may not have been recorded. Both end the
                 # pass before a single mutating trading stage runs.
                 return self._summary(started, account)
-            # Exits first: closing what the policy says to close reduces risk
-            # before any new case is opened, and needs nothing intake produces.
-            await self._exit_phase(account, deadline)
+            if with_exits:
+                # Exits first: closing what the policy says to close reduces
+                # risk before any new case is opened, and needs nothing intake
+                # produces.
+                await self._exit_phase(account, deadline)
             if await self._entry_halted(account):
-                # Exits ran; nothing that could lead to a BUY starts. Every BUY
-                # path refuses a halted entry under the account lock anyway —
-                # this only spares the work that would be refused.
+                # Nothing that could lead to a BUY starts. Every BUY path
+                # refuses a halted entry under the account lock anyway — this
+                # only spares the work that would be refused.
                 return self._summary(started, account)
             await self._promote(account, deadline)
             await self._intake(account, deadline)
@@ -374,6 +593,33 @@ class BoundedPaperRun:
         return self._summary(started, account)
 
     # ------------------------------------------------------------- the pass
+
+    async def _exits_live(self, account: Account) -> bool:
+        """Whether the exit job's latest evidence lets this entry job start at all.
+
+        Read on its own, before any provider request. Unreadable is stale.
+        """
+        gate = self.stack.exit_liveness
+        if gate is None:
+            return True
+        try:
+
+            async def read() -> str | None:
+                async with self.stack.sessions() as session:
+                    return await exit_liveness(session, gate, at=self.stack.clock.now())
+
+            stale = await asyncio.wait_for(read(), timeout=RECORD_SECONDS)
+        except (SQLAlchemyError, OSError, TimeoutError):
+            stale = "EXIT_JOB_UNREADABLE"
+        account.exit_liveness = "READY" if stale is None else stale
+        if stale is None:
+            return True
+        account.stop = RunStop.EXIT_JOB_STALE
+        return False
+
+    async def _coverage(self) -> Coverage:
+        async with self.stack.sessions() as session:
+            return await coverage(session)
 
     async def _acquire(
         self,
@@ -1273,6 +1519,8 @@ class BoundedPaperRun:
             entry_halt=account.entry_halt,
             errors=tuple(account.errors),
             early=account.early,
+            exits_delegated=self.mode is RunMode.ENTRIES_ONLY,
+            exit_liveness=account.exit_liveness,
         )
 
 
@@ -1290,6 +1538,9 @@ def _exit_report(sweep: ExitSweep | None) -> ExitReport | None:
         replayed=sweep.replayed,
         timed_out=sweep.timed_out,
         unknown=sweep.unknown,
+        failed=sweep.failed,
+        blocked=sweep.blocked,
+        mark_unknown=sweep.mark_unknown,
         deferred=sum(sweep.deferred.values()),
         deferred_reasons=tuple(sorted(sweep.deferred)),
         unevaluated=sweep.unevaluated,
@@ -1326,6 +1577,27 @@ def _exit_phase_report(budget: ExitBudget | None) -> ExitPhaseReport | None:
         deferred_reasons=tuple(sorted(budget.deferred)),
         unknown=budget.unknown,
     )
+
+
+def _unrecorded(summary: RunSummary) -> RunSummary:
+    """The same summary, saying the run could not be recorded in `paper_job_runs`."""
+    if "JOB_RUN_UNRECORDED" in summary.errors:
+        return summary
+    return summary.model_copy(update={"errors": (*summary.errors, "JOB_RUN_UNRECORDED")})
+
+
+def _phase_status(summary: RunSummary) -> str | None:
+    """One code for the exit phase: absent, delegated, cut short, or completed."""
+    if summary.exits_delegated:
+        return "DELEGATED_TO_EXIT_JOB"
+    phase = summary.exit_phase
+    if phase is None:
+        return None
+    if phase.unknown:
+        return "OUTCOME_UNKNOWN"
+    if phase.deferred:
+        return "DEFERRED"
+    return "COMPLETED"
 
 
 def _code(value: str | None) -> str | None:

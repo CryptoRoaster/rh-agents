@@ -1,4 +1,4 @@
-"""The operator's controls for the entry-only halt. Exactly one action per call.
+"""The operator's controls for the entry-only halt and the pause. One action per call.
 
     python -m src.runner.control --status
     python -m src.runner.control --events [--limit N]
@@ -6,9 +6,18 @@
     python -m src.runner.control --clear-manual-halt --reason CODE [--actor REF]
     python -m src.runner.control --clear-auto-halt   --reason CODE [--actor REF]
                                                      [--confirm-loss-day YYYY-MM-DD]
+    python -m src.runner.control --pause-origin
+    python -m src.runner.control --clear-system-pause --reason CODE [--actor REF]
+                                                     --confirm-pause-origin DECISION_ID
 
 A halt stops every new BUY on every path and no SELL. The durable pause and the
-kill switch — the full stops — are not set or lifted here; this tool reports them.
+kill switch — the full stops — are never set here, and the kill switch is never
+lifted here. The pause is lifted only in one case: it was set by the daily loss
+limit before that limit halted entries instead (#85), the record shows nothing
+else since, the operator names that verdict (`--pause-origin` shows it), the
+kill switch is off in this configuration, and an entry halt is already in force
+— so sales resume and purchases stay halted. Every other pause is refused and
+needs the recovery in `docs/paper-minimum-release-gate.md`.
 
 **Who may use this.** Whoever can run this module against the database: the
 same host, shell and `DATABASE_URL` access that applies migrations. Nothing
@@ -31,6 +40,7 @@ import asyncio
 import json
 from datetime import date
 from typing import Any
+from uuid import UUID
 
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
@@ -50,7 +60,15 @@ async def perform(service: EntryHaltService, arguments: argparse.Namespace) -> t
     if arguments.events:
         events = await service.events(arguments.limit)
         return COMPLETED, {"events": [item.model_dump(mode="json") for item in events]}
-    if arguments.halt_entries:
+    if arguments.pause_origin:
+        return COMPLETED, (await service.pause_origin()).model_dump(mode="json")
+    if arguments.clear_system_pause:
+        outcome = await service.clear_pause(
+            reason=arguments.reason,
+            actor=arguments.actor,
+            confirm_origin=arguments.confirm_pause_origin,
+        )
+    elif arguments.halt_entries:
         outcome = await service.set_manual(reason=arguments.reason, actor=arguments.actor)
     elif arguments.clear_manual_halt:
         outcome = await service.clear_manual(reason=arguments.reason, actor=arguments.actor)
@@ -66,7 +84,8 @@ async def perform(service: EntryHaltService, arguments: argparse.Namespace) -> t
 async def _run(settings: Settings, arguments: argparse.Namespace) -> tuple[int, Any]:
     engine, sessions = connect(settings.database_url)
     try:
-        return await perform(EntryHaltService(sessions), arguments)
+        service = EntryHaltService(sessions, kill_switch=settings.commander_kill_switch)
+        return await perform(service, arguments)
     finally:
         await engine.dispose()
 
@@ -83,6 +102,14 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Lift the automatic halt after its loss day, under the daily loss limit.",
     )
+    action.add_argument(
+        "--pause-origin", action="store_true", help="Read where the durable pause came from."
+    )
+    action.add_argument(
+        "--clear-system-pause",
+        action="store_true",
+        help="Lift a pre-#85 daily loss pause into an entry halt. Nothing else.",
+    )
     parse.add_argument("--reason", help="Required for every change: an UPPER_SNAKE_CASE code.")
     parse.add_argument("--actor", help="Who is asking, as recorded. Never verified.")
     parse.add_argument("--limit", type=int, default=20, help="Events to list (1-500).")
@@ -90,6 +117,11 @@ def parser() -> argparse.ArgumentParser:
         "--confirm-loss-day",
         type=date.fromisoformat,
         help="The automatic halt's own UTC loss day, to lift exactly that halt.",
+    )
+    parse.add_argument(
+        "--confirm-pause-origin",
+        type=UUID,
+        help="The verdict that set the pause (see --pause-origin), to lift exactly that pause.",
     )
     return parse
 
@@ -100,12 +132,18 @@ def render(code: int, document: Any) -> str:
 
 def main() -> int:
     arguments = parser().parse_args()
-    changing = not (arguments.status or arguments.events)
+    changing = not (arguments.status or arguments.events or arguments.pause_origin)
     if changing and not arguments.reason:
         print(render(REFUSED, {"refusal": "REASON_REQUIRED"}))
         return REFUSED
     if arguments.confirm_loss_day is not None and not arguments.clear_auto_halt:
         print(render(REFUSED, {"refusal": "CONFIRM_LOSS_DAY_ONLY_FOR_AUTO_HALT"}))
+        return REFUSED
+    if arguments.clear_system_pause and arguments.confirm_pause_origin is None:
+        print(render(REFUSED, {"refusal": "CONFIRM_PAUSE_ORIGIN_REQUIRED"}))
+        return REFUSED
+    if arguments.confirm_pause_origin is not None and not arguments.clear_system_pause:
+        print(render(REFUSED, {"refusal": "CONFIRM_PAUSE_ORIGIN_ONLY_FOR_PAUSE"}))
         return REFUSED
     try:
         if changing:

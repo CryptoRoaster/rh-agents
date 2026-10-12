@@ -87,6 +87,9 @@ class ExecutionRefusal(StrEnum):
     SYSTEM_PAUSED = "SYSTEM_PAUSED"
     # An entry-only halt is in force: no new BUY, whatever was approved before.
     ENTRY_HALTED = "ENTRY_HALTED"
+    # Split operation, and the exit job's evidence does not cover this BUY at
+    # the fill instant — whatever was approved before.
+    EXIT_JOB_STALE = "EXIT_JOB_STALE"
     SYSTEM_STOP_UNREADABLE = "SYSTEM_STOP_UNREADABLE"
     KILL_SWITCH_ENGAGED = "KILL_SWITCH_ENGAGED"
     # SENTINEL, asked again immediately before the fill, did not approve. The
