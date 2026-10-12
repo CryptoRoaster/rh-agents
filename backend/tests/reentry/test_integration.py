@@ -33,6 +33,7 @@ from tests.reentry.conftest import (
     position_of,
     set_account,
 )
+from tests.riskrequest.conftest import lift_pause
 
 # ------------------------------------------------------- the whole chain
 
@@ -369,7 +370,7 @@ async def test_a_paused_account_blocks_a_re_entry(risk_db, now, trace):
     assert result.reason is ReentryRefusal.SYSTEM_PAUSED
     assert len(await cycles(sessions)) == 1
 
-    await set_account(sessions, paused=False)
+    await lift_pause(sessions)
     allowed = await build_reentry_service(sessions, now).open_reentry(
         sale.exit_id, request_key="unpaused"
     )

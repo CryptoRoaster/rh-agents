@@ -16,6 +16,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
+    SmallInteger,
     String,
     UniqueConstraint,
     Uuid,
@@ -214,7 +215,7 @@ class AccountRow(Base):
 
 
 class PaperControlEventRow(Base):
-    """One change — or refused change — of an entry halt. Append-only (0023).
+    """One change — or refused change — of an entry halt or the pause. Append-only (0023).
 
     Written in the same transaction as the account row it describes. On
     PostgreSQL the database also records the writing transaction (`txid`, not
@@ -225,8 +226,14 @@ class PaperControlEventRow(Base):
     __tablename__ = "paper_control_events"
     __table_args__ = (
         CheckConstraint(
-            "control IN ('ENTRY_HALT_AUTO', 'ENTRY_HALT_MANUAL')",
+            "control IN ('ENTRY_HALT_AUTO', 'ENTRY_HALT_MANUAL', 'SYSTEM_PAUSE')",
             name="paper_control_event_control",
+        ),
+        # Lifting the durable pause is an operator's alone (0024).
+        CheckConstraint(
+            "control <> 'SYSTEM_PAUSE'"
+            " OR (actor_kind = 'OPERATOR' AND action IN ('CLEAR', 'REFUSED'))",
+            name="paper_control_event_pause_actor",
         ),
         CheckConstraint("action IN ('SET', 'CLEAR', 'REFUSED')", name="paper_control_event_action"),
         CheckConstraint(
@@ -259,6 +266,68 @@ class PaperControlEventRow(Base):
     daily_loss_limit_usd: Mapped[Decimal | None] = mapped_column(Numeric(38, 18), default=None)
     risk_decision_id: Mapped[UUID | None] = mapped_column(Uuid, default=None)
     run_id: Mapped[UUID | None] = mapped_column(Uuid, default=None)
+
+
+class PaperJobRunRow(Base):
+    """One started run of a PAPER job, finished exactly once (0024).
+
+    Written `RUNNING` when the run holds its job lock and finished with what it
+    ended as; a row left `RUNNING` past the job's runtime bound is a crash. For
+    the exit job, `exit_ready` says whether the run is evidence that exits work —
+    what the entry side's liveness gate reads. Codes, counts and instants only.
+    On PostgreSQL a finished row is final (trigger).
+    """
+
+    __tablename__ = "paper_job_runs"
+    __table_args__ = (
+        CheckConstraint("job IN ('PAPER_EXIT_JOB', 'PAPER_ENTRY_JOB')", name="paper_job_run_job"),
+        CheckConstraint(
+            "mode IN ('FULL', 'EXITS_ONLY', 'ENTRIES_ONLY')", name="paper_job_run_mode"
+        ),
+        CheckConstraint(
+            "outcome IN ('RUNNING', 'SUCCEEDED', 'REFUSED', 'TECHNICAL_FAILURE', 'TIMED_OUT',"
+            " 'ALREADY_RUNNING', 'EXIT_COVERAGE_MISSING')",
+            name="paper_job_run_outcome",
+        ),
+        CheckConstraint(
+            "(outcome = 'RUNNING') = (finished_at IS NULL)", name="paper_job_run_finished"
+        ),
+        CheckConstraint(
+            "(exit_ready AND job = 'PAPER_EXIT_JOB' AND mode = 'EXITS_ONLY'"
+            " AND outcome = 'SUCCEEDED' AND exit_ready_reason IS NULL)"
+            " OR NOT exit_ready",
+            name="paper_job_run_exit_ready",
+        ),
+        Index("ix_paper_job_runs_job_time", "job", "started_at"),
+    )
+    run_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    job: Mapped[str] = mapped_column(String(32))
+    mode: Mapped[str] = mapped_column(String(16))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    outcome: Mapped[str] = mapped_column(String(32))
+    stop_code: Mapped[str | None] = mapped_column(String(64), default=None)
+    exit_code: Mapped[int | None] = mapped_column(SmallInteger, default=None)
+    lock_status: Mapped[str | None] = mapped_column(String(16), default=None)
+    acquisition_status: Mapped[str | None] = mapped_column(String(64), default=None)
+    exit_phase_status: Mapped[str | None] = mapped_column(String(64), default=None)
+    exit_ready: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    exit_ready_reason: Mapped[str | None] = mapped_column(String(64), default=None)
+    policy_classes: Mapped[list[str]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"),
+        default=list,
+        server_default=text("'[]'"),
+    )
+    result_codes: Mapped[list[str]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"),
+        default=list,
+        server_default=text("'[]'"),
+    )
+    metrics: Mapped[dict[str, int]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"),
+        default=dict,
+        server_default=text("'{}'"),
+    )
 
 
 class RuntimeAuditRow(Base):

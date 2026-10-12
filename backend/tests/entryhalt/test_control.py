@@ -252,6 +252,9 @@ def arguments(**values):
         "actor": None,
         "limit": 20,
         "confirm_loss_day": None,
+        "pause_origin": False,
+        "clear_system_pause": False,
+        "confirm_pause_origin": None,
     }
     return argparse.Namespace(**{**defaults, **values})
 

@@ -52,6 +52,8 @@ from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
 from src.orchestration.entryhalt.models import entry_halt
 from src.orchestration.entryhalt.service import halt_on_daily_loss
+from src.orchestration.jobruns.models import ExitLivenessGate, judge_exit_liveness
+from src.orchestration.jobruns.service import exit_evidence, policy_class
 from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
 from src.orchestration.riskrequest.models import (
@@ -188,6 +190,9 @@ class RiskRequestService:
     pause: SystemPausePort | None = None
     clock: Clock = SystemClock()
     include_fixtures: bool = False
+    # Split operation only: no request is asked unless the exit job's latest
+    # evidence covers the BUY it could lead to. Absent, never consulted.
+    exit_liveness: ExitLivenessGate | None = None
 
     async def request_risk_evaluation(
         self,
@@ -273,6 +278,9 @@ class RiskRequestService:
             ledger = (
                 await early_ledger(session) if is_early(trade_case.strategy_policy_id) else None
             )
+            # The exit job's latest evidence, read under the account lock like
+            # every other input and judged at the decision instant below.
+            evidence = await exit_evidence(session) if self.exit_liveness is not None else None
 
             # The last clock read, after the last input read. Everything from
             # here to the verdict is synchronous, so one instant governs
@@ -281,6 +289,20 @@ class RiskRequestService:
             # when the loading began, and a case can lapse while it runs.
             now = self.clock.now()
             roll_loss_day(account, now)
+            if evidence is not None and self.exit_liveness is not None:
+                stale = judge_exit_liveness(
+                    evidence,
+                    at=now,
+                    gate=self.exit_liveness,
+                    policy=policy_class(trade_case.strategy_policy_id),
+                )
+                if stale is not None:
+                    return _refused(
+                        trade_case,
+                        RiskRequestRefusal.EXIT_JOB_STALE,
+                        assessed.readiness,
+                        detail=stale,
+                    )
 
             # What the case *is* at the decision instant, not what the last
             # write recorded. A stored status is a snapshot and time moves

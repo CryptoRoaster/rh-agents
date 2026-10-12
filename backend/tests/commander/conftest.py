@@ -213,6 +213,7 @@ async def commander_db():
             "0005_trade_case_workflow",
             "0006_worker_runtime",
             "0023_persistent_entry_halt",
+            "0024_paper_job_runs",
         ):
             spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
             module = importlib.util.module_from_spec(spec)

@@ -435,6 +435,7 @@ class EarlyExitService:
                 result.held += 1
                 if verdict.reason == "HOLD_MARK_UNKNOWN":
                     # Visible, and asked again next sweep: no price, no price exit.
+                    result.mark_unknown += 1
                     result.refused("EARLY_EXIT_MARK_UNKNOWN")
                 elif verdict.reason == "HOLD_PEAK_INCOMPLETE":
                     result.refused("EARLY_EXIT_PEAK_INCOMPLETE")

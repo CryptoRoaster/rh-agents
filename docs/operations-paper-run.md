@@ -186,9 +186,74 @@ jobs do not exclude each other: every fill and exit takes the paper account
 row first, orders are keyed and the database allows one exit per cycle, so a
 second lock would only add a lock order and let an entry run delay a stop.
 
-Every summary now carries `mode` (`FULL` / `EXITS_ONLY`), `lock`
-(`ACQUIRED`, `ALREADY_RUNNING`, or `NOT_SUPPORTED` on the SQLite test engine)
-and `duration_seconds` (monotonic). No scheduler is installed by any of this.
+Every summary now carries `mode` (`FULL` / `EXITS_ONLY` / `ENTRIES_ONLY`),
+`lock` (`ACQUIRED`, `ALREADY_RUNNING`, or `NOT_SUPPORTED` on the SQLite test
+engine) and `duration_seconds` (monotonic). No scheduler is installed by any of
+this.
+
+### Split operation: `--entries-once`, `paper_job_runs` and `EXIT_JOB_STALE` (migration 0024)
+
+Split operation runs two jobs: `--exits-once` sells, `--entries-once` buys.
+`--entries-once` is everything `--once` does **except the exit sweeps** — no
+normal or early exit, no SELL, no exit chain read — and it shares the entry
+job's lock with `--once`, so the two never run together. It refuses to start
+(`EXIT_JOB_GATE_NOT_ENABLED`, exit code 2) unless
+`PAPER_ENTRY_REQUIRES_EXIT_JOB=true`. `--once` is unchanged and keeps running
+its own exits.
+
+**Every run is recorded** in `paper_job_runs` (one row per started run): written
+`RUNNING` once the job lock is held and finished exactly once with `outcome`
+(`SUCCEEDED`, `REFUSED`, `TECHNICAL_FAILURE`, `TIMED_OUT`,
+`EXIT_COVERAGE_MISSING`), `stop_code`, `exit_code`, `lock_status`,
+`acquisition_status`, `exit_phase_status` (`DELEGATED_TO_EXIT_JOB` for the entry
+job), bounded result codes and counts. A start that found the lock held is a row
+with `outcome=ALREADY_RUNNING`. A row still `RUNNING` past
+`PAPER_EXIT_RUN_MAX_SECONDS` + 30 s never finished (a crash, or a finish that
+could not be written — the summary then carries `JOB_RUN_UNRECORDED` and exit
+code 1). On PostgreSQL a finished row is final. Codes, counts and instants only.
+
+**Exit evidence.** Each exit-job run records whether it is evidence that exits
+work (`exit_ready`) and, if not, why (`exit_ready_reason`). Exit code 0 is not
+enough. Ready requires: the job lock held; no technical error; not stopped,
+paused or out of time; at least one exit policy configured; every open position
+closable by a configured policy (`EXIT_POLICY_COVERAGE_MISSING` otherwise —
+including positions with no case-bound entry); market acquisition switched on
+and every held market answered (`EXIT_ACQUISITION_DISABLED` /
+`EXIT_ACQUISITION_INCOMPLETE`); every position judged
+(`EXIT_PLAN_INCOMPLETE`); no exit outcome unknown, attempt failed, attempt cut
+off or attempt deferred (`EXIT_OUTCOME_UNKNOWN`, `EXIT_ATTEMPT_FAILED`,
+`EXIT_ATTEMPT_TIMED_OUT`, `EXIT_BACKLOG`); no triggered exit refused for
+anything but a trigger that had gone or a holding already closed
+(`EXIT_BLOCKED`); no position held for want of a mark (`EXIT_MARK_UNKNOWN`). An
+exit run with nothing open is ready when those checks pass. The recorded
+`policy_classes` say which positions it closes (`NORMAL`, `EARLY`).
+
+**The gate.** With `PAPER_ENTRY_REQUIRES_EXIT_JOB=true`, every BUY path judges
+the latest exit-job evidence under the paper account lock, at its own instant:
+the risk request before SENTINEL is asked (`EXIT_JOB_STALE`, nothing spent), the
+fill at the fill instant and again at the execution boundary — so an approval
+granted while the exit job was live buys nothing once it is not. A booked fill
+still replays. `--entries-once` reads the same evidence first and ends with
+`stop=EXIT_JOB_STALE` before any provider request. The detail says why:
+
+| Detail | Meaning |
+|---|---|
+| `EXIT_JOB_MISSING` | no exit-job run recorded |
+| `EXIT_JOB_INCOMPLETE` | the latest run never finished (or two are unfinished) |
+| `EXIT_JOB_UNHEALTHY` | the latest finished run is not evidence (see its `exit_ready_reason`) |
+| `EXIT_JOB_TOO_OLD` | finished longer ago than `PAPER_EXIT_LIVENESS_MAX_AGE_SECONDS` (default 180) |
+| `EXIT_JOB_CLOCK_AHEAD` | finished after the instant judged |
+| `EXIT_POLICY_NOT_COVERED` | the latest run does not close positions of the BUY's class |
+| `EXIT_JOB_UNREADABLE` | the record could not be read as evidence |
+
+The latest *finished* run decides; one still within its runtime bound is passed
+over to the run before it. A start that found the lock held is never evidence.
+The exit job records without the account lock, so there is no second lock order:
+a fill reads the evidence committed when it holds the lock, and a verdict
+committed a moment later applies from the next BUY. With the gate on, `--once`
+is held to the same exit-job evidence. `PAPER_EXIT_LIVENESS_MAX_AGE_SECONDS`
+must exceed `PAPER_EXIT_RUN_MAX_SECONDS`; the exit job's schedule must be
+shorter than the max age, or every BUY is refused.
 
 ### Pre-exit refresh (both exit sweeps, both jobs)
 
@@ -359,6 +424,28 @@ constraint trigger refuses at commit any change of a halt field that no event of
 the same transaction accounts for (same halt, the state it ended in, the same
 reason). This makes every change *recorded*; it does not make it *authorised* —
 a role that may write the account may also write a matching event.
+
+**Lifting a durable pause (migration 0024).** `paused=true` carries no reason.
+`--pause-origin` reads where it came from: the first `PAUSE_SYSTEM` verdict
+SENTINEL recorded after the last audited lift, checked against everything after
+it (`LEGACY_DAILY_LOSS_LIMIT`, `KILL_SWITCH`, `UNKNOWN`, `INCONSISTENT`).
+`--clear-system-pause` lifts **only** a pre-#85 daily loss pause, and only when
+the kill switch is off in this configuration, the record shows one
+uninterrupted pause, the operator names exactly that verdict, and an entry halt
+is already in force — so sales resume and purchases stay halted. Everything else
+is refused and recorded (`NOT_PAUSED`, `KILL_SWITCH_ENGAGED`,
+`PAUSE_ORIGIN_KILL_SWITCH`, `PAUSE_ORIGIN_UNKNOWN`, `PAUSE_HISTORY_INCONSISTENT`,
+`PAUSE_ORIGIN_NOT_CONFIRMED`, `ENTRY_HALT_REQUIRED`); its recovery is the manual
+procedure in `docs/paper-minimum-release-gate.md`. Nothing lifts a pause on its
+own, and PostgreSQL refuses any commit that lifts it without a `SYSTEM_PAUSE`
+`CLEAR` event of the same transaction (only `actor_kind=OPERATOR` may write one).
+
+```sh
+uv run python -m src.runner.control --pause-origin
+uv run python -m src.runner.control --halt-entries --reason PAUSE_RECOVERY --actor kai
+uv run python -m src.runner.control --clear-system-pause --reason LEGACY_DAILY_LOSS_PAUSE_REVIEWED \
+  --actor kai --confirm-pause-origin <decision_id from --pause-origin>
+```
 
 **Migration 0023** adds the columns (both halts cleared), the event table and
 its triggers, and changes nothing else: an existing `paused=true` stays true. Its

@@ -335,6 +335,15 @@ class Settings(BaseSettings):
     # The exit job's market acquisition, capped so it can never spend the time
     # the exit phase needs for even one attempt.
     paper_exit_acquisition_max_seconds: int = Field(default=20, ge=1, le=600)
+    # Split operation: the entry job (`--entries-once`) runs no exit sweep, and
+    # every BUY — on every path, under the paper account lock — requires recent
+    # evidence that the exit job works (`EXIT_JOB_STALE` otherwise). Off by
+    # default; `--entries-once` refuses to start without it. `--once` keeps
+    # running its own exits, and is held to the same evidence while this is on.
+    paper_entry_requires_exit_job: bool = False
+    # How long ago the exit job's last successful, ready run may have finished
+    # for a BUY to rest on it. Longer than the exit job's own runtime bound.
+    paper_exit_liveness_max_age_seconds: int = Field(default=180, ge=30, le=3600)
     # Phase 2N-C bounded market acquisition. Disabled by default and separate
     # from `paper_runner_enabled`, because consenting to a run is not consenting
     # to that run calling a public market provider. With this off, a run behaves
@@ -505,6 +514,19 @@ class Settings(BaseSettings):
             raise ValueError(
                 "PAPER_EXIT_RUN_MAX_SECONDS must cover PAPER_EXIT_ACQUISITION_MAX_SECONDS, "
                 "one PAPER_EXIT_ATTEMPT_MAX_SECONDS and five seconds to settle it"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def exit_liveness_configuration(self) -> "Settings":
+        """Evidence younger than one exit run could never exist; demanding it halts every BUY."""
+        if not self.paper_entry_requires_exit_job:
+            return self
+        if not self.paper_runner_enabled:
+            raise ValueError("PAPER_ENTRY_REQUIRES_EXIT_JOB requires the bounded paper run")
+        if self.paper_exit_liveness_max_age_seconds <= self.paper_exit_run_max_seconds:
+            raise ValueError(
+                "PAPER_EXIT_LIVENESS_MAX_AGE_SECONDS must exceed PAPER_EXIT_RUN_MAX_SECONDS"
             )
         return self
 

@@ -19,7 +19,6 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from src.data.schema import expected_revision
 from tests.reentry.test_migration import load
 from tests.scout.test_outcome_percent_migration import THROUGH_0021
 
@@ -96,9 +95,10 @@ async def event(connection, control, action, reason, before, after):
     )
 
 
-def test_0023_follows_0022_and_is_the_head():
+def test_0023_follows_0022_and_is_followed_by_0024():
+    # The chain's head is asserted by the newest migration's own test.
     assert load(MODULE).down_revision == "0022"
-    assert expected_revision() == "0023"
+    assert load("0024_paper_job_runs").down_revision == "0023"
 
 
 async def test_an_existing_pause_survives_the_upgrade_and_both_halts_arrive_cleared(at_0022):

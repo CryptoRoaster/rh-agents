@@ -52,6 +52,8 @@ from src.orchestration.commander.context import SystemPausePort
 from src.orchestration.costs.models import PaperCostAssumptions, PaperCostReading
 from src.orchestration.cycles import cycle_of
 from src.orchestration.entryhalt.models import entry_halt
+from src.orchestration.jobruns.models import ExitLivenessGate, Liveness, judge_exit_liveness
+from src.orchestration.jobruns.service import exit_evidence, policy_class
 from src.orchestration.paper import PaperOutcome, PaperTradingService
 from src.orchestration.riskdata.context import RiskDataReader
 from src.orchestration.riskdata.models import RiskDataReadiness
@@ -79,6 +81,9 @@ from src.orchestration.workflow.models import (
 )
 from src.orchestration.workflow.service import TradeCaseService, case_from_row, risk_from_row
 from src.risk.authorization import RiskAuthorization
+
+# What the execution boundary answers when the exit job's evidence lapsed there.
+STALE_EXIT_JOB = frozenset(item.value for item in Liveness)
 
 
 class _Abort(Exception):  # noqa: N818 - carries a reading, not an error condition
@@ -121,6 +126,9 @@ class CaseFillService:
     pause: SystemPausePort | None = None
     clock: Clock = SystemClock()
     include_fixtures: bool = False
+    # Split operation only: no BUY is filled unless the exit job's latest
+    # evidence covers it at the fill instant. Absent, never consulted.
+    exit_liveness: ExitLivenessGate | None = None
 
     @property
     def limits(self) -> RiskLimits:
@@ -223,6 +231,17 @@ class CaseFillService:
             refusal = self._stops(trade_case, account)
             if refusal is not None:
                 return refusal
+            # The exit job's latest evidence, read under the account lock and
+            # judged at the fill instant below and again at the boundary. After
+            # the replay above: a fill already booked stays what it was.
+            evidence = await exit_evidence(session) if self.exit_liveness is not None else None
+            policy = policy_class(trade_case.strategy_policy_id)
+
+            def exit_job_stale(at: datetime) -> str | None:
+                if evidence is None or self.exit_liveness is None:
+                    return None
+                return judge_exit_liveness(evidence, at=at, gate=self.exit_liveness, policy=policy)
+
             if (
                 request.outcome != "APPROVE"
                 or request.authorization != RiskAuthorization.APPROVED.value
@@ -288,6 +307,14 @@ class CaseFillService:
             # eligibility, the approval's own validity, every source age, the
             # UTC loss day and SENTINEL itself.
             now = self.clock.now()
+
+            stale_exits = exit_job_stale(now)
+            if stale_exits is not None:
+                # Approved or not, no position opens that nothing is watching.
+                # Not recorded: the case's request stays as it is.
+                return _refused(
+                    trade_case, ExecutionRefusal.EXIT_JOB_STALE, readiness, detail=stale_exits
+                )
 
             effective = self.cases.evaluate_inputs(workflow, now)
             if effective.status in TERMINAL_CASE_STATUSES:
@@ -447,6 +474,9 @@ class CaseFillService:
                     return "SAFETY_EVIDENCE_CHANGED"
                 if not readiness.is_current_at(at):
                     return "DECISION_BASIS_EXPIRED"
+                stale_exits = exit_job_stale(at)
+                if stale_exits is not None:
+                    return stale_exits
                 if valuation.stale_at(at, self.limits.max_snapshot_age_seconds):
                     # A holding's price aged out while the execution was being
                     # prepared. Exposure would then rest on a moment that has
@@ -490,6 +520,17 @@ class CaseFillService:
                         ExecutionRefusal.EARLY_STRATEGY_CAP_REACHED,
                         readiness,
                         detail=outcome.fill_refusal,
+                    )
+                )
+            if outcome.stop_reason in STALE_EXIT_JOB:
+                # The exit job's evidence lapsed between the checks above and
+                # the execution boundary. Rolled back like any lapsed window.
+                raise _Abort(
+                    _refused(
+                        trade_case,
+                        ExecutionRefusal.EXIT_JOB_STALE,
+                        readiness,
+                        detail=outcome.stop_reason,
                     )
                 )
             if outcome.stop_reason is not None:

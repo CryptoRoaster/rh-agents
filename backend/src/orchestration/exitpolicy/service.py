@@ -217,6 +217,8 @@ class AutoExitService:
             result.evaluated += 1
             if verdict.trigger is None:
                 result.held += 1
+                if verdict.reason == "HOLD_MARK_UNKNOWN":
+                    result.mark_unknown += 1
                 continue
             result.triggered += 1
             code = verdict.trigger.value

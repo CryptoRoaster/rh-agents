@@ -374,6 +374,12 @@ def test_the_summary_carries_no_secret_and_no_payload(risk_db):
         "exit_phase",
         # A code only: which entry-only halt this run read, absent when none.
         "entry_halt",
+        # A flag and codes only: split operation's delegated exits, the exit
+        # job's liveness as read, and whether an exit run is evidence.
+        "exits_delegated",
+        "exit_liveness",
+        "exit_ready",
+        "exit_ready_reason",
         "errors",
         # Counts and codes only; absent unless PRE_VECTOR_EARLY_ENTRY_V1 is enabled.
         "early",

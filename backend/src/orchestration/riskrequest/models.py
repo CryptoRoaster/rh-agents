@@ -87,6 +87,10 @@ class RiskRequestRefusal(StrEnum):
     # An entry-only halt is in force. Refused before SENTINEL is asked, so the
     # case's one request is not spent on a verdict nothing may act on.
     ENTRY_HALTED = "ENTRY_HALTED"
+    # Split operation, and the exit job has not recently shown that it works.
+    # Refused before SENTINEL is asked: no position may open that nothing is
+    # watching. The detail names why (`src.orchestration.jobruns`).
+    EXIT_JOB_STALE = "EXIT_JOB_STALE"
     SYSTEM_STOP_UNREADABLE = "SYSTEM_STOP_UNREADABLE"
     KILL_SWITCH_ENGAGED = "KILL_SWITCH_ENGAGED"
     # The case already has its one canonical trade request under another key.
