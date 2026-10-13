@@ -127,6 +127,29 @@ the case and its `strategy_policy_id`.
 `EARLY_SCOUT_ENABLED` and `ATLAS_FUNDING_GRAPH_ENABLED`. Preflight then also
 requires every role of the early workflow.
 
+`PAPER_EARLY_ONLY=true` (off by default, requires
+`PRE_VECTOR_EARLY_ENTRY_ENABLED`) restricts the bounded PAPER run to early
+entries:
+
+- the normal intake and its PROMOTABLE-watch refresh are skipped, so no normal
+  (V2) case opens;
+- the run works on early cases only. An older normal case is not worked, not
+  expired and takes no case budget, so it can never starve an early case;
+- a risk request for a non-early case is refused before SENTINEL
+  (`NORMAL_ENTRY_DISABLED`);
+- the case fill refuses a non-early case under the account lock
+  (`NORMAL_ENTRY_DISABLED`), so an approval stored before the switch buys
+  nothing; a fill already booked still replays as recorded. The paper executor
+  raises `NormalEntryDisabledError` for any BUY that is not an early case's,
+  including its standalone path. Sales are never affected;
+- both exit sweeps, the entry halt, the kill switch, SENTINEL and the
+  `EXIT_JOB_STALE` gate are unchanged.
+
+Preflight then judges roles against the early workflow only (a V2-only role such
+as VECTOR switched off is a decision) and adds `EARLY_ONLY_INTAKE`,
+`EARLY_ONLY_EXIT_POLICY`, `EARLY_ONLY_HISTORY`, `EARLY_ONLY_QUOTES`,
+`EARLY_ONLY_ACQUISITION` and `EARLY_ONLY_LIVENESS`, each blocked when missing.
+
 ## Exit: EARLY_PAPER_EXIT_V1
 
 A deterministic sweep over open positions whose cycle an early case opened,

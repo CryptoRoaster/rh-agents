@@ -90,6 +90,9 @@ class ExecutionRefusal(StrEnum):
     # Split operation, and the exit job's evidence does not cover this BUY at
     # the fill instant — whatever was approved before.
     EXIT_JOB_STALE = "EXIT_JOB_STALE"
+    # Early-only operation (PAPER_EARLY_ONLY), and this case is not an early
+    # one: no new normal BUY, whatever was approved before. Not recorded.
+    NORMAL_ENTRY_DISABLED = "NORMAL_ENTRY_DISABLED"
     SYSTEM_STOP_UNREADABLE = "SYSTEM_STOP_UNREADABLE"
     KILL_SWITCH_ENGAGED = "KILL_SWITCH_ENGAGED"
     # SENTINEL, asked again immediately before the fill, did not approve. The

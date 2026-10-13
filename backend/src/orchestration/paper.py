@@ -32,6 +32,7 @@ from src.ledger.portfolio import PortfolioState, portfolio_state, roll_loss_day
 from src.markets.models import MarketIdentity
 from src.orchestration.entryhalt.models import entry_halt
 from src.orchestration.entryhalt.service import halt_on_daily_loss, halt_on_realized_loss
+from src.orchestration.strategy.early import is_early
 from src.orchestration.valuation.models import PositionMark
 from src.risk.engine import evaluate
 
@@ -100,6 +101,13 @@ class EntryHaltedError(Exception):
         super().__init__(f"ENTRY_HALTED:{detail}")
 
 
+class NormalEntryDisabledError(Exception):
+    """A non-early BUY reached the paper executor in early-only operation."""
+
+    def __init__(self) -> None:
+        super().__init__("NORMAL_ENTRY_DISABLED")
+
+
 def approval_window(decision: RiskDecision, at: datetime) -> str | None:
     """Whether this approval still covers `at`.
 
@@ -119,10 +127,13 @@ class PaperTradingService:
         mode: TradingMode = TradingMode.OBSERVE,
         *,
         clock: Clock | None = None,
+        early_only: bool = False,
     ) -> None:
         if mode == TradingMode.LIVE_AUTONOMOUS:
             raise ValueError("Live execution is unavailable")
         self.sessions, self.limits, self.mode = sessions, limits, mode
+        # Early-only operation (PAPER_EARLY_ONLY): no BUY but an early case's.
+        self.early_only = early_only
         self.executor = PaperExecutor()
         # Only trusted bootstrap/test infrastructure constructs this service.
         self._clock = clock if clock is not None else SystemClock()
@@ -222,6 +233,7 @@ class PaperTradingService:
         authorize: Callable[[datetime], str | None] | None = None,
         limits: RiskLimits | None = None,
         admit: Callable[[Position, Position], str | None] | None = None,
+        strategy_policy_id: str | None = None,
     ) -> PaperOutcome:
         """Risk-check, fill and book one order inside a transaction the caller owns.
 
@@ -259,6 +271,12 @@ class PaperTradingService:
                 # Every caller refuses a halted BUY by name before this point;
                 # arriving here means one did not, and nothing is written.
                 raise EntryHaltedError(halted)
+            if self.early_only and not is_early(strategy_policy_id):
+                # Early-only operation. The case fill refuses a non-early BUY by
+                # name before this point; the standalone path has no case and
+                # so no strategy. Arriving here means nothing refused it, and
+                # nothing is written.
+                raise NormalEntryDisabledError()
         # A case-bound caller may name the limits its case is judged against —
         # the early strategy's profile — and gets exactly those; anyone else
         # gets this service's own. The engine is the same either way.

@@ -129,6 +129,8 @@ class CaseFillService:
     # Split operation only: no BUY is filled unless the exit job's latest
     # evidence covers it at the fill instant. Absent, never consulted.
     exit_liveness: ExitLivenessGate | None = None
+    # Early-only operation (PAPER_EARLY_ONLY): only an early case may be filled.
+    early_only: bool = False
 
     @property
     def limits(self) -> RiskLimits:
@@ -509,6 +511,7 @@ class CaseFillService:
                 authorize=still_authorised,
                 limits=case_limits,
                 admit=admit if ledger is not None else None,
+                strategy_policy_id=trade_case.strategy_policy_id,
             )
             if outcome.fill_refusal is not None:
                 # Approved, simulated, and one more early position would book
@@ -675,6 +678,11 @@ class CaseFillService:
             # booked stays what it was, and an approval granted before the halt
             # buys nothing now. Not recorded — the case's request stays as it is.
             return _refused(trade_case, ExecutionRefusal.ENTRY_HALTED, detail=halted)
+        if self.early_only and not is_early(trade_case.strategy_policy_id):
+            # Early-only operation, after the replay above: a booked fill stays
+            # what it was, and an approval stored before the switch buys nothing.
+            # Not recorded — the case's request stays as it is.
+            return _refused(trade_case, ExecutionRefusal.NORMAL_ENTRY_DISABLED)
         return None
 
     def _record(

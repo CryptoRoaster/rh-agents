@@ -454,7 +454,13 @@ def build_stack(
         slippage_bps=settings.paper_slippage_bps,
         trading_mode=settings.trading_mode,
     )
-    paper = PaperTradingService(sessions, RiskLimits(), settings.trading_mode, clock=tick)
+    paper = PaperTradingService(
+        sessions,
+        RiskLimits(),
+        settings.trading_mode,
+        clock=tick,
+        early_only=settings.paper_early_only,
+    )
     limits = limits_from_settings(settings)
     # Split operation: every BUY path asks for the exit job's evidence first.
     exit_liveness = (
@@ -470,15 +476,20 @@ def build_stack(
     candidates: MarketReader | PromotedWatchCandidates = markets
     if settings.early_scout_enabled:
         watches = WatchRepository(sessions)
-        candidates = PromotedWatchCandidates(sessions=sessions, markets=markets, watches=watches)
-        promotion = PromotionRefresh(
-            settings=settings,
-            sessions=sessions,
-            source=candidates,
-            pause=supplied.pause,
-            clock=tick,
-            http=supplied.market_http,
-        )
+        promoted = PromotedWatchCandidates(sessions=sessions, markets=markets, watches=watches)
+        candidates = promoted
+        if not settings.paper_early_only:
+            # The normal intake's own prelude. Early-only skips the normal
+            # intake, so re-observing PROMOTABLE watches for it would be
+            # provider requests spent on cases that may not open.
+            promotion = PromotionRefresh(
+                settings=settings,
+                sessions=sessions,
+                source=promoted,
+                pause=supplied.pause,
+                clock=tick,
+                http=supplied.market_http,
+            )
     early_intake: CommanderIntakeService | None = None
     early_promotion: PromotionRefresh | None = None
     if settings.pre_vector_early_entry_enabled and watches is not None:
@@ -547,6 +558,7 @@ def build_stack(
         pause=supplied.pause,
         clock=tick,
         exit_liveness=exit_liveness,
+        early_only=settings.paper_early_only,
     )
     fills = CaseFillService(
         sessions=sessions,
@@ -559,6 +571,7 @@ def build_stack(
         pause=supplied.pause,
         clock=tick,
         exit_liveness=exit_liveness,
+        early_only=settings.paper_early_only,
     )
     acquisition = None
     pre_risk = None
