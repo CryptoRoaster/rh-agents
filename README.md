@@ -266,6 +266,8 @@ harness in `backend/src/evaluation/codex` for every call (isolated home,
 pinned catalog, Seatbelt profile, release gates), and the runtime reaches it
 only through `backend/src/codex_reasoning`. See
 [the scout cockpit notes](docs/scout-cockpit.md) for the scheduler setup.
+The exit job's scheduler, the exit-only supervisor, is described in
+[the exit supervisor notes](docs/exit-supervisor.md); it is not activated.
 
 ## Phase 2D ATLAS on-chain intelligence
 
