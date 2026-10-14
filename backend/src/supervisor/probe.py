@@ -1,4 +1,9 @@
-"""Read-only gathering for the supervisor's judgements: launchd and the database.
+"""Read-only gathering for the supervisor's judgements: the service manager and the database.
+
+The service manager is launchd on macOS and systemd on Linux
+(`RH_AGENTS_SUPERVISOR_BACKEND` overrides the platform's default). Either way
+the answer is one `ServiceStatus`; one that cannot be established is
+`loaded=None`, never "not loaded".
 
 Nothing here writes. The database is read in one transaction that PostgreSQL
 is told is read-only, through the same queries the exit gate itself uses
@@ -10,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -20,9 +26,19 @@ from src.data.repository import aware
 from src.data.tables import AccountRow, PaperJobRunRow
 from src.orchestration.jobruns.models import RUNNING_GRACE_SECONDS, JobName, JobOutcome
 from src.orchestration.jobruns.service import coverage, exit_evidence
-from src.supervisor.models import LABEL, DatabaseFacts, ServiceStatus
+from src.supervisor.models import (
+    LABEL,
+    SYSTEMD_SERVICE,
+    SYSTEMD_TIMER,
+    DatabaseFacts,
+    ServiceStatus,
+)
 
+BACKEND_ENV = "RH_AGENTS_SUPERVISOR_BACKEND"
+LAUNCHD = "launchd"
+SYSTEMD = "systemd"
 LAUNCHCTL_ENV = "RH_AGENTS_LAUNCHCTL"
+SYSTEMCTL_ENV = "RH_AGENTS_SYSTEMCTL"
 # `launchctl print` for a label launchd does not know.
 LAUNCHCTL_NOT_FOUND = 113
 
@@ -32,7 +48,31 @@ def launchctl_executable() -> str | None:
     return configured or shutil.which("launchctl")
 
 
+def service_backend() -> str | None:
+    """`launchd` or `systemd`: configured, else the platform's own. `None`: neither."""
+    configured = os.environ.get(BACKEND_ENV, "").strip().lower()
+    if configured:
+        return configured if configured in (LAUNCHD, SYSTEMD) else None
+    if sys.platform == "darwin":
+        return LAUNCHD
+    if sys.platform.startswith("linux"):
+        return SYSTEMD
+    return None
+
+
 def service_status(*, launchctl: str | None = None, uid: int | None = None) -> ServiceStatus:
+    """The supervisor service as its platform's service manager reports it."""
+    backend = LAUNCHD if launchctl is not None else service_backend()
+    if backend == LAUNCHD:
+        return launchd_service_status(launchctl=launchctl, uid=uid)
+    if backend == SYSTEMD:
+        return systemd_service_status()
+    return ServiceStatus(loaded=None)
+
+
+def launchd_service_status(
+    *, launchctl: str | None = None, uid: int | None = None
+) -> ServiceStatus:
     """Whether launchd has the supervisor job loaded, running, and how it last exited."""
     executable = launchctl if launchctl is not None else launchctl_executable()
     if not executable:
@@ -65,6 +105,76 @@ def parse_service(printed: str) -> ServiceStatus:
         running=state is not None and state.group(1).strip() == "running",
         last_exit_status=int(status.group(1)) if status else None,
     )
+
+
+def systemctl_executable() -> str | None:
+    configured = os.environ.get(SYSTEMCTL_ENV, "").strip()
+    return configured or shutil.which("systemctl")
+
+
+TIMER_PROPERTIES = "LoadState,ActiveState,UnitFileState"
+SERVICE_PROPERTIES = "LoadState,ActiveState,SubState,Result,ExecMainStatus"
+# A oneshot tick is `activating` while it runs.
+RUNNING_STATES = frozenset({"activating", "active", "deactivating", "reloading"})
+
+
+def _show(executable: str, unit: str, properties: str) -> dict[str, str] | None:
+    try:
+        completed = subprocess.run(
+            [executable, "show", unit, f"--property={properties}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return parse_properties(completed.stdout)
+
+
+def parse_properties(printed: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for line in printed.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            found[key.strip()] = value.strip()
+    return found
+
+
+def systemd_service_status(*, systemctl: str | None = None) -> ServiceStatus:
+    """The supervisor as systemd runs it: a timer that starts a oneshot service.
+
+    Supervising means the timer is armed (`active`). Not installed or stopped
+    (`inactive`) is not loaded. Anything else — a failed or half-started timer,
+    a systemctl that cannot answer — is unknown, never "fine".
+    """
+    executable = systemctl if systemctl is not None else systemctl_executable()
+    if not executable:
+        return ServiceStatus(loaded=None)
+    timer = _show(executable, SYSTEMD_TIMER, TIMER_PROPERTIES)
+    service = _show(executable, SYSTEMD_SERVICE, SERVICE_PROPERTIES)
+    if timer is None or service is None:
+        return ServiceStatus(loaded=None)
+    return parse_systemd(timer, service)
+
+
+def parse_systemd(timer: dict[str, str], service: dict[str, str]) -> ServiceStatus:
+    load_state = timer.get("LoadState")
+    active_state = timer.get("ActiveState")
+    if load_state == "not-found":
+        return ServiceStatus(loaded=False)
+    if load_state != "loaded":
+        return ServiceStatus(loaded=None)
+    running = service.get("ActiveState") in RUNNING_STATES
+    raw_status = service.get("ExecMainStatus", "")
+    last_exit_status = int(raw_status) if raw_status.lstrip("-").isdigit() else None
+    if active_state == "active":
+        return ServiceStatus(loaded=True, running=running, last_exit_status=last_exit_status)
+    if active_state == "inactive":
+        return ServiceStatus(loaded=False, running=running, last_exit_status=last_exit_status)
+    return ServiceStatus(loaded=None, running=running, last_exit_status=last_exit_status)
 
 
 def _row(row: PaperJobRunRow | None) -> dict[str, Any] | None:
@@ -141,4 +251,15 @@ async def database_facts(
     )
 
 
-__all__ = ["database_facts", "launchctl_executable", "parse_service", "service_status"]
+__all__ = [
+    "database_facts",
+    "launchctl_executable",
+    "launchd_service_status",
+    "parse_properties",
+    "parse_service",
+    "parse_systemd",
+    "service_backend",
+    "service_status",
+    "systemctl_executable",
+    "systemd_service_status",
+]

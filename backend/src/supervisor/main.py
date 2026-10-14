@@ -6,12 +6,16 @@
     python -m src.supervisor.main stop-check    may a regular stop happen now?
     python -m src.supervisor.main deploy-check  may a code deploy happen now?
     python -m src.supervisor.main audit --action ACTION --reason CODE [--actor REF]
+    python -m src.supervisor.main alert [--dry-run]  one alert pass on the health verdict
+    python -m src.supervisor.main heartbeat     one signed heartbeat line on stdout
 
 `tick` is the only action that starts anything, and what it starts is the exit
 job and nothing else. `health`, `stop-check` and `deploy-check` read launchd,
 the state file and the database and write nothing. `audit` appends one line
 to the supervisor's local audit log; the operator scripts call it for every
-start and stop, the emergency stop included.
+start and stop, the emergency stop included. `alert` judges health the same
+read-only way and hands news to the configured transport (`alerts.py`);
+`heartbeat` prints one signed line for the dead-man receiver (`deadman.py`).
 
 Exit codes
 ----------
@@ -20,6 +24,9 @@ Exit codes
 ``health``        ``0`` HEALTHY, ``1`` DEGRADED, ``2`` CRITICAL, ``3`` STOPPED.
 ``*-check``       ``0`` allowed, ``2`` refused (the refusals say why).
 ``audit``         ``0`` recorded, ``2`` invalid argument.
+``alert``         ``0`` nothing to send or delivered, ``1`` delivery failed,
+                  ``2`` no usable transport configured.
+``heartbeat``     ``0`` printed, ``2`` no usable key.
 
 Output is one JSON object of codes, counts and instants — never a secret, a
 connection string or a provider message.
@@ -30,7 +37,9 @@ import asyncio
 import json
 import os
 import signal
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -40,6 +49,16 @@ from src.core.config import Settings
 from src.data.database import connect
 from src.orchestration.entryhalt.models import REASON_PATTERN
 from src.orchestration.jobruns.models import ExitLivenessGate
+from src.supervisor.alerts import (
+    HOST_ALIAS_ENV,
+    AlertPassBusy,
+    Observation,
+    TransportUnavailable,
+    observe,
+    run_alert_pass,
+    transport_from_environment,
+)
+from src.supervisor.deadman import key_path, load_key, sign
 from src.supervisor.models import (
     LABEL,
     TICK_ABANDONED_SECONDS,
@@ -58,8 +77,9 @@ from src.supervisor.state import StateUnreadable, append_audit, load_state, stat
 from src.supervisor.tick import run_tick
 
 REFUSED = 2
+ALERT_STATE_DIR_ENV = "RH_AGENTS_ALERT_STATE_DIR"
 DATABASE_SECONDS = 15.0
-AUDIT_ACTIONS = ("start", "stop", "emergency-stop")
+AUDIT_ACTIONS = ("start", "stop", "emergency-stop", "alerts-stop")
 
 
 def _settings() -> Settings:
@@ -164,6 +184,7 @@ def health_document(report: HealthReport) -> dict[str, Any]:
             "in_progress_since": _iso(state.in_progress_since),
             "last_gap_seconds": state.last_gap_seconds,
             "warnings": list(state.warnings),
+            "host_restarted_at": _iso(state.host_restarted_at),
         },
     }
 
@@ -262,6 +283,72 @@ def _audit(action: str, reason: str | None, actor: str | None) -> int:
     return 0
 
 
+def _health_observation(now: datetime) -> Observation:
+    """The current verdict as an alert sees it. A crash of the check is CRITICAL."""
+    try:
+        service, state, readable, database, gate = gather(now)
+        report = evaluate_health(
+            now=now,
+            service=service,
+            state=state,
+            state_readable=readable,
+            database=database,
+            gate=gate,
+        )
+        return observe(health_document(report), now=now)
+    except Exception:
+        return Observation("CRITICAL", ("HEALTH_CHECK_FAILED",), None, now)
+
+
+def alert_state_dir() -> Path:
+    configured = os.environ.get(ALERT_STATE_DIR_ENV, "").strip()
+    return Path(configured) if configured else state_dir().parent / "alerts"
+
+
+def _alert(dry_run: bool) -> int:
+    now = datetime.now(UTC)
+    observation = _health_observation(now)
+    refusal: str | None = None
+    try:
+        transport = None if dry_run else transport_from_environment()
+    except TransportUnavailable as unavailable:
+        transport, refusal = None, unavailable.code
+    try:
+        outcome = run_alert_pass(
+            alert_state_dir(),
+            observation,
+            transport=transport,
+            host=os.environ.get(HOST_ALIAS_ENV, ""),
+            dry_run=dry_run,
+        )
+    except AlertPassBusy:
+        _print({"kind": "exit_supervisor_alert", "skipped": "ALERT_PASS_ALREADY_RUNNING"})
+        return 0
+    _print({"kind": "exit_supervisor_alert", "transport_refusal": refusal, **outcome.as_dict()})
+    if refusal is not None and not dry_run:
+        return REFUSED
+    return 1 if outcome.failure is not None else 0
+
+
+def _heartbeat() -> int:
+    path = key_path()
+    try:
+        if path is None:
+            raise TransportUnavailable("HEARTBEAT_KEY_NOT_CONFIGURED")
+        key = load_key(path)
+    except TransportUnavailable as unavailable:
+        # stdout carries the heartbeat alone; a refusal goes to stderr.
+        print(
+            json.dumps({"kind": "exit_supervisor_heartbeat", "refusal": unavailable.code}),
+            file=sys.stderr,
+        )
+        return REFUSED
+    now = datetime.now(UTC)
+    observation = _health_observation(now)
+    print(sign(key, host=os.environ.get(HOST_ALIAS_ENV, ""), status=observation.status, now=now))
+    return 0
+
+
 def _terminated(signum: int, frame: Any) -> None:
     # launchd stops a job with SIGTERM. Raised as an exit, so the tick's child —
     # in its own process group — is killed on the way out, not orphaned.
@@ -282,10 +369,16 @@ def _tick() -> int:
 
 def parser() -> argparse.ArgumentParser:
     parse = argparse.ArgumentParser(description="The exit-only PAPER supervisor.")
-    parse.add_argument("action", choices=("tick", "health", "stop-check", "deploy-check", "audit"))
+    parse.add_argument(
+        "action",
+        choices=("tick", "health", "stop-check", "deploy-check", "audit", "alert", "heartbeat"),
+    )
     parse.add_argument("--action", dest="audited", choices=AUDIT_ACTIONS)
     parse.add_argument("--reason", help="UPPER_SNAKE_CASE code (audit only).")
     parse.add_argument("--actor", help="Who is asking, as recorded. Never verified.")
+    parse.add_argument(
+        "--dry-run", action="store_true", help="alert: show what would be sent, record nothing."
+    )
     return parse
 
 
@@ -299,6 +392,10 @@ def main() -> int:
         return _check("stop")
     if arguments.action == "deploy-check":
         return _check("deploy")
+    if arguments.action == "alert":
+        return _alert(arguments.dry_run)
+    if arguments.action == "heartbeat":
+        return _heartbeat()
     if arguments.audited is None:
         _print({"kind": "exit_supervisor_audit", "refusal": "ACTION_REQUIRED"})
         return REFUSED

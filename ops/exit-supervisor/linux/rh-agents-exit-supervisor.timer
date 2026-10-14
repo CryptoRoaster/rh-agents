@@ -1,0 +1,14 @@
+# One exit tick a minute, from boot on, once start.sh has enabled this timer.
+# systemd never starts the oneshot tick again while it still runs: no overlap.
+[Unit]
+Description=RH Agents exit-only PAPER supervisor, every 60 seconds
+
+[Timer]
+Unit=rh-agents-exit-supervisor.service
+OnActiveSec=10
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,56 @@
+# Exit-only PAPER supervisor: one exit-job tick (exits-once) per start.
+# Rendered by install.sh; never edit the installed copy by hand. No secrets here.
+# Started only by its timer, which install.sh leaves disabled and stopped:
+# start.sh is the one action that enables it.
+[Unit]
+Description=RH Agents exit-only PAPER supervisor tick
+Documentation=file://__REPO__/docs/exit-supervisor-linux.md
+After=network-online.target postgresql.service postgresql@17-main.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+Group=__USER__
+WorkingDirectory=__REPO__/backend
+ExecStart=/bin/bash __REPO__/ops/exit-supervisor/linux/run-exit-supervisor.sh
+Environment=RH_AGENTS_SUPERVISOR_BACKEND=systemd
+Environment=RH_AGENTS_EXIT_SUPERVISOR_STATE_DIR=/var/lib/rh-agents/exit-supervisor
+Environment=RH_AGENTS_EXIT_SUPERVISOR_REQUIRE_BRANCH=main
+Environment=GIT_OPTIONAL_LOCKS=0
+StateDirectory=rh-agents/exit-supervisor
+StateDirectoryMode=0700
+# A tick kills its child at 85 s (+5 s grace). Past this bound systemd stops
+# the whole control group: nothing the tick started outlives it.
+TimeoutStartSec=120
+TimeoutStopSec=15
+KillMode=control-group
+KillSignal=SIGTERM
+# Resource limits: the tick cannot starve the host's other services.
+MemoryHigh=600M
+MemoryMax=800M
+CPUQuota=100%
+TasksMax=64
+Nice=5
+IOWeight=50
+# Process restrictions.
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

@@ -1,0 +1,50 @@
+# One signed heartbeat to the dead-man receiver on another machine.
+# Rendered by install.sh; never edit the installed copy by hand. No secrets here:
+# the HMAC key, the SSH key and the receiver's host key come in as credentials.
+# Started only with start.sh --with-heartbeat, once a receiver exists.
+[Unit]
+Description=RH Agents dead-man heartbeat
+Documentation=file://__REPO__/docs/exit-supervisor-linux.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+Group=__USER__
+WorkingDirectory=__REPO__/backend
+ExecStart=/bin/bash __REPO__/ops/exit-supervisor/linux/run-heartbeat.sh
+Environment=RH_AGENTS_SUPERVISOR_BACKEND=systemd
+Environment=RH_AGENTS_EXIT_SUPERVISOR_STATE_DIR=/var/lib/rh-agents/exit-supervisor
+Environment=RH_AGENTS_ALERT_HOST_ALIAS=__HOST_ALIAS__
+Environment=RH_AGENTS_HEARTBEAT_TARGET=__HEARTBEAT_TARGET__
+Environment=RH_AGENTS_HEARTBEAT_PORT=__HEARTBEAT_PORT__
+LoadCredential=heartbeat-key:__CREDENTIALS_DIR__/heartbeat-key
+LoadCredential=heartbeat-ssh-key:__CREDENTIALS_DIR__/heartbeat-ssh-key
+LoadCredential=heartbeat-known-hosts:__CREDENTIALS_DIR__/heartbeat-known-hosts
+TimeoutStartSec=60
+KillMode=control-group
+MemoryHigh=300M
+MemoryMax=400M
+CPUQuota=50%
+TasksMax=32
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

@@ -119,7 +119,7 @@ With **no** open position the exit job makes no provider or RPC call. A provider
 
 ## Alerting
 
-**No alert path exists.** The application has none. The Telegram hook on this machine (`@rhplatform_bot`) reports Claude Code turns and is not a monitoring channel. Health is pull-only: `health.sh`, or its exit code for any monitor. A `CRITICAL` nobody sees protects nothing, so **a missing alert path is an activation blocker**. Wiring one up, for example a separate periodic job that pushes `CRITICAL` to an operator channel, needs its own approval and must not create new external accounts.
+**No alert path is configured on this host.** The application now has an alert pass (`python -m src.supervisor.main alert`, Telegram transport, deduplicated, persisted) and a dead-man heartbeat; see [the Linux notes](exit-supervisor-linux.md#alerting). On macOS neither is scheduled, and the Telegram hook on this machine (`@rhplatform_bot`) only reports Claude Code turns. Health is pull-only here: `health.sh`, or its exit code for any monitor. A `CRITICAL` nobody sees protects nothing, so **a missing alert path is an activation blocker**.
 
 ## Logs
 
@@ -180,7 +180,9 @@ A code deploy into the runtime worktree (`git pull --ff-only`, `uv sync`, migrat
 ops/exit-supervisor/deploy-check.sh   # 0 allowed, 2 refused
 ```
 
-`deploy-check` refuses while the supervisor is loaded, while a position is open (or positions are unknown), or while an exit run is going. The order is: book empty, entries halted, `stop.sh`, deploy, migrate, verify, `start.sh`. If a tick runs against a worktree that is not on `main` or is modified, the wrapper refuses it (exit 78). Such a tick writes nothing, so health turns `DEGRADED`, or `CRITICAL` with positions open.
+`deploy-check` refuses while the supervisor is loaded, while a position is open (or positions are unknown), while an exit or entry run is recorded as going, or while any runner or tick process is alive (`pgrep`). The order is: book empty, entries halted, `stop.sh`, deploy, migrate, verify, `start.sh`. If a tick runs against a worktree that is not on `main` or is modified, the wrapper refuses it (exit 78). Such a tick writes nothing, so health turns `DEGRADED`, or `CRITICAL` with positions open.
+
+The same gate exists for Linux (`ops/exit-supervisor/linux/deploy-check.sh`); the runbook covering both hosts is in [the Linux notes](exit-supervisor-linux.md#deploy-gate).
 
 **Still missing (specified, not built):** there is no deploy script. The runtime deploy is a manual runbook. That runbook, and any future deploy tooling, must call `deploy-check.sh` first and abort on a non-zero exit. The scout's `install.sh` unloads only `com.rh-agents.scout` and never touches this agent.
 
@@ -200,7 +202,7 @@ Assessed read-only on 2026-10-13. No setting was changed.
 **Verdict:** this host cannot guarantee 72 hours of unattended exit supervision. Activation stays **NO_GO** until an operator explicitly accepts one of these:
 
 - attended operation: lid open, AC, automatic restarts for updates deferred, health watched;
-- or a host that boots unattended, such as the Linux VPS target with a systemd unit.
+- or a host that boots unattended, such as the Linux VPS target with the systemd units in `ops/exit-supervisor/linux` ([Linux notes](exit-supervisor-linux.md)).
 
 In either case a working alert path is required as well.
 

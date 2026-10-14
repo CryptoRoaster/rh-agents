@@ -1,0 +1,13 @@
+# One heartbeat a minute, from boot on, once start.sh --with-heartbeat enabled it.
+[Unit]
+Description=RH Agents dead-man heartbeat, every 60 seconds
+
+[Timer]
+Unit=rh-agents-heartbeat.service
+OnActiveSec=15
+OnBootSec=120
+OnUnitActiveSec=60
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

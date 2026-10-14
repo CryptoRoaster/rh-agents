@@ -57,6 +57,13 @@ TICK_ABANDONED_SECONDS = CHILD_HARD_TIMEOUT_SECONDS + CHILD_KILL_GRACE_SECONDS +
 EXIT_COMMAND: tuple[str, ...] = ("-m", "src.runner.main", "--exits-once")
 
 LABEL = "com.rh-agents.exit-supervisor"
+# The Linux service manager's names for the same supervisor: a timer that
+# starts one oneshot tick (`ops/exit-supervisor/linux`).
+SYSTEMD_TIMER = "rh-agents-exit-supervisor.timer"
+SYSTEMD_SERVICE = "rh-agents-exit-supervisor.service"
+# How long after a detected host restart health still says so: long enough
+# for a once-a-minute alert pass to see it.
+HOST_RESTART_NOTICE_SECONDS = 15 * 60
 STATE_VERSION = 1
 # Bounded so a state file and a health document stay small.
 MAX_WARNINGS = 16
@@ -274,7 +281,7 @@ class HealthExit(IntEnum):
 
 @dataclass(frozen=True)
 class ServiceStatus:
-    """What launchd says about the supervisor job. `loaded=None`: could not be asked."""
+    """What launchd or systemd says about the supervisor. `loaded=None`: could not be asked."""
 
     loaded: bool | None
     running: bool = False
@@ -294,6 +301,10 @@ class SupervisorState:
     in_progress_since: datetime | None = None
     last_gap_seconds: int | None = None
     warnings: tuple[str, ...] = ()
+    # The host's boot identity at the last tick, where the platform has one
+    # (Linux), and when a tick last found it changed: the host restarted.
+    boot_id: str | None = None
+    host_restarted_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -403,6 +414,9 @@ def evaluate_health(
             degraded.append("SUPERVISOR_TICK_ABANDONED")
         if state.consecutive_failures:
             degraded.append(f"CONSECUTIVE_FAILURES:{state.consecutive_failures}")
+        restarted = _age(now, state.host_restarted_at)
+        if restarted is not None and 0 <= restarted <= HOST_RESTART_NOTICE_SECONDS:
+            degraded.append("HOST_RESTARTED_RECENTLY")
         degraded.extend(state.warnings)
     if running and service.last_exit_status not in (None, 0):
         degraded.append("SERVICE_LAST_EXIT_NONZERO")
@@ -465,6 +479,7 @@ class DeployRefusal(StrEnum):
     SERVICE_STATUS_UNKNOWN = "DEPLOY_REFUSED_SERVICE_STATUS_UNKNOWN"
     OPEN_POSITIONS = "DEPLOY_REFUSED_OPEN_POSITIONS"
     EXIT_RUN_ACTIVE = "DEPLOY_REFUSED_EXIT_RUN_ACTIVE"
+    ENTRY_RUN_ACTIVE = "DEPLOY_REFUSED_ENTRY_RUN_ACTIVE"
 
 
 def deploy_refusals(database: DatabaseFacts | None, service: ServiceStatus) -> list[str]:
@@ -473,7 +488,7 @@ def deploy_refusals(database: DatabaseFacts | None, service: ServiceStatus) -> l
     A deploy changes the code the supervisor's next tick runs, and the schema
     may be behind that code until a migration is applied. So a deploy waits
     until the supervisor has been stopped regularly — which itself needs an
-    empty book — and no exit run is going. Nothing here stops anything.
+    empty book — and no exit or entry run is going. Nothing here stops anything.
     """
     found: list[str] = []
     if service.loaded is None:
@@ -487,6 +502,8 @@ def deploy_refusals(database: DatabaseFacts | None, service: ServiceStatus) -> l
         found.append(DeployRefusal.OPEN_POSITIONS.value)
     if database.exit_run_active:
         found.append(DeployRefusal.EXIT_RUN_ACTIVE.value)
+    if database.entry_run_active:
+        found.append(DeployRefusal.ENTRY_RUN_ACTIVE.value)
     return found
 
 

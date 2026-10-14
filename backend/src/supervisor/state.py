@@ -71,6 +71,9 @@ def load_state(directory: Path) -> SupervisorState | None:
         gap = document.get("last_gap_seconds")
         if gap is not None and (not isinstance(gap, int) or isinstance(gap, bool)):
             raise ValueError("A gap must be whole seconds")
+        boot_id = document.get("boot_id")
+        if boot_id is not None and not isinstance(boot_id, str):
+            raise ValueError("A boot identity must be a string")
         last_result = document.get("last_result")
         last_failure = document.get("last_failure")
         for item in (last_result, last_failure):
@@ -86,6 +89,8 @@ def load_state(directory: Path) -> SupervisorState | None:
             in_progress_since=_instant(document.get("in_progress_since")),
             last_gap_seconds=gap,
             warnings=tuple(warnings[:MAX_WARNINGS]),
+            boot_id=boot_id,
+            host_restarted_at=_instant(document.get("host_restarted_at")),
         )
     except (ValueError, TypeError) as error:
         raise StateUnreadable from error
@@ -103,6 +108,8 @@ def _document(state: SupervisorState) -> dict[str, Any]:
         "in_progress_since": _iso(state.in_progress_since),
         "last_gap_seconds": state.last_gap_seconds,
         "warnings": list(state.warnings[:MAX_WARNINGS]),
+        "boot_id": state.boot_id,
+        "host_restarted_at": _iso(state.host_restarted_at),
     }
 
 

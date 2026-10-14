@@ -1,0 +1,13 @@
+# One alert pass a minute, from boot on, once start.sh has enabled this timer.
+[Unit]
+Description=RH Agents exit supervisor alerts, every 60 seconds
+
+[Timer]
+Unit=rh-agents-exit-alert.service
+OnActiveSec=5
+OnBootSec=30
+OnUnitActiveSec=60
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

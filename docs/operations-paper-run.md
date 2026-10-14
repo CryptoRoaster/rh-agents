@@ -257,7 +257,8 @@ shorter than the max age, or every BUY is refused.
 
 The exit job's schedule is the exit-only supervisor (`ops/exit-supervisor`,
 one `--exits-once` tick a minute under launchd, with health, stop and deploy
-guards): see [the exit supervisor](exit-supervisor.md). It is not activated.
+guards): see [the exit supervisor](exit-supervisor.md) and, for Linux, alerting and
+the dead-man switch, [its Linux notes](exit-supervisor-linux.md). It is not activated.
 
 ### Pre-exit refresh (both exit sweeps, both jobs)
 
