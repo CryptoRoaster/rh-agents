@@ -48,6 +48,16 @@ supervisor() {
   (cd "$REPO/backend" && as_service_user "$PYTHON" -m src.supervisor.main "$@")
 }
 
+# One property of a unit; `unknown` when systemd cannot say. An empty answer
+# is passed on as such (UnitFileState is empty for a unit with no file).
+unit_property() {
+  local value
+  if ! value="$("$SYSTEMCTL" show "$1" --property="$2" --value 2>/dev/null)"; then
+    value="unknown"
+  fi
+  printf '%s\n' "$value"
+}
+
 # A unit's ActiveState; `unknown` when systemd cannot say. Guards compare
 # against the one state they accept, so an unknown answer always refuses.
 unit_state() {

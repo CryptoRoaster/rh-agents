@@ -4,9 +4,21 @@
 #   ops/exit-supervisor/linux/install.sh [--host-alias NAME] [--heartbeat-target ALIAS]
 #   ops/exit-supervisor/linux/install.sh --dry-run [...]   print the rendered units only
 #
-# Installing is not starting. The units are written, systemd re-reads them and
-# every timer is marked disabled; nothing is enabled or started, now or at the
-# next boot. Starting is a separate operator action: start.sh --confirm --reason.
+# Installing is not starting. In this order, each step verified, stopping at
+# the first failure (INSTALL_REFUSED before anything changed, INSTALL_FAILED
+# after):
+#
+#   1. every timer and service has a known state, and none is running;
+#   2. every timer that has a unit file is disabled (an enabled but idle one
+#      would otherwise start at the next boot with the new units);
+#   3. the unit files are replaced, then systemd re-reads them;
+#   4. every timer is disabled again (a stale enablement link of a timer that
+#      had no file becomes live once its file is back), then
+#   5. every timer reads disabled and inactive, every service not running.
+#
+# Nothing is enabled, started or stopped: a running unit is a refusal, never
+# a reason to stop it. Starting is a separate operator action:
+# start.sh --confirm --reason.
 #
 # Run as root (system units) from the runtime checkout on main.
 set -euo pipefail
@@ -78,23 +90,72 @@ if [[ -n "$dry_run" ]]; then
 fi
 require_runtime_main
 
+refuse() {
+  echo "INSTALL_REFUSED: $*; nothing was changed" >&2
+  exit 1
+}
+fail() {
+  echo "INSTALL_FAILED: $*" >&2
+  echo "INSTALL_FAILED: check every timer with: systemctl is-enabled ${TIMERS[*]}" >&2
+  exit 3
+}
+
+# 1. Known and idle, every unit. A timer must be inactive; a service inactive
+#    or failed (a failed oneshot runs nothing). Anything else refuses.
 for timer in "${TIMERS[@]}"; do
-  if ! is_inactive "$timer"; then
-    echo "refusing: $timer is $(unit_state "$timer"); a running supervisor is never replaced by an install" >&2
-    exit 1
+  state="$(unit_state "$timer")"
+  [[ "$state" == "inactive" ]] ||
+    refuse "$timer is $state; a running or unknown supervisor is never replaced by an install"
+  load="$(unit_property "$timer" LoadState)"
+  [[ "$load" == "loaded" || "$load" == "not-found" ]] || refuse "$timer has load state $load"
+  file_state="$(unit_property "$timer" UnitFileState)"
+  if [[ "$load" == "loaded" ]]; then
+    [[ "$file_state" == "enabled" || "$file_state" == "disabled" ]] ||
+      refuse "$timer has unit file state ${file_state:-none}"
+  fi
+done
+for service in "$SUPERVISOR_SERVICE" "$ALERT_SERVICE" "$HEARTBEAT_SERVICE"; do
+  state="$(unit_state "$service")"
+  [[ "$state" == "inactive" || "$state" == "failed" ]] ||
+    refuse "$service is $state; a running or unknown unit is never replaced by an install"
+done
+
+# 2. Disabled before any file changes.
+for timer in "${TIMERS[@]}"; do
+  if [[ "$(unit_property "$timer" LoadState)" == "loaded" ]]; then
+    "$SYSTEMCTL" disable "$timer" || refuse "could not disable $timer"
+    [[ "$(unit_property "$timer" UnitFileState)" == "disabled" ]] ||
+      refuse "$timer is still $(unit_property "$timer" UnitFileState) after disable"
   fi
 done
 
-mkdir -p "$UNIT_DIR"
+# 3. Replace the files, each atomically; then let systemd re-read them.
+mkdir -p "$UNIT_DIR" || fail "cannot create $UNIT_DIR"
 for unit in "${UNITS[@]}"; do
-  render "$(source_of "$unit")" >"$UNIT_DIR/$unit.tmp"
-  chmod 0644 "$UNIT_DIR/$unit.tmp"
-  mv "$UNIT_DIR/$unit.tmp" "$UNIT_DIR/$unit"
+  { render "$(source_of "$unit")" >"$UNIT_DIR/$unit.tmp" &&
+    chmod 0644 "$UNIT_DIR/$unit.tmp" &&
+    mv "$UNIT_DIR/$unit.tmp" "$UNIT_DIR/$unit"; } 2>/dev/null ||
+    fail "could not write $unit (timers are disabled)"
 done
-"$SYSTEMCTL" daemon-reload
-# Disabled, whatever an earlier install left: a boot starts nothing.
-"$SYSTEMCTL" disable "${TIMERS[@]}"
+"$SYSTEMCTL" daemon-reload || fail "daemon-reload failed (timers are disabled)"
+
+# 4. Disabled again, now that every timer has its file.
+"$SYSTEMCTL" disable "${TIMERS[@]}" || fail "could not disable the timers after the reload"
+
+# 5. Verify: nothing enabled, nothing running.
+for timer in "${TIMERS[@]}"; do
+  file_state="$(unit_property "$timer" UnitFileState)"
+  state="$(unit_state "$timer")"
+  [[ "$file_state" == "disabled" && "$state" == "inactive" ]] ||
+    fail "$timer is ${file_state:-none}/$state after the install, expected disabled/inactive"
+done
+for service in "$SUPERVISOR_SERVICE" "$ALERT_SERVICE" "$HEARTBEAT_SERVICE"; do
+  state="$(unit_state "$service")"
+  [[ "$state" == "inactive" || "$state" == "failed" ]] ||
+    fail "$service is $state after the install"
+done
+
 if [[ ! -x "$PYTHON" ]]; then
   echo "note: $PYTHON is missing; run uv sync --locked in $REPO/backend before start.sh" >&2
 fi
-echo "installed ${#UNITS[@]} units (disabled, not started; start with start.sh --confirm --reason CODE)"
+echo "INSTALLED: ${#UNITS[@]} units, every timer disabled and inactive; nothing started (start with start.sh --confirm --reason CODE)"

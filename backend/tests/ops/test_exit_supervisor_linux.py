@@ -50,38 +50,73 @@ def executable(path: Path, body: str) -> Path:
     return path
 
 
+# A stand-in `systemctl`. Unit state lives in files under units.state/:
+# `<unit>` ActiveState, `<unit>.enabled` UnitFileState, `<unit>.load` LoadState,
+# `<unit>.result` Result. Without a file: inactive; loaded when the unit file
+# exists, not-found otherwise; disabled when loaded. Failure switches are
+# files in the test directory.
+SYSTEMCTL = r"""
+T="@TMP@"
+U="$T/units.state"
+echo "$*" >> "$T/systemctl.calls"
+load_state() {
+  if [[ -f "$U/$1.load" ]]; then cat "$U/$1.load"
+  elif [[ -f "$RH_AGENTS_SYSTEMD_UNIT_DIR/$1" ]]; then echo loaded
+  else echo not-found; fi
+}
+case "$1" in
+  show)
+    [[ -f "$T/show.fails" ]] && exit 1
+    unit="$2" property="${3#--property=}"
+    case "$property" in
+      Result) if [[ -f "$U/$unit.result" ]]; then cat "$U/$unit.result"; else echo success; fi ;;
+      ActiveState) if [[ -f "$U/$unit" ]]; then cat "$U/$unit"; else echo inactive; fi ;;
+      LoadState) load_state "$unit" ;;
+      UnitFileState)
+        if [[ -f "$U/$unit.enabled" ]]; then cat "$U/$unit.enabled"
+        elif [[ "$(load_state "$unit")" == loaded ]]; then echo disabled
+        else echo; fi ;;
+    esac ;;
+  start)
+    [[ -f "$T/start.fails.$2" ]] && exit 1
+    exit 0 ;;
+  enable)
+    shift; now=""; [[ "$1" == --now ]] && { now=1; shift; }
+    for u in "$@"; do
+      [[ -f "$T/enable.fails.$u" ]] && exit 5
+      echo enabled > "$U/$u.enabled"
+      [[ -n "$now" ]] && echo active > "$U/$u"
+    done ;;
+  disable)
+    shift; now=""; [[ "$1" == --now ]] && { now=1; shift; }
+    [[ -f "$T/disable.fails" ]] && exit 5
+    [[ -f "$T/disable.fails.after-reload" && -f "$T/reloaded" ]] && exit 5
+    for u in "$@"; do
+      [[ -f "$T/disable.fails.$u" ]] && exit 5
+      [[ -f "$T/disable.ignored.$u" ]] || echo disabled > "$U/$u.enabled"
+      [[ -n "$now" ]] && echo inactive > "$U/$u"
+    done ;;
+  daemon-reload)
+    [[ -f "$T/daemon-reload.fails" ]] && exit 1
+    touch "$T/reloaded"
+    for f in "$T"/after-reload.*; do
+      [[ -f "$f" ]] && cp "$f" "$U/${f##*/after-reload.}"
+    done ;;
+  stop)
+    [[ -f "$T/stop.fails" ]] && exit 5
+    echo inactive > "$U/$2" ;;
+esac
+exit 0
+"""
+
+
 def stand_ins(tmp_path: Path, *, states=None, codes=None, pgrep: int = 1, credentials=True):
     """A `systemctl` with unit states in files, a Python per action, a `pgrep`."""
     units = tmp_path / "units.state"
     units.mkdir()
     for unit, state in (states or {}).items():
         (units / unit).write_text(state)
-    executable(
-        tmp_path / "systemctl",
-        f'echo "$*" >> "{tmp_path}/systemctl.calls"\n'
-        f'U="{units}"\n'
-        'case "$1" in\n'
-        "  show)\n"
-        f'    [[ -f "{tmp_path}/show.fails" ]] && exit 1\n'
-        '    if [[ "$3" == --property=Result ]]; then\n'
-        '      if [[ -f "$U/$2.result" ]]; then cat "$U/$2.result"; else echo success; fi\n'
-        '    elif [[ -f "$U/$2" ]]; then cat "$U/$2"; else echo inactive; fi ;;\n'
-        "  start)\n"
-        f'    [[ -f "{tmp_path}/start.fails.$2" ]] && exit 1\n'
-        "    exit 0 ;;\n"
-        "  enable)\n"
-        '    shift; [[ "$1" == --now ]] && shift\n'
-        '    for u in "$@"; do\n'
-        f'      [[ -f "{tmp_path}/enable.fails.$u" ]] && exit 5\n'
-        '      echo active > "$U/$u"; done ;;\n'
-        "  disable)\n"
-        '    shift; [[ "$1" == --now ]] || exit 0; shift\n'
-        f'    [[ -f "{tmp_path}/disable.fails" ]] && exit 5\n'
-        '    for u in "$@"; do echo inactive > "$U/$u"; done ;;\n'
-        f'  stop) [[ -f "{tmp_path}/stop.fails" ]] && exit 5\n'
-        '    echo inactive > "$U/$2" ;;\n'
-        "esac\nexit 0\n",
-    )
+    executable(tmp_path / "systemctl", SYSTEMCTL.replace("@TMP@", str(tmp_path)))
     cases = "".join(f"  *' {action}'*) exit {code} ;;\n" for action, code in (codes or {}).items())
     executable(
         tmp_path / "python",
@@ -272,6 +307,185 @@ def test_install_refuses_a_branch_other_than_main(tmp_path):
         pytest.skip("checked out on main")
     assert run("install.sh", env).returncode == 1
     assert changes(tmp_path) == []
+
+
+# Install order and failures ---------------------------------------------------
+
+TIMERS = (SUPERVISOR_TIMER, ALERT_TIMER, HEARTBEAT_TIMER)
+SERVICES = (SUPERVISOR_SERVICE, ALERT_SERVICE, HEARTBEAT_SERVICE)
+
+
+def present(tmp_path: Path, *units: str, text: str = "old\n") -> None:
+    """Unit files from an earlier install."""
+    directory = tmp_path / "systemd"
+    directory.mkdir(exist_ok=True)
+    for name in units:
+        (directory / name).write_text(text)
+
+
+def enablement(tmp_path: Path, unit: str) -> str:
+    path = tmp_path / "units.state" / f"{unit}.enabled"
+    return path.read_text().strip() if path.exists() else "disabled"
+
+
+def never_starts(tmp_path: Path) -> None:
+    for call in changes(tmp_path):
+        assert not call.startswith(("enable", "start", "stop", "restart")), call
+
+
+def test_an_enabled_idle_timer_is_disabled_before_any_file_changes(tmp_path):
+    env = stand_ins(tmp_path, states={f"{SUPERVISOR_TIMER}.enabled": "enabled"})
+    present(tmp_path, *UNITS)
+    result = run("install.sh", env)
+    assert result.returncode == 0, result.stderr
+    assert "INSTALLED" in result.stdout
+    made = changes(tmp_path)
+    assert made == [
+        f"disable {SUPERVISOR_TIMER}",
+        f"disable {ALERT_TIMER}",
+        f"disable {HEARTBEAT_TIMER}",
+        "daemon-reload",
+        f"disable {SUPERVISOR_TIMER} {ALERT_TIMER} {HEARTBEAT_TIMER}",
+    ]
+    assert all(enablement(tmp_path, timer) == "disabled" for timer in TIMERS)
+    never_starts(tmp_path)
+
+
+def test_a_failed_disable_refuses_before_any_file_changes(tmp_path):
+    env = stand_ins(tmp_path, states={f"{ALERT_TIMER}.enabled": "enabled"})
+    present(tmp_path, *UNITS)
+    (tmp_path / f"disable.fails.{ALERT_TIMER}").write_text("")
+    result = run("install.sh", env)
+    assert result.returncode == 1
+    assert f"INSTALL_REFUSED: could not disable {ALERT_TIMER}" in result.stderr
+    assert all((tmp_path / "systemd" / name).read_text() == "old\n" for name in UNITS)
+    assert "daemon-reload" not in changes(tmp_path)
+    never_starts(tmp_path)
+
+
+def test_a_disable_that_did_not_take_refuses(tmp_path):
+    env = stand_ins(tmp_path, states={f"{HEARTBEAT_TIMER}.enabled": "enabled"})
+    present(tmp_path, *UNITS)
+    (tmp_path / f"disable.ignored.{HEARTBEAT_TIMER}").write_text("")
+    result = run("install.sh", env)
+    assert result.returncode == 1 and "still enabled" in result.stderr
+    assert all((tmp_path / "systemd" / name).read_text() == "old\n" for name in UNITS)
+
+
+@pytest.mark.parametrize(
+    ("unit", "value"),
+    [
+        (f"{SUPERVISOR_TIMER}.load", "masked"),
+        (f"{ALERT_TIMER}.load", "error"),
+        (f"{HEARTBEAT_TIMER}.enabled", "masked"),
+        (f"{SUPERVISOR_TIMER}.enabled", "unknown"),
+        (SUPERVISOR_SERVICE, "activating"),
+        (ALERT_SERVICE, "active"),
+        (HEARTBEAT_SERVICE, "deactivating"),
+    ],
+)
+def test_an_unexpected_or_running_state_refuses_without_changes(tmp_path, unit, value):
+    env = stand_ins(tmp_path, states={unit: value})
+    present(tmp_path, *UNITS)
+    result = run("install.sh", env)
+    assert result.returncode == 1 and "INSTALL_REFUSED" in result.stderr
+    assert changes(tmp_path) == []
+
+
+def test_a_failed_service_runs_nothing_and_does_not_block(tmp_path):
+    env = stand_ins(tmp_path, states={SUPERVISOR_SERVICE: "failed"})
+    assert run("install.sh", env).returncode == 0
+
+
+def test_a_unit_that_cannot_be_written_fails_with_timers_disabled(tmp_path):
+    env = stand_ins(tmp_path, states={f"{SUPERVISOR_TIMER}.enabled": "enabled"})
+    present(tmp_path, *UNITS)
+    (tmp_path / "systemd").chmod(0o555)
+    try:
+        result = run("install.sh", env)
+    finally:
+        (tmp_path / "systemd").chmod(0o755)
+    assert result.returncode == 3 and "INSTALL_FAILED" in result.stderr
+    assert "INSTALLED" not in result.stdout
+    assert all(enablement(tmp_path, timer) == "disabled" for timer in TIMERS)
+    assert "daemon-reload" not in changes(tmp_path)
+    never_starts(tmp_path)
+
+
+def test_a_failed_reload_fails_with_timers_disabled(tmp_path):
+    env = stand_ins(tmp_path, states={f"{ALERT_TIMER}.enabled": "enabled"})
+    present(tmp_path, *UNITS)
+    (tmp_path / "daemon-reload.fails").write_text("")
+    result = run("install.sh", env)
+    assert result.returncode == 3 and "daemon-reload failed" in result.stderr
+    assert all(enablement(tmp_path, timer) == "disabled" for timer in TIMERS)
+    never_starts(tmp_path)
+
+
+def test_a_failed_second_disable_fails(tmp_path):
+    env = stand_ins(tmp_path)
+    (tmp_path / "disable.fails.after-reload").write_text("")
+    result = run("install.sh", env)
+    assert result.returncode == 3 and "after the reload" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("unit", "value"),
+    [
+        (SUPERVISOR_TIMER, "active"),
+        (f"{ALERT_TIMER}.enabled", "enabled"),
+        (HEARTBEAT_SERVICE, "activating"),
+    ],
+)
+def test_an_unexpected_state_after_the_install_fails_and_stops_nothing(tmp_path, unit, value):
+    env = stand_ins(tmp_path)
+    (tmp_path / f"after-reload.{unit}").write_text(value)
+    if unit.endswith(".enabled"):
+        # Enabled again behind the install's back, after its second disable.
+        (tmp_path / f"disable.ignored.{ALERT_TIMER}").write_text("")
+    result = run("install.sh", env)
+    assert result.returncode == 3 and "INSTALL_FAILED" in result.stderr
+    assert "INSTALLED" not in result.stdout
+    never_starts(tmp_path)
+
+
+def test_a_stale_enablement_link_does_not_come_back_with_the_file(tmp_path):
+    # Enabled once, its file removed by hand: no file, but the link remains.
+    env = stand_ins(tmp_path, states={f"{ALERT_TIMER}.enabled": "enabled"})
+    result = run("install.sh", env)
+    assert result.returncode == 0, result.stderr
+    assert enablement(tmp_path, ALERT_TIMER) == "disabled"
+
+
+def test_a_partial_earlier_install_is_completed_disabled(tmp_path):
+    env = stand_ins(tmp_path, states={f"{SUPERVISOR_TIMER}.enabled": "enabled"})
+    present(tmp_path, SUPERVISOR_SERVICE, SUPERVISOR_TIMER)
+    result = run("install.sh", env)
+    assert result.returncode == 0, result.stderr
+    assert changes(tmp_path)[0] == f"disable {SUPERVISOR_TIMER}"
+    assert all((tmp_path / "systemd" / name).read_text() != "old\n" for name in UNITS)
+    assert all(enablement(tmp_path, timer) == "disabled" for timer in TIMERS)
+
+
+def test_installing_twice_is_safe_and_starts_nothing(tmp_path):
+    env = stand_ins(tmp_path)
+    assert run("install.sh", env).returncode == 0
+    first = {name: (tmp_path / "systemd" / name).read_text() for name in UNITS}
+    assert run("install.sh", env).returncode == 0
+    assert first == {name: (tmp_path / "systemd" / name).read_text() for name in UNITS}
+    assert all(enablement(tmp_path, timer) == "disabled" for timer in TIMERS)
+    assert all(state(tmp_path, unit) == "inactive" for unit in (*TIMERS, *SERVICES))
+    never_starts(tmp_path)
+
+
+def test_uninstall_disables_before_removing(tmp_path):
+    env = stand_ins(tmp_path)
+    installed(tmp_path, env)
+    (tmp_path / "units.state" / f"{ALERT_TIMER}.enabled").write_text("enabled")
+    assert run("uninstall.sh", env).returncode == 0
+    made = changes(tmp_path)
+    assert made.index(f"disable {ALERT_TIMER}") < made.index("daemon-reload")
+    assert enablement(tmp_path, ALERT_TIMER) == "disabled"
 
 
 # Start ------------------------------------------------------------------------

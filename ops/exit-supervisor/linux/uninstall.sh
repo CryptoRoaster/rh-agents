@@ -12,6 +12,16 @@ for timer in "${TIMERS[@]}"; do
     exit 1
   fi
 done
+# Disabled before the files go: no enablement link outlives its unit file
+# and comes back to life with a later install.
+for timer in "${TIMERS[@]}"; do
+  if [[ "$(unit_property "$timer" LoadState)" == "loaded" ]]; then
+    "$SYSTEMCTL" disable "$timer" || {
+      echo "refusing: could not disable $timer; nothing was removed" >&2
+      exit 1
+    }
+  fi
+done
 for unit in "${UNITS[@]}"; do
   rm -f -- "${UNIT_DIR:?}/${unit:?}"
 done

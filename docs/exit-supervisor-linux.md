@@ -41,7 +41,7 @@ This is the Linux counterpart of [the exit supervisor](exit-supervisor.md). It c
 | Bounded hard timeout | The tick kills its child's process group after 85 s, plus a 5 s grace. In addition, `TimeoutStartSec=120` together with `KillMode=control-group` makes systemd kill everything in the unit's cgroup. This also catches descendants that left the process group. |
 | Persistent evidence, 180 s liveness | Unchanged. The child writes `paper_job_runs`, and `judge_exit_liveness` reads it. |
 | Restart after reboot | The timers are `WantedBy=timers.target`, so once enabled they start at every boot. A boot changes `/proc/sys/kernel/random/boot_id`. The next tick records `HOST_RESTART_DETECTED`, and health reports `HOST_RESTARTED_RECENTLY` (DEGRADED) for 15 minutes, long enough for the alert pass to see it. |
-| Install does not activate | `install.sh` writes the units, runs `daemon-reload` and `disable` on every timer. It never runs `enable` or `start`. Only `start.sh` enables units. |
+| Install does not activate | `install.sh` works in a fixed order and stops at the first failure: `INSTALL_REFUSED` (exit 1) while nothing has changed yet, `INSTALL_FAILED` (exit 3) afterwards. |
 | Explicit start | `start.sh --confirm --reason CODE`, audited. It is refused without alert credentials: exit supervision never starts without a way to raise an alarm. The alert timer starts before the supervisor's, and one alert pass must then **succeed synchronously**: credentials readable and valid, the message delivered. While the supervisor is still stopped, that pass sends a real `STOPPED` alert, which proves delivery. If it fails, the alert timer is disabled again and the supervisor is not started. `--with-heartbeat` proves the heartbeat the same way. At boot the alert timer fires first (30 s, against 60 s for the tick). |
 | Guarded stop | Same rules as on macOS (`stop-check`). It is also refused while the tick unit is anything but inactive or failed; an unknown state also refuses. Afterwards the script checks that the timer actually stopped. |
 | Runtime checkout only | The wrapper refuses (exit 78) a checkout that is not on `main`, or that has modified **or untracked** files (`git status --porcelain`; ignored files such as `.env` and `.venv` are not listed). Scripts run as root pass `safe.directory` for this one checkout, so git's ownership check does not block them. |
@@ -49,6 +49,16 @@ This is the Linux counterpart of [the exit supervisor](exit-supervisor.md). It c
 | Alerts outlive the supervisor | `stop.sh` stops only the supervisor. `stop-alerts.sh` is refused while the supervisor timer is not stopped. |
 | Limited rights and resources | The units run as the service user, never root. They set `NoNewPrivileges`, an empty capability set, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, kernel and cgroup protection, `RestrictNamespaces`, `RestrictSUIDSGID` and `UMask=0077`. The tick is capped at `MemoryHigh=600M`/`MemoryMax=800M`, `CPUQuota=100%`, `TasksMax=64`, Nice 5, IOWeight 50. Alert and heartbeat are capped at 400 MB and 50 % CPU. |
 | Secrets | Database settings live in the checkout's `.env` (0600, service user). Telegram and heartbeat secrets reach only their own unit, as systemd credentials (`LoadCredential=`). The tick that runs the exit job never sees them. The journal receives codes only. |
+
+### Install order
+
+1. Every timer must be `inactive` with a known load state (loaded or not-found) and, when loaded, unit file state enabled or disabled. Every service must be `inactive` or `failed`. Anything else, or an unanswerable `systemctl`, is `INSTALL_REFUSED`.
+2. Every loaded timer is disabled, and the script checks that it now reads disabled. An enabled but idle timer would otherwise start at the next boot with the new units. A failure here is `INSTALL_REFUSED`, and no file has been touched.
+3. The unit files are replaced, each written to a temporary file and renamed. Then `daemon-reload`. A failure is `INSTALL_FAILED`; the timers are already disabled, so a reboot starts nothing.
+4. Every timer is disabled again. A timer that had no unit file can still have a stale enablement link, which becomes live once the file is back.
+5. Check: every timer is disabled and inactive, every service is not running. Otherwise `INSTALL_FAILED`. Only after this does the script print `INSTALLED`.
+
+The script never runs `enable`, `start` or `stop`. A running unit is a reason to refuse, never a reason to stop it. Re-running the install, or running it over a partial earlier install, ends in the same disabled state. `uninstall.sh` disables every timer before removing the files.
 
 ### Operating
 
