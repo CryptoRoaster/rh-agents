@@ -17,6 +17,13 @@ This package is that something, and nothing more:
   the service status, the state file and the database's own exit evidence.
 - `stop-check` / `deploy-check` — read-only guards an operator script must pass
   before a regular stop or a code deploy.
+- `alert` — one alert pass on that verdict: news goes to the configured
+  transport (Telegram), deduplicated and persisted (`alerts.py`).
+- `heartbeat` — one signed line for a dead-man receiver on another machine;
+  the receiver is `python -m src.supervisor.deadman` (`deadman.py`).
+
+launchd runs it on macOS (`ops/exit-supervisor`), systemd on Linux
+(`ops/exit-supervisor/linux`).
 
 It never starts an entry, a scout or a combined run, never opens a case and
 never buys: the only command it can build is `--exits-once`. It adds no

@@ -137,6 +137,17 @@ def _codex_missing(settings: SupervisedSettings) -> bool:
 
 
 TICK_LOCK = "tick.lock"
+# Linux's identity of the current boot; it changes with every restart.
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+def read_boot_id(path: Path = BOOT_ID_PATH) -> str | None:
+    """This boot's identity where the platform keeps one; `None` elsewhere (macOS)."""
+    try:
+        value = path.read_text().strip()
+    except OSError:
+        return None
+    return value if 0 < len(value) <= 64 else None
 
 
 def run_tick(
@@ -145,6 +156,7 @@ def run_tick(
     load_settings: Callable[[], SupervisedSettings],
     spawn: Callable[[list[str]], ChildOutcome] = run_child,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    boot_id: Callable[[], str | None] = read_boot_id,
 ) -> TickResult:
     """One tick, recorded whatever happens to it. Never raises for a failed child.
 
@@ -158,7 +170,9 @@ def run_tick(
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return TickResult(TickCode.TICK_ALREADY_RUNNING.value, Category.SKIPPED, None)
-        return _locked_tick(directory, load_settings=load_settings, spawn=spawn, clock=clock)
+        return _locked_tick(
+            directory, load_settings=load_settings, spawn=spawn, clock=clock, boot_id=boot_id
+        )
     finally:
         os.close(descriptor)
 
@@ -169,6 +183,7 @@ def _locked_tick(
     load_settings: Callable[[], SupervisedSettings],
     spawn: Callable[[list[str]], ChildOutcome],
     clock: Callable[[], datetime],
+    boot_id: Callable[[], str | None],
 ) -> TickResult:
     warnings: list[str] = []
     try:
@@ -182,12 +197,19 @@ def _locked_tick(
         warnings.append("TICK_GAP_DETECTED")
     if previous.in_progress_since is not None:
         warnings.append("PREVIOUS_TICK_ABANDONED")
+    boot = boot_id()
+    restarted_at = previous.host_restarted_at
+    if boot is not None and previous.boot_id is not None and boot != previous.boot_id:
+        warnings.append("HOST_RESTART_DETECTED")
+        restarted_at = started
     state = replace(
         previous,
         last_tick_started_at=started,
         in_progress_since=started,
         last_gap_seconds=gap,
         warnings=(),
+        boot_id=boot if boot is not None else previous.boot_id,
+        host_restarted_at=restarted_at,
     )
     result: TickResult | None = None
     try:
@@ -215,4 +237,4 @@ def _locked_tick(
     return result
 
 
-__all__ = ["ChildOutcome", "exit_command", "run_child", "run_tick"]
+__all__ = ["ChildOutcome", "exit_command", "read_boot_id", "run_child", "run_tick"]

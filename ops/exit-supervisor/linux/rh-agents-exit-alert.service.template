@@ -1,0 +1,52 @@
+# One alert pass on the exit supervisor's read-only health verdict. At boot it
+# runs before the first tick (30 s against 60 s): the supervisor is never unwatched.
+# Rendered by install.sh; never edit the installed copy by hand. No secrets here:
+# the Telegram token and chat id come in as systemd credentials, readable by
+# this unit only, never by the tick that runs the exit job.
+[Unit]
+Description=RH Agents exit supervisor alert pass
+Documentation=file://__REPO__/docs/exit-supervisor-linux.md
+After=network-online.target postgresql.service postgresql@17-main.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+Group=__USER__
+WorkingDirectory=__REPO__/backend
+ExecStart=/bin/bash __REPO__/ops/exit-supervisor/linux/run-alert.sh
+Environment=RH_AGENTS_SUPERVISOR_BACKEND=systemd
+Environment=RH_AGENTS_EXIT_SUPERVISOR_STATE_DIR=/var/lib/rh-agents/exit-supervisor
+Environment=RH_AGENTS_ALERT_STATE_DIR=/var/lib/rh-agents/alerts
+Environment=RH_AGENTS_ALERT_TRANSPORT=telegram
+Environment=RH_AGENTS_ALERT_HOST_ALIAS=__HOST_ALIAS__
+LoadCredential=telegram-token:__CREDENTIALS_DIR__/telegram-token
+LoadCredential=telegram-chat-id:__CREDENTIALS_DIR__/telegram-chat-id
+StateDirectory=rh-agents/alerts
+StateDirectoryMode=0700
+TimeoutStartSec=60
+KillMode=control-group
+MemoryHigh=300M
+MemoryMax=400M
+CPUQuota=50%
+TasksMax=32
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

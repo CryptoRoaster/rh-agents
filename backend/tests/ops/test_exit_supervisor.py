@@ -33,7 +33,9 @@ def executable(path: Path, body: str) -> Path:
     return path
 
 
-def stand_ins(tmp_path: Path, *, loaded: bool = False, running: bool = False, codes=None):
+def stand_ins(
+    tmp_path: Path, *, loaded: bool = False, running: bool = False, codes=None, pgrep: int = 1
+):
     """A `launchctl` that is loaded or not, and a `uv` answering per supervisor action."""
     codes = codes or {}
     (tmp_path / "launchd.state").write_text(
@@ -57,6 +59,7 @@ def stand_ins(tmp_path: Path, *, loaded: bool = False, running: bool = False, co
         "esac\nexit 0\n",
     )
     cases = "".join(f"  *' {action}'*) exit {code} ;;\n" for action, code in codes.items())
+    executable(tmp_path / "pgrep", f'echo "$*" >> "{tmp_path}/pgrep.calls"\nexit {pgrep}\n')
     executable(
         tmp_path / "uv",
         f'echo "$PWD|$*" >> "{tmp_path}/uv.calls"\ncase " $*" in\n{cases}esac\nexit 0\n',
@@ -66,6 +69,7 @@ def stand_ins(tmp_path: Path, *, loaded: bool = False, running: bool = False, co
         "HOME": str(tmp_path),
         "RH_AGENTS_UV": str(tmp_path / "uv"),
         "RH_AGENTS_LAUNCHCTL": str(tmp_path / "launchctl"),
+        "RH_AGENTS_PGREP": str(tmp_path / "pgrep"),
         "RH_AGENTS_LAUNCH_AGENTS": str(tmp_path / "agents"),
         "RH_AGENTS_EXIT_SUPERVISOR_LOG_DIR": str(tmp_path / "logs"),
         "RH_AGENTS_EXIT_SUPERVISOR_STATE_DIR": str(tmp_path / "state"),
@@ -300,6 +304,20 @@ def test_health_and_deploy_check_pass_their_codes_through(tmp_path):
     assert run("health.sh", env).returncode == 2
     assert run("deploy-check.sh", env).returncode == 2
     assert launchd_changes(tmp_path) == []
+
+
+def test_the_deploy_gate_refuses_a_live_or_unknown_runner_process(tmp_path):
+    for pgrep, code in ((0, "RUNNER_PROCESS_ALIVE"), (3, "PROCESS_LIST_UNKNOWN")):
+        env = stand_ins(tmp_path, pgrep=pgrep)
+        result = run("deploy-check.sh", env)
+        assert result.returncode == 2 and code in result.stdout
+    assert launchd_changes(tmp_path) == []
+
+
+def test_the_deploy_gate_passes_when_nothing_runs(tmp_path):
+    env = stand_ins(tmp_path)
+    assert run("deploy-check.sh", env).returncode == 0
+    assert calls(tmp_path, "pgrep") == ["-f src\\.runner\\.main|src\\.supervisor\\.main tick"]
 
 
 def test_the_wrapper_runs_one_tick_from_the_backend(tmp_path):
