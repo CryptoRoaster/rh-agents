@@ -25,6 +25,26 @@ if TYPE_CHECKING:
     from src.agents.atlas.sources.blockscout_funding import BlockscoutFundingSource
 
 
+def funding_refusal(settings: Settings, chain: str) -> str | None:
+    """Why ``chain`` has no creator funding source, or None when it has one.
+
+    The one statement of the conditions, shared by the factory below and by the
+    early-only preflight: the early strategy reads its age from the funding
+    graph's chain-side creation time, and without a source every early case is
+    refused. (A Blockscout selection without its key never boots: the settings
+    refuse it.)
+    """
+    if not settings.atlas_funding_graph_enabled:
+        return "FUNDING_GRAPH_NOT_ENABLED"
+    if chain != "robinhood":
+        return "FUNDING_CHAIN_NOT_SUPPORTED"
+    if settings.atlas_rh_origin_provider != "blockscout":
+        return "FUNDING_ORIGIN_PROVIDER_NOT_BLOCKSCOUT"
+    if not settings.blockscout_api_key.get_secret_value():
+        return "FUNDING_BLOCKSCOUT_KEY_MISSING"
+    return None
+
+
 def funding_source(settings: Settings, chain: str) -> "BlockscoutFundingSource | None":
     """The creator funding source for ``chain``, where one is configured.
 
@@ -37,12 +57,7 @@ def funding_source(settings: Settings, chain: str) -> "BlockscoutFundingSource |
         BlockscoutFundingSource,
     )
 
-    if (
-        not settings.atlas_funding_graph_enabled
-        or chain != "robinhood"
-        or settings.atlas_rh_origin_provider != "blockscout"
-        or not settings.blockscout_api_key.get_secret_value()
-    ):
+    if funding_refusal(settings, chain) is not None:
         return None
     return BlockscoutFundingSource(
         config=BlockscoutFundingConfig(

@@ -425,7 +425,18 @@ TRADE_CASE_EARLY_V1 = WorkflowPolicy(
             wait=WaitPolicy(
                 interval=timedelta(seconds=60),
                 horizon=timedelta(hours=1),
-                reasons=frozenset({"ATLAS_EVIDENCE_PENDING", "MARKET_OBSERVATION_PENDING"}),
+                # ATLAS not answered yet, or answered with something a refreshed
+                # reading may still settle; a measured danger is a refusal.
+                reasons=frozenset(
+                    {
+                        "ATLAS_EVIDENCE_PENDING",
+                        "ATLAS_EVIDENCE_STALE",
+                        "ATLAS_EVIDENCE_UNKNOWN",
+                        "ATLAS_EVIDENCE_UNAVAILABLE",
+                        "ATLAS_EVIDENCE_INSUFFICIENT",
+                        "MARKET_OBSERVATION_PENDING",
+                    }
+                ),
             ),
         ),
         next(item for item in TRADE_CASE_V1.tasks if item.role is AgentRole.PULSE),

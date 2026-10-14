@@ -181,3 +181,77 @@ async def test_an_early_setup_cannot_be_filed_on_a_normal_case(risk_db, now, tra
     )
     with pytest.raises(WorkflowFailure):
         await cases.record_evidence(normal.id, result.submission)
+
+
+# S4: what ATLAS's evidence means for an early case ---------------------------
+#
+#   no envelope                 wait  ATLAS_EVIDENCE_PENDING     (not answered yet)
+#   STALE                       wait  ATLAS_EVIDENCE_STALE       (a refresh may renew it)
+#   UNKNOWN / UNAVAILABLE       wait  ATLAS_EVIDENCE_UNKNOWN / _UNAVAILABLE
+#                                                                (not measured: may still be)
+#   AVAILABLE, INSUFFICIENT     wait  ATLAS_EVIDENCE_INSUFFICIENT
+#   INVALID                     refuse ATLAS_EVIDENCE_INVALID    (the record itself is wrong)
+#   AVAILABLE, BLOCKED          refuse ATLAS_EVIDENCE_BLOCKED    (a measured danger)
+#   AVAILABLE, ACCEPTED         go on
+
+
+class NoHistory:
+    """A history source that must not be asked: refusing ATLAS comes first."""
+
+    async def history(self, identity, *, timeframe, aggregate, bars):
+        raise AssertionError("the history provider was called")
+
+
+async def _with_onchain(risk_db, now, trace, *, valid_until=None, **domains):
+    from tests.early.conftest import early_onchain
+    from tests.riskdata.conftest import record_onchain
+
+    _, sessions = risk_db
+    cases = TradeCaseService(sessions, clock=FixedClock(now))
+    trade_case = await open_early_case(cases, sessions, now, trace)
+    payload = early_onchain(now).model_copy(update=domains)
+    extra = {} if valid_until is None else {"valid_until": valid_until}
+    await record_onchain(cases, trade_case, now, payload, key=f"s4-{trade_case.id}", **extra)
+    return cases, trade_case
+
+
+@pytest.mark.parametrize("domain", ["contract_integrity", "holder_integrity"])
+async def test_a_measured_atlas_violation_is_refused_not_awaited(risk_db, now, trace, domain):
+    cases, trade_case = await _with_onchain(risk_db, now, trace, **{domain: "FAIL"})
+    result, _ = await early_setup(
+        cases, trade_case, RecordedMarkets(fresh_snapshot(now)), now, NoHistory()
+    )
+    assert result.kind == "failure", result
+    assert result.reason_code == "ATLAS_EVIDENCE_BLOCKED"
+    assert result.category.value == "CAPABILITY_DENIED"
+
+
+async def test_an_unestablished_atlas_domain_is_awaited_by_name(risk_db, now, trace):
+    cases, trade_case = await _with_onchain(risk_db, now, trace, holder_integrity="UNKNOWN")
+    result, _ = await early_setup(
+        cases, trade_case, RecordedMarkets(fresh_snapshot(now)), now, NoHistory()
+    )
+    assert result.kind == "wait", result
+    assert result.reason_code == "ATLAS_EVIDENCE_UNKNOWN"
+
+
+async def test_stale_atlas_evidence_is_awaited_by_name(risk_db, now, trace):
+    cases, trade_case = await _with_onchain(
+        risk_db, now, trace, valid_until=now + timedelta(minutes=1)
+    )
+    later = now + timedelta(minutes=2)
+    result, _ = await early_setup(
+        cases, trade_case, RecordedMarkets(fresh_snapshot(later)), later, NoHistory()
+    )
+    assert result.kind == "wait", result
+    assert result.reason_code == "ATLAS_EVIDENCE_STALE"
+
+
+async def test_atlas_evidence_from_the_future_is_refused(risk_db, now, trace):
+    cases, trade_case = await _case(risk_db, now, trace)
+    earlier = now - timedelta(minutes=1)
+    result, _ = await early_setup(
+        cases, trade_case, RecordedMarkets(fresh_snapshot(earlier)), earlier, NoHistory()
+    )
+    assert result.kind == "failure", result
+    assert result.reason_code == "ATLAS_EVIDENCE_INVALID"
