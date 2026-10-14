@@ -376,12 +376,17 @@ class Preflight:
         scout, its funding graph and its exit contract; the roles are checked
         against the early workflow above. What is left is what composes without
         complaint and would still leave every early case unable to reach risk,
-        or a BUY with nothing to rest on: a history source, a quote source,
-        market acquisition and the exit-job liveness gate.
+        or a BUY with nothing to rest on: a history source, the funding source
+        that dates the token, a quote source, market acquisition and the
+        exit-job liveness gate.
         """
         settings = self._settings
         if not settings.paper_early_only:
             return []
+        from src.agents.atlas.sources.factory import funding_refusal
+
+        # The early strategy is Robinhood only; its age comes from there.
+        funding = funding_refusal(settings, "robinhood")
         wanted = (
             (
                 "EARLY_ONLY_INTAKE",
@@ -402,6 +407,12 @@ class Preflight:
                 "A market history source is configured for the early setup.",
             ),
             (
+                "EARLY_ONLY_FUNDING_SOURCE",
+                funding is None,
+                "EARLY_ONLY_FUNDING_SOURCE_NOT_CONFIGURED",
+                "A creator funding source gives every early case its chain-side creation time.",
+            ),
+            (
                 "EARLY_ONLY_QUOTES",
                 settings.execution_quote_provider != "disabled",
                 "EARLY_ONLY_QUOTES_NOT_CONFIGURED",
@@ -420,8 +431,15 @@ class Preflight:
                 "Every BUY requires recent exit-job evidence.",
             ),
         )
+        # Why, where the check knows more than that it is missing.
+        why = {
+            "EARLY_ONLY_FUNDING_SOURCE": f" {funding}: without it every early case is "
+            "refused EARLY_CREATION_TIME_UNAVAILABLE.",
+        }
         return [
-            _satisfied(name, note) if met else _blocked(name, reason, "Early-only requires it.")
+            _satisfied(name, note)
+            if met
+            else _blocked(name, reason, "Early-only requires it." + why.get(name, ""))
             for name, met, reason, note in wanted
         ]
 

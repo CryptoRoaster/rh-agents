@@ -19,7 +19,7 @@ would make a pre-VECTOR entry anything other than what the strategy says:
 """
 
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
@@ -36,9 +36,11 @@ from src.orchestration.strategy.early import (
     EarlyEntryPolicy,
     is_early,
 )
-from src.orchestration.workflow.engine import active_evidence, unusable_reason
+from src.orchestration.workflow.engine import active_evidence
 from src.orchestration.workflow.models import (
+    EvidenceAcceptance,
     EvidenceEnvelope,
+    EvidenceStatus,
     EvidenceType,
     OnchainPayload,
     TradeCase,
@@ -53,6 +55,29 @@ YOUNG_HISTORY_POLICY = replace(
     min_closed_bars=1,
     max_setup_lifetime=timedelta(hours=1),
 )
+
+
+def atlas_gate(onchain: EvidenceEnvelope, now: datetime) -> None:
+    """What ATLAS's current evidence means for an early case; returns if usable.
+
+    The workflow's own two axes, mapped one by one. A record that is wrong in
+    itself (INVALID) or a measured danger (AVAILABLE and BLOCKED) is a refusal:
+    no later reading turns a known violation into a pass, so waiting an hour
+    for one would only hide why the case cannot go on. Anything not yet
+    measured — STALE, UNKNOWN, UNAVAILABLE, or available but INSUFFICIENT — is a
+    wait under its own name, because a refreshed observation may still settle
+    it. Only AVAILABLE and ACCEPTED goes on, as before.
+    """
+    status = onchain.effective_status(now)
+    if status == EvidenceStatus.INVALID:
+        raise EarlyContextUnavailable("ATLAS_EVIDENCE_INVALID")
+    if status != EvidenceStatus.AVAILABLE:
+        raise EarlyContextPending(f"ATLAS_EVIDENCE_{status.value}")
+    acceptance = onchain.payload.acceptance()
+    if acceptance == EvidenceAcceptance.BLOCKED:
+        raise EarlyContextUnavailable("ATLAS_EVIDENCE_BLOCKED")
+    if acceptance != EvidenceAcceptance.ACCEPTED:
+        raise EarlyContextPending(f"ATLAS_EVIDENCE_{acceptance.value}")
 
 
 class EarlyCaseSource(Protocol):
@@ -91,8 +116,9 @@ class EarlyContextReader:
         now = self.clock.now()
 
         onchain = current.get(EvidenceType.ONCHAIN)
-        if onchain is None or unusable_reason(onchain, now) is not None:
+        if onchain is None:
             raise EarlyContextPending("ATLAS_EVIDENCE_PENDING")
+        atlas_gate(onchain, now)
         payload = onchain.payload
         intelligence = payload.intelligence if isinstance(payload, OnchainPayload) else None
         funding = None if intelligence is None else intelligence.funding_graph

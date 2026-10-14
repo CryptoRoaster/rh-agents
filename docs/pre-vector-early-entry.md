@@ -43,9 +43,20 @@ shadow), EARLY (TRADE_SETUP, safety-critical), PULSE (trigger), ANCHOR
 Deterministic, no model, no provider of its own. In order:
 
 1. case must be an early case of the early workflow (`EARLY_STRATEGY_MISMATCH`);
-2. usable ATLAS evidence (else wait `ATLAS_EVIDENCE_PENDING`) carrying the
-   chain-side creation block, timestamp and source
-   (`EARLY_CREATION_TIME_UNAVAILABLE`);
+2. usable ATLAS evidence carrying the chain-side creation block, timestamp
+   and source (`EARLY_CREATION_TIME_UNAVAILABLE`). Each other state of that
+   evidence is named:
+
+   | ATLAS evidence | EARLY |
+   |---|---|
+   | none yet | wait `ATLAS_EVIDENCE_PENDING` |
+   | `STALE` / `UNKNOWN` / `UNAVAILABLE` | wait `ATLAS_EVIDENCE_<status>`; a refreshed reading may settle it |
+   | `AVAILABLE`, acceptance `INSUFFICIENT` | wait `ATLAS_EVIDENCE_INSUFFICIENT` |
+   | `INVALID` (observed in the future) | refuse `ATLAS_EVIDENCE_INVALID` |
+   | `AVAILABLE`, acceptance `BLOCKED` (a domain `FAIL`) | refuse `ATLAS_EVIDENCE_BLOCKED`; a measured danger is not awaited |
+   | `AVAILABLE`, `ACCEPTED` | go on |
+
+   A refusal is decided before any history request;
 3. `0 <= now - creation_timestamp <= 6h` (`EARLY_CREATION_TIME_IN_FUTURE`,
    `EARLY_CANDIDATE_TOO_OLD`); never the scout's first-seen time;
 4. a fresh recorded price for the case's own market (else wait
@@ -70,6 +81,26 @@ the setup fingerprint and policy version.
 
 An ineligible market is a permanent task failure with its reason; the case
 expires and is the no-entry baseline.
+
+### How many runs an early entry takes
+
+Replayed through the real bounded run (`tests/early/test_pulse_replay.py`):
+
+- **One `--entries-once` never buys a fresh early case.** EARLY publishes its
+  setup during the pass; PULSE may confirm it only on a market observation
+  recorded *after* `valid_from`, and the pass observed its markets before its
+  specialists worked. The case ends the pass `READY_FOR_TRIGGER`.
+- **A second pass between PULSE's re-check interval (the workflow's wait cadence, 90 s) and the setup's expiry
+  (10 min)** observes the market again (market acquisition, required in
+  early-only), PULSE confirms, ANCHOR proves capacity, the run's own source
+  refresh renews ATLAS's holder facts for SENTINEL's 30-second bound, and the
+  early entry is decided.
+- Sooner than 90 s the watch is not due; after ten minutes the setup has
+  expired (`SETUP_EXPIRED`) and nothing is bought.
+
+This is the same two-pass contract the normal path has (setup in one pass,
+trigger in a later one). Any operating procedure for an early pilot therefore
+needs entries passes roughly every 2–5 minutes, not a single run.
 
 ## ANCHOR `early-anchor-execution-v1`
 
@@ -250,3 +281,6 @@ the exit.
   early daily loss cap.
 - **No re-entry:** a closed early cycle is refused
   (`STRATEGY_REENTRY_NOT_PERMITTED`).
+
+Holder data for young tokens and discovery coverage are assessed in
+[the early pipeline readiness notes](early-pipeline-readiness.md).
