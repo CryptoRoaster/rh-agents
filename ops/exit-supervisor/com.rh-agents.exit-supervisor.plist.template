@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Exit-only PAPER supervisor: one exit-job tick (exits-once) every 60 seconds.
+  Rendered by install.sh; never edit the installed copy by hand. No secrets here.
+
+  install.sh writes this file *disabled* and never loads it, so neither the
+  install nor the next login starts anything. Only start.sh enables and loads
+  it; from then on launchd loads it again at every login until stop.sh.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.rh-agents.exit-supervisor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/ops/exit-supervisor/run-exit-supervisor.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__/backend</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>RH_AGENTS_EXIT_SUPERVISOR_LOG_DIR</key>
+    <string>__LOG_DIR__</string>
+    <key>RH_AGENTS_EXIT_SUPERVISOR_STATE_DIR</key>
+    <string>__STATE_DIR__</string>
+    <key>RH_AGENTS_EXIT_SUPERVISOR_REQUIRE_BRANCH</key>
+    <string>main</string>
+  </dict>
+  <!-- One tick a minute. launchd never starts a tick while the last one runs. -->
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <!-- Loaded only once enabled (start.sh): then tick at once, also after a login. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <!--
+    Standard, never Background: Background lets macOS throttle CPU, I/O and
+    network, and an exit run has a 60-second budget it must not spend waiting.
+  -->
+  <key>ProcessType</key>
+  <string>Standard</string>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/exit-supervisor.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/exit-supervisor.launchd.log</string>
+</dict>
+</plist>

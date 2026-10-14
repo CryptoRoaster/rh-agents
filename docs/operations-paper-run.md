@@ -255,6 +255,10 @@ is held to the same exit-job evidence. `PAPER_EXIT_LIVENESS_MAX_AGE_SECONDS`
 must exceed `PAPER_EXIT_RUN_MAX_SECONDS`; the exit job's schedule must be
 shorter than the max age, or every BUY is refused.
 
+The exit job's schedule is the exit-only supervisor (`ops/exit-supervisor`,
+one `--exits-once` tick a minute under launchd, with health, stop and deploy
+guards): see [the exit supervisor](exit-supervisor.md). It is not activated.
+
 ### Pre-exit refresh (both exit sweeps, both jobs)
 
 A trigger is decided on the marks recorded at the start of the run, and each
