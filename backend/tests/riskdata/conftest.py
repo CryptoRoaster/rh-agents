@@ -129,6 +129,7 @@ def recorded_snapshot(
     label: str = "",
     quote_address: str = QUOTE,
     quote_price: Decimal | None | Literal["legacy"] = Decimal(1),
+    venue: str = "uniswap-v3",
 ) -> MarketSnapshot:
     """One observation of the ATLAS market, shaped as the recorder stores them.
 
@@ -180,11 +181,9 @@ def recorded_snapshot(
         pair_id=pair_id,
         base=base,
         quote=quote,
-        venue="uniswap-v3",
+        venue=venue,
         pool_locator=(
-            PoolLocator(
-                kind=PoolLocatorKind.CONTRACT_ADDRESS, value=pool.group(1), venue="uniswap-v3"
-            )
+            PoolLocator(kind=PoolLocatorKind.CONTRACT_ADDRESS, value=pool.group(1), venue=venue)
             if versioned and pool is not None
             else None
         ),
