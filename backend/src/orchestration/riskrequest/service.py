@@ -16,7 +16,7 @@ rule somebody has to keep.
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import select
@@ -24,10 +24,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.clock import Clock, SystemClock
 from src.core.models import (
+    LP_CONTROL_V4_POOL_CENSUS,
     ExecutionTiming,
     HolderSnapshot,
     LiquiditySnapshot,
+    LpControlSnapshot,
+    LpControlStatus,
     MarketSnapshot,
+    PoolLocatorCode,
     RiskLimits,
     RiskOutcome,
     SafetyStatus,
@@ -45,7 +49,7 @@ from src.ledger.portfolio import (
     portfolio_state,
     roll_loss_day,
 )
-from src.markets.models import Availability
+from src.markets.models import Availability, PoolLocatorKind
 from src.markets.models import MarketSnapshot as RecordedMarket
 from src.markets.scope import MarketScope, latest_in
 from src.orchestration.commander.context import SystemPausePort
@@ -772,6 +776,68 @@ def entry_concentration_established(onchain: OnchainPayload) -> bool:
     return control is None or not control.required or control.economic_concentration is not None
 
 
+# A V4 pool without a hook. Any other hook is code nobody here has verified,
+# and a hook can hold or move liquidity, so its pool's control is unknown.
+NO_HOOK = "0x" + "0" * 40
+
+
+class LpControlFinding(NamedTuple):
+    """What the market view records as a BUY's LP-control evidence."""
+
+    status: LpControlStatus
+    detail: str
+    pool_locator_kind: PoolLocatorCode | None = None
+    pool_id: str | None = None
+    census_block: int | None = None
+
+
+def lp_control_view(*, snapshot: RecordedMarket, onchain: OnchainPayload) -> LpControlFinding:
+    """Whether the traded pool's liquidity control is established, and on what.
+
+    The only evidence there is today is ATLAS's V4 pool census, so only a
+    32-byte market pool can pass, and only when the census is complete (its
+    economic concentration established, every position's control resolved),
+    lists the market's own pool in the verified PoolManager, and that pool has
+    no hook. A 20-byte pool (V2/V3 and alike) has no LP-control source at all:
+    its LP tokens or position NFTs are unread, so it is UNSUPPORTED. Nothing
+    here reads a provider.
+    """
+    locator = snapshot.pair.pool_locator
+    if locator is None:
+        return LpControlFinding(LpControlStatus.UNKNOWN, "POOL_LOCATOR_UNKNOWN")
+    pool_id = locator.value
+    kind: PoolLocatorCode = (
+        "CONTRACT_ADDRESS"
+        if locator.kind is PoolLocatorKind.CONTRACT_ADDRESS
+        else "BYTES32_POOL_ID"
+    )
+
+    def finding(status: LpControlStatus, detail: str, block: int | None = None) -> LpControlFinding:
+        return LpControlFinding(status, detail, kind, pool_id, block)
+
+    if locator.kind is PoolLocatorKind.CONTRACT_ADDRESS:
+        return finding(LpControlStatus.UNSUPPORTED, "LP_CONTROL_SOURCE_ABSENT")
+    if locator.kind is not PoolLocatorKind.BYTES32_POOL_ID:  # pragma: no cover - closed enum
+        return finding(LpControlStatus.UNKNOWN, "POOL_LOCATOR_UNKNOWN")
+    control = None if onchain.intelligence is None else onchain.intelligence.pool_control
+    if control is None or not control.required:
+        return finding(LpControlStatus.UNKNOWN, "V4_POOL_CENSUS_ABSENT")
+    if control.economic_concentration is None:
+        return finding(LpControlStatus.UNKNOWN, control.gap or "V4_POOL_CENSUS_UNAVAILABLE")
+    if control.pool_manager is None or control.snapshot_block is None:
+        return finding(LpControlStatus.UNKNOWN, "V4_POOL_CENSUS_BASIS_INCOMPLETE")
+    pool = next((item for item in control.pools if item.pool_id == pool_id), None)
+    if pool is None or not pool.initialized:
+        return finding(LpControlStatus.UNKNOWN, "V4_MARKET_POOL_NOT_IN_CENSUS")
+    if pool.hook != NO_HOOK:
+        if pool.hook_owner_is_creator is True:
+            # Established: the creator owns the code every liquidity change in
+            # the market's pool runs through.
+            return finding(LpControlStatus.BLOCKED, "V4_HOOK_CREATOR_CONTROLLED")
+        return finding(LpControlStatus.UNKNOWN, "V4_HOOK_UNVERIFIED")
+    return finding(LpControlStatus.PASS, LP_CONTROL_V4_POOL_CENSUS, control.snapshot_block)
+
+
 def market_view(
     *,
     base_asset_id: str,
@@ -831,6 +897,27 @@ def market_view(
         if not fits_ledger(liquidity.value_usd):
             raise RiskRequestUnavailable("LIQUIDITY_OUTSIDE_ACCOUNTING_PRECISION")
         liquidity_usd = quantize_down(liquidity.value_usd)
+
+    lp_control = None
+    if side is Side.BUY:
+        # Issue #92: only a purchase is judged on it. A sale's snapshot keeps
+        # the exact shape it always had.
+        found = lp_control_view(snapshot=snapshot, onchain=payload)
+        lp_control = LpControlSnapshot(
+            id=identity("lp-control"),
+            # Read beside the holder facts, at the same instant.
+            created_at=holders.observed_at,
+            updated_at=holders.observed_at,
+            source=holders.source,
+            correlation_id=correlation_id,
+            asset_id=base_asset_id,
+            status=found.status,
+            pool_locator_kind=found.pool_locator_kind,
+            pool_id=found.pool_id,
+            basis=LP_CONTROL_V4_POOL_CENSUS if found.status is LpControlStatus.PASS else None,
+            census_block=found.census_block,
+            detail=found.detail,
+        )
 
     price_at = price.observed_at
     return MarketSnapshot(
@@ -896,6 +983,7 @@ def market_view(
         ),
         # The configured proportional fee on one side's executed notional.
         fee_bps=costs.fee_bps,
+        lp_control=lp_control,
     )
 
 

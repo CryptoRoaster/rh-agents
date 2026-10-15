@@ -4,10 +4,17 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 from uuid import UUID, uuid4
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_serializer,
+    model_validator,
+)
 
 Amount = Annotated[Decimal, Field(ge=0, allow_inf_nan=False, max_digits=38, decimal_places=18)]
 Positive = Annotated[Decimal, Field(gt=0, allow_inf_nan=False, max_digits=38, decimal_places=18)]
@@ -100,6 +107,46 @@ class HolderSnapshot(Record):
     concentration_check: SafetyStatus = SafetyStatus.UNKNOWN
 
 
+class LpControlStatus(StrEnum):
+    """Whether the control of the traded pool's liquidity is established.
+
+    PASS: established in full, by a verified source, and judged with the holder
+    concentration. BLOCKED: established, and a violation. UNKNOWN: the evidence
+    is missing or incomplete. UNSUPPORTED: no source exists for this market's
+    pool or custody architecture. Only PASS lets a BUY through; BLOCKED is the
+    LP-control counterpart of SafetyStatus.FAIL.
+    """
+
+    PASS = "PASS"
+    BLOCKED = "BLOCKED"
+    UNKNOWN = "UNKNOWN"
+    UNSUPPORTED = "UNSUPPORTED"
+
+
+# The one basis a PASS may rest on today: ATLAS's complete V4 pool census of the
+# market's own pool in the verified PoolManager.
+LP_CONTROL_V4_POOL_CENSUS = "V4_POOL_CENSUS"
+PoolLocatorCode = Literal["CONTRACT_ADDRESS", "BYTES32_POOL_ID"]
+
+
+class LpControlSnapshot(Record):
+    """Who can withdraw the traded pool's liquidity, as far as it is known.
+
+    A purchase needs it; a sale never does. ``pool_locator_kind`` and
+    ``pool_id`` name the market's own pool, ``basis`` the evidence a PASS
+    rests on and ``census_block`` the block that evidence was read at, so a
+    PASS that names no verified basis is recognisably not one.
+    """
+
+    asset_id: Identifier
+    status: LpControlStatus = LpControlStatus.UNKNOWN
+    pool_locator_kind: PoolLocatorCode | None = None
+    pool_id: Identifier | None = None
+    basis: Identifier | None = None
+    census_block: int | None = Field(default=None, ge=0)
+    detail: Identifier | None = None
+
+
 class WalletActivity(Record):
     asset_id: Identifier
     wallet_address: Identifier  # Public identifier only.
@@ -116,15 +163,31 @@ class MarketSnapshot(Record):
     token: TokenSnapshot
     holders: HolderSnapshot
     fee_bps: Amount | None = None
+    # Absent from every snapshot recorded before issue #92 and from every sale's:
+    # absent reads as UNKNOWN, which no BUY passes.
+    lp_control: LpControlSnapshot | None = None
 
     def fingerprint(self) -> str:
         return sha256(self.model_dump_json().encode()).hexdigest()
 
     @model_validator(mode="after")
     def matching_assets(self) -> Self:
-        if any(x.asset_id != self.asset_id for x in (self.liquidity, self.token, self.holders)):
+        nested: tuple[LiquiditySnapshot | TokenSnapshot | HolderSnapshot | LpControlSnapshot, ...]
+        nested = (self.liquidity, self.token, self.holders)
+        if self.lp_control is not None:
+            nested = (*nested, self.lp_control)
+        if any(x.asset_id != self.asset_id for x in nested):
             raise ValueError("Snapshot asset identifiers must agree")
         return self
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        # A snapshot without LP-control evidence keeps the shape, and so the
+        # fingerprint, it was recorded and approved with.
+        emitted: dict[str, Any] = handler(self)
+        if emitted.get("lp_control") is None:
+            emitted.pop("lp_control", None)
+        return emitted
 
 
 class TradeSetup(Record):

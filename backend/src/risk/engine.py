@@ -4,7 +4,10 @@ from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal, localcontext
 
 from src.core.models import (
+    LP_CONTROL_V4_POOL_CENSUS,
+    LpControlStatus,
     MarketSnapshot,
+    Record,
     RiskContext,
     RiskDecision,
     RiskLimits,
@@ -23,6 +26,30 @@ ORDER = {"TOKEN": 0, "ROUTING": 1, "HOLDERS": 2, "ACCOUNTING": 3}
 # The reason a BUY refused at the daily loss limit carries, and the one its
 # caller turns into the automatic entry halt.
 DAILY_LOSS_LIMIT = "DAILY_LOSS_LIMIT"
+
+
+def lp_control_refusal(market: MarketSnapshot) -> str | None:
+    """Why a purchase in this market is not covered by LP-control evidence.
+
+    The one fact a BUY needs beyond the holder figures: who can withdraw the
+    traded pool's liquidity. Holder evidence, however positive, does not stand
+    in for it. Absent evidence is UNKNOWN. A PASS counts only when it names the
+    one verified basis there is -- the complete V4 pool census of the market's
+    own 32-byte pool, at a census block; any other PASS is not evidence.
+    """
+    control = market.lp_control
+    if control is None:
+        return "LP_CONTROL_UNKNOWN"
+    if control.status != LpControlStatus.PASS:
+        return f"LP_CONTROL_{control.status.value}"
+    if (
+        control.pool_locator_kind != "BYTES32_POOL_ID"
+        or control.pool_id is None
+        or control.basis != LP_CONTROL_V4_POOL_CENSUS
+        or control.census_block is None
+    ):
+        return "LP_CONTROL_EVIDENCE_INCONSISTENT"
+    return None
 
 
 def _additional_buy_notional(
@@ -89,7 +116,11 @@ def evaluate(
     age = (now - market.observed_at).total_seconds()
     if age < 0 or age > limits.max_snapshot_age_seconds:
         reasons.append("STALE_OR_FUTURE_MARKET")
-    for snapshot in (market.token, market.liquidity, market.holders):
+    nested: tuple[Record, ...] = (market.token, market.liquidity, market.holders)
+    if intent.side == Side.BUY and market.lp_control is not None:
+        # LP-control evidence binds a purchase only, its age included.
+        nested = (*nested, market.lp_control)
+    for snapshot in nested:
         nested_age = (now - snapshot.created_at).total_seconds()
         if nested_age < 0 or nested_age > limits.max_snapshot_age_seconds:
             reasons.append("STALE_OR_FUTURE_SAFETY_DATA")
@@ -121,6 +152,12 @@ def evaluate(
     for name, status in sorted(checks.items(), key=lambda item: ORDER[item[0]]):
         if status != SafetyStatus.PASS:
             reasons.append(f"{name}_{status.value}")
+    if buying:
+        # Issue #92. A purchase needs the traded pool's liquidity control
+        # established; a sale never does, so an exit is never trapped by it.
+        lp_refusal = lp_control_refusal(market)
+        if lp_refusal is not None:
+            reasons.append(lp_refusal)
     liquidity = market.liquidity.liquidity_usd
     slippage = market.liquidity.estimated_slippage_bps
     if market.holders.holder_count is None or market.holders.top_ten_fraction is None:

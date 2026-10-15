@@ -64,7 +64,10 @@ def buy_market(now, venue: str, *, side: Side = Side.BUY):
         snapshot=snapshot,
         onchain=evidence_envelope(now, EvidenceType.ONCHAIN, AgentRole.ATLAS, onchain_payload(now)),
         anchor=evidence_envelope(
-            now, EvidenceType.LIQUIDITY_EXECUTION, AgentRole.ANCHOR, anchor_payload(uuid4(), uuid4())
+            now,
+            EvidenceType.LIQUIDITY_EXECUTION,
+            AgentRole.ANCHOR,
+            anchor_payload(uuid4(), uuid4()),
         ),
         costs=configured_costs(),
         correlation_id=CORRELATION,
