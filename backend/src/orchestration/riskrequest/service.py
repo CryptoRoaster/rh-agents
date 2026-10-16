@@ -899,8 +899,9 @@ def unresolved_custody(control: PoolControlSummary) -> str | None:
     if control.basis != "EXACT":
         return "V4_CONCENTRATION_NOT_EXACT"
     states = control.position_control_states
-    if states is None and control.positions_total:
-        # Recorded before control facts existed: no position's control was read.
+    if not states and control.positions_total:
+        # None: recorded before control facts existed. Empty: none was counted.
+        # Either way no position's control was read.
         return "V4_POSITION_CONTROL_UNRESOLVED"
     if any(state not in RESOLVED_CONTROL_STATES for state in states or {}) or any(
         raw not in (None, "0") for raw in (control.timelocked_raw, control.unknown_custody_raw)
