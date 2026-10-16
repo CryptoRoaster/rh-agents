@@ -161,6 +161,7 @@ async def test_every_other_gap_in_position_control_is_unknown(now) -> None:
     }
     for state in ("TIMELOCKED", "UNKNOWN_CONTRACT_CUSTODY", "SOMETHING_NEW"):
         cases[f"state:{state}"] = {"position_control_states": {state: 1}}
+    cases["empty_states"] = {"position_control_states": {}}
     cases["timelocked_raw"] = {"timelocked_raw": "1"}
     cases["unknown_custody_raw"] = {"unknown_custody_raw": "1"}
     cases["unattributed_raw_absent"] = {"unattributed_raw": None}
