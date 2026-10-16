@@ -141,3 +141,33 @@ async def test_a_complete_verified_census_without_unknowns_passes(now, intent, c
     assert market.lp_control is not None
     assert market.lp_control.status is LpControlStatus.PASS
     assert decision.outcome is RiskOutcome.APPROVE, decision.reason_codes
+
+
+def with_census(payload: OnchainPayload, **changes: object) -> OnchainPayload:
+    assert payload.intelligence is not None
+    control = census(payload).model_copy(update=changes)
+    intelligence = payload.intelligence.model_copy(update={"pool_control": control})
+    return payload.model_copy(update={"intelligence": intelligence})
+
+
+async def test_every_other_gap_in_position_control_is_unknown(now) -> None:
+    payload, pool_id = await launch(now)
+    snapshot = recorded(now, pool_id=pool_id)
+    assert lp_control_view(snapshot=snapshot, onchain=payload)[0] is LpControlStatus.PASS
+    cases = {
+        "V4_CONCENTRATION_NOT_EXACT": {"basis": "UPPER_BOUND"},
+        # Recorded before position control facts existed.
+        "V4_POSITION_CONTROL_UNRESOLVED": {"position_control_states": None},
+    }
+    for state in ("TIMELOCKED", "UNKNOWN_CONTRACT_CUSTODY", "SOMETHING_NEW"):
+        cases[f"state:{state}"] = {"position_control_states": {state: 1}}
+    cases["timelocked_raw"] = {"timelocked_raw": "1"}
+    cases["unknown_custody_raw"] = {"unknown_custody_raw": "1"}
+    cases["unattributed_raw_absent"] = {"unattributed_raw": None}
+    for label, changes in cases.items():
+        status, detail = lp_control_view(
+            snapshot=snapshot, onchain=with_census(payload, **changes)
+        )[:2]
+        assert status is LpControlStatus.UNKNOWN, label
+        if label.startswith("V4_"):
+            assert detail == label

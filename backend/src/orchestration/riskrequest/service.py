@@ -92,6 +92,7 @@ from src.orchestration.workflow.models import (
     HolderDistributionFacts,
     LiquidityExecutionPayload,
     OnchainPayload,
+    PoolControlSummary,
     TradeCase,
     TradeCaseStatus,
     WorkflowFailure,
@@ -835,7 +836,43 @@ def lp_control_view(*, snapshot: RecordedMarket, onchain: OnchainPayload) -> LpC
             # the market's pool runs through.
             return finding(LpControlStatus.BLOCKED, "V4_HOOK_CREATOR_CONTROLLED")
         return finding(LpControlStatus.UNKNOWN, "V4_HOOK_UNVERIFIED")
+    unresolved = unresolved_custody(control)
+    if unresolved is not None:
+        return finding(LpControlStatus.UNKNOWN, unresolved)
     return finding(LpControlStatus.PASS, LP_CONTROL_V4_POOL_CENSUS, control.snapshot_block)
+
+
+# The position control states that settle who can move a position's principal:
+# a named controller, or proof that nobody can. Anything else is unresolved.
+RESOLVED_CONTROL_STATES = frozenset({"DIRECT_CONTROL", "RELEASABLE", "PERMANENTLY_LOCKED"})
+
+
+def unresolved_custody(control: PoolControlSummary) -> str | None:
+    """Why some liquidity in the census has no established controller, if any does.
+
+    The economic concentration tolerates a small untraced remainder (fees,
+    round-down), because it ranks holders of token supply. LP control asks who
+    can withdraw a pool's liquidity, and a token-supply tolerance proves nothing
+    about that: a position with an unknown owner can hold almost no token and
+    most of the pool's ETH. So there is no tolerance here. Every position is
+    attributed, nothing in the PoolManager is unexplained, the concentration is
+    exact, and every position's control is resolved -- or the control is unknown.
+    """
+    if control.positions_unattributed != 0:
+        return "V4_POSITION_OWNER_UNKNOWN"
+    if control.unattributed_raw != "0":
+        return "V4_POOL_BALANCE_UNATTRIBUTED"
+    if control.basis != "EXACT":
+        return "V4_CONCENTRATION_NOT_EXACT"
+    states = control.position_control_states
+    if states is None and control.positions_total:
+        # Recorded before control facts existed: no position's control was read.
+        return "V4_POSITION_CONTROL_UNRESOLVED"
+    if any(state not in RESOLVED_CONTROL_STATES for state in states or {}) or any(
+        raw not in (None, "0") for raw in (control.timelocked_raw, control.unknown_custody_raw)
+    ):
+        return "V4_POSITION_CONTROL_UNRESOLVED"
+    return None
 
 
 def market_view(
