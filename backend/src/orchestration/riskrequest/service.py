@@ -22,6 +22,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from src.agents.atlas.v4.protocol import V4_DEPLOYMENTS
 from src.core.clock import Clock, SystemClock
 from src.core.models import (
     LP_CONTROL_V4_POOL_CENSUS,
@@ -91,6 +92,7 @@ from src.orchestration.workflow.models import (
     EvidenceType,
     HolderDistributionFacts,
     LiquidityExecutionPayload,
+    OnchainIntelligence,
     OnchainPayload,
     PoolControlSummary,
     TradeCase,
@@ -796,10 +798,11 @@ def lp_control_view(*, snapshot: RecordedMarket, onchain: OnchainPayload) -> LpC
     """Whether the traded pool's liquidity control is established, and on what.
 
     The only evidence there is today is ATLAS's V4 pool census, so only a
-    32-byte market pool can pass, and only when the census is complete (its
-    economic concentration established, every position's control resolved),
-    lists the market's own pool in the verified PoolManager, and that pool has
-    no hook. A 20-byte pool (V2/V3 and alike) has no LP-control source at all:
+    32-byte market pool can pass, and only when the census is bound to the
+    verified deployment of the market's chain at the ATLAS block
+    (`census_basis_gap`), is complete without any tolerance
+    (`unresolved_custody`), lists the market's own pool in that PoolManager,
+    and that pool has no hook. A 20-byte pool (V2/V3 and alike) has no LP-control source at all:
     its LP tokens or position NFTs are unread, so it is UNSUPPORTED. Nothing
     here reads a provider.
     """
@@ -820,13 +823,17 @@ def lp_control_view(*, snapshot: RecordedMarket, onchain: OnchainPayload) -> LpC
         return finding(LpControlStatus.UNSUPPORTED, "LP_CONTROL_SOURCE_ABSENT")
     if locator.kind is not PoolLocatorKind.BYTES32_POOL_ID:  # pragma: no cover - closed enum
         return finding(LpControlStatus.UNKNOWN, "POOL_LOCATOR_UNKNOWN")
-    control = None if onchain.intelligence is None else onchain.intelligence.pool_control
-    if control is None or not control.required:
+    intelligence = onchain.intelligence
+    control = None if intelligence is None else intelligence.pool_control
+    if intelligence is None or control is None or not control.required:
         return finding(LpControlStatus.UNKNOWN, "V4_POOL_CENSUS_ABSENT")
     if control.economic_concentration is None:
         return finding(LpControlStatus.UNKNOWN, control.gap or "V4_POOL_CENSUS_UNAVAILABLE")
-    if control.pool_manager is None or control.snapshot_block is None:
-        return finding(LpControlStatus.UNKNOWN, "V4_POOL_CENSUS_BASIS_INCOMPLETE")
+    unbound = census_basis_gap(
+        chain=snapshot.pair.chain, intelligence=intelligence, control=control
+    )
+    if unbound is not None:
+        return finding(LpControlStatus.UNKNOWN, unbound)
     pool = next((item for item in control.pools if item.pool_id == pool_id), None)
     if pool is None or not pool.initialized:
         return finding(LpControlStatus.UNKNOWN, "V4_MARKET_POOL_NOT_IN_CENSUS")
@@ -840,6 +847,33 @@ def lp_control_view(*, snapshot: RecordedMarket, onchain: OnchainPayload) -> LpC
     if unresolved is not None:
         return finding(LpControlStatus.UNKNOWN, unresolved)
     return finding(LpControlStatus.PASS, LP_CONTROL_V4_POOL_CENSUS, control.snapshot_block)
+
+
+def census_basis_gap(
+    *, chain: str, intelligence: OnchainIntelligence, control: PoolControlSummary
+) -> str | None:
+    """Why the census is not evidence for this market's chain and ATLAS read, if not.
+
+    A census proves something only about the PoolManager and block it was read
+    at. That manager must be the verified V4 deployment of the market's chain,
+    and every PositionManager it named one of that deployment's; its chain must
+    be the ATLAS evidence's; and its block must be the block that evidence was
+    pinned to, so a census from another read cannot be carried beside it.
+    """
+    if control.pool_manager is None or control.snapshot_block is None:
+        return "V4_POOL_CENSUS_BASIS_INCOMPLETE"
+    if control.chain_id is None or control.chain_id != intelligence.chain_id:
+        return "V4_CENSUS_CHAIN_MISMATCH"
+    deployment = V4_DEPLOYMENTS.get((chain, control.chain_id))
+    if deployment is None:
+        return "V4_DEPLOYMENT_UNKNOWN"
+    if control.pool_manager != deployment.pool_manager:
+        return "V4_CENSUS_POOL_MANAGER_UNVERIFIED"
+    if not set(control.position_managers) <= set(deployment.position_managers):
+        return "V4_CENSUS_POSITION_MANAGER_UNVERIFIED"
+    if control.snapshot_block != intelligence.block_number:
+        return "V4_CENSUS_BLOCK_MISMATCH"
+    return None
 
 
 # The position control states that settle who can move a position's principal:

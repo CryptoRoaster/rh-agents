@@ -122,3 +122,61 @@ async def test_a_census_bound_to_its_manager_and_block_passes(now, intent, conte
     assert market.lp_control.census_block == payload.intelligence.block_number
     assert market.lp_control.pool_id == pool_id
     assert decision.outcome is RiskOutcome.APPROVE, decision.reason_codes
+
+
+async def test_an_incomplete_or_foreign_position_manager_basis_is_unknown(
+    now, intent, context
+) -> None:
+    payload, pool_id = await launch(now)
+    refused(
+        now,
+        intent,
+        context,
+        with_census(payload, position_managers=(FOREIGN_MANAGER,)),
+        pool_id,
+        "V4_CENSUS_POSITION_MANAGER_UNVERIFIED",
+    )
+    for missing in ({"pool_manager": None}, {"snapshot_block": None}):
+        refused(
+            now,
+            intent,
+            context,
+            with_census(payload, **missing),
+            pool_id,
+            "V4_POOL_CENSUS_BASIS_INCOMPLETE",
+        )
+
+
+def test_the_market_view_is_the_only_producer_of_a_sentinel_snapshot() -> None:
+    """LP control binds to the traded pool where it is derived: in the market view,
+    from the market's own pool locator. SENTINEL's snapshot carries no pool of its
+    own to compare against, so a second producer could pair any evidence with any
+    market. There is none; this keeps it that way.
+    """
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / "src"
+    producers = []
+    for path in sorted(source.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        names = {
+            alias.asname or alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "src.core.models"
+            for alias in node.names
+            if alias.name == "MarketSnapshot"
+        }
+        if path.name == "models.py" and path.parent.name == "core":
+            names.add("MarketSnapshot")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                called = func.id if isinstance(func, ast.Name) else None
+                if called in names:
+                    producers.append(str(path.relative_to(source)))
+                if isinstance(func, ast.Attribute) and func.attr == "model_copy":
+                    keywords = ast.dump(node)
+                    if "lp_control" in keywords:
+                        producers.append(f"{path.relative_to(source)}:model_copy")
+    assert producers == ["orchestration/riskrequest/service.py"]
