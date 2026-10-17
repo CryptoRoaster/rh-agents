@@ -26,6 +26,10 @@ from src.markets.models import (
 # own, stated once here rather than guessed at the call site.
 MAX_POOLS_PER_REQUEST = 20
 
+# The new-pool pages discovery may read. Page 2 exists for one reason only: a
+# saturated page 1 (issue #77). Anything deeper is a crawl, not discovery.
+MAX_DISCOVERY_PAGE = 2
+
 
 # The zero address, as GeckoTerminal names a chain's native asset (BNB on BSC).
 NATIVE_ASSET_ADDRESS = "0x" + "0" * 40
@@ -219,20 +223,28 @@ class GeckoTerminalAdapter:
         self.discovered = 0
         self.failed = 0
         self.rejections: dict[str, int] = {}
+        # How many pool resources the provider put on the last page read, before
+        # any limit or validation: a page shorter than a full one is the end of
+        # the list, so nothing can lie beyond it.
+        self.returned = 0
 
-    async def discover(self) -> tuple[MarketPair, ...]:
+    async def discover(self, *, page: int = 1) -> tuple[MarketPair, ...]:
+        """One page of new pools, page 1 unless told otherwise; one request."""
+        if not 1 <= page <= MAX_DISCOVERY_PAGE:
+            raise ConfigurationError()
         self._snapshots = {}
-        self.discovered = self.failed = 0
+        self.discovered = self.failed = self.returned = 0
         self.rejections = {}
         network_id = await self._directory.resolve(self.chain)
         payload = await self._transport.get(
             f"networks/{network_id}/new_pools",
-            {"include": "base_token,quote_token,dex", "page": 1},
+            {"include": "base_token,quote_token,dex", "page": page},
         )
         at = self._clock.now()  # Successful fetch completion, never pool creation time.
         response = validate(PoolsResponse, payload)
         provenance(response, self.chain)
         included = index_included(response)
+        self.returned = len(response.data)
         seen: dict[tuple[str, str], object] = {}
         snapshots: dict[MarketIdentity, MarketSnapshot] = {}
         pool_addresses: set[str] = set()
