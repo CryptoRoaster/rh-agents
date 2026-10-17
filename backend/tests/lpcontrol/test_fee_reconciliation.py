@@ -23,8 +23,9 @@ from src.agents.atlas.policy import evaluate_snapshot
 from src.core.models import LpControlStatus, RiskOutcome
 from src.orchestration.riskrequest.service import lp_control_view
 from src.orchestration.workflow.models import OnchainPayload, PoolControlSummary
-from tests.atlas.v4.chain import NATIVE, POOL_MANAGER, FakeV4Chain
-from tests.atlas.v4.scenarios import UNIT, build, official_launch
+from tests.atlas.conftest import TOKEN
+from tests.atlas.v4.chain import NATIVE, POOL_MANAGER, FakeV4Chain, Pool
+from tests.atlas.v4.scenarios import HIDDEN_RANGE, UNIT, build, official_launch
 from tests.lpcontrol.test_lp_control import recorded, sentinel
 
 # Token-side fee growth: about 0.4 % of the launch position's liquidity per
@@ -217,4 +218,37 @@ async def test_fees_owed_to_an_unresolved_position_do_not_pass(now, intent, cont
     unresolved = with_census(payload, position_control_states={"TIMELOCKED": 1})
     lp, decision = judged(now, intent, context, unresolved, pool_id)
     assert (lp.status, lp.detail) == (LpControlStatus.UNKNOWN, "V4_POSITION_CONTROL_UNRESOLVED")
+    assert decision.outcome is RiskOutcome.REJECT
+
+
+async def test_a_pool_initialized_before_the_token_cannot_hide_in_the_surplus(
+    now, intent, context
+) -> None:
+    # Review finding B1. v4-core initializes a pool for a currency address
+    # without checking that code exists there, and a token's address is known
+    # before it is deployed. The census looks for pools from the token's
+    # creation block, so liquidity added later to a pool initialized earlier
+    # sits in the PoolManager with no position the census knows of.
+    hidden_owner = "0x" + "ad" * 20
+
+    def configure(chain: FakeV4Chain, pool) -> None:
+        fees(chain, pool)
+        early = chain.add_pool(
+            Pool(
+                currency0=NATIVE,
+                currency1=TOKEN,
+                fee=500,
+                tick_spacing=10,
+                created_block=chain.created_block - 1_000,
+                tick=300_000,
+            )
+        )
+        chain.mint(
+            early, hidden_owner, 9_999_999, *HIDDEN_RANGE, 10**18, block=chain.created_block + 50
+        )
+
+    payload, pool_id, chain = await launch(now, configure)
+    assert len(census(payload).pools) == 1  # the early pool was never found
+    lp, decision = judged(now, intent, context, payload, pool_id)
+    assert lp.status is LpControlStatus.UNKNOWN, lp.detail
     assert decision.outcome is RiskOutcome.REJECT
