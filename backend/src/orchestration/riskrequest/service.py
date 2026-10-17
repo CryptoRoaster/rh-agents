@@ -1011,9 +1011,15 @@ def unexplained_remainder(control: PoolControlSummary) -> str:
         return "V4_POOL_BALANCE_UNATTRIBUTED"
     if control.claims_raw != "0":
         return "V4_POOL_CLAIMS_UNATTRIBUTED"
-    if control.surplus_raw != "0":
+    if control.surplus_raw != "0" and control.pool_discovery_basis != "MANAGER_HISTORY":
+        # Discovery from the token's creation block can miss a pool initialized
+        # before the token existed; whatever such a pool holds sits here.
         return "V4_POOL_SURPLUS_UNEXPLAINED"
-    return "V4_POOL_FEES_NOT_CREDITED"
+    if control.uncollected_fees_raw != "0" or control.protocol_fees_raw != "0":
+        return "V4_POOL_FEES_NOT_CREDITED"
+    # Only a surplus is left, over a discovery covering the PoolManager's whole
+    # history: owed to nobody, but the economic figure still ranks it (#103).
+    return "V4_POOL_SURPLUS_NOT_CREDITED"
 
 
 def market_view(

@@ -110,9 +110,10 @@ async def run(
     return run_id
 
 
-def test_0024_follows_0023_and_is_the_head():
+def test_0024_follows_0023():
     assert load(MODULE).down_revision == "0023"
-    assert expected_revision() == "0024"
+    # 0025 (the V4 pool index, issue #94) follows it as the head.
+    assert expected_revision() == "0025"
 
 
 async def test_an_existing_pause_survives_the_upgrade_untouched(at_0023):

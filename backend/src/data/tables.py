@@ -1381,3 +1381,43 @@ class DiscoveryStreamOutcomeRow(Base):
     volume_usd: Mapped[Decimal | None] = mapped_column(Numeric())
     second_half_volume_share: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
     computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class V4PoolIndexCoverageRow(Base):
+    """How far the PoolManager-wide V4 pool index reaches (issue #94).
+
+    Every Initialize the PoolManager emitted from ``deployment_block`` through
+    ``through_block`` is in `v4_pool_index_pools`; ``through_hash`` is that
+    block's hash when it was confirmed, re-checked before the index advances.
+    """
+
+    __tablename__ = "v4_pool_index_coverage"
+    __table_args__ = (
+        CheckConstraint("deployment_block >= 0", name="v4_index_deployment"),
+        CheckConstraint("through_block >= deployment_block - 1", name="v4_index_through"),
+    )
+    chain_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    pool_manager: Mapped[str] = mapped_column(String(42), primary_key=True)
+    deployment_block: Mapped[int] = mapped_column(BigInteger)
+    through_block: Mapped[int] = mapped_column(BigInteger)
+    through_hash: Mapped[str] = mapped_column(String(66))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class V4PoolIndexPoolRow(Base):
+    """One pool the PoolManager initialized, as its Initialize event stated it."""
+
+    __tablename__ = "v4_pool_index_pools"
+    __table_args__ = (
+        Index("ix_v4_index_currency0", "chain_id", "pool_manager", "currency0"),
+        Index("ix_v4_index_currency1", "chain_id", "pool_manager", "currency1"),
+    )
+    chain_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    pool_manager: Mapped[str] = mapped_column(String(42), primary_key=True)
+    pool_id: Mapped[str] = mapped_column(String(66), primary_key=True)
+    currency0: Mapped[str] = mapped_column(String(42))
+    currency1: Mapped[str] = mapped_column(String(42))
+    fee: Mapped[int] = mapped_column(Integer)
+    tick_spacing: Mapped[int] = mapped_column(Integer)
+    hooks: Mapped[str] = mapped_column(String(42))
+    block_number: Mapped[int] = mapped_column(BigInteger)

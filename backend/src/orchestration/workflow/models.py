@@ -451,6 +451,8 @@ POOL_CONTROL_ADDED_KEYS = (
     "protocol_fees_raw",
     "claims_raw",
     "surplus_raw",
+    "pool_discovery_basis",
+    "pool_discovery_from_block",
 )
 
 
@@ -592,6 +594,10 @@ class PoolControlSummary(Immutable):
     protocol_fees_raw: RawAmount | None = None
     claims_raw: RawAmount | None = None
     surplus_raw: RawAmount | None = None
+    # Issue #94: TOKEN_CREATION or MANAGER_HISTORY, and the block pool
+    # discovery started at. Absent on evidence recorded before, and omitted.
+    pool_discovery_basis: Code | None = None
+    pool_discovery_from_block: int | None = Field(default=None, strict=True, ge=0)
 
     @model_validator(mode="after")
     def figures_match_status(self) -> Self:

@@ -44,7 +44,7 @@ def indexed_chain() -> tuple[FakeV4Chain, Pool, Pool]:
             currency0=NATIVE, currency1=OTHER, fee=3000, tick_spacing=60, created_block=DEPLOYED + 5
         ),
         Pool(
-            currency0=MEME, currency1=OTHER, fee=500, tick_spacing=10, created_block=HEAD_BLOCK - 30
+            currency0=MEME, currency1=OTHER, fee=500, tick_spacing=10, created_block=HEAD_BLOCK - 10
         ),
     ]
     return chain, traded, early
@@ -132,7 +132,7 @@ async def test_an_initialize_whose_id_does_not_hash_from_its_key_stops_the_index
 
 async def test_a_transport_failure_keeps_what_was_confirmed(now) -> None:
     chain, _, _ = indexed_chain()
-    chain.fail_at = 40
+    chain.fail_at = 34
     chain.fail_with = ErrorCode.RATE_LIMITED
     store = MemoryPoolIndexStore()
     result = await indexer(chain, store).advance()

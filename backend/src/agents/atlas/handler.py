@@ -432,6 +432,10 @@ def pool_control_summary(
         protocol_fees_raw=None if found is None else raw(found.protocol_fees_raw),
         claims_raw=None if found is None else raw(found.claims_raw),
         surplus_raw=None if found is None else raw(found.surplus_raw),
+        pool_discovery_basis=(
+            census.pool_discovery_basis if census.status == Availability.AVAILABLE else None
+        ),
+        pool_discovery_from_block=census.pool_discovery_from_block,
     )
 
 

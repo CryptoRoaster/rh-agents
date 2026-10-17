@@ -16,7 +16,7 @@ import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Literal, Protocol
 
 from src.agents.atlas.models import AtlasSourceFailure, ChainSnapshot
 from src.agents.atlas.v4.control import (
@@ -50,6 +50,7 @@ from src.agents.atlas.v4.models import (
     V4PoolFacts,
     V4PositionFacts,
 )
+from src.agents.atlas.v4.pool_index import IndexedPool, PoolHistory
 from src.agents.atlas.v4.protocol import (
     CLAIM_TRANSFER_TOPIC,
     EXTSLOAD_SELECTOR,
@@ -234,6 +235,9 @@ class V4PoolCensus:
     # What a contract holding a position NFT is verified to allow. Order is
     # irrelevant: each adapter recognises only its own exact code.
     custody: tuple[PositionCustodyAdapter, ...] = DEFAULT_ADAPTERS
+    # The PoolManager-wide pool index (issue #94). Without one, or when it does
+    # not yet cover the token's creation block, discovery starts at the token.
+    index: PoolHistory | None = None
 
     async def census(self, snapshot: ChainSnapshot, token: str, from_block: int | None) -> V4Census:
         if snapshot.chain != self.chain:
@@ -316,6 +320,15 @@ class V4PoolCensus:
                 PoolControlGap.CENSUS_BOUNDS_EXCEEDED, AtlasSourceFailure.INCOMPLETE_RESULT
             )
         found = await self._initializations(run, deployment.pool_manager, token, from_block, block)
+        basis: Literal["TOKEN_CREATION", "MANAGER_HISTORY"] = "TOKEN_CREATION"
+        discovery_from = from_block
+        if self.index is not None:
+            history = await self.index.history(
+                snapshot.chain_id, deployment.pool_manager, token, from_block
+            )
+            if history is not None:
+                found = self._before_creation(run, history.pools, token, from_block, found)
+                basis, discovery_from = "MANAGER_HISTORY", history.deployment_block
         pools = [await self._pool(run, deployment, item, block) for item in found]
 
         run.phase = PoolControlGap.POSITION_FACTS_INCOMPLETE
@@ -336,6 +349,8 @@ class V4PoolCensus:
             pools=tuple(pools),
             positions=tuple(positions),
             pool_manager_balance_raw=balance,
+            pool_discovery_basis=basis,
+            pool_discovery_from_block=discovery_from,
         )
 
     async def _reconciled(
@@ -489,6 +504,54 @@ class V4PoolCensus:
             # More claims burned than were ever minted: the history is not whole.
             raise _Incomplete(PoolControlGap.CLAIMS_INCONSISTENT, None)
         return owed, protocol, net
+
+    def _before_creation(
+        self,
+        run: _Run,
+        indexed: tuple[IndexedPool, ...],
+        token: str,
+        from_block: int,
+        found: list[InitializeEvent],
+    ) -> list[InitializeEvent]:
+        """The pools the index recorded before the token existed, checked like any Initialize.
+
+        Each must hash from its key, pair the token and predate the token's
+        creation block; none may repeat a pool the live scan found. An entry
+        that fails is refused as a key mismatch: the index is evidence, not trust.
+        """
+        mismatch = _Incomplete(
+            PoolControlGap.POOL_KEY_MISMATCH, AtlasSourceFailure.INVALID_RESPONSE
+        )
+        known = {item.pool_id for item in found}
+        early: list[InitializeEvent] = []
+        for item in indexed:
+            if (
+                pool_id(item.currency0, item.currency1, item.fee, item.tick_spacing, item.hooks)
+                != item.pool_id
+                or token not in (item.currency0, item.currency1)
+                or item.block_number >= from_block
+                or item.pool_id in known
+            ):
+                raise mismatch
+            known.add(item.pool_id)
+            early.append(
+                InitializeEvent(
+                    pool_id=item.pool_id,
+                    currency0=item.currency0,
+                    currency1=item.currency1,
+                    fee=item.fee,
+                    tick_spacing=item.tick_spacing,
+                    hooks=item.hooks,
+                    block_number=item.block_number,
+                )
+            )
+        merged = sorted(early + found, key=lambda item: (item.block_number, item.pool_id))
+        run.pools_found = len(merged)
+        if len(merged) > self.bounds.max_pools:
+            raise _Incomplete(
+                PoolControlGap.CENSUS_BOUNDS_EXCEEDED, AtlasSourceFailure.INCOMPLETE_RESULT
+            )
+        return merged
 
     async def _verify_deployment(self, run: _Run, deployment: V4Deployment, block: int) -> None:
         """Code at every address, and each PositionManager bound to this PoolManager.
