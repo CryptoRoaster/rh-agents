@@ -15,6 +15,7 @@ from src.agents.atlas.policy import evaluate_snapshot
 from src.core.models import LpControlStatus, RiskLimits, RiskOutcome
 from src.orchestration.riskrequest.service import too_old_for
 from src.orchestration.workflow.models import OnchainPayload
+from src.orchestration.workflow.policy import TRADE_CASE_EARLY_V1, TRADE_CASE_V1
 from tests.atlas.v4.chain import POOL_MANAGER
 from tests.atlas.v4.scenarios import build, official_launch
 from tests.lpcontrol.test_lp_control import sentinel
@@ -60,6 +61,9 @@ async def test_a_census_minutes_old_is_not_dated_by_the_holder_observation(
     assert market.lp_control.created_at == now - timedelta(minutes=4)
     # Reported before SENTINEL is asked, as a refreshable stale source.
     assert too_old_for(market, now, RiskLimits()) == "LP_CONTROL_OLDER_THAN_RISK_LIMIT"
+    for policy in (TRADE_CASE_V1, TRADE_CASE_EARLY_V1):
+        declared = policy.refreshable_for_label("LP_CONTROL")
+        assert declared is not None and declared.origin == "ATLAS_ONCHAIN_EVIDENCE"
 
 
 async def test_a_census_inside_the_risk_limit_still_passes(now, intent, context) -> None:
@@ -79,6 +83,8 @@ async def test_a_census_without_its_block_time_is_unknown(now, intent, context) 
     control = payload.intelligence.pool_control.model_copy(
         update={"snapshot_block_timestamp": None}
     )
+    # Such evidence keeps the exact shape it was recorded with.
+    assert "snapshot_block_timestamp" not in control.model_dump(mode="json")
     legacy = payload.model_copy(
         update={"intelligence": payload.intelligence.model_copy(update={"pool_control": control})}
     )

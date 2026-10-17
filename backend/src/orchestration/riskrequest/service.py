@@ -792,6 +792,8 @@ class LpControlFinding(NamedTuple):
     pool_locator_kind: PoolLocatorCode | None = None
     pool_id: str | None = None
     census_block: int | None = None
+    # The census block's chain time, with a PASS: the age SENTINEL judges.
+    census_observed_at: datetime | None = None
 
 
 def lp_control_view(*, snapshot: RecordedMarket, onchain: OnchainPayload) -> LpControlFinding:
@@ -816,8 +818,8 @@ def lp_control_view(*, snapshot: RecordedMarket, onchain: OnchainPayload) -> LpC
         else "BYTES32_POOL_ID"
     )
 
-    def finding(status: LpControlStatus, detail: str, block: int | None = None) -> LpControlFinding:
-        return LpControlFinding(status, detail, kind, pool_id, block)
+    def finding(status: LpControlStatus, detail: str) -> LpControlFinding:
+        return LpControlFinding(status, detail, kind, pool_id)
 
     if locator.kind is PoolLocatorKind.CONTRACT_ADDRESS:
         return finding(LpControlStatus.UNSUPPORTED, "LP_CONTROL_SOURCE_ABSENT")
@@ -846,7 +848,14 @@ def lp_control_view(*, snapshot: RecordedMarket, onchain: OnchainPayload) -> LpC
     unresolved = unresolved_custody(control)
     if unresolved is not None:
         return finding(LpControlStatus.UNKNOWN, unresolved)
-    return finding(LpControlStatus.PASS, LP_CONTROL_V4_POOL_CENSUS, control.snapshot_block)
+    return LpControlFinding(
+        LpControlStatus.PASS,
+        LP_CONTROL_V4_POOL_CENSUS,
+        kind,
+        pool_id,
+        control.snapshot_block,
+        control.snapshot_block_timestamp,
+    )
 
 
 def census_basis_gap(
@@ -858,7 +867,9 @@ def census_basis_gap(
     at. That manager must be the verified V4 deployment of the market's chain,
     and every PositionManager it named one of that deployment's; its chain must
     be the ATLAS evidence's; and its block must be the block that evidence was
-    pinned to, so a census from another read cannot be carried beside it.
+    pinned to, so a census from another read cannot be carried beside it. And
+    its block's chain time must be known: that, not the holder observation
+    beside it, is how old the census is.
     """
     if control.pool_manager is None or control.snapshot_block is None:
         return "V4_POOL_CENSUS_BASIS_INCOMPLETE"
@@ -873,6 +884,8 @@ def census_basis_gap(
         return "V4_CENSUS_POSITION_MANAGER_UNVERIFIED"
     if control.snapshot_block != intelligence.block_number:
         return "V4_CENSUS_BLOCK_MISMATCH"
+    if control.snapshot_block_timestamp is None:
+        return "V4_CENSUS_BLOCK_TIME_UNKNOWN"
     return None
 
 
@@ -975,11 +988,15 @@ def market_view(
         # Issue #92: only a purchase is judged on it. A sale's snapshot keeps
         # the exact shape it always had.
         found = lp_control_view(snapshot=snapshot, onchain=payload)
+        # A PASS is as old as its census block, which ATLAS lets lie minutes
+        # from the holder observation; dating it by that observation would
+        # hand the census a freshness it never had. Without a PASS there is no
+        # census to date, and the finding stands beside the holder facts.
+        lp_control_at = found.census_observed_at or holders.observed_at
         lp_control = LpControlSnapshot(
             id=identity("lp-control"),
-            # Read beside the holder facts, at the same instant.
-            created_at=holders.observed_at,
-            updated_at=holders.observed_at,
+            created_at=lp_control_at,
+            updated_at=lp_control_at,
             source=holders.source,
             correlation_id=correlation_id,
             asset_id=base_asset_id,
@@ -1084,12 +1101,16 @@ def too_old_for(market: MarketSnapshot, now: datetime, limits: RiskLimits) -> st
     reported as a stale reading instead of coming back as a terminal rejection
     of the market. Nothing is loosened to make a source fit.
     """
-    for label, instant in (
+    instants = [
         ("MARKET", market.observed_at),
         ("TOKEN", market.token.created_at),
         ("LIQUIDITY", market.liquidity.created_at),
         ("HOLDERS", market.holders.created_at),
-    ):
+    ]
+    if market.lp_control is not None:
+        # Only a purchase carries it, and SENTINEL then judges its age too.
+        instants.append(("LP_CONTROL", market.lp_control.created_at))
+    for label, instant in instants:
         age = (now - instant).total_seconds()
         if age < 0:
             return f"{label}_OBSERVED_IN_THE_FUTURE"

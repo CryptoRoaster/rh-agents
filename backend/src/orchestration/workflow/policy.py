@@ -333,7 +333,9 @@ TRADE_CASE_V1 = WorkflowPolicy(
     # market, and a configured assumption was never observed at all — declaring
     # either would promise work that cannot be done.
     refreshable_sources=(
-        RefreshableSource("ATLAS_ONCHAIN_EVIDENCE", EvidenceType.ONCHAIN, frozenset({"HOLDERS"})),
+        RefreshableSource(
+            "ATLAS_ONCHAIN_EVIDENCE", EvidenceType.ONCHAIN, frozenset({"HOLDERS", "LP_CONTROL"})
+        ),
         RefreshableSource("ANCHOR_EXECUTION_EVIDENCE", EvidenceType.LIQUIDITY_EXECUTION),
     ),
 )

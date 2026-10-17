@@ -33,6 +33,7 @@ from src.agents.atlas.models import (
     AtlasReasonCode,
     AtlasSafetyDecision,
     AtlasVerdict,
+    ChainSnapshot,
     HolderFacts,
 )
 from src.agents.atlas.policy import ATLAS_POLICY_V1, AtlasPolicy, evaluate_snapshot
@@ -300,13 +301,17 @@ def position_control_record(facts: PositionControlFacts | None) -> PositionContr
 
 
 def pool_control_summary(
-    control: PoolControlFacts | None, raw_top_ten: Decimal | None
+    control: PoolControlFacts | None,
+    raw_top_ten: Decimal | None,
+    chain: ChainSnapshot | None = None,
 ) -> PoolControlSummary | None:
     """The bounded, durable record of a token's V4 pool control.
 
     Every pool is listed (the census caps them); positions are listed largest
     controlled amount first up to a fixed count, and the counts beside them
     always cover all of them. No event list is written, only what it proved.
+    The census block's chain time is recorded only when the census was read at
+    the chain block whose time is known.
     """
     if control is None:
         return None
@@ -336,6 +341,11 @@ def pool_control_summary(
         position_managers=census.position_managers,
         scan_from_block=census.scan_from_block,
         snapshot_block=census.scan_to_block,
+        snapshot_block_timestamp=(
+            chain.block_timestamp
+            if chain is not None and census.scan_to_block == chain.block_number
+            else None
+        ),
         total_supply_raw=raw(control.total_supply_raw),
         pool_manager_balance_raw=raw(census.pool_manager_balance_raw),
         attributed_raw=raw(control.attributed_raw),
@@ -463,7 +473,9 @@ def onchain_payload(
             # a different fact from a row written before the block
             # existed — and the two must not serialise alike.
             holders=holder_distribution(snapshot.holders),
-            pool_control=pool_control_summary(snapshot.pool_control, snapshot.holders.top10_share),
+            pool_control=pool_control_summary(
+                snapshot.pool_control, snapshot.holders.top10_share, snapshot.chain
+            ),
             funding_graph=funding_graph_summary(snapshot.funding_graph),
         ),
     )
