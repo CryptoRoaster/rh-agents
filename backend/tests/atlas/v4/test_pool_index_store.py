@@ -3,7 +3,7 @@
 The same indexer runs against the SQL store as against the in-memory one and
 must end in the same state; coverage moves only from where it was, a pool is
 recorded once, and a rewind drops exactly what lies beyond it. On PostgreSQL
-the schema is created by migration 0025 itself.
+the schema is created by migration 0026 itself.
 """
 
 import importlib.util
@@ -41,8 +41,8 @@ async def store():
     try:
         async with engine.begin() as connection:
             if url:
-                path = Path(__file__).parents[3] / "migrations/versions/0025_v4_pool_index.py"
-                spec = importlib.util.spec_from_file_location("m0025", path)
+                path = Path(__file__).parents[3] / "migrations/versions/0026_v4_pool_index.py"
+                spec = importlib.util.spec_from_file_location("m0026", path)
                 assert spec is not None and spec.loader is not None
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)

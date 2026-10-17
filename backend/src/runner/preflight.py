@@ -528,7 +528,12 @@ class Preflight:
                 f"{settings.early_scout_max_orbit_reviews_per_run}, history reads "
                 f"{settings.early_scout_history_max_requests_per_run} "
                 f"(own transport, {settings.early_scout_history_request_spacing_seconds:g}s "
-                f"apart), refreshes {settings.early_scout_max_refresh_markets_per_run}.",
+                f"apart), refreshes {settings.early_scout_max_refresh_markets_per_run}; "
+                f"page 2 on saturation "
+                f"{'on' if settings.early_scout_discovery_page2_enabled else 'off'} "
+                f"(at most {settings.early_scout_max_discovery_page2_per_day} a day), "
+                f"V4 prefilter "
+                f"{'on' if settings.early_scout_v4_prefilter_enabled else 'off'}.",
             )
         )
         return found

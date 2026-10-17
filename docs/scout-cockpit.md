@@ -100,7 +100,10 @@ ops/scout/uninstall.sh           # unload and remove it (logs stay)
   --locked`, then `alembic upgrade head` — migrate before a release that adds
   columns reaches the scheduler.
 - The agent runs only `python -m src.runner.main --scout-once` from `backend/`,
-  every 900 seconds. It never runs the full PAPER run.
+  every 900 seconds unless installed with `RH_AGENTS_SCOUT_INTERVAL_SECONDS`
+  (300 to 3600; 300 is the five-minute discovery cadence of issue #77, see
+  [early-discovery-watch.md](early-discovery-watch.md#five-minute-discovery-issue-77)).
+  It never runs the full PAPER run.
 - **No overlap.** launchd never starts a job again while the previous run is
   still going. The scout also holds a PostgreSQL advisory lock for the whole
   run, so a manual run and a scheduled one cannot run together either. The

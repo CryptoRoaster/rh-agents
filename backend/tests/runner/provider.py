@@ -150,8 +150,17 @@ class MarketProvider:
         discovery_status: int | None = None,
         networks: dict[str, Any] | None = None,
         discovery_by_network: dict[str, list[dict[str, Any]]] | None = None,
+        discovery_pages: dict[int, list[dict[str, Any]]] | None = None,
+        page_status: dict[int, int] | None = None,
     ) -> None:
         self.discovery = discovery if discovery is not None else []
+        # New pools by page number, for a test of pagination. Page 1 falls back
+        # to `discovery` when absent; any other missing page is empty.
+        self.discovery_pages = discovery_pages
+        # A failure on one page of the new-pool read alone.
+        self.page_status = page_status if page_status is not None else {}
+        # The page number of every new-pool read, in order.
+        self.discovery_page_numbers: list[int] = []
         # Per-network new pools, for a test with more than one chain.
         self.discovery_by_network = discovery_by_network
         # What `pools/multi` knows about, by address. Anything not here is a
@@ -183,6 +192,15 @@ class MarketProvider:
         if self.status is not None:
             return httpx.Response(self.status, text=json.dumps({"errors": [{"status": "boom"}]}))
         if path.endswith("new_pools"):
+            page = int(request.url.params.get("page", "1"))
+            self.discovery_page_numbers.append(page)
+            if page in self.page_status:
+                return httpx.Response(
+                    self.page_status[page], text=json.dumps({"errors": [{"status": "boom"}]})
+                )
+            if self.discovery_pages is not None:
+                fallback = self.discovery if page == 1 else []
+                return self._json(document(self.discovery_pages.get(page, fallback)))
             if self.discovery_status is not None:
                 return httpx.Response(
                     self.discovery_status, text=json.dumps({"errors": [{"status": "boom"}]})
