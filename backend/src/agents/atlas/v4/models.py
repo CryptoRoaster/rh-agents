@@ -25,7 +25,11 @@ from src.agents.atlas.primitives import (
     Immutable,
     Ratio,
 )
-from src.agents.atlas.v4.control import PositionControlFacts
+from src.agents.atlas.v4.control import (
+    CONTROLLED_STATES,
+    PositionControlFacts,
+    PositionControlState,
+)
 from src.markets.models import Availability
 
 # Bounds on what one snapshot may carry. Exceeding one is never a silent cut:
@@ -154,6 +158,9 @@ class V4PositionFacts(Immutable):
     # as a collect would pay them. Only with a complete reconciliation.
     uncollected_token_raw: int | None = Field(default=None, ge=0)
     owner_is_creator: bool | None = None
+    # Whether the controller -- who can take the principal now -- is the
+    # receipt-verified creator. None unless both are known.
+    controller_is_creator: bool | None = None
     # What the NFT owner means for control. Present exactly for a
     # PositionManager position whose `ownerOf` was read; the raw owner above
     # stays what the chain said.
@@ -180,6 +187,24 @@ class V4PositionFacts(Immutable):
         ):
             raise ValueError("Control facts describe this position's own NFT")
         return self
+
+    @property
+    def withdrawal(self) -> str:
+        """Whether this position's principal can be withdrawn now, as far as is known.
+
+        RESTRICTED: verified permanently locked. WITHDRAWABLE: an established
+        controller can take it now -- an account's NFT, a released timelock's
+        operator, an account's own direct position. UNRESOLVED: anything else.
+        """
+        if self.control is not None:
+            if self.control.control_state == PositionControlState.PERMANENTLY_LOCKED:
+                return "RESTRICTED"
+            if self.control.control_state in CONTROLLED_STATES:
+                return "WITHDRAWABLE"
+            return "UNRESOLVED"
+        if self.kind == PositionKind.DIRECT and self.owner is not None:
+            return "WITHDRAWABLE"
+        return "UNRESOLVED"
 
     @property
     def controller(self) -> str | None:

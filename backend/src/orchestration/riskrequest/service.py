@@ -94,6 +94,7 @@ from src.orchestration.workflow.models import (
     LiquidityExecutionPayload,
     OnchainIntelligence,
     OnchainPayload,
+    PoolControlPool,
     PoolControlSummary,
     TradeCase,
     TradeCaseStatus,
@@ -845,9 +846,15 @@ def lp_control_view(*, snapshot: RecordedMarket, onchain: OnchainPayload) -> LpC
             # the market's pool runs through.
             return finding(LpControlStatus.BLOCKED, "V4_HOOK_CREATOR_CONTROLLED")
         return finding(LpControlStatus.UNKNOWN, "V4_HOOK_UNVERIFIED")
+    if pool.positions_creator_withdrawable:
+        # Established: the creator can take the market's liquidity now.
+        return finding(LpControlStatus.BLOCKED, "V4_CREATOR_CAN_WITHDRAW")
     unresolved = unresolved_custody(control)
     if unresolved is not None:
         return finding(LpControlStatus.UNKNOWN, unresolved)
+    restricted = withdrawal_unrestricted(pool)
+    if restricted is not None:
+        return finding(LpControlStatus.UNKNOWN, restricted)
     return LpControlFinding(
         LpControlStatus.PASS,
         LP_CONTROL_V4_POOL_CENSUS,
@@ -921,6 +928,33 @@ def unresolved_custody(control: PoolControlSummary) -> str | None:
         raw not in (None, "0") for raw in (control.timelocked_raw, control.unknown_custody_raw)
     ):
         return "V4_POSITION_CONTROL_UNRESOLVED"
+    return None
+
+
+def withdrawal_unrestricted(pool: PoolControlPool) -> str | None:
+    """Why some of the market pool's liquidity could be withdrawn now, if any could.
+
+    Issue #97. Known control is not restricted withdrawal: an account holding a
+    position can remove it in the next block, and nobody here can tell a third
+    party from the creator's other wallet. So a purchase passes only when every
+    position in the market's own pool is verified permanently locked. (One the
+    verified creator can withdraw is BLOCKED before this is asked.) Positions in
+    the token's other pools cannot drain this one; their custody is judged by
+    `unresolved_custody`.
+    """
+    counts = (
+        pool.positions_total,
+        pool.positions_withdrawal_restricted,
+        pool.positions_withdrawable,
+    )
+    if any(value is None for value in counts):
+        # Recorded before withdrawal was counted.
+        return "V4_WITHDRAWAL_RESTRICTION_UNKNOWN"
+    if pool.positions_withdrawable:
+        return "V4_LIQUIDITY_WITHDRAWABLE"
+    if not pool.positions_total or pool.positions_withdrawal_restricted != pool.positions_total:
+        # No position to lock anything, or one whose withdrawal is unresolved.
+        return "V4_WITHDRAWAL_RESTRICTION_UNKNOWN"
     return None
 
 

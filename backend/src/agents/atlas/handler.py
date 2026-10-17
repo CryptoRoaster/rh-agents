@@ -39,7 +39,7 @@ from src.agents.atlas.models import (
 from src.agents.atlas.policy import ATLAS_POLICY_V1, AtlasPolicy, evaluate_snapshot
 from src.agents.atlas.prompt import ATLAS_INSTRUCTIONS, ATLAS_PROMPT_HASH, ATLAS_PROMPT_VERSION
 from src.agents.atlas.v4.control import PositionControlFacts
-from src.agents.atlas.v4.models import PoolControlFacts
+from src.agents.atlas.v4.models import PoolControlFacts, V4Census
 from src.agents.atlas.validation import AtlasValidationError, validate_assessment
 from src.core.clock import Clock, SystemClock
 from src.core.models import AgentRole
@@ -383,6 +383,7 @@ def pool_control_summary(
                 hook_owner_is_creator=(
                     None if pool.hook_facts is None else pool.hook_facts.owner_is_creator
                 ),
+                **withdrawal_counts(census, pool.pool_id),
             )
             for pool in census.pools
         ),
@@ -432,6 +433,22 @@ def pool_control_summary(
         claims_raw=None if found is None else raw(found.claims_raw),
         surplus_raw=None if found is None else raw(found.surplus_raw),
     )
+
+
+def withdrawal_counts(census: V4Census, pool: str) -> dict[str, int]:
+    """How many of the pool's positions are locked, withdrawable, and by the creator."""
+    held = [item for item in census.positions if item.pool_id == pool]
+    withdrawable = [item for item in held if item.withdrawal == "WITHDRAWABLE"]
+    return {
+        "positions_total": len(held),
+        "positions_withdrawal_restricted": sum(
+            1 for item in held if item.withdrawal == "RESTRICTED"
+        ),
+        "positions_withdrawable": len(withdrawable),
+        "positions_creator_withdrawable": sum(
+            1 for item in withdrawable if item.controller_is_creator is True
+        ),
+    }
 
 
 def onchain_payload(

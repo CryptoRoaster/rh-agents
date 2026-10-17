@@ -155,3 +155,52 @@ async def test_a_locked_launch_alone_passes(now, intent, context) -> None:
     (market,) = [p for p in payload.intelligence.pool_control.pools if p.pool_id == pool_id]
     assert (market.positions_total, market.positions_withdrawal_restricted) == (1, 1)
     assert (market.positions_withdrawable, market.positions_creator_withdrawable) == (0, 0)
+
+
+async def test_a_market_pool_without_withdrawal_counts_is_unknown(now) -> None:
+    from src.orchestration.riskrequest.service import lp_control_view
+    from tests.lpcontrol.test_lp_control import recorded
+
+    payload, pool_id = await launch(now)
+    assert payload.intelligence is not None and payload.intelligence.pool_control is not None
+    control = payload.intelligence.pool_control
+    snapshot = recorded(now, pool_id=pool_id)
+    assert lp_control_view(snapshot=snapshot, onchain=payload)[0] is LpControlStatus.PASS
+
+    def with_market(**changes: object) -> OnchainPayload:
+        pools = tuple(
+            item.model_copy(update=changes) if item.pool_id == pool_id else item
+            for item in control.pools
+        )
+        updated = control.model_copy(update={"pools": pools})
+        assert payload.intelligence is not None
+        return payload.model_copy(
+            update={
+                "intelligence": payload.intelligence.model_copy(update={"pool_control": updated})
+            }
+        )
+
+    legacy = {
+        key: None
+        for key in (
+            "positions_total",
+            "positions_withdrawal_restricted",
+            "positions_withdrawable",
+            "positions_creator_withdrawable",
+        )
+    }
+    # Evidence recorded before the counts keeps its exact shape...
+    legacy_pool = next(p for p in control.pools if p.pool_id == pool_id).model_copy(update=legacy)
+    assert not set(legacy) & set(legacy_pool.model_dump(mode="json"))
+    cases = {
+        "legacy": legacy,
+        "unresolved_position": {"positions_total": 2},
+        "no_position": {"positions_total": 0, "positions_withdrawal_restricted": 0},
+    }
+    for label, changes in cases.items():
+        status, detail = lp_control_view(snapshot=snapshot, onchain=with_market(**changes))[:2]
+        # ...and passes nothing.
+        assert (status, detail) == (
+            LpControlStatus.UNKNOWN,
+            "V4_WITHDRAWAL_RESTRICTION_UNKNOWN",
+        ), label
