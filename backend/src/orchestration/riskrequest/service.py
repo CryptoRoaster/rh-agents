@@ -911,6 +911,11 @@ def census_basis_gap(
 RESOLVED_CONTROL_STATES = frozenset({"DIRECT_CONTROL", "RELEASABLE", "PERMANENTLY_LOCKED"})
 
 
+# Reconciliation gaps that say the census contradicts itself, not that a read
+# was merely unavailable.
+INCONSISTENT_RECONCILIATION = frozenset({"V4_POOL_BALANCE_DEFICIT", "V4_CLAIMS_INCONSISTENT"})
+
+
 def unresolved_custody(control: PoolControlSummary) -> str | None:
     """Why some liquidity in the census has no established controller, if any does.
 
@@ -925,6 +930,10 @@ def unresolved_custody(control: PoolControlSummary) -> str | None:
     """
     if control.positions_unattributed != 0:
         return "V4_POSITION_OWNER_UNKNOWN"
+    if control.reconciliation_gap in INCONSISTENT_RECONCILIATION:
+        # The reconciliation read liabilities the balance cannot hold: the
+        # census misread something, whatever the remainder looks like.
+        return "V4_POOL_BALANCE_INCONSISTENT"
     if control.unattributed_raw != "0":
         return unexplained_remainder(control)
     if control.basis != "EXACT":
