@@ -837,9 +837,19 @@ def lp_control_view(*, snapshot: RecordedMarket, onchain: OnchainPayload) -> LpC
     )
     if unbound is not None:
         return finding(LpControlStatus.UNKNOWN, unbound)
+    manager = locator.pool_manager_address
+    if manager is not None and manager != control.pool_manager:
+        # The market says it trades on a PoolManager other than the verified
+        # one the census read: the same pool id there is another pool.
+        return finding(LpControlStatus.UNKNOWN, "V4_MARKET_POOL_MANAGER_MISMATCH")
     pool = next((item for item in control.pools if item.pool_id == pool_id), None)
     if pool is None or not pool.initialized:
         return finding(LpControlStatus.UNKNOWN, "V4_MARKET_POOL_NOT_IN_CENSUS")
+    token = snapshot.pair.base.asset_id.rsplit(":", 1)[-1].lower()
+    if token not in (pool.currency0, pool.currency1):
+        # Issue #98: checked here, not left to the producer. The evidence is
+        # about the market's own token, or it is not evidence for this market.
+        return finding(LpControlStatus.UNKNOWN, "V4_MARKET_POOL_TOKEN_MISMATCH")
     if pool.hook != NO_HOOK:
         if pool.hook_owner_is_creator is True:
             # Established: the creator owns the code every liquidity change in
