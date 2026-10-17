@@ -21,18 +21,31 @@ INITIALIZE_TOPIC = (
 MODIFY_LIQUIDITY_TOPIC = (
     "0x" + keccak256(b"ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)").hex()
 )
+# The PoolManager's own ERC-6909 claims (`ERC6909.sol` in v4-core): caller and
+# amount in data; from, to and the currency id indexed.
+CLAIM_TRANSFER_TOPIC = "0x" + keccak256(b"Transfer(address,address,address,uint256,uint256)").hex()
 
 OWNER_SELECTOR = selector("owner()")
 OWNER_OF_SELECTOR = selector("ownerOf(uint256)")
 EXTSLOAD_SELECTOR = selector("extsload(bytes32)")
 POOL_MANAGER_SELECTOR = selector("poolManager()")
 POOL_AND_POSITION_INFO_SELECTOR = selector("getPoolAndPositionInfo(uint256)")
+PROTOCOL_FEES_ACCRUED_SELECTOR = selector("protocolFeesAccrued(address)")
 
 # `StateLibrary.POOLS_SLOT` and `POSITIONS_OFFSET` in v4-core: pools live in a
 # mapping at slot 6, and inside `Pool.State` the positions mapping is the
 # seventh member (offset 6).
 POOLS_SLOT = 6
 POSITIONS_OFFSET = 6
+# `Pool.State`: slot0, feeGrowthGlobal0X128, feeGrowthGlobal1X128, liquidity,
+# ticks, tickBitmap, positions. `TickInfo`: the packed liquidity word, then
+# feeGrowthOutside0X128 and feeGrowthOutside1X128. `Position.State`: liquidity,
+# then feeGrowthInside0LastX128 and feeGrowthInside1LastX128. Each fee-growth
+# pair is consecutive, currency0 first, so currency `c` sits at `base + 1 + c`.
+FEE_GROWTH_GLOBAL0_OFFSET = 1
+TICKS_OFFSET = 4
+FEE_GROWTH_OUTSIDE0_OFFSET = 1
+FEE_GROWTH_INSIDE0_LAST_OFFSET = 1
 
 ZERO_ADDRESS = "0x" + "0" * 40
 WORD = re.compile(r"^0x[0-9a-f]{64}$")
@@ -140,6 +153,38 @@ def position_slot(pool: str, owner: str, tick_lower: int, tick_upper: int, salt:
     mapping = pool_state_slot(pool) + POSITIONS_OFFSET
     key = position_key(owner, tick_lower, tick_upper, salt)
     return int.from_bytes(keccak256(key + word(mapping)), "big")
+
+
+def fee_growth_global_slot(pool: str, currency: int) -> int:
+    """`pools[poolId].feeGrowthGlobal{currency}X128`."""
+    return pool_state_slot(pool) + FEE_GROWTH_GLOBAL0_OFFSET + currency
+
+
+def tick_info_slot(pool: str, tick: int) -> int:
+    """`StateLibrary._getTickInfoSlot`: keccak256(int256(tick), ticks mapping slot)."""
+    mapping = pool_state_slot(pool) + TICKS_OFFSET
+    return int.from_bytes(keccak256(word(tick) + word(mapping)), "big")
+
+
+def fee_growth_outside_slot(pool: str, tick: int, currency: int) -> int:
+    """`pools[poolId].ticks[tick].feeGrowthOutside{currency}X128`."""
+    return tick_info_slot(pool, tick) + FEE_GROWTH_OUTSIDE0_OFFSET + currency
+
+
+def fee_growth_inside_last_slot(
+    pool: str, owner: str, tick_lower: int, tick_upper: int, salt: str, currency: int
+) -> int:
+    """`pools[poolId].positions[key].feeGrowthInside{currency}LastX128`."""
+    return (
+        position_slot(pool, owner, tick_lower, tick_upper, salt)
+        + FEE_GROWTH_INSIDE0_LAST_OFFSET
+        + currency
+    )
+
+
+def currency_id_topic(currency: str) -> str:
+    """The indexed ERC-6909 id of a currency: `uint160(currency)` as a topic."""
+    return "0x" + word(int(currency, 16)).hex()
 
 
 def slot_word(slot: int) -> str:
@@ -277,6 +322,34 @@ def decode_pool_and_position_info(data: str) -> PositionInfo:
         tick_upper=upper - (1 << 24) if upper >> 23 else upper,
         truncated_pool_id=info >> 56,
     )
+
+
+@dataclass(frozen=True)
+class ClaimTransfer:
+    sender: str
+    receiver: str
+    currency_id: int
+    amount: int
+    block_number: int
+
+
+def decode_claim_transfer(topics: tuple[str, ...], data: str, block_number: int) -> ClaimTransfer:
+    if len(topics) != 4 or topics[0] != CLAIM_TRANSFER_TOPIC:
+        raise V4DecodeError("not an ERC-6909 Transfer event")
+    caller, amount = words(data, 2)
+    as_address(caller)
+    return ClaimTransfer(
+        sender=topic_address(topics[1]),
+        receiver=topic_address(topics[2]),
+        currency_id=as_unsigned(int(topics[3], 16), 160),
+        amount=amount,
+        block_number=block_number,
+    )
+
+
+def decode_uint256(data: str) -> int:
+    (value,) = words(data, 1)
+    return value
 
 
 def decode_address_result(data: str) -> str:

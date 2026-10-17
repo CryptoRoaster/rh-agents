@@ -14,8 +14,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from src.agents.atlas.v4.census import ChainLog
-from src.agents.atlas.v4.math import position_amounts, sqrt_price_at_tick
+from src.agents.atlas.v4.math import (
+    fee_growth_inside,
+    fees_owed,
+    position_amounts,
+    sqrt_price_at_tick,
+)
 from src.agents.atlas.v4.protocol import (
+    CLAIM_TRANSFER_TOPIC,
     EXTSLOAD_SELECTOR,
     INITIALIZE_TOPIC,
     MODIFY_LIQUIDITY_TOPIC,
@@ -23,6 +29,11 @@ from src.agents.atlas.v4.protocol import (
     OWNER_SELECTOR,
     POOL_AND_POSITION_INFO_SELECTOR,
     POOL_MANAGER_SELECTOR,
+    PROTOCOL_FEES_ACCRUED_SELECTOR,
+    currency_id_topic,
+    fee_growth_global_slot,
+    fee_growth_inside_last_slot,
+    fee_growth_outside_slot,
     pool_id,
     pool_state_slot,
     position_slot,
@@ -115,8 +126,21 @@ class FakeV4Chain:
     slots: dict[tuple[str, str], int] = field(default_factory=dict)
     # A manager bound to some other PoolManager, for verification failures.
     manager_binding: dict[str, str] = field(default_factory=dict)
-    # Token units the PoolManager holds beyond every position: fees, rounding.
+    # Token units the PoolManager holds beyond every liability -- principal,
+    # fees owed, protocol fees and claims: rounding dust, stray transfers.
     extra_pool_balance: int = 0
+    # Fee growth, per currency index (0, 1), exactly as the PoolManager stores
+    # it: the pool's global accumulators, each initialized tick's outside
+    # values, and each position's inside value at its last update. Absent: 0.
+    fee_growth_global: dict[str, tuple[int, int]] = field(default_factory=dict)
+    fee_growth_outside: dict[tuple[str, int], tuple[int, int]] = field(default_factory=dict)
+    fee_growth_inside_last: dict[tuple[str, str, int, int, str], tuple[int, int]] = field(
+        default_factory=dict
+    )
+    # `protocolFeesAccrued(token)`. None: the call reverts.
+    protocol_fees: int | None = 0
+    # ERC-6909 claim transfers of the token's id: (from, to, amount, block).
+    claim_transfers: list[tuple[str, str, int, int]] = field(default_factory=list)
     # Fail the n-th request (1-based) with this error.
     fail_at: int | None = None
     fail_with: ErrorCode = ErrorCode.TIMEOUT
@@ -204,8 +228,50 @@ class FakeV4Chain:
             held[key] = amount0 if pool.currency0 == self.token else amount1
         return held
 
+    def side(self, pool: Pool) -> int:
+        return 0 if pool.currency0 == self.token else 1
+
+    def owed(self, block: int) -> dict[tuple[str, str, int, int, str], int]:
+        """Token-side fees each active position is owed, with the protocol's math."""
+        by_id = {pool.id: pool for pool in self.pools}
+        found: dict[tuple[str, str, int, int, str], int] = {}
+        for key, liquidity in self.net_liquidity(block).items():
+            if liquidity <= 0:
+                continue
+            pool = by_id[key[0]]
+            side = self.side(pool)
+            inside = fee_growth_inside(
+                pool.tick,
+                key[2],
+                key[3],
+                self.fee_growth_global.get(pool.id, (0, 0))[side],
+                self.fee_growth_outside.get((pool.id, key[2]), (0, 0))[side],
+                self.fee_growth_outside.get((pool.id, key[3]), (0, 0))[side],
+            )
+            last = self.fee_growth_inside_last.get(key, (0, 0))[side]
+            found[key] = fees_owed(inside, last, liquidity)
+        return found
+
+    def claims(self, block: int) -> int:
+        minted = sum(a for f, _, a, b in self.claim_transfers if f == NATIVE and b <= block)
+        burned = sum(a for _, t, a, b in self.claim_transfers if t == NATIVE and b <= block)
+        return minted - burned
+
+    def accrue(self, pool: Pool, growth: int) -> None:
+        """Token-side fee growth on ``pool``: every in-range position earns it."""
+        side = self.side(pool)
+        pair = [0, 0]
+        pair[side] = growth
+        self.fee_growth_global[pool.id] = (pair[0], pair[1])
+
     def pool_balance(self, block: int) -> int:
-        return sum(self.controlled(block).values()) + self.extra_pool_balance
+        return (
+            sum(self.controlled(block).values())
+            + sum(self.owed(block).values())
+            + (self.protocol_fees or 0)
+            + self.claims(block)
+            + self.extra_pool_balance
+        )
 
     # --------------------------------------------------------------------- port
 
@@ -259,6 +325,23 @@ class FakeV4Chain:
                         ),
                     )
                 )
+        elif topics[0] == CLAIM_TRANSFER_TOPIC:
+            if topics[3] == currency_id_topic(self.token):
+                for sender, receiver, amount, block in self.claim_transfers:
+                    if not start <= block <= end:
+                        continue
+                    found.append(
+                        ChainLog(
+                            block_number=block,
+                            topics=(
+                                CLAIM_TRANSFER_TOPIC,
+                                address_topic(sender),
+                                address_topic(receiver),
+                                currency_id_topic(self.token),
+                            ),
+                            data="0x" + word(int(sender, 16)).hex() + word(amount).hex(),
+                        )
+                    )
         elif topics[0] == MODIFY_LIQUIDITY_TOPIC:
             for change in self.changes:
                 if change.pool.id != topics[1] or not start <= change.block <= end:
@@ -325,6 +408,10 @@ class FakeV4Chain:
         value = int(argument, 16)
         if address == self.pool_manager and selector == EXTSLOAD_SELECTOR:
             return hex_word(self._storage(value, block))
+        if address == self.pool_manager and selector == PROTOCOL_FEES_ACCRUED_SELECTOR:
+            if self.protocol_fees is None:
+                raise RuntimeFailure(ErrorCode.RPC_ERROR)
+            return hex_word(self.protocol_fees if value == int(self.token, 16) else 0)
         if address in self.position_managers and selector == OWNER_OF_SELECTOR:
             owner = self.nft_owners.get((address, value))
             if owner is None:
@@ -338,6 +425,17 @@ class FakeV4Chain:
         for pool in self.pools:
             if pool_state_slot(pool.id) == slot:
                 return pool.sqrt_price | ((pool.tick % (1 << 24)) << 160)
+            for currency in (0, 1):
+                if fee_growth_global_slot(pool.id, currency) == slot:
+                    return self.fee_growth_global.get(pool.id, (0, 0))[currency]
+        for (pool_key, tick), values in self.fee_growth_outside.items():
+            for currency in (0, 1):
+                if fee_growth_outside_slot(pool_key, tick, currency) == slot:
+                    return values[currency]
+        for key, values in self.fee_growth_inside_last.items():
+            for currency in (0, 1):
+                if fee_growth_inside_last_slot(*key, currency) == slot:
+                    return values[currency]
         for key, liquidity in self.net_liquidity(block).items():
             if position_slot(*key) == slot:
                 if self.tamper_liquidity is not None:
