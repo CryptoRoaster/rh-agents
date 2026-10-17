@@ -29,8 +29,9 @@ Two tables (migration `0025`):
 4. Reads `Initialize` logs of the PoolManager (no token filter) window by
    window up to `head − confirmations`, checks that every pool id hashes from
    its key and occurs once, and stores each window atomically together with the
-   hash of its last block — only if that hash was the same before and after
-   the logs were read, and only if the coverage did not move meanwhile.
+   hash of its last block — only if its parent is still the confirmed block,
+   that hash was the same before and after the logs were read, and the
+   coverage did not move meanwhile.
 5. Every read counts against `max_requests`; running out keeps what was
    confirmed (`PARTIAL`), and the next run resumes there. A failed read is never
    "no pools".
@@ -71,12 +72,12 @@ by its block time (PR #95).
 | Step | Reads | Estimate |
 |---|---|---|
 | Locate and verify the deployment block | `eth_getCode` ~log2(head) + 2 | ~30 |
-| Backfill from deployment to head | 1 `eth_getLogs` + 2 headers (before and after) per 100 000-block window | Robinhood ≈ 10 blocks/s, so ≈ 3 × (chain age in blocks / 100 000); at ~77 M blocks ≈ 2 310 |
+| Backfill from deployment to head | 1 `eth_getLogs` + 3 headers (parent, and the last block before and after) per 100 000-block window | Robinhood ≈ 10 blocks/s, so ≈ 4 × (chain age in blocks / 100 000); at ~77 M blocks ≈ 3 080 |
 | Window narrowing on provider caps | extra `eth_getLogs` per refused window | budget ×1.2 |
-| Incremental run every 5 minutes | ~3 000 blocks: chain id, head, tip hash, 1 log read, 2 headers | ~6 per run, ~1 730 per day |
+| Incremental run every 5 minutes | ~3 000 blocks: chain id, head, tip hash, 1 log read, 3 headers | ~7 per run, ~2 020 per day |
 
 The PoolManager emits roughly 2 000 Initialize events per day on Robinhood
 (shadow run B: ≈ 55 % of 3 741 new pools a day are V4-style), far below the
 5 000-log cap per window. Run the backfill in several bounded calls (for
-example `--max-requests 600` four times) and compare the result with a second,
+example `--max-requests 800` four times) and compare the result with a second,
 independent RPC endpoint before enabling the census setting.

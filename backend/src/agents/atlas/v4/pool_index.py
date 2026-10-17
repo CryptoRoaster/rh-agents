@@ -234,6 +234,11 @@ class V4PoolIndexer:
 
     async def _window(self, coverage: IndexCoverage, safe: int) -> IndexCoverage:
         start = coverage.through_block + 1
+        if coverage.through_block >= 0:
+            # The window must extend the branch the coverage was confirmed on.
+            self._spend()
+            if await self.reads.block_hash(coverage.through_block) != coverage.through_hash:
+                raise IndexConflict("the confirmed block changed before the window was read")
         span = self.window
         while True:
             end = min(start + span - 1, safe)
