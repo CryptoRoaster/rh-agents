@@ -209,3 +209,26 @@ async def test_a_collector_outside_an_incomplete_holder_list_is_not_exact(now) -
     payload = atlas_payload(snapshot, evaluate_snapshot(snapshot, now))
     found = lp_control_view(snapshot=recorded(now, pool_id=pool.id), onchain=payload)
     assert found[0] is LpControlStatus.UNKNOWN
+
+
+async def test_a_complete_credit_that_does_not_add_up_is_not_trusted(now) -> None:
+    # Review N4: the decision re-checks the credit's own figures.
+    def configure(chain: FakeV4Chain, pool: Pool) -> None:
+        chain.accrue(side_pool(chain, pool), GROWTH)
+        chain.extra_pool_balance = 13
+
+    chain, pool = launch(configure)
+    control, found = await judged(now, chain, pool)
+    assert found[0] is LpControlStatus.PASS, found.detail
+    from src.orchestration.riskrequest.service import unresolved_custody
+
+    credited = int(control.remainder_credited_raw or "0")
+    cases = {
+        "uncredited": {"remainder_uncredited_raw": "1"},
+        "uncredited_absent": {"remainder_uncredited_raw": None},
+        "short": {"remainder_credited_raw": str(credited - 1)},
+        "unowned_beyond_surplus": {"remainder_unowned_raw": "14"},
+        "unowned_without_history": {"pool_discovery_basis": "TOKEN_CREATION"},
+    }
+    for label, changes in cases.items():
+        assert unresolved_custody(control.model_copy(update=changes)) is not None, label
