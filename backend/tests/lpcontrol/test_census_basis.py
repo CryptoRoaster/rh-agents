@@ -147,36 +147,114 @@ async def test_an_incomplete_or_foreign_position_manager_basis_is_unknown(
         )
 
 
+SNAPSHOT_MODELS = frozenset({"MarketSnapshot", "LpControlSnapshot"})
+FACTORIES = frozenset(
+    {"model_validate", "model_validate_json", "model_validate_strings", "model_construct"}
+)
+
+
+def snapshot_producers(text: str, where: str, *, in_core: bool = False) -> list[str]:
+    """Every call in ``text`` that builds a SENTINEL snapshot or its LP control.
+
+    Issue #98: any way of naming the two models counts -- imported names and
+    their aliases, the module imported whole or relatively -- and every
+    constructor, validator, `model_construct` and `lp_control` `model_copy`.
+    """
+    import ast
+
+    tree = ast.parse(text)
+    names: set[str] = set(SNAPSHOT_MODELS) if in_core and where.endswith("models.py") else set()
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            core_models = module == "src.core.models" or (
+                bool(node.level)
+                and (module.endswith("core.models") or (in_core and module == "models"))
+            )
+            for alias in node.names:
+                if core_models and alias.name in SNAPSHOT_MODELS:
+                    names.add(alias.asname or alias.name)
+                if (module == "src.core" or (node.level and module in ("", "core"))) and (
+                    alias.name == "models"
+                ):
+                    modules.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "src.core.models":
+                    modules.add(alias.asname or alias.name)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+            if node.value.id in names:
+                names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+
+    def is_model(expr: ast.expr) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id in names
+        if isinstance(expr, ast.Attribute) and expr.attr in SNAPSHOT_MODELS:
+            dotted = ast.unparse(expr.value)
+            return dotted in modules or dotted == "src.core.models"
+        return False
+
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if is_model(func):
+            found.append(where)
+        elif isinstance(func, ast.Attribute) and func.attr in FACTORIES and is_model(func.value):
+            found.append(f"{where}:{func.attr}")
+        elif isinstance(func, ast.Attribute) and func.attr == "model_copy":
+            if "lp_control" in ast.dump(node):
+                found.append(f"{where}:model_copy")
+    return found
+
+
 def test_the_market_view_is_the_only_producer_of_a_sentinel_snapshot() -> None:
     """LP control binds to the traded pool where it is derived: in the market view,
     from the market's own pool locator. SENTINEL's snapshot carries no pool of its
     own to compare against, so a second producer could pair any evidence with any
     market. There is none; this keeps it that way.
     """
-    import ast
     from pathlib import Path
 
     source = Path(__file__).resolve().parents[2] / "src"
-    producers = []
-    for path in sorted(source.rglob("*.py")):
-        tree = ast.parse(path.read_text())
-        names = {
-            alias.asname or alias.name
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module == "src.core.models"
-            for alias in node.names
-            if alias.name == "MarketSnapshot"
+    producers = sorted(
+        {
+            item
+            for path in source.rglob("*.py")
+            for item in snapshot_producers(
+                path.read_text(),
+                str(path.relative_to(source)),
+                in_core=path.parent.name == "core",
+            )
         }
-        if path.name == "models.py" and path.parent.name == "core":
-            names.add("MarketSnapshot")
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                func = node.func
-                called = func.id if isinstance(func, ast.Name) else None
-                if called in names:
-                    producers.append(str(path.relative_to(source)))
-                if isinstance(func, ast.Attribute) and func.attr == "model_copy":
-                    keywords = ast.dump(node)
-                    if "lp_control" in keywords:
-                        producers.append(f"{path.relative_to(source)}:model_copy")
-    assert producers == ["orchestration/riskrequest/service.py"]
+    )
+    # The market view builds both; SENTINEL and the executor only re-validate
+    # what they were handed, which produces nothing new.
+    assert producers == [
+        "execution/paper.py:model_validate_json",
+        "orchestration/riskrequest/service.py",
+        "risk/engine.py:model_validate_json",
+    ]
+
+
+def test_the_guard_sees_every_way_of_naming_the_models() -> None:
+    evasions = {
+        "validate": "from src.core.models import MarketSnapshot\nMarketSnapshot.model_validate({})",
+        "json": "from src.core.models import MarketSnapshot as S\nS.model_validate_json('')",
+        "construct": "from src.core.models import MarketSnapshot\nMarketSnapshot.model_construct()",
+        "module": "from src.core import models\nmodels.MarketSnapshot()",
+        "module_alias": "import src.core.models as m\nm.MarketSnapshot()",
+        "relative": "from ...core.models import MarketSnapshot\nMarketSnapshot()",
+        "relative_module": "from ...core import models\nmodels.LpControlSnapshot()",
+        "lp_control": "from src.core.models import LpControlSnapshot as L\nL()",
+        "rename": "from src.core.models import MarketSnapshot\nM = MarketSnapshot\nM()",
+        "copy": "snapshot.model_copy(update={'lp_control': forged})",
+    }
+    for label, text in evasions.items():
+        assert snapshot_producers(text, "x.py"), label
+    assert not snapshot_producers(
+        "from src.markets.models import MarketSnapshot\nMarketSnapshot()", "x.py"
+    )
