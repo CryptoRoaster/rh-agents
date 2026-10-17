@@ -163,7 +163,7 @@ async def test_claims_minted_and_burned_again_leave_nothing(now, intent, context
     refused(now, intent, context, payload, pool_id, "V4_POOL_FEES_NOT_CREDITED")
 
 
-async def test_a_balance_below_the_liabilities_is_unattributed(now, intent, context) -> None:
+async def test_a_balance_below_the_liabilities_is_inconsistent(now, intent, context) -> None:
     # The PoolManager cannot owe more than it holds; a census that says so
     # missed or misread something.
     def configure(chain: FakeV4Chain, pool) -> None:
@@ -174,7 +174,7 @@ async def test_a_balance_below_the_liabilities_is_unattributed(now, intent, cont
     control = census(payload)
     assert control.reconciliation_status == "INCOMPLETE"
     assert control.reconciliation_gap == "V4_POOL_BALANCE_DEFICIT"
-    refused(now, intent, context, payload, pool_id, "V4_POOL_BALANCE_UNATTRIBUTED")
+    refused(now, intent, context, payload, pool_id, "V4_POOL_BALANCE_INCONSISTENT")
 
 
 async def test_an_unreadable_liability_leaves_the_remainder_unattributed(

@@ -25,7 +25,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -88,6 +88,10 @@ from src.scout.candidates import EarlyWatchCandidates, PromotedWatchCandidates, 
 from src.scout.repository import WatchRepository
 
 Closer = Callable[[], Awaitable[None]]
+
+
+if TYPE_CHECKING:
+    from src.agents.atlas.v4.pool_index import PoolHistory
 
 
 def _exit(resource: Any) -> Closer:
@@ -372,8 +376,30 @@ def _exit_read(settings: Settings, ports: RunnerPorts, clock: Clock) -> ExitOnch
     )
 
 
+def _pool_index(
+    settings: Settings, sessions: async_sessionmaker[AsyncSession]
+) -> "PoolHistory | None":
+    """The PoolManager-wide pool index (issue #94), read by the census when enabled.
+
+    It only says which pools exist before a token's creation block, and only
+    when it covers that block; it is filled by its own bounded job. Off, pool
+    discovery starts at the token and a PoolManager surplus stays unexplained.
+    """
+    if not settings.atlas_v4_pool_index_enabled:
+        return None
+    from src.agents.atlas.v4.pool_index import PoolIndexHistory
+    from src.agents.atlas.v4.pool_index_sql import SqlPoolIndexStore
+
+    return PoolIndexHistory(SqlPoolIndexStore(sessions))
+
+
 def atlas_builder(
-    settings: Settings, ports: RunnerPorts, clock: Clock, *, pool_control: bool = True
+    settings: Settings,
+    ports: RunnerPorts,
+    clock: Clock,
+    *,
+    pool_control: bool = True,
+    pool_index: "PoolHistory | None" = None,
 ) -> SnapshotBuilderPort:
     # ``pool_control`` is False for a PAPER exit's read: neither the V4 census
     # nor the funding graph can bind a sale, so neither is collected for one.
@@ -403,7 +429,9 @@ def atlas_builder(
             # The same chain-bound client as the contract source, so the census
             # can only ever answer for the chain this builder is routed to.
             census = V4PoolCensus(
-                reads=RpcV4ChainReads(contracts.client), chain=contracts.config.chain
+                reads=RpcV4ChainReads(contracts.client),
+                chain=contracts.config.chain,
+                index=pool_index,
             )
             verifier = contracts
         funding = (
@@ -766,7 +794,10 @@ def _runners(
             CapabilityProvider(
                 service=runtime,
                 onchain=AtlasContextReader(
-                    cases=cases, builder=atlas_builder(settings, ports, clock)
+                    cases=cases,
+                    builder=atlas_builder(
+                        settings, ports, clock, pool_index=_pool_index(settings, sessions)
+                    ),
                 ),
             ),
         )

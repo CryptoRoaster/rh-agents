@@ -98,7 +98,12 @@ def _with_creator(census: V4Census, creator: str | None) -> V4Census:
         for pool in census.pools
     )
     positions = tuple(
-        item.model_copy(update={"owner_is_creator": matches(item.owner)})
+        item.model_copy(
+            update={
+                "owner_is_creator": matches(item.owner),
+                "controller_is_creator": matches(item.controller),
+            }
+        )
         for item in census.positions
     )
     return census.model_copy(update={"pools": pools, "positions": positions})

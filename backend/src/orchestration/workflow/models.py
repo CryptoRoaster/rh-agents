@@ -403,6 +403,31 @@ class PoolControlPool(Immutable):
     # OWNER_READ or OWNER_UNKNOWN; a failed `owner()` is never "no owner".
     hook_owner_status: Code | None = None
     hook_owner_is_creator: bool | None = None
+    # Issue #97. Every census position in this pool, by whether its principal
+    # can be withdrawn now: verified permanently locked; withdrawable by an
+    # established controller; and of those, by the receipt-verified creator.
+    # The rest is unresolved. Absent on evidence recorded before, and omitted.
+    positions_total: int | None = Field(default=None, strict=True, ge=0)
+    positions_withdrawal_restricted: int | None = Field(default=None, strict=True, ge=0)
+    positions_withdrawable: int | None = Field(default=None, strict=True, ge=0)
+    positions_creator_withdrawable: int | None = Field(default=None, strict=True, ge=0)
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        emitted: dict[str, Any] = handler(self)
+        for key in POOL_ADDED_KEYS:
+            if emitted.get(key) is None:
+                emitted.pop(key, None)
+        return emitted
+
+
+# Keys added to `PoolControlPool` after it was first written; omitted while empty.
+POOL_ADDED_KEYS = (
+    "positions_total",
+    "positions_withdrawal_restricted",
+    "positions_withdrawable",
+    "positions_creator_withdrawable",
+)
 
 
 # Keys added after pool control was first written. Each is omitted while it
@@ -426,6 +451,8 @@ POOL_CONTROL_ADDED_KEYS = (
     "protocol_fees_raw",
     "claims_raw",
     "surplus_raw",
+    "pool_discovery_basis",
+    "pool_discovery_from_block",
 )
 
 
@@ -567,6 +594,10 @@ class PoolControlSummary(Immutable):
     protocol_fees_raw: RawAmount | None = None
     claims_raw: RawAmount | None = None
     surplus_raw: RawAmount | None = None
+    # Issue #94: TOKEN_CREATION or MANAGER_HISTORY, and the block pool
+    # discovery started at. Absent on evidence recorded before, and omitted.
+    pool_discovery_basis: Code | None = None
+    pool_discovery_from_block: int | None = Field(default=None, strict=True, ge=0)
 
     @model_validator(mode="after")
     def figures_match_status(self) -> Self:

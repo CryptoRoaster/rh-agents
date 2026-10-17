@@ -25,6 +25,12 @@ class RpcV4ChainReads:
     async def block_timestamp(self, number: int) -> int:
         return (await self.client.block(number)).timestamp
 
+    async def head_block(self) -> int:
+        return await self.client.block_number()
+
+    async def block_hash(self, number: int) -> str:
+        return (await self.client.block(number)).hash
+
     async def code(self, address: str, block: int) -> str:
         return await self.client.code(address, block)
 

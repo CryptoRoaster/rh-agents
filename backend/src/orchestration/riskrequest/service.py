@@ -94,6 +94,7 @@ from src.orchestration.workflow.models import (
     LiquidityExecutionPayload,
     OnchainIntelligence,
     OnchainPayload,
+    PoolControlPool,
     PoolControlSummary,
     TradeCase,
     TradeCaseStatus,
@@ -836,18 +837,34 @@ def lp_control_view(*, snapshot: RecordedMarket, onchain: OnchainPayload) -> LpC
     )
     if unbound is not None:
         return finding(LpControlStatus.UNKNOWN, unbound)
+    manager = locator.pool_manager_address
+    if manager is not None and manager != control.pool_manager:
+        # The market says it trades on a PoolManager other than the verified
+        # one the census read: the same pool id there is another pool.
+        return finding(LpControlStatus.UNKNOWN, "V4_MARKET_POOL_MANAGER_MISMATCH")
     pool = next((item for item in control.pools if item.pool_id == pool_id), None)
     if pool is None or not pool.initialized:
         return finding(LpControlStatus.UNKNOWN, "V4_MARKET_POOL_NOT_IN_CENSUS")
+    token = snapshot.pair.base.asset_id.rsplit(":", 1)[-1].lower()
+    if token not in (pool.currency0, pool.currency1):
+        # Issue #98: checked here, not left to the producer. The evidence is
+        # about the market's own token, or it is not evidence for this market.
+        return finding(LpControlStatus.UNKNOWN, "V4_MARKET_POOL_TOKEN_MISMATCH")
     if pool.hook != NO_HOOK:
         if pool.hook_owner_is_creator is True:
             # Established: the creator owns the code every liquidity change in
             # the market's pool runs through.
             return finding(LpControlStatus.BLOCKED, "V4_HOOK_CREATOR_CONTROLLED")
         return finding(LpControlStatus.UNKNOWN, "V4_HOOK_UNVERIFIED")
+    if pool.positions_creator_withdrawable:
+        # Established: the creator can take the market's liquidity now.
+        return finding(LpControlStatus.BLOCKED, "V4_CREATOR_CAN_WITHDRAW")
     unresolved = unresolved_custody(control)
     if unresolved is not None:
         return finding(LpControlStatus.UNKNOWN, unresolved)
+    restricted = withdrawal_unrestricted(pool)
+    if restricted is not None:
+        return finding(LpControlStatus.UNKNOWN, restricted)
     return LpControlFinding(
         LpControlStatus.PASS,
         LP_CONTROL_V4_POOL_CENSUS,
@@ -894,6 +911,11 @@ def census_basis_gap(
 RESOLVED_CONTROL_STATES = frozenset({"DIRECT_CONTROL", "RELEASABLE", "PERMANENTLY_LOCKED"})
 
 
+# Reconciliation gaps that say the census contradicts itself, not that a read
+# was merely unavailable.
+INCONSISTENT_RECONCILIATION = frozenset({"V4_POOL_BALANCE_DEFICIT", "V4_CLAIMS_INCONSISTENT"})
+
+
 def unresolved_custody(control: PoolControlSummary) -> str | None:
     """Why some liquidity in the census has no established controller, if any does.
 
@@ -908,6 +930,10 @@ def unresolved_custody(control: PoolControlSummary) -> str | None:
     """
     if control.positions_unattributed != 0:
         return "V4_POSITION_OWNER_UNKNOWN"
+    if control.reconciliation_gap in INCONSISTENT_RECONCILIATION:
+        # The reconciliation read liabilities the balance cannot hold: the
+        # census misread something, whatever the remainder looks like.
+        return "V4_POOL_BALANCE_INCONSISTENT"
     if control.unattributed_raw != "0":
         return unexplained_remainder(control)
     if control.basis != "EXACT":
@@ -921,6 +947,33 @@ def unresolved_custody(control: PoolControlSummary) -> str | None:
         raw not in (None, "0") for raw in (control.timelocked_raw, control.unknown_custody_raw)
     ):
         return "V4_POSITION_CONTROL_UNRESOLVED"
+    return None
+
+
+def withdrawal_unrestricted(pool: PoolControlPool) -> str | None:
+    """Why some of the market pool's liquidity could be withdrawn now, if any could.
+
+    Issue #97. Known control is not restricted withdrawal: an account holding a
+    position can remove it in the next block, and nobody here can tell a third
+    party from the creator's other wallet. So a purchase passes only when every
+    position in the market's own pool is verified permanently locked. (One the
+    verified creator can withdraw is BLOCKED before this is asked.) Positions in
+    the token's other pools cannot drain this one; their custody is judged by
+    `unresolved_custody`.
+    """
+    counts = (
+        pool.positions_total,
+        pool.positions_withdrawal_restricted,
+        pool.positions_withdrawable,
+    )
+    if any(value is None for value in counts):
+        # Recorded before withdrawal was counted.
+        return "V4_WITHDRAWAL_RESTRICTION_UNKNOWN"
+    if pool.positions_withdrawable:
+        return "V4_LIQUIDITY_WITHDRAWABLE"
+    if not pool.positions_total or pool.positions_withdrawal_restricted != pool.positions_total:
+        # No position to lock anything, or one whose withdrawal is unresolved.
+        return "V4_WITHDRAWAL_RESTRICTION_UNKNOWN"
     return None
 
 
@@ -958,9 +1011,15 @@ def unexplained_remainder(control: PoolControlSummary) -> str:
         return "V4_POOL_BALANCE_UNATTRIBUTED"
     if control.claims_raw != "0":
         return "V4_POOL_CLAIMS_UNATTRIBUTED"
-    if control.surplus_raw != "0":
+    if control.surplus_raw != "0" and control.pool_discovery_basis != "MANAGER_HISTORY":
+        # Discovery from the token's creation block can miss a pool initialized
+        # before the token existed; whatever such a pool holds sits here.
         return "V4_POOL_SURPLUS_UNEXPLAINED"
-    return "V4_POOL_FEES_NOT_CREDITED"
+    if control.uncollected_fees_raw != "0" or control.protocol_fees_raw != "0":
+        return "V4_POOL_FEES_NOT_CREDITED"
+    # Only a surplus is left, over a discovery covering the PoolManager's whole
+    # history: owed to nobody, but the economic figure still ranks it (#103).
+    return "V4_POOL_SURPLUS_NOT_CREDITED"
 
 
 def market_view(

@@ -20,6 +20,7 @@ from src.agents.atlas.models import (
 )
 from src.agents.atlas.v4.census import CensusBounds, V4PoolCensus
 from src.agents.atlas.v4.math import Q96, sqrt_price_at_tick
+from src.agents.atlas.v4.pool_index import PoolHistory
 from src.agents.atlas.v4.protocol import V4Deployment
 from src.core.clock import FixedClock
 from src.markets.models import Availability, MarketIdentity, PoolLocatorIdentity, PoolLocatorKind
@@ -72,12 +73,15 @@ def deployment(*managers: str) -> V4Deployment:
     )
 
 
-def census_for(chain: FakeV4Chain, *, bounds: CensusBounds | None = None) -> V4PoolCensus:
+def census_for(
+    chain: FakeV4Chain, *, bounds: CensusBounds | None = None, index: PoolHistory | None = None
+) -> V4PoolCensus:
     return V4PoolCensus(
         reads=chain,
         chain="robinhood",
         bounds=bounds or CensusBounds(),
         deployments={("robinhood", CHAIN_ID): deployment(*chain.position_managers)},
+        index=index,
     )
 
 
@@ -200,6 +204,7 @@ def builder(
     excluded: tuple[str, ...] = (),
     block_timestamp: datetime | None = None,
     observation_basis: HolderObservationBasis = HolderObservationBasis.SOURCE_BLOCK,
+    index: PoolHistory | None = None,
 ) -> AtlasSnapshotBuilder:
     holder_result = holder_source_result(
         now,
@@ -219,7 +224,7 @@ def builder(
         ),
         holders=StubHolders(holder_result),
         origins=StubOrigins(origin() if origin_facts is None else origin_facts),
-        pool_census=None if chain is None else census_for(chain, bounds=bounds),
+        pool_census=None if chain is None else census_for(chain, bounds=bounds, index=index),
         clock=FixedClock(now),
     )
 
