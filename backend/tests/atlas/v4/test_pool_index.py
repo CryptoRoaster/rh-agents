@@ -201,3 +201,64 @@ async def test_a_forged_index_entry_makes_the_census_incomplete(now) -> None:
     found = await census(now, indexed_chain()[0], store)
     assert found.status is Availability.UNAVAILABLE
     assert found.gap is not None and found.gap.value == "V4_POOL_KEY_MISMATCH"
+
+
+async def test_a_rewind_between_the_two_reads_is_not_answered_as_covered(now) -> None:
+    # Review N1: coverage and pools are read separately; a rewind in between
+    # must not yield a "covered" answer missing pools.
+    chain, _, early = indexed_chain()
+    store = MemoryPoolIndexStore()
+    await indexer(chain, store).advance()
+    coverage = await store.coverage(chain.network_id, chain.pool_manager)
+    assert coverage is not None
+    original = store.pools_with
+
+    async def racing(chain_id, pool_manager, token, before_block):
+        from dataclasses import replace
+
+        back = replace(
+            coverage, through_block=early.created_block - 1, through_hash="0x" + "11" * 32
+        )
+        await store.rewind(back, expected_through=coverage.through_block)
+        return await original(chain_id, pool_manager, token, before_block)
+
+    store.pools_with = racing  # type: ignore[method-assign]
+    answer = await PoolIndexHistory(store).history(
+        chain.network_id, chain.pool_manager, TOKEN, CREATED_BLOCK
+    )
+    assert answer is None
+
+
+async def test_the_census_refuses_an_index_whose_tip_the_chain_no_longer_has(now) -> None:
+    # Review N2: an index not yet rewound after a reorganisation is stale.
+    chain, _, early = indexed_chain()
+    store = MemoryPoolIndexStore()
+    await indexer(chain, store).advance()
+    coverage = await store.coverage(chain.network_id, chain.pool_manager)
+    assert coverage is not None
+    stale = indexed_chain()[0]
+    stale.reorged[coverage.through_block] = "0x" + "ee" * 32
+    found = await census(now, stale, store)
+    assert found.pool_discovery_basis == "TOKEN_CREATION"
+    assert early.id not in {pool.pool_id for pool in found.pools}
+
+
+async def test_a_window_whose_last_block_changed_while_it_was_read_is_not_stored(now) -> None:
+    # Review N2: logs of one branch must not be stored with another's hash.
+    chain, _, _ = indexed_chain()
+    store = MemoryPoolIndexStore()
+    original = chain.logs
+    first_end: list[int] = []
+
+    async def reorganising(address, topics, start, end):
+        result = await original(address, topics, start, end)
+        if not first_end:
+            first_end.append(end)
+            chain.reorged[end] = "0x" + "dd" * 32
+        return result
+
+    chain.logs = reorganising  # type: ignore[method-assign]
+    result = await indexer(chain, store).advance()
+    assert result.status == "FAILED"
+    coverage = await store.coverage(chain.network_id, chain.pool_manager)
+    assert coverage is not None and coverage.through_block < first_end[0]
