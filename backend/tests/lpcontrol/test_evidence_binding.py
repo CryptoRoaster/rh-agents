@@ -62,3 +62,17 @@ async def test_a_market_naming_the_verified_pool_manager_passes(now, intent, con
     payload, pool_id = await launch(now)
     found = lp_control_view(snapshot=market(now, pool_id, manager=POOL_MANAGER), onchain=payload)
     assert found[0] is LpControlStatus.PASS, found.detail
+
+
+async def test_a_reconciliation_that_found_an_inconsistency_blocks_even_without_remainder(
+    now,
+) -> None:
+    # Release review N2: the balance equals the principal, yet the
+    # reconciliation found fees or claims it cannot fit -- a misread somewhere.
+    payload, pool_id = await launch(now)
+    assert payload.intelligence is not None and payload.intelligence.pool_control is not None
+    assert payload.intelligence.pool_control.unattributed_raw == "0"
+    for gap in ("V4_POOL_BALANCE_DEFICIT", "V4_CLAIMS_INCONSISTENT"):
+        broken = with_census(payload, reconciliation_status="INCOMPLETE", reconciliation_gap=gap)
+        found = lp_control_view(snapshot=market(now, pool_id), onchain=broken)
+        assert found[:2] == (LpControlStatus.UNKNOWN, "V4_POOL_BALANCE_INCONSISTENT"), gap
