@@ -29,7 +29,8 @@ Two tables (migration `0025`):
 4. Reads `Initialize` logs of the PoolManager (no token filter) window by
    window up to `head − confirmations`, checks that every pool id hashes from
    its key and occurs once, and stores each window atomically together with the
-   hash of its last block — only if the coverage did not move meanwhile.
+   hash of its last block — only if that hash was the same before and after
+   the logs were read, and only if the coverage did not move meanwhile.
 5. Every read counts against `max_requests`; running out keeps what was
    confirmed (`PARTIAL`), and the next run resumes there. A failed read is never
    "no pools".
@@ -38,6 +39,9 @@ The census (`V4PoolCensus.index`) asks it only for pools of one token
 initialized *before* the token's creation block, and only when the coverage
 reaches that block. Each such pool is re-checked exactly like a live Initialize
 (key hash, token, block) and then read live at the census block like any other.
+The census first checks that the chain still has the index's last confirmed
+block (one header read); a stale index is not used. The index answers only if
+its coverage is the same before and after the pool read.
 The census records `pool_discovery_basis` (`TOKEN_CREATION` or
 `MANAGER_HISTORY`) and `pool_discovery_from_block`.
 
@@ -67,12 +71,12 @@ by its block time (PR #95).
 | Step | Reads | Estimate |
 |---|---|---|
 | Locate and verify the deployment block | `eth_getCode` ~log2(head) + 2 | ~30 |
-| Backfill from deployment to head | 1 `eth_getLogs` + 1 header per 100 000-block window | Robinhood ≈ 10 blocks/s, so ≈ 2 × (chain age in blocks / 100 000); at ~77 M blocks ≈ 1 550 |
+| Backfill from deployment to head | 1 `eth_getLogs` + 2 headers (before and after) per 100 000-block window | Robinhood ≈ 10 blocks/s, so ≈ 3 × (chain age in blocks / 100 000); at ~77 M blocks ≈ 2 310 |
 | Window narrowing on provider caps | extra `eth_getLogs` per refused window | budget ×1.2 |
-| Incremental run every 5 minutes | ~3 000 blocks: chain id, head, tip hash, 1 log read, 1 header | ~5 per run, ~1 440 per day |
+| Incremental run every 5 minutes | ~3 000 blocks: chain id, head, tip hash, 1 log read, 2 headers | ~6 per run, ~1 730 per day |
 
 The PoolManager emits roughly 2 000 Initialize events per day on Robinhood
 (shadow run B: ≈ 55 % of 3 741 new pools a day are V4-style), far below the
 5 000-log cap per window. Run the backfill in several bounded calls (for
-example `--max-requests 400` four times) and compare the result with a second,
+example `--max-requests 600` four times) and compare the result with a second,
 independent RPC endpoint before enabling the census setting.

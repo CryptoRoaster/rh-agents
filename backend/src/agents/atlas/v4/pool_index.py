@@ -238,6 +238,8 @@ class V4PoolIndexer:
         while True:
             end = min(start + span - 1, safe)
             self._spend()
+            before = await self.reads.block_hash(end)
+            self._spend()
             try:
                 logs = await self.reads.logs(
                     self.deployment.pool_manager, (INITIALIZE_TOPIC,), start, end
@@ -250,9 +252,12 @@ class V4PoolIndexer:
             break
         pools = _pools(logs, start, end)
         self._spend()
-        extended = replace(
-            coverage, through_block=end, through_hash=await self.reads.block_hash(end)
-        )
+        after = await self.reads.block_hash(end)
+        if before != after:
+            # The window's last block changed while its logs were read: they may
+            # belong to a branch the chain no longer has.
+            raise IndexConflict("the window's last block changed while it was read")
+        extended = replace(coverage, through_block=end, through_hash=after)
         await self.store.extend(extended, pools, expected_through=coverage.through_block)
         return extended
 
@@ -281,10 +286,16 @@ def _pools(logs: tuple[LogRecord, ...], start: int, end: int) -> tuple[IndexedPo
 
 @dataclass(frozen=True)
 class IndexedHistory:
-    """The pools of one token initialized before a block, from a covering index."""
+    """The pools of one token initialized before a block, from a covering index.
+
+    ``through_block`` and ``through_hash`` name the last block the index
+    confirmed, so its reader can check the chain still has it.
+    """
 
     deployment_block: int
     pools: tuple[IndexedPool, ...]
+    through_block: int
+    through_hash: str
 
 
 class PoolHistory(Protocol):
@@ -306,4 +317,13 @@ class PoolIndexHistory:
         if coverage is None or coverage.through_block < before_block - 1:
             return None
         pools = await self.store.pools_with(chain_id, pool_manager, token, before_block)
-        return IndexedHistory(deployment_block=coverage.deployment_block, pools=pools)
+        # The two reads are separate; an index run may have rewound in between,
+        # and the pools may then miss some. Only an unchanged coverage answers.
+        if await self.store.coverage(chain_id, pool_manager) != coverage:
+            return None
+        return IndexedHistory(
+            deployment_block=coverage.deployment_block,
+            pools=pools,
+            through_block=coverage.through_block,
+            through_hash=coverage.through_hash,
+        )

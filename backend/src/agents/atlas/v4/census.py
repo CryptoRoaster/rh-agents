@@ -125,6 +125,8 @@ class V4ChainReadPort(Protocol):
 
     async def block_timestamp(self, number: int) -> int: ...
 
+    async def block_hash(self, number: int) -> str: ...
+
     async def code(self, address: str, block: int) -> str: ...
 
     async def call(self, address: str, selector: str, block: int) -> str: ...
@@ -327,8 +329,12 @@ class V4PoolCensus:
                 snapshot.chain_id, deployment.pool_manager, token, from_block
             )
             if history is not None:
-                found = self._before_creation(run, history.pools, token, from_block, found)
-                basis, discovery_from = "MANAGER_HISTORY", history.deployment_block
+                # The index is only as good as the branch it was built on: the
+                # chain must still have the last block it confirmed.
+                run.spend()
+                if await self.reads.block_hash(history.through_block) == history.through_hash:
+                    found = self._before_creation(run, history.pools, token, from_block, found)
+                    basis, discovery_from = "MANAGER_HISTORY", history.deployment_block
         pools = [await self._pool(run, deployment, item, block) for item in found]
 
         run.phase = PoolControlGap.POSITION_FACTS_INCOMPLETE
