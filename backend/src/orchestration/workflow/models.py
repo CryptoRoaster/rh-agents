@@ -403,6 +403,31 @@ class PoolControlPool(Immutable):
     # OWNER_READ or OWNER_UNKNOWN; a failed `owner()` is never "no owner".
     hook_owner_status: Code | None = None
     hook_owner_is_creator: bool | None = None
+    # Issue #97. Every census position in this pool, by whether its principal
+    # can be withdrawn now: verified permanently locked; withdrawable by an
+    # established controller; and of those, by the receipt-verified creator.
+    # The rest is unresolved. Absent on evidence recorded before, and omitted.
+    positions_total: int | None = Field(default=None, strict=True, ge=0)
+    positions_withdrawal_restricted: int | None = Field(default=None, strict=True, ge=0)
+    positions_withdrawable: int | None = Field(default=None, strict=True, ge=0)
+    positions_creator_withdrawable: int | None = Field(default=None, strict=True, ge=0)
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        emitted: dict[str, Any] = handler(self)
+        for key in POOL_ADDED_KEYS:
+            if emitted.get(key) is None:
+                emitted.pop(key, None)
+        return emitted
+
+
+# Keys added to `PoolControlPool` after it was first written; omitted while empty.
+POOL_ADDED_KEYS = (
+    "positions_total",
+    "positions_withdrawal_restricted",
+    "positions_withdrawable",
+    "positions_creator_withdrawable",
+)
 
 
 # Keys added after pool control was first written. Each is omitted while it
