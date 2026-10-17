@@ -324,6 +324,8 @@ def pool_control_summary(
     def raw(value: int | None) -> str | None:
         return None if value is None else str(value)
 
+    # The balance reconciliation, when the census carried one.
+    found = census.reconciliation
     states: dict[str, int] = {}
     for item in census.positions:
         if item.control is not None:
@@ -423,6 +425,12 @@ def pool_control_summary(
         unknown_custody_pool_supply_fraction=control.unknown_custody_pool_supply_fraction,
         position_control_states=dict(sorted(states.items())) or None,
         economic_top_ten_floor_fraction=control.economic_top10_floor,
+        reconciliation_status=None if found is None else found.status,
+        reconciliation_gap=None if found is None or found.gap is None else found.gap.value,
+        uncollected_fees_raw=None if found is None else raw(found.uncollected_fees_raw),
+        protocol_fees_raw=None if found is None else raw(found.protocol_fees_raw),
+        claims_raw=None if found is None else raw(found.claims_raw),
+        surplus_raw=None if found is None else raw(found.surplus_raw),
     )
 
 

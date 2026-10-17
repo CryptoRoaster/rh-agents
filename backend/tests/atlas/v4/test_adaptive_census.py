@@ -12,7 +12,12 @@ from src.agents.atlas.models import AtlasSourceFailure
 from src.agents.atlas.v4.census import MIN_LOG_SPAN, CensusBounds
 from src.agents.atlas.v4.control import PositionControlState
 from src.agents.atlas.v4.models import PoolControlGap
-from src.agents.atlas.v4.protocol import INITIALIZE_TOPIC, MODIFY_LIQUIDITY_TOPIC
+from src.agents.atlas.v4.protocol import (
+    CLAIM_TRANSFER_TOPIC,
+    INITIALIZE_TOPIC,
+    MODIFY_LIQUIDITY_TOPIC,
+    currency_id_topic,
+)
 from src.markets.models import Availability
 from src.runtime.models import ErrorCode
 from tests.atlas.conftest import TOKEN, chain_snapshot
@@ -76,8 +81,10 @@ async def test_a_token_two_point_six_million_blocks_old_is_censused(now) -> None
     assert [item.pool_id for item in census.pools] == [pool.id]
     (position,) = census.positions
     assert position.control.control_state is PositionControlState.DIRECT_CONTROL
-    # 27 windows per stream, three streams, plus a handful of reads.
-    assert census.requests_made < 120
+    # 27 windows per stream, three streams, plus a handful of reads -- and
+    # then the reconciliation's own claim stream and storage words.
+    assert census.reconciliation is not None and census.reconciliation.status == "COMPLETE"
+    assert census.requests_made - census.reconciliation.requests_made < 120
     assert census.requests_made == chain.requests
 
 
@@ -109,12 +116,15 @@ async def test_a_provider_capped_at_25k_blocks_is_learned_and_covered(now) -> No
     assert [e - s + 1 for s, e in attempts[:3]] == [100_000, 50_000, 25_000]
     assert all(e - s + 1 <= 25_000 for s, e in attempts[3:])
     failed = [item for item in chain.log_requests if item[3] - item[2] + 1 > 25_000]
-    assert len(failed) == 6  # two refused probes in each of the three streams
+    # Two refused probes in each of the four streams: both orientations, the
+    # pool's positions and the reconciliation's claims.
+    assert len(failed) == 8
 
     for topics, start in (
         (currency0, OLD_CREATED),
         ((INITIALIZE_TOPIC, None, None, "0x" + "0" * 24 + TOKEN[2:]), OLD_CREATED),
         ((MODIFY_LIQUIDITY_TOPIC, pool.id), pool.created_block),
+        ((CLAIM_TRANSFER_TOPIC, None, None, currency_id_topic(TOKEN)), OLD_CREATED),
     ):
         assert_tiles(windows_of(chain, topics), start, OLD_CREATED + age)
     # Every refused probe was a budgeted read like any other.
@@ -230,7 +240,11 @@ async def test_a_history_the_budget_can_cover_is_attempted(now) -> None:
     chain = FakeV4Chain(token=TOKEN, created_block=created, head=head)
     census = await run(now, chain, from_block=created, block=head)
     assert census.status is Availability.AVAILABLE  # no pools: discovery was all it needed
-    assert census.requests_made == 239
+    # The census proper took 239 reads; the reconciliation then met the cap,
+    # which it may, leaving the census untouched.
+    assert census.reconciliation is not None
+    assert census.requests_made - census.reconciliation.requests_made == 239
+    assert census.reconciliation.gap == "V4_RECONCILIATION_BOUNDS_EXCEEDED"
 
 
 # ------------------------------------------------------------- semantics

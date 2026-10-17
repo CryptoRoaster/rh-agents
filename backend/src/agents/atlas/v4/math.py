@@ -95,3 +95,35 @@ def position_amounts(
             amount1_delta(sqrt_lower, sqrt_price, liquidity),
         )
     return 0, amount1_delta(sqrt_lower, sqrt_upper, liquidity)
+
+
+def fee_growth_inside(
+    tick_current: int,
+    tick_lower: int,
+    tick_upper: int,
+    global_growth: int,
+    lower_outside: int,
+    upper_outside: int,
+) -> int:
+    """`Pool.getFeeGrowthInside` for one currency, in its unchecked uint256 arithmetic."""
+    if tick_current < tick_lower:
+        inside = lower_outside - upper_outside
+    elif tick_current >= tick_upper:
+        inside = upper_outside - lower_outside
+    else:
+        inside = global_growth - lower_outside - upper_outside
+    return inside & MAX_UINT256
+
+
+def fees_owed(growth_inside: int, growth_inside_last: int, liquidity: int) -> int:
+    """`Position.update`'s fees for one currency: mulDiv(inside - last, liquidity, Q128).
+
+    The subtraction wraps exactly as the protocol's unchecked block does; the
+    product is floored, which is what a collect would pay.
+    """
+    if not 0 <= liquidity <= MAX_UINT128:
+        raise LiquidityMathError("liquidity out of range")
+    for value in (growth_inside, growth_inside_last):
+        if not 0 <= value <= MAX_UINT256:
+            raise LiquidityMathError("fee growth out of range")
+    return ((growth_inside - growth_inside_last) & MAX_UINT256) * liquidity >> 128

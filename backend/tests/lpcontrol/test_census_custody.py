@@ -42,12 +42,16 @@ def unknown_position(chain: FakeV4Chain, pool: Pool, lower: int, liquidity: int)
     return token
 
 
-async def launch(now, *, extra: int = 0, unknown: str | None = None):
+async def launch(now, *, extra: int = 0, unknown: str | None = None, reconcilable: bool = True):
     """An official launch with buyers; ``extra`` units the PoolManager keeps beyond
     every position, and optionally an unknown-owner position in the traded pool.
+    ``reconcilable=False`` makes a liability unreadable (issue #96), so the census
+    cannot account for what the PoolManager holds beyond the positions.
     """
     chain, pool, rows = official_launch()
     chain.extra_pool_balance = extra
+    if not reconcilable:
+        chain.protocol_fees = None
     if unknown == "token-and-eth":
         # One tick spacing below the price: a sliver of token, the rest ETH.
         token = unknown_position(chain, pool, pool.tick - pool.tick_spacing, 10**23)
@@ -99,7 +103,10 @@ async def test_an_unknown_owner_with_little_token_and_much_eth_is_unknown(
 async def test_an_unattributed_pool_manager_balance_is_unknown(now, intent, context) -> None:
     # B: every position resolved, but the PoolManager holds token no position
     # accounts for -- inside the old 1 % tolerance, and still not evidence.
-    payload, pool_id = await launch(now, extra=3 * UNIT)
+    # Since issue #96 a remainder passes only when the census reconciled it
+    # against every liability (tests/lpcontrol/test_fee_reconciliation.py);
+    # here it could not, so the remainder is as unexplained as it always was.
+    payload, pool_id = await launch(now, extra=3 * UNIT, reconcilable=False)
     control = census(payload)
     assert control.economic_concentration is not None
     assert control.positions_unattributed == 0

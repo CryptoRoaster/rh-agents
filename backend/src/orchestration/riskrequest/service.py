@@ -902,13 +902,14 @@ def unresolved_custody(control: PoolControlSummary) -> str | None:
     can withdraw a pool's liquidity, and a token-supply tolerance proves nothing
     about that: a position with an unknown owner can hold almost no token and
     most of the pool's ETH. So there is no tolerance here. Every position is
-    attributed, nothing in the PoolManager is unexplained, the concentration is
-    exact, and every position's control is resolved -- or the control is unknown.
+    attributed, nothing in the PoolManager is unexplained (`unexplained_remainder`),
+    the concentration is exact, and every position's control is resolved -- or
+    the control is unknown.
     """
     if control.positions_unattributed != 0:
         return "V4_POSITION_OWNER_UNKNOWN"
     if control.unattributed_raw != "0":
-        return "V4_POOL_BALANCE_UNATTRIBUTED"
+        return unexplained_remainder(control)
     if control.basis != "EXACT":
         return "V4_CONCENTRATION_NOT_EXACT"
     states = control.position_control_states
@@ -921,6 +922,45 @@ def unresolved_custody(control: PoolControlSummary) -> str | None:
     ):
         return "V4_POSITION_CONTROL_UNRESOLVED"
     return None
+
+
+def unexplained_remainder(control: PoolControlSummary) -> str:
+    """Why a PoolManager remainder beyond the positions' principal blocks a PASS.
+
+    Issue #96. The census reconciles the balance against every liability of
+    the positions it found -- their uncollected fees, the protocol's fees and
+    the ERC-6909 claims -- so the reason is exact. None of them passes yet:
+
+    * claims are held by accounts nobody here enumerated;
+    * a surplus beyond those liabilities is not provably nobody's: v4-core
+      lets a pool be initialized for a token address before the token exists,
+      and the census finds pools only from the token's creation block, so a
+      position in such a pool would sit exactly there (until pool discovery
+      covers the PoolManager's whole history, #94);
+    * fees and protocol fees are known exactly, but the economic concentration
+      still ranks them as one unattributed holder rather than with whoever can
+      collect them, so the figure is not exact.
+
+    No tolerance, no estimate. Called only with every position attributed.
+    """
+    if control.reconciliation_status != "COMPLETE":
+        return "V4_POOL_BALANCE_UNATTRIBUTED"
+    parts = (
+        control.uncollected_fees_raw,
+        control.protocol_fees_raw,
+        control.claims_raw,
+        control.surplus_raw,
+    )
+    if control.unattributed_raw is None or any(part is None for part in parts):
+        return "V4_POOL_BALANCE_UNATTRIBUTED"
+    if int(control.unattributed_raw) != sum(int(part) for part in parts if part is not None):
+        # The reconciliation and the economic split describe different states.
+        return "V4_POOL_BALANCE_UNATTRIBUTED"
+    if control.claims_raw != "0":
+        return "V4_POOL_CLAIMS_UNATTRIBUTED"
+    if control.surplus_raw != "0":
+        return "V4_POOL_SURPLUS_UNEXPLAINED"
+    return "V4_POOL_FEES_NOT_CREDITED"
 
 
 def market_view(
