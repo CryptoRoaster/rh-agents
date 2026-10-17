@@ -229,10 +229,18 @@ def pool_control(
         )
 
     ranked = _ranked(holders, census, controlled, unseen=unseen, unattributed_raw=unattributed_raw)
+    # What the basis would be without the remainder: whether some controller's
+    # holdings outside the pools could only be bounded. A reader that accounts
+    # for the remainder by other evidence needs this half of the answer alone.
+    beyond_remainder = (
+        ConcentrationBasis.UPPER_BOUND
+        if unseen and any(owner not in _retained(holders, census) for owner, _ in controlled)
+        else ConcentrationBasis.EXACT
+    )
+    figures |= {"basis_excluding_remainder": beyond_remainder}
     basis = (
         ConcentrationBasis.UPPER_BOUND
-        if unattributed_raw
-        or (unseen and any(owner not in _retained(holders, census) for owner, _ in controlled))
+        if unattributed_raw or beyond_remainder == ConcentrationBasis.UPPER_BOUND
         else ConcentrationBasis.EXACT
     )
     if (not ranked or ranked[0][1] == 0) and _nobody_controls_principal(

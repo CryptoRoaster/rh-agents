@@ -55,6 +55,12 @@ class PoolControlGap(StrEnum):
     # either not verified at all or verified as timelocked: nobody can be named
     # as its controller and nobody may call it locked.
     POSITION_CONTROL_UNRESOLVED = "V4_POSITION_CONTROL_UNRESOLVED"
+    # Why the balance reconciliation (`V4BalanceReconciliation`) is incomplete.
+    # They leave the census itself available.
+    RECONCILIATION_BOUNDS_EXCEEDED = "V4_RECONCILIATION_BOUNDS_EXCEEDED"
+    RECONCILIATION_UNAVAILABLE = "V4_RECONCILIATION_UNAVAILABLE"
+    CLAIMS_INCONSISTENT = "V4_CLAIMS_INCONSISTENT"
+    POOL_BALANCE_DEFICIT = "V4_POOL_BALANCE_DEFICIT"
 
 
 class HookOwnerStatus(StrEnum):
@@ -144,6 +150,9 @@ class V4PositionFacts(Immutable):
     owner: EvmAddress | None = None
     owner_status: PositionOwnerStatus
     controlled_token_raw: int = Field(ge=0)
+    # Token-side swap fees the position is owed at the census block, exactly
+    # as a collect would pay them. Only with a complete reconciliation.
+    uncollected_token_raw: int | None = Field(default=None, ge=0)
     owner_is_creator: bool | None = None
     # What the NFT owner means for control. Present exactly for a
     # PositionManager position whose `ownerOf` was read; the raw owner above
@@ -184,6 +193,47 @@ class V4PositionFacts(Immutable):
         return self.control.controller
 
 
+class V4BalanceReconciliation(Immutable):
+    """The PoolManager's token balance against every liability it has in that token.
+
+    In v4-core the PoolManager owes a currency to exactly three kinds of
+    claimant outside an unlock: liquidity positions (principal plus the fees
+    they are owed), the protocol (`protocolFeesAccrued`) and ERC-6909 claim
+    holders. Rounding always goes the PoolManager's way, so its balance covers
+    all of them; whatever it holds beyond them -- rounding dust, a transfer that
+    was never settled -- is owed to nobody and no account can withdraw it.
+
+    COMPLETE means every liability was read at the census block and the
+    balance covers them. Anything else is INCOMPLETE with its reason and no
+    surplus, because a remainder nobody fully accounted for is not "nobody's".
+    """
+
+    status: Literal["COMPLETE", "INCOMPLETE"]
+    gap: PoolControlGap | None = None
+    requests_made: int = Field(default=0, ge=0)
+    principal_raw: int | None = Field(default=None, ge=0)
+    uncollected_fees_raw: int | None = Field(default=None, ge=0)
+    protocol_fees_raw: int | None = Field(default=None, ge=0)
+    claims_raw: int | None = Field(default=None, ge=0)
+    unowned_surplus_raw: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def figures_match_status(self) -> Self:
+        figures = (
+            self.principal_raw,
+            self.uncollected_fees_raw,
+            self.protocol_fees_raw,
+            self.claims_raw,
+            self.unowned_surplus_raw,
+        )
+        if self.status == "COMPLETE":
+            if self.gap is not None or any(value is None for value in figures):
+                raise ValueError("A complete reconciliation names every liability and no gap")
+        elif self.gap is None or self.unowned_surplus_raw is not None:
+            raise ValueError("An incomplete reconciliation says why and claims no surplus")
+        return self
+
+
 class V4Census(Immutable):
     """What the chain said, before any economic interpretation."""
 
@@ -203,6 +253,8 @@ class V4Census(Immutable):
     # How many pools were proven, even when the census later failed. A census
     # that found V4 pools and then broke off must not make them look absent.
     pools_found: int = Field(default=0, ge=0)
+    # Only on an available census, and then always: complete or why not.
+    reconciliation: V4BalanceReconciliation | None = None
 
     @property
     def has_pools(self) -> bool:
@@ -268,6 +320,9 @@ class PoolControlFacts(Immutable):
     # so the true concentration is this or higher.
     economic_top10_floor: Ratio | None = None
     basis: ConcentrationBasis | None = None
+    # The basis with the unattributed remainder left aside: UPPER_BOUND only
+    # when some controller's holdings outside the pools could only be bounded.
+    basis_excluding_remainder: ConcentrationBasis | None = None
     economic_top1_share: Ratio | None = None
     economic_top5_share: Ratio | None = None
     economic_top10_share: Ratio | None = None

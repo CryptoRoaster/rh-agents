@@ -21,10 +21,11 @@ from src.agents.atlas.handler import onchain_payload as atlas_payload
 from src.agents.atlas.models import HolderCompleteness, HolderSourceRow
 from src.agents.atlas.policy import evaluate_snapshot
 from src.core.models import LpControlStatus, RiskOutcome
+from src.orchestration.riskrequest.service import lp_control_view
 from src.orchestration.workflow.models import OnchainPayload, PoolControlSummary
 from tests.atlas.v4.chain import NATIVE, POOL_MANAGER, FakeV4Chain
 from tests.atlas.v4.scenarios import UNIT, build, official_launch
-from tests.lpcontrol.test_lp_control import sentinel
+from tests.lpcontrol.test_lp_control import recorded, sentinel
 
 # Token-side fee growth: about 0.4 % of the launch position's liquidity per
 # unit, so the owed amount is material and nowhere near rounding.
@@ -159,4 +160,61 @@ async def test_an_unreadable_liability_leaves_the_remainder_unknown(now, intent,
     assert control.reconciliation_status == "INCOMPLETE"
     lp, decision = judged(now, intent, context, payload, pool_id)
     assert (lp.status, lp.detail) == (LpControlStatus.UNKNOWN, "V4_POOL_BALANCE_UNATTRIBUTED")
+    assert decision.outcome is RiskOutcome.REJECT
+
+
+def with_census(payload: OnchainPayload, **changes: object) -> OnchainPayload:
+    assert payload.intelligence is not None
+    control = census(payload).model_copy(update=changes)
+    intelligence = payload.intelligence.model_copy(update={"pool_control": control})
+    return payload.model_copy(update={"intelligence": intelligence})
+
+
+async def test_every_other_gap_in_the_reconciliation_is_unknown(now) -> None:
+    payload, pool_id, _ = await launch(now, fees)
+    snapshot = recorded(now, pool_id=pool_id)
+    assert lp_control_view(snapshot=snapshot, onchain=payload)[0] is LpControlStatus.PASS
+    control = census(payload)
+    assert control.basis == "UPPER_BOUND" and control.basis_excluding_remainder == "EXACT"
+    off_by_one = str(int(control.uncollected_fees_raw or "0") + 1)
+    cases = {
+        # Evidence recorded before the reconciliation existed.
+        "legacy": {
+            key: None
+            for key in (
+                "reconciliation_status",
+                "uncollected_fees_raw",
+                "protocol_fees_raw",
+                "claims_raw",
+                "unowned_surplus_raw",
+            )
+        },
+        "incomplete": {"reconciliation_status": "INCOMPLETE"},
+        "claims_unread": {"claims_raw": None},
+        "fees_unread": {"uncollected_fees_raw": None},
+        "surplus_absent": {"unowned_surplus_raw": None},
+        # The reconciliation and the economic split disagree by one unit.
+        "inconsistent": {"uncollected_fees_raw": off_by_one},
+        # Bounded for a reason the reconciliation does not touch.
+        "bounded_holdings": {"basis_excluding_remainder": "UPPER_BOUND"},
+        "basis_unrecorded": {"basis_excluding_remainder": None},
+    }
+    for label, changes in cases.items():
+        status, detail = lp_control_view(
+            snapshot=snapshot, onchain=with_census(payload, **changes)
+        )[:2]
+        assert status is LpControlStatus.UNKNOWN, label
+        assert detail in {
+            "V4_POOL_BALANCE_UNATTRIBUTED",
+            "V4_POOL_CLAIMS_UNATTRIBUTED",
+            "V4_CONCENTRATION_NOT_EXACT",
+        }, (label, detail)
+
+
+async def test_fees_owed_to_an_unresolved_position_do_not_pass(now, intent, context) -> None:
+    # The fees follow the position: a timelocked launch NFT is unresolved.
+    payload, pool_id, _ = await launch(now, fees)
+    unresolved = with_census(payload, position_control_states={"TIMELOCKED": 1})
+    lp, decision = judged(now, intent, context, unresolved, pool_id)
+    assert (lp.status, lp.detail) == (LpControlStatus.UNKNOWN, "V4_POSITION_CONTROL_UNRESOLVED")
     assert decision.outcome is RiskOutcome.REJECT

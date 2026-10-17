@@ -31,7 +31,12 @@ from src.agents.atlas.v4.custody.resolver import (
     resolve_owner,
 )
 from src.agents.atlas.v4.custody.template import code_keccak
-from src.agents.atlas.v4.math import LiquidityMathError, position_amounts
+from src.agents.atlas.v4.math import (
+    LiquidityMathError,
+    fee_growth_inside,
+    fees_owed,
+    position_amounts,
+)
 from src.agents.atlas.v4.models import (
     MAX_POOLS,
     MAX_POSITIONS,
@@ -39,12 +44,14 @@ from src.agents.atlas.v4.models import (
     PoolControlGap,
     PositionKind,
     PositionOwnerStatus,
+    V4BalanceReconciliation,
     V4Census,
     V4HookFacts,
     V4PoolFacts,
     V4PositionFacts,
 )
 from src.agents.atlas.v4.protocol import (
+    CLAIM_TRANSFER_TOPIC,
     EXTSLOAD_SELECTOR,
     INITIALIZE_TOPIC,
     MODIFY_LIQUIDITY_TOPIC,
@@ -52,16 +59,24 @@ from src.agents.atlas.v4.protocol import (
     OWNER_SELECTOR,
     POOL_AND_POSITION_INFO_SELECTOR,
     POOL_MANAGER_SELECTOR,
+    PROTOCOL_FEES_ACCRUED_SELECTOR,
     V4_DEPLOYMENTS,
+    ZERO_ADDRESS,
     InitializeEvent,
     V4DecodeError,
     V4Deployment,
+    currency_id_topic,
     decode_address_result,
+    decode_claim_transfer,
     decode_initialize,
     decode_liquidity,
     decode_modify_liquidity,
     decode_pool_and_position_info,
     decode_slot0,
+    decode_uint256,
+    fee_growth_global_slot,
+    fee_growth_inside_last_slot,
+    fee_growth_outside_slot,
     hook_permissions,
     pool_id,
     pool_state_slot,
@@ -248,9 +263,10 @@ class V4PoolCensus:
                 **common,  # type: ignore[arg-type]
             )
         run = _Run(self.reads, self.bounds)
+        started = asyncio.get_running_loop().time()
         try:
             async with asyncio.timeout(self.bounds.timeout_seconds):
-                return await self._collect(run, deployment, snapshot, token, from_block)
+                found = await self._collect(run, deployment, snapshot, token, from_block)
         except CustodyChainRefused:
             raise PoolControlChainRefused(snapshot.chain) from None
         except _Incomplete as error:
@@ -262,6 +278,9 @@ class V4PoolCensus:
                 raise PoolControlChainRefused(snapshot.chain) from None
             gap = run.phase
             failure = FAILURES.get(error.code, AtlasSourceFailure.UNAVAILABLE)
+        else:
+            remaining = self.bounds.timeout_seconds - (asyncio.get_running_loop().time() - started)
+            return await self._reconciled(run, deployment, found, token, remaining)
         return V4Census(
             status=Availability.UNAVAILABLE,
             gap=gap,
@@ -318,6 +337,158 @@ class V4PoolCensus:
             positions=tuple(positions),
             pool_manager_balance_raw=balance,
         )
+
+    async def _reconciled(
+        self,
+        run: _Run,
+        deployment: V4Deployment,
+        census: V4Census,
+        token: str,
+        remaining: float,
+    ) -> V4Census:
+        """The census, with its balance reconciled against every liability -- or why not.
+
+        A separate stage on what is left of the same budget and deadline. It
+        can only add to the census: whatever stops it is recorded on the
+        reconciliation, and the census and its economic figures stand as they
+        were collected. A chain answering for another chain still stops all.
+        """
+        before = run.requests
+        run.phase = PoolControlGap.RECONCILIATION_UNAVAILABLE
+        run.bound_gap = PoolControlGap.RECONCILIATION_BOUNDS_EXCEEDED
+        gap: PoolControlGap
+        try:
+            if remaining <= 0:
+                raise TimeoutError
+            async with asyncio.timeout(remaining):
+                owed, protocol, claims = await self._liabilities(run, deployment, census, token)
+        except _Incomplete as error:
+            gap = error.gap
+        except (TimeoutError, V4DecodeError, LiquidityMathError):
+            gap = PoolControlGap.RECONCILIATION_UNAVAILABLE
+        except RuntimeFailure as error:
+            if error.code == ErrorCode.CHAIN_ID_MISMATCH:
+                raise PoolControlChainRefused(self.chain) from None
+            gap = PoolControlGap.RECONCILIATION_UNAVAILABLE
+        else:
+            principal = sum(item.controlled_token_raw for item in census.positions)
+            fees = sum(owed)
+            balance = census.pool_manager_balance_raw or 0
+            surplus = balance - principal - fees - protocol - claims
+            complete = surplus >= 0
+            reconciliation = V4BalanceReconciliation(
+                status="COMPLETE" if complete else "INCOMPLETE",
+                # The PoolManager cannot owe more than it holds: something was
+                # missed or misread, and the remainder is not explained.
+                gap=None if complete else PoolControlGap.POOL_BALANCE_DEFICIT,
+                requests_made=run.requests - before,
+                principal_raw=principal,
+                uncollected_fees_raw=fees,
+                protocol_fees_raw=protocol,
+                claims_raw=claims,
+                unowned_surplus_raw=surplus if complete else None,
+            )
+            positions = census.positions
+            if complete:
+                positions = tuple(
+                    item.model_copy(update={"uncollected_token_raw": amount})
+                    for item, amount in zip(census.positions, owed, strict=True)
+                )
+            return census.model_copy(
+                update={
+                    "requests_made": run.requests,
+                    "positions": positions,
+                    "reconciliation": reconciliation,
+                }
+            )
+        return census.model_copy(
+            update={
+                "requests_made": run.requests,
+                "reconciliation": V4BalanceReconciliation(
+                    status="INCOMPLETE", gap=gap, requests_made=run.requests - before
+                ),
+            }
+        )
+
+    async def _liabilities(
+        self, run: _Run, deployment: V4Deployment, census: V4Census, token: str
+    ) -> tuple[list[int], int, int]:
+        """Fees owed to each position (in census order), protocol fees and claims.
+
+        Every value is read at the census block through the PoolManager's own
+        storage and events, in the token's currency only, and computed with the
+        protocol's own arithmetic. Shared words are read once.
+        """
+        manager = deployment.pool_manager
+        block = census.scan_to_block
+        if block is None or census.scan_from_block is None:  # pragma: no cover - available
+            raise _Incomplete(PoolControlGap.RECONCILIATION_UNAVAILABLE, None)
+        words: dict[int, int] = {}
+
+        async def stored(slot: int) -> int:
+            if slot not in words:
+                run.spend()
+                words[slot] = decode_uint256(
+                    await self.reads.call_word(manager, EXTSLOAD_SELECTOR, slot_word(slot), block)
+                )
+            return words[slot]
+
+        pools = {pool.pool_id: pool for pool in census.pools}
+        owed: list[int] = []
+        for item in census.positions:
+            pool = pools[item.pool_id]
+            if pool.tick is None:  # pragma: no cover - positions need a price
+                raise _Incomplete(PoolControlGap.RECONCILIATION_UNAVAILABLE, None)
+            side = 0 if pool.currency0 == token else 1
+            inside = fee_growth_inside(
+                pool.tick,
+                item.tick_lower,
+                item.tick_upper,
+                await stored(fee_growth_global_slot(pool.pool_id, side)),
+                await stored(fee_growth_outside_slot(pool.pool_id, item.tick_lower, side)),
+                await stored(fee_growth_outside_slot(pool.pool_id, item.tick_upper, side)),
+            )
+            last = await stored(
+                fee_growth_inside_last_slot(
+                    pool.pool_id, item.owner_key, item.tick_lower, item.tick_upper, item.salt, side
+                )
+            )
+            owed.append(fees_owed(inside, last, item.liquidity))
+
+        run.spend()
+        protocol = decode_uint256(
+            await self.reads.call_word(
+                manager, PROTOCOL_FEES_ACCRUED_SELECTOR, slot_word(int(token, 16)), block
+            )
+        )
+
+        currency = int(token, 16)
+        net = 0
+
+        def accept(logs: tuple[ChainLog, ...], low: int, high: int) -> None:
+            nonlocal net
+            for log in logs:
+                transfer = decode_claim_transfer(log.topics, log.data, log.block_number)
+                if transfer.currency_id != currency or not low <= transfer.block_number <= high:
+                    raise V4DecodeError("not the claim log that was asked for")
+                minted = transfer.sender == ZERO_ADDRESS
+                burned = transfer.receiver == ZERO_ADDRESS
+                if minted and burned:
+                    raise V4DecodeError("a claim transfer from and to nobody")
+                net += transfer.amount if minted else -transfer.amount if burned else 0
+
+        await self._scan(
+            run,
+            manager,
+            (CLAIM_TRANSFER_TOPIC, None, None, currency_id_topic(token)),
+            census.scan_from_block,
+            block,
+            accept,
+        )
+        if net < 0:
+            # More claims burned than were ever minted: the history is not whole.
+            raise _Incomplete(PoolControlGap.CLAIMS_INCONSISTENT, None)
+        return owed, protocol, net
 
     async def _verify_deployment(self, run: _Run, deployment: V4Deployment, block: int) -> None:
         """Code at every address, and each PositionManager bound to this PoolManager.

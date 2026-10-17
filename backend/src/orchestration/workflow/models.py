@@ -420,6 +420,13 @@ POOL_CONTROL_ADDED_KEYS = (
     "position_control_states",
     "economic_top_ten_floor_fraction",
     "snapshot_block_timestamp",
+    "basis_excluding_remainder",
+    "reconciliation_status",
+    "reconciliation_gap",
+    "uncollected_fees_raw",
+    "protocol_fees_raw",
+    "claims_raw",
+    "unowned_surplus_raw",
 )
 
 
@@ -552,6 +559,18 @@ class PoolControlSummary(Immutable):
     # Only with V4_POSITION_CONTROL_UNRESOLVED: the top ten without any
     # unresolved supply. A floor -- the true figure is this or higher.
     economic_top_ten_floor_fraction: Share | None = None
+    # The basis with the unattributed remainder left aside (EXACT or
+    # UPPER_BOUND), for a reader that accounts for the remainder otherwise.
+    basis_excluding_remainder: Code | None = None
+    # The PoolManager balance against every liability in the token, read at
+    # `snapshot_block`: COMPLETE, or INCOMPLETE with its gap and no surplus.
+    # Absent on evidence recorded before it existed, and then omitted.
+    reconciliation_status: Code | None = None
+    reconciliation_gap: Code | None = None
+    uncollected_fees_raw: RawAmount | None = None
+    protocol_fees_raw: RawAmount | None = None
+    claims_raw: RawAmount | None = None
+    unowned_surplus_raw: RawAmount | None = None
 
     @model_validator(mode="after")
     def figures_match_status(self) -> Self:
