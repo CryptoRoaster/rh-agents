@@ -412,8 +412,28 @@ class Settings(BaseSettings):
     # takes no case budget), and a risk request for any other case is refused
     # before SENTINEL. Exits — normal and early — and every gate are untouched.
     paper_early_only: bool = False
-    # Pools one new-pool read may bring back, per configured chain.
+    # Pools one new-pool read may bring back, per configured chain. 20 is one
+    # whole GeckoTerminal page; at a five-minute cadence the whole page sees
+    # essentially every new pool (issue #77, shadow run B), the first ten ~69 %.
     early_scout_max_discovery_pools: int = Field(default=10, ge=1, le=20)
+    # Page 2 of `new_pools`, read once and only on proven saturation: page 1 was
+    # full, processed whole (`early_scout_max_discovery_pools=20`), and shares
+    # no pool with what this system recorded before the run. Off by default:
+    # it adds provider requests. Every such poll is counted as a possible gap
+    # either way; this only decides whether one more page is asked for.
+    early_scout_discovery_page2_enabled: bool = False
+    # The hard daily bound on page-2 reads, summed over the UTC day's recorded
+    # scout runs. At a five-minute cadence about one poll in five lacks overlap
+    # (~57 a day); 72 is a quarter of the 288 daily polls. Exhausted means no
+    # page 2 and the poll recorded as a possible gap — never a wider read.
+    early_scout_max_discovery_page2_per_day: int = Field(default=72, ge=0, le=288)
+    # The V4 prefilter. Only a 32-byte V4 pool id can reach LP_CONTROL=PASS; a
+    # 20-byte pool address (V2/V3-style) is UNSUPPORTED, so it can never be
+    # bought (issue #92). On, such a pool is still discovered, recorded and
+    # watched — its data is kept — but it gets no paid ORBIT review and the
+    # early intake never reads it, so ATLAS spends no holder or RPC reads on it.
+    # Off by default: off, nothing changes.
+    early_scout_v4_prefilter_enabled: bool = False
     # Discovery capacity is deliberately decoupled from model-review capacity.
     # Discovery is the cheap input: every valid pool it finds, up to this bound,
     # becomes a watch. A watch does not demand an immediate review — it waits in

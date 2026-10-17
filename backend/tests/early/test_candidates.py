@@ -157,7 +157,7 @@ async def test_a_fixture_watch_is_never_an_early_candidate(risk_db):
     fixture = watch.model_copy(update={"is_fixture": True})
 
     class FixtureWatches:
-        async def young_watching(self, limit, *, seen_since, chain):
+        async def young_watching(self, limit, *, seen_since, chain, v4_only=False):
             return (fixture,)
 
     candidates = EarlyWatchCandidates(

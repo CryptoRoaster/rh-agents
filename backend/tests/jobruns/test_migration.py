@@ -110,9 +110,10 @@ async def run(
     return run_id
 
 
-def test_0024_follows_0023_and_is_the_head():
+def test_0024_follows_0023():
     assert load(MODULE).down_revision == "0023"
-    assert expected_revision() == "0024"
+    # A later revision may follow; the head is asserted by the newest one.
+    assert expected_revision() >= "0024"
 
 
 async def test_an_existing_pause_survives_the_upgrade_untouched(at_0023):

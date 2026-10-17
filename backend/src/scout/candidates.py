@@ -130,12 +130,17 @@ class EarlyWatchCandidates:
     clock: Clock = SystemClock()
     policy: EarlyEntryPolicy = EARLY_ENTRY_V1
     chain: str = "robinhood"
+    # The V4 prefilter (`EARLY_SCOUT_V4_PREFILTER_ENABLED`): only 32-byte V4
+    # pools can pass LP control, so a 20-byte pool would cost ATLAS holder and
+    # RPC reads for a BUY that can never happen. It stays a watch; it is just
+    # not an early candidate.
+    v4_only: bool = False
 
     async def eligible(self, *, include_fixtures: bool = False) -> tuple[DiscoveryWatch, ...]:
         found: list[DiscoveryWatch] = []
         since = self.clock.now() - self.policy.max_age
         for watch in await self.watches.young_watching(
-            SCAN_LIMIT, seen_since=since, chain=self.chain
+            SCAN_LIMIT, seen_since=since, chain=self.chain, v4_only=self.v4_only
         ):
             if watch.is_fixture and not include_fixtures:
                 continue
