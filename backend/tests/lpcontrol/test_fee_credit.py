@@ -125,7 +125,10 @@ async def test_protocol_fees_are_the_protocols_row_and_pass(now) -> None:
     chain, pool = launch(configure)
     control, found = await judged(now, chain, pool)
     assert found[0] is LpControlStatus.PASS, found.detail
-    assert holder(control, "V4_PROTOCOL_FEES") == 7 * UNIT
+    # Credited to the protocol's own row (too small for the top ten here),
+    # and no longer one unattributed holder.
+    assert control.remainder_credited_raw == str(7 * UNIT)
+    assert holder(control, "UNATTRIBUTED_POOL_BALANCE") is None
 
 
 async def test_claims_are_their_holders_and_pass(now) -> None:
@@ -138,7 +141,9 @@ async def test_claims_are_their_holders_and_pass(now) -> None:
     chain, pool = launch(configure)
     control, found = await judged(now, chain, pool)
     assert found[0] is LpControlStatus.PASS, found.detail
-    assert holder(control, CLAIMANT) is not None
+    assert control.claims_raw == str(5 * UNIT)
+    assert control.remainder_credited_raw == str(5 * UNIT)
+    assert holder(control, "UNATTRIBUTED_POOL_BALANCE") is None
 
 
 async def test_a_surplus_over_the_managers_history_is_nobodys_and_passes(now) -> None:
@@ -160,3 +165,47 @@ async def test_without_the_managers_history_a_surplus_stays_unexplained(now) -> 
     control, found = await judged(now, chain, pool, indexed=False)
     assert control.remainder_credit_status == "INCOMPLETE"
     assert found[:2] == (LpControlStatus.UNKNOWN, "V4_POOL_SURPLUS_UNEXPLAINED")
+
+
+async def test_more_claim_holders_than_are_named_stay_uncredited(now) -> None:
+    from src.agents.atlas.v4.models import MAX_CLAIM_HOLDERS
+
+    def configure(chain: FakeV4Chain, pool: Pool) -> None:
+        chain.claim_transfers += [
+            (NATIVE, "0x" + f"{index + 1:040x}", UNIT, pool.created_block + 3)
+            for index in range(MAX_CLAIM_HOLDERS + 1)
+        ]
+
+    chain, pool = launch(configure)
+    control, found = await judged(now, chain, pool)
+    assert control.remainder_credit_status == "INCOMPLETE"
+    assert found[:2] == (LpControlStatus.UNKNOWN, "V4_POOL_CLAIMS_UNATTRIBUTED")
+
+
+async def test_a_collector_outside_an_incomplete_holder_list_is_not_exact(now) -> None:
+    # The account earning fees might hold more than the retained rows show.
+    def configure(chain: FakeV4Chain, pool: Pool) -> None:
+        chain.accrue(side_pool(chain, pool), GROWTH)
+
+    chain, pool = launch(configure)
+    store = MemoryPoolIndexStore()
+    await V4PoolIndexer(
+        reads=chain, store=store, deployment=deployment(), confirmations=20, max_requests=200
+    ).advance()
+    _, _, launch_rows = official_launch()
+    rows = (
+        HolderSourceRow(address=POOL_MANAGER, balance_raw=chain.pool_balance(chain.head)),
+        *launch_rows[1:],
+    )
+    snapshot = await build(
+        now,
+        chain,
+        rows=rows,
+        completeness=HolderCompleteness.TOP_N_ONLY,
+        supply=sum(row.balance_raw for row in rows) + 10**24,
+        holder_count=len(rows) + 50,
+        index=PoolIndexHistory(store),
+    )
+    payload = atlas_payload(snapshot, evaluate_snapshot(snapshot, now))
+    found = lp_control_view(snapshot=recorded(now, pool_id=pool.id), onchain=payload)
+    assert found[0] is LpControlStatus.UNKNOWN

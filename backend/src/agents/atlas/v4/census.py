@@ -38,8 +38,10 @@ from src.agents.atlas.v4.math import (
     position_amounts,
 )
 from src.agents.atlas.v4.models import (
+    MAX_CLAIM_HOLDERS,
     MAX_POOLS,
     MAX_POSITIONS,
+    ClaimBalance,
     HookOwnerStatus,
     PoolControlGap,
     PositionKind,
@@ -382,7 +384,9 @@ class V4PoolCensus:
             if remaining <= 0:
                 raise TimeoutError
             async with asyncio.timeout(remaining):
-                owed, protocol, claims = await self._liabilities(run, deployment, census, token)
+                owed, protocol, claims, holders = await self._liabilities(
+                    run, deployment, census, token
+                )
         except _Incomplete as error:
             gap = error.gap
         except (TimeoutError, V4DecodeError, LiquidityMathError):
@@ -408,6 +412,7 @@ class V4PoolCensus:
                 protocol_fees_raw=protocol,
                 claims_raw=claims,
                 surplus_raw=surplus if complete else None,
+                claim_holders=holders,
             )
             positions = census.positions
             if complete:
@@ -433,7 +438,7 @@ class V4PoolCensus:
 
     async def _liabilities(
         self, run: _Run, deployment: V4Deployment, census: V4Census, token: str
-    ) -> tuple[list[int], int, int]:
+    ) -> tuple[list[int], int, int, tuple[ClaimBalance, ...] | None]:
         """Fees owed to each position (in census order), protocol fees and claims.
 
         Every value is read at the census block through the PoolManager's own
@@ -485,6 +490,7 @@ class V4PoolCensus:
 
         currency = int(token, 16)
         net = 0
+        balances: dict[str, int] = {}
 
         def accept(logs: tuple[ChainLog, ...], low: int, high: int) -> None:
             nonlocal net
@@ -497,6 +503,12 @@ class V4PoolCensus:
                 if minted and burned:
                     raise V4DecodeError("a claim transfer from and to nobody")
                 net += transfer.amount if minted else -transfer.amount if burned else 0
+                if not minted:
+                    balances[transfer.sender] = balances.get(transfer.sender, 0) - transfer.amount
+                if not burned:
+                    balances[transfer.receiver] = (
+                        balances.get(transfer.receiver, 0) + transfer.amount
+                    )
 
         await self._scan(
             run,
@@ -506,10 +518,16 @@ class V4PoolCensus:
             block,
             accept,
         )
-        if net < 0:
-            # More claims burned than were ever minted: the history is not whole.
+        if net < 0 or any(value < 0 for value in balances.values()):
+            # More claims burned or sent than were ever held: the history is not whole.
             raise _Incomplete(PoolControlGap.CLAIMS_INCONSISTENT, None)
-        return owed, protocol, net
+        held = sorted((owner, value) for owner, value in balances.items() if value > 0)
+        holders = (
+            tuple(ClaimBalance(holder=owner, balance_raw=value) for owner, value in held)
+            if len(held) <= MAX_CLAIM_HOLDERS
+            else None
+        )
+        return owed, protocol, net, holders
 
     def _before_creation(
         self,

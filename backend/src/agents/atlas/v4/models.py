@@ -38,6 +38,8 @@ MAX_POOLS = 16
 MAX_POSITIONS = 64
 # The pseudo-holder an unexplained PoolManager remainder is ranked as.
 UNATTRIBUTED_POOL_BALANCE = "UNATTRIBUTED_POOL_BALANCE"
+# The row protocol fees are ranked as: one claimant, the protocol (issue #103).
+PROTOCOL_FEES_HOLDER = "V4_PROTOCOL_FEES"
 
 
 class PoolControlGap(StrEnum):
@@ -218,6 +220,17 @@ class V4PositionFacts(Immutable):
         return self.control.controller
 
 
+# The most claim holders one reconciliation names; more leaves them unnamed.
+MAX_CLAIM_HOLDERS = 64
+
+
+class ClaimBalance(Immutable):
+    """One account's ERC-6909 claim on the token, from the claim transfers."""
+
+    holder: EvmAddress
+    balance_raw: int = Field(gt=0)
+
+
 class V4BalanceReconciliation(Immutable):
     """The PoolManager's token balance against every liability it has in that token.
 
@@ -246,6 +259,11 @@ class V4BalanceReconciliation(Immutable):
     claims_raw: int | None = Field(default=None, ge=0)
     # Beyond every liability of the positions found. Not attributed to anyone.
     surplus_raw: int | None = Field(default=None, ge=0)
+    # Who holds the claims, from every claim transfer since the token's
+    # creation. None when there were more holders than are named.
+    claim_holders: tuple[ClaimBalance, ...] | None = Field(
+        default=None, max_length=MAX_CLAIM_HOLDERS
+    )
 
     @model_validator(mode="after")
     def figures_match_status(self) -> Self:
@@ -261,6 +279,11 @@ class V4BalanceReconciliation(Immutable):
                 raise ValueError("A complete reconciliation names every liability and no gap")
         elif self.gap is None or self.surplus_raw is not None:
             raise ValueError("An incomplete reconciliation says why and claims no surplus")
+        if self.claim_holders is not None and (
+            self.claims_raw is None
+            or sum(item.balance_raw for item in self.claim_holders) != self.claims_raw
+        ):
+            raise ValueError("Named claim holders hold exactly the claims")
         return self
 
 
@@ -360,6 +383,16 @@ class PoolControlFacts(Immutable):
     economic_top5_share: Ratio | None = None
     economic_top10_share: Ratio | None = None
     economic_top_holders: tuple[EconomicHolder, ...] = Field(default=(), max_length=10)
+    # Issue #103: the PoolManager remainder (beyond attributed principal),
+    # credited part by part. COMPLETE: every unit went to who can take it --
+    # fees to their collector, protocol fees to the protocol, claims to their
+    # holders -- or provably to nobody, and the ranking counts each credit
+    # with its holder instead of one unattributed row. INCOMPLETE: some part
+    # has nobody established; the figures below say how much.
+    remainder_credit_status: Literal["COMPLETE", "INCOMPLETE"] | None = None
+    remainder_credited_raw: int | None = Field(default=None, ge=0)
+    remainder_unowned_raw: int | None = Field(default=None, ge=0)
+    remainder_uncredited_raw: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def availability_matches_content(self) -> Self:
