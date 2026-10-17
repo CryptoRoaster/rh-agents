@@ -89,6 +89,11 @@ class GeckoTerminalTransport:
     ) -> None:
         await self._client.aclose()
 
+    @property
+    def remaining(self) -> int:
+        """Logical requests this transport may still make."""
+        return max(0, self._max_requests - self.logical_requests)
+
     def retry_delay(self, header: str | None, attempt: int) -> int:
         fallback = min(self._delay * (1 << attempt), self._delay_cap)
         if header is None:

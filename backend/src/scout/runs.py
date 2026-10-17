@@ -55,6 +55,9 @@ COUNTERS = (
     "history_backoff_set",
     "history_rate_limited",
     "oldest_history_due_age_seconds",
+    "discovery_no_overlap_polls",
+    "discovery_page2_requests",
+    "discovery_possible_gaps",
 )
 
 

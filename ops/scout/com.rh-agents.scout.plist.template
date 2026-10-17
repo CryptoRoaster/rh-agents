@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Early-discovery scout, every 15 minutes. Rendered by install.sh; never edit the
+  Early-discovery scout, every 900 seconds unless install.sh was given
+  RH_AGENTS_SCOUT_INTERVAL_SECONDS (300..3600), which replaces StartInterval. Rendered by install.sh; never edit the
   installed copy by hand. Scout mode only (see run-scout.sh). No secrets here.
 -->
 <plist version="1.0">

@@ -69,7 +69,7 @@ from src.markets.geckoterminal.networks import CHAINS, Chain, NetworkDirectory, 
 from src.markets.geckoterminal.ohlcv import GeckoTerminalOhlcvSource
 from src.markets.geckoterminal.transport import GeckoTerminalTransport
 from src.markets.history import MarketHistory, MarketHistorySource, MarketHistoryUnavailable
-from src.markets.models import Availability, MarketSnapshot
+from src.markets.models import Availability, MarketPair, MarketSnapshot
 from src.markets.recorder import MarketRecorder, ObservationConflict, record_pair_reporting
 from src.orchestration.commander.context import (
     AccountPauseReader,
@@ -80,6 +80,15 @@ from src.reasoning.models import ReasoningErrorCategory, ReasoningFailure
 from src.reasoning.provider import ReasoningProvider
 from src.runner.models import ConfigurationRefused
 from src.scout.budget import OrbitBudget, SlotPacing, utc_day
+from src.scout.discovery import (
+    PAGE2_DAILY_BUDGET,
+    PAGE2_DISABLED,
+    PAGE2_FAILED_PREFIX,
+    PAGE2_NO_OVERLAP,
+    PAGE2_RUN_BUDGET,
+    PAGE_TRUNCATED,
+    DiscoveryReference,
+)
 from src.scout.history_queue import (
     BUDGET_EXHAUSTED,
     CURRENT_WINDOW,
@@ -276,6 +285,11 @@ class Tally:
     history_backoff_set: int = 0
     history_rate_limited: int = 0
     oldest_history_due_age_seconds: int | None = None
+    # Early discovery page coverage (issue #77).
+    discovery_no_overlap_polls: int = 0
+    discovery_page2_requests: int = 0
+    discovery_possible_gaps: int = 0
+    discovery_gap_reasons: list[str] = field(default_factory=list)
     reviews: list[ScoutReview] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     shadow: ShadowTally = field(default_factory=ShadowTally)
@@ -284,6 +298,12 @@ class Tally:
     def fail(self, code: str) -> None:
         if code not in self.errors:
             self.errors.append(code)
+
+    def gap(self, reason: str) -> None:
+        """One poll left as a possible gap, and why it was not closed."""
+        self.discovery_possible_gaps += 1
+        if reason not in self.discovery_gap_reasons:
+            self.discovery_gap_reasons.append(reason)
 
 
 # How many due watches one run may walk past while looking for ones it can
@@ -318,7 +338,11 @@ class EarlyScoutCycle:
         self._ports = ports if ports is not None else scout_ports_from_settings(settings)
         self._clock = clock if clock is not None else SystemClock()
         self._policy = policy
-        self._watches = WatchRepository(sessions, policy=policy)
+        self._watches = WatchRepository(
+            sessions,
+            policy=policy,
+            orbit_v4_only=settings.early_scout_v4_prefilter_enabled,
+        )
         self._budget = OrbitBudget(sessions)
         # V2 spreads the day's paid ORBIT slots evenly; V1 keeps its daily cap only.
         self._pacing = SlotPacing() if policy.fresh_first_only else None
@@ -384,7 +408,7 @@ class EarlyScoutCycle:
                 )
                 directory = NetworkDirectory(transport, self._settings)
                 recorder = MarketRecorder(self._sessions, clock=self._clock)
-                fresh = await self._discover(transport, directory, recorder, tally)
+                fresh = await self._discover(transport, directory, recorder, tally, started)
                 await self._scheduled(transport, directory, recorder, fresh, tally)
                 # Last, after every review and check: shadow work cannot change
                 # what the run already decided, nor delay it.
@@ -566,6 +590,7 @@ class EarlyScoutCycle:
         directory: NetworkDirectory,
         recorder: MarketRecorder,
         tally: Tally,
+        started: datetime,
     ) -> dict[str, MarketSnapshot]:
         """One new-pool read per chain. Returns what this run recorded, by pair.
 
@@ -575,13 +600,18 @@ class EarlyScoutCycle:
         ranked by liquidity, volume or price. A stream the limit turns away is
         marked declined, which keeps the recovery bootstrap from adopting it on
         the next run.
+
+        A saturated page 1 — full, and sharing no pool with anything recorded
+        before the run — is a possible gap; page 2 may then be read once
+        (`_page_two`). Its pools are discovery data exactly like page 1's.
         """
         recorded: dict[str, MarketSnapshot] = {}
         by_chain: list[list[MarketSnapshot]] = []
         bounded = self._settings.model_copy(
             update={"geckoterminal_pools_per_chain": self._settings.early_scout_max_discovery_pools}
         )
-        for chain in selected_chains(self._settings):
+        chains = selected_chains(self._settings)
+        for index, chain in enumerate(chains):
             adapter = GeckoTerminalAdapter(transport, directory, chain, bounded, clock=self._clock)
             try:
                 pairs = await adapter.discover()
@@ -592,19 +622,21 @@ class EarlyScoutCycle:
                 )
                 continue
             finally:
-                tally.discovered += adapter.discovered
-                for code, count in adapter.rejections.items():
-                    tally.rejections[code.upper()] = tally.rejections.get(code.upper(), 0) + count
-                    if code == IdentityError.code:
-                        tally.provider_identity_rejects += count
-                    else:
-                        tally.other_provider_rejects += count
+                self._count(adapter, tally)
             tally.valid_markets += len(pairs)
             batch: list[MarketSnapshot] = []
             for pair in pairs:
                 snapshot = await self._record(adapter, pair, recorder, tally)
                 if snapshot is None:
                     continue
+                recorded[snapshot.pair.pair_id] = snapshot
+                batch.append(snapshot)
+            # What the run still needs after this page: page 1 of every later
+            # chain, and one refresh request per chain. Page 2 never takes it.
+            reserve = (len(chains) - index - 1) + len(chains)
+            for snapshot in await self._page_two(
+                chain, adapter, pairs, transport, recorder, tally, started, reserve
+            ):
                 recorded[snapshot.pair.pair_id] = snapshot
                 batch.append(snapshot)
             by_chain.append(batch)
@@ -638,6 +670,86 @@ class EarlyScoutCycle:
                 ):
                     tally.watches_declined += 1
         return recorded
+
+    @staticmethod
+    def _count(adapter: GeckoTerminalAdapter, tally: Tally) -> None:
+        """Add one page's discovered pools and rejections to the run's tally."""
+        tally.discovered += adapter.discovered
+        for code, count in adapter.rejections.items():
+            tally.rejections[code.upper()] = tally.rejections.get(code.upper(), 0) + count
+            if code == IdentityError.code:
+                tally.provider_identity_rejects += count
+            else:
+                tally.other_provider_rejects += count
+
+    async def _page_two(
+        self,
+        chain: Chain,
+        adapter: GeckoTerminalAdapter,
+        page_one: tuple[MarketPair, ...],
+        transport: GeckoTerminalTransport,
+        recorder: MarketRecorder,
+        tally: Tally,
+        started: datetime,
+        reserve: int,
+    ) -> list[MarketSnapshot]:
+        """Page 2 of new pools, once, and only on proven saturation of page 1.
+
+        Proven means: page 1 was full, and none of its pools had been recorded
+        before this run started, while something on this chain had been. Such
+        a poll is counted as a possible gap unless page 2 reaches a recorded
+        pool. Page 2 is read only when switched on, when page 1 was processed
+        whole, within the day's page-2 budget and while the run's own request
+        budget still holds what the run needs after it. Each refusal, and a
+        page 2 that fails or reaches nothing recorded, leaves the gap recorded
+        with its reason — never a wider read.
+        """
+        reference = DiscoveryReference(self._sessions)
+        if not await reference.has_reference(chain.name, started):
+            return []
+        seen = {pair.pair_id for pair in page_one}
+        if await reference.seen_before(chain.name, seen, started):
+            return []
+        if adapter.returned < MAX_POOLS_PER_REQUEST:
+            # A short page is the end of the list: nothing lies beyond it.
+            return []
+        tally.discovery_no_overlap_polls += 1
+        settings = self._settings
+        if not settings.early_scout_discovery_page2_enabled:
+            tally.gap(PAGE2_DISABLED)
+            return []
+        if settings.early_scout_max_discovery_pools < MAX_POOLS_PER_REQUEST:
+            # Page 2 would skip the unprocessed rest of page 1.
+            tally.gap(PAGE_TRUNCATED)
+            return []
+        used = await reference.page2_used(self._clock.now()) + tally.discovery_page2_requests
+        if used >= settings.early_scout_max_discovery_page2_per_day:
+            tally.gap(PAGE2_DAILY_BUDGET)
+            return []
+        if transport.remaining < 1 + reserve:
+            tally.gap(PAGE2_RUN_BUDGET)
+            return []
+        tally.discovery_page2_requests += 1
+        try:
+            pairs = await adapter.discover(page=2)
+        except ProviderError as error:
+            tally.provider_failures += 1
+            tally.gap(PAGE2_FAILED_PREFIX + error.code.upper())
+            return []
+        finally:
+            self._count(adapter, tally)
+        # Pools pushed down from page 1 by new listings are not new twice.
+        fresh = [pair for pair in pairs if pair.pair_id not in seen]
+        tally.discovered -= len(pairs) - len(fresh)
+        tally.valid_markets += len(fresh)
+        if not await reference.seen_before(chain.name, [p.pair_id for p in fresh], started):
+            tally.gap(PAGE2_NO_OVERLAP)
+        snapshots: list[MarketSnapshot] = []
+        for pair in fresh:
+            snapshot = await self._record(adapter, pair, recorder, tally)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        return snapshots
 
     async def _record(
         self, adapter: GeckoTerminalAdapter, pair: object, recorder: MarketRecorder, tally: Tally
@@ -1213,6 +1325,10 @@ class EarlyScoutCycle:
             history_backoff_set=tally.history_backoff_set,
             history_rate_limited=tally.history_rate_limited,
             oldest_history_due_age_seconds=tally.oldest_history_due_age_seconds,
+            discovery_no_overlap_polls=tally.discovery_no_overlap_polls,
+            discovery_page2_requests=tally.discovery_page2_requests,
+            discovery_possible_gaps=tally.discovery_possible_gaps,
+            discovery_gap_reasons=tuple(tally.discovery_gap_reasons[:16]),
             reviews=tuple(tally.reviews[:16]),
             model_failure_reasons=tuple(
                 ModelFailureCount(provider=provider, category=category, reason_code=code, count=n)

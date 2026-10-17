@@ -106,6 +106,7 @@ async def risk_db():
                 "0022_stream_outcome_percent_type",
                 "0023_persistent_entry_halt",
                 "0024_paper_job_runs",
+                "0025_scout_discovery_gaps",
             ):
                 spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
                 module = importlib.util.module_from_spec(spec)

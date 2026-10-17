@@ -124,11 +124,97 @@ is never bypassed.
 | `EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN` | 4 |
 | `EARLY_SCOUT_MAX_BOOTSTRAP_STREAMS` | 100 |
 
+| `EARLY_SCOUT_DISCOVERY_PAGE2_ENABLED` | `false` |
+| `EARLY_SCOUT_MAX_DISCOVERY_PAGE2_PER_DAY` | 72 (UTC day) |
+| `EARLY_SCOUT_V4_PREFILTER_ENABLED` | `false` |
+
 Streams recorded before the scout existed are adopted by a bounded, idempotent
 application bootstrap. Migration `0012` creates only the schema.
 
 Operating the scout on a schedule, the cockpit and run history are covered in
 [scout-cockpit.md](scout-cockpit.md).
+
+## Five-minute discovery (issue #77)
+
+Shadow run B ([early-discovery-shadow-b.md](early-discovery-shadow-b.md))
+measured `robinhood/new_pools` for 24 hours: about 156 new pools an hour, one
+page of 20 covering about 7 minutes, and at a five-minute poll one poll in five
+sharing no pool with the previous one. The current profile (15 minutes, first
+10 pools) sees about a quarter of new pools; five minutes with the whole page
+sees essentially all of them. The code supports that profile; every part that
+changes provider or model volume is off or bounded by default.
+
+**The whole page.** `EARLY_SCOUT_MAX_DISCOVERY_POOLS=20` processes the whole
+page (the bound already allowed 20; the path is covered by a test). Every valid
+pool is recorded; as many become watches as
+`EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN` allows, so set it to at least 20 (40
+with page 2), or the rest are declined as before.
+
+**Overlap and possible gaps.** A pool counts as already seen when this system
+recorded an observation of it before the run started. The reference is the
+recorded observations themselves: no cursor or pool list is kept beside them,
+so a restart neither loses the reference nor re-creates a watch (watches stay
+unique per market stream, `uq_discovery_watch_stream`). A chain poll whose page
+1 is full and shares no pool with that reference is counted in
+`discovery_no_overlap_polls`; if nothing closes it, also in
+`discovery_possible_gaps`, with its reason in the summary's
+`discovery_gap_reasons`. A first run ever has no reference and records no gap;
+a short page is the end of the list and is never a gap. These counters cost no
+request and are kept in `scout_runs` (migration 0025) whether page 2 is on or
+not.
+
+**Page 2, only on proven saturation.** With
+`EARLY_SCOUT_DISCOVERY_PAGE2_ENABLED=true`, such a poll reads page 2 once. It is
+refused, and the gap recorded with its reason, when:
+
+| Reason | Condition |
+|---|---|
+| `DISCOVERY_PAGE2_DISABLED` | the setting is off (default) |
+| `DISCOVERY_PAGE_TRUNCATED` | page 1 was not processed whole (`EARLY_SCOUT_MAX_DISCOVERY_POOLS` < 20): page 2 would skip the rest of page 1 |
+| `DISCOVERY_PAGE2_DAILY_BUDGET` | the UTC day's page-2 reads, summed over recorded scout runs, reached `EARLY_SCOUT_MAX_DISCOVERY_PAGE2_PER_DAY` |
+| `DISCOVERY_PAGE2_RUN_BUDGET` | the run's GeckoTerminal transport (`GECKOTERMINAL_MAX_REQUESTS`) could not also cover page 1 of every later chain and one refresh per chain |
+| `DISCOVERY_PAGE2_PROVIDER_*` | page 2 failed (for example `..._PROVIDER_RATE_LIMITED`); page 1 is kept, retries and `Retry-After` handling are the transport's unchanged ones |
+| `DISCOVERY_PAGE2_NO_OVERLAP` | page 2 was read and still reached no recorded pool |
+
+Page 2 is one request on the same transport and budget as page 1, never a
+loop; the adapter refuses any page but 1 and 2. Its pools are discovery data
+like page 1's; pools repeated across the page boundary are counted once.
+
+**V4 prefilter.** Only a 32-byte V4 pool id can reach `LP_CONTROL=PASS`; a
+20-byte pool address (V2/V3-style) is `UNSUPPORTED` (issue #92), so it can
+never be bought. With `EARLY_SCOUT_V4_PREFILTER_ENABLED=true` a 20-byte pool is
+still recorded and watched, with its history schedule and outcome labelling,
+but:
+
+- it is not due for a scout ORBIT review and not counted as review debt
+  (`WatchRepository(orbit_v4_only=True)`);
+- the early intake (`EarlyWatchCandidates`) does not read it, so no early case
+  is opened and ATLAS spends no holder or V4 census reads on it.
+
+The PROMOTABLE path of the normal VECTOR intake and the JEV shadow are
+unchanged. Off by default; off, nothing changes.
+
+**Cadence.** The scout runs under launchd every 900 s. `ops/scout/install.sh`
+takes `RH_AGENTS_SCOUT_INTERVAL_SECONDS` (whole seconds, 300 to 3600) to render
+another interval; 300 is the five-minute cadence. It is an install-time choice:
+an installed agent keeps its interval until reinstalled. At 300 s, keep ORBIT
+reviews per run small enough to finish inside the interval (launchd never
+overlaps runs, and the advisory lock turns a late overlap into
+`ALREADY_RUNNING`).
+
+**Provider budget.** Page 1 every five minutes is 288 `new_pools` requests a
+day per chain; with page 2 on every non-overlapping poll about 345 (≈ 57 more),
+capped at 72 page-2 reads a day by default. The public limit (30 per minute) is
+not approached. Downstream cost is bounded separately: ORBIT per run and per
+day, ATLAS census `max_requests`; the prefilter roughly halves what reaches
+them.
+
+**Runtime change for the recommended profile** (not applied by this code):
+`EARLY_SCOUT_MAX_DISCOVERY_POOLS=20`, `EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN=40`,
+`EARLY_SCOUT_DISCOVERY_PAGE2_ENABLED=true`, `EARLY_SCOUT_V4_PREFILTER_ENABLED=true`,
+migration 0025 applied, and the agent reinstalled with
+`RH_AGENTS_SCOUT_INTERVAL_SECONDS=300`. Size the ORBIT daily cap to the V4
+share.
 
 ## Provider identity and coverage
 

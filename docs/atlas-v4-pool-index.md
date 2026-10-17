@@ -12,7 +12,7 @@ over a token-creation discovery is `V4_POOL_SURPLUS_UNEXPLAINED`.
 
 ## What it is
 
-Two tables (migration `0025`):
+Two tables (migration `0026`, after `0025` scout discovery gaps):
 
 | Table | Content |
 |---|---|
@@ -64,7 +64,7 @@ by its block time (PR #95).
   read the index.
 - `python -m src.agents.atlas.v4.index_job --chain robinhood --max-requests N`
   advances it once. Exit `0` complete, `3` partial, `1` failed.
-- Migration `0025` must be applied before either is used; the runtime
+- Migration `0026` must be applied before either is used; the runtime
   preflight refuses a database behind the code's head.
 
 ## Live evidence still required (not executed; needs budget approval)
