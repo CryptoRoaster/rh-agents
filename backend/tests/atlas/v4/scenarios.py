@@ -6,12 +6,14 @@ owned single-sided position hold ~57.4 % of supply — with synthetic addresses.
 Nothing here or in the code under test keys on the historical token.
 """
 
+from datetime import datetime
 from decimal import Decimal
 
 from src.agents.atlas.context import AtlasSnapshotBuilder
 from src.agents.atlas.models import (
     AtlasOnchainSnapshot,
     HolderCompleteness,
+    HolderObservationBasis,
     HolderSourceRow,
     OriginFacts,
     OriginVerification,
@@ -196,11 +198,14 @@ def builder(
     supply: int = SUPPLY,
     holder_count: int | None = 4200,
     excluded: tuple[str, ...] = (),
+    block_timestamp: datetime | None = None,
+    observation_basis: HolderObservationBasis = HolderObservationBasis.SOURCE_BLOCK,
 ) -> AtlasSnapshotBuilder:
     holder_result = holder_source_result(
         now,
         rows=wallets() if rows is None else rows,
         completeness=completeness,
+        observation_basis=observation_basis,
         snapshot_block=block,
         provider_total_supply_raw=supply,
         holder_count=holder_count,
@@ -209,7 +214,8 @@ def builder(
         holder_result = holder_result.model_copy(update={"excluded_addresses": excluded})
     return AtlasSnapshotBuilder(
         contracts=StubContracts(
-            chain_snapshot(now, block=block), contract_facts(total_supply_raw=supply, block=block)
+            chain_snapshot(now, block=block, block_timestamp=block_timestamp),
+            contract_facts(total_supply_raw=supply, block=block),
         ),
         holders=StubHolders(holder_result),
         origins=StubOrigins(origin() if origin_facts is None else origin_facts),

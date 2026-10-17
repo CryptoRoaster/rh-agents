@@ -16,18 +16,23 @@ rule somebody has to keep.
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from src.agents.atlas.v4.protocol import V4_DEPLOYMENTS
 from src.core.clock import Clock, SystemClock
 from src.core.models import (
+    LP_CONTROL_V4_POOL_CENSUS,
     ExecutionTiming,
     HolderSnapshot,
     LiquiditySnapshot,
+    LpControlSnapshot,
+    LpControlStatus,
     MarketSnapshot,
+    PoolLocatorCode,
     RiskLimits,
     RiskOutcome,
     SafetyStatus,
@@ -45,7 +50,7 @@ from src.ledger.portfolio import (
     portfolio_state,
     roll_loss_day,
 )
-from src.markets.models import Availability
+from src.markets.models import Availability, PoolLocatorKind
 from src.markets.models import MarketSnapshot as RecordedMarket
 from src.markets.scope import MarketScope, latest_in
 from src.orchestration.commander.context import SystemPausePort
@@ -87,7 +92,9 @@ from src.orchestration.workflow.models import (
     EvidenceType,
     HolderDistributionFacts,
     LiquidityExecutionPayload,
+    OnchainIntelligence,
     OnchainPayload,
+    PoolControlSummary,
     TradeCase,
     TradeCaseStatus,
     WorkflowFailure,
@@ -772,6 +779,150 @@ def entry_concentration_established(onchain: OnchainPayload) -> bool:
     return control is None or not control.required or control.economic_concentration is not None
 
 
+# A V4 pool without a hook. Any other hook is code nobody here has verified,
+# and a hook can hold or move liquidity, so its pool's control is unknown.
+NO_HOOK = "0x" + "0" * 40
+
+
+class LpControlFinding(NamedTuple):
+    """What the market view records as a BUY's LP-control evidence."""
+
+    status: LpControlStatus
+    detail: str
+    pool_locator_kind: PoolLocatorCode | None = None
+    pool_id: str | None = None
+    census_block: int | None = None
+    # The census block's chain time, with a PASS: the age SENTINEL judges.
+    census_observed_at: datetime | None = None
+
+
+def lp_control_view(*, snapshot: RecordedMarket, onchain: OnchainPayload) -> LpControlFinding:
+    """Whether the traded pool's liquidity control is established, and on what.
+
+    The only evidence there is today is ATLAS's V4 pool census, so only a
+    32-byte market pool can pass, and only when the census is bound to the
+    verified deployment of the market's chain at the ATLAS block
+    (`census_basis_gap`), is complete without any tolerance
+    (`unresolved_custody`), lists the market's own pool in that PoolManager,
+    and that pool has no hook. A 20-byte pool (V2/V3 and alike) has no LP-control source at all:
+    its LP tokens or position NFTs are unread, so it is UNSUPPORTED. Nothing
+    here reads a provider.
+    """
+    locator = snapshot.pair.pool_locator
+    if locator is None:
+        return LpControlFinding(LpControlStatus.UNKNOWN, "POOL_LOCATOR_UNKNOWN")
+    pool_id = locator.value
+    kind: PoolLocatorCode = (
+        "CONTRACT_ADDRESS"
+        if locator.kind is PoolLocatorKind.CONTRACT_ADDRESS
+        else "BYTES32_POOL_ID"
+    )
+
+    def finding(status: LpControlStatus, detail: str) -> LpControlFinding:
+        return LpControlFinding(status, detail, kind, pool_id)
+
+    if locator.kind is PoolLocatorKind.CONTRACT_ADDRESS:
+        return finding(LpControlStatus.UNSUPPORTED, "LP_CONTROL_SOURCE_ABSENT")
+    if locator.kind is not PoolLocatorKind.BYTES32_POOL_ID:  # pragma: no cover - closed enum
+        return finding(LpControlStatus.UNKNOWN, "POOL_LOCATOR_UNKNOWN")
+    intelligence = onchain.intelligence
+    control = None if intelligence is None else intelligence.pool_control
+    if intelligence is None or control is None or not control.required:
+        return finding(LpControlStatus.UNKNOWN, "V4_POOL_CENSUS_ABSENT")
+    if control.economic_concentration is None:
+        return finding(LpControlStatus.UNKNOWN, control.gap or "V4_POOL_CENSUS_UNAVAILABLE")
+    unbound = census_basis_gap(
+        chain=snapshot.pair.chain, intelligence=intelligence, control=control
+    )
+    if unbound is not None:
+        return finding(LpControlStatus.UNKNOWN, unbound)
+    pool = next((item for item in control.pools if item.pool_id == pool_id), None)
+    if pool is None or not pool.initialized:
+        return finding(LpControlStatus.UNKNOWN, "V4_MARKET_POOL_NOT_IN_CENSUS")
+    if pool.hook != NO_HOOK:
+        if pool.hook_owner_is_creator is True:
+            # Established: the creator owns the code every liquidity change in
+            # the market's pool runs through.
+            return finding(LpControlStatus.BLOCKED, "V4_HOOK_CREATOR_CONTROLLED")
+        return finding(LpControlStatus.UNKNOWN, "V4_HOOK_UNVERIFIED")
+    unresolved = unresolved_custody(control)
+    if unresolved is not None:
+        return finding(LpControlStatus.UNKNOWN, unresolved)
+    return LpControlFinding(
+        LpControlStatus.PASS,
+        LP_CONTROL_V4_POOL_CENSUS,
+        kind,
+        pool_id,
+        control.snapshot_block,
+        control.snapshot_block_timestamp,
+    )
+
+
+def census_basis_gap(
+    *, chain: str, intelligence: OnchainIntelligence, control: PoolControlSummary
+) -> str | None:
+    """Why the census is not evidence for this market's chain and ATLAS read, if not.
+
+    A census proves something only about the PoolManager and block it was read
+    at. That manager must be the verified V4 deployment of the market's chain,
+    and every PositionManager it named one of that deployment's; its chain must
+    be the ATLAS evidence's; and its block must be the block that evidence was
+    pinned to, so a census from another read cannot be carried beside it. And
+    its block's chain time must be known: that, not the holder observation
+    beside it, is how old the census is.
+    """
+    if control.pool_manager is None or control.snapshot_block is None:
+        return "V4_POOL_CENSUS_BASIS_INCOMPLETE"
+    if control.chain_id is None or control.chain_id != intelligence.chain_id:
+        return "V4_CENSUS_CHAIN_MISMATCH"
+    deployment = V4_DEPLOYMENTS.get((chain, control.chain_id))
+    if deployment is None:
+        return "V4_DEPLOYMENT_UNKNOWN"
+    if control.pool_manager != deployment.pool_manager:
+        return "V4_CENSUS_POOL_MANAGER_UNVERIFIED"
+    if not set(control.position_managers) <= set(deployment.position_managers):
+        return "V4_CENSUS_POSITION_MANAGER_UNVERIFIED"
+    if control.snapshot_block != intelligence.block_number:
+        return "V4_CENSUS_BLOCK_MISMATCH"
+    if control.snapshot_block_timestamp is None:
+        return "V4_CENSUS_BLOCK_TIME_UNKNOWN"
+    return None
+
+
+# The position control states that settle who can move a position's principal:
+# a named controller, or proof that nobody can. Anything else is unresolved.
+RESOLVED_CONTROL_STATES = frozenset({"DIRECT_CONTROL", "RELEASABLE", "PERMANENTLY_LOCKED"})
+
+
+def unresolved_custody(control: PoolControlSummary) -> str | None:
+    """Why some liquidity in the census has no established controller, if any does.
+
+    The economic concentration tolerates a small untraced remainder (fees,
+    round-down), because it ranks holders of token supply. LP control asks who
+    can withdraw a pool's liquidity, and a token-supply tolerance proves nothing
+    about that: a position with an unknown owner can hold almost no token and
+    most of the pool's ETH. So there is no tolerance here. Every position is
+    attributed, nothing in the PoolManager is unexplained, the concentration is
+    exact, and every position's control is resolved -- or the control is unknown.
+    """
+    if control.positions_unattributed != 0:
+        return "V4_POSITION_OWNER_UNKNOWN"
+    if control.unattributed_raw != "0":
+        return "V4_POOL_BALANCE_UNATTRIBUTED"
+    if control.basis != "EXACT":
+        return "V4_CONCENTRATION_NOT_EXACT"
+    states = control.position_control_states
+    if not states and control.positions_total:
+        # None: recorded before control facts existed. Empty: none was counted.
+        # Either way no position's control was read.
+        return "V4_POSITION_CONTROL_UNRESOLVED"
+    if any(state not in RESOLVED_CONTROL_STATES for state in states or {}) or any(
+        raw not in (None, "0") for raw in (control.timelocked_raw, control.unknown_custody_raw)
+    ):
+        return "V4_POSITION_CONTROL_UNRESOLVED"
+    return None
+
+
 def market_view(
     *,
     base_asset_id: str,
@@ -831,6 +982,31 @@ def market_view(
         if not fits_ledger(liquidity.value_usd):
             raise RiskRequestUnavailable("LIQUIDITY_OUTSIDE_ACCOUNTING_PRECISION")
         liquidity_usd = quantize_down(liquidity.value_usd)
+
+    lp_control = None
+    if side is Side.BUY:
+        # Issue #92: only a purchase is judged on it. A sale's snapshot keeps
+        # the exact shape it always had.
+        found = lp_control_view(snapshot=snapshot, onchain=payload)
+        # A PASS is as old as its census block, which ATLAS lets lie minutes
+        # from the holder observation; dating it by that observation would
+        # hand the census a freshness it never had. Without a PASS there is no
+        # census to date, and the finding stands beside the holder facts.
+        lp_control_at = found.census_observed_at or holders.observed_at
+        lp_control = LpControlSnapshot(
+            id=identity("lp-control"),
+            created_at=lp_control_at,
+            updated_at=lp_control_at,
+            source=holders.source,
+            correlation_id=correlation_id,
+            asset_id=base_asset_id,
+            status=found.status,
+            pool_locator_kind=found.pool_locator_kind,
+            pool_id=found.pool_id,
+            basis=LP_CONTROL_V4_POOL_CENSUS if found.status is LpControlStatus.PASS else None,
+            census_block=found.census_block,
+            detail=found.detail,
+        )
 
     price_at = price.observed_at
     return MarketSnapshot(
@@ -896,6 +1072,7 @@ def market_view(
         ),
         # The configured proportional fee on one side's executed notional.
         fee_bps=costs.fee_bps,
+        lp_control=lp_control,
     )
 
 
@@ -924,12 +1101,16 @@ def too_old_for(market: MarketSnapshot, now: datetime, limits: RiskLimits) -> st
     reported as a stale reading instead of coming back as a terminal rejection
     of the market. Nothing is loosened to make a source fit.
     """
-    for label, instant in (
+    instants = [
         ("MARKET", market.observed_at),
         ("TOKEN", market.token.created_at),
         ("LIQUIDITY", market.liquidity.created_at),
         ("HOLDERS", market.holders.created_at),
-    ):
+    ]
+    if market.lp_control is not None:
+        # Only a purchase carries it, and SENTINEL then judges its age too.
+        instants.append(("LP_CONTROL", market.lp_control.created_at))
+    for label, instant in instants:
         age = (now - instant).total_seconds()
         if age < 0:
             return f"{label}_OBSERVED_IN_THE_FUTURE"

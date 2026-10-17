@@ -4,7 +4,7 @@ from uuid import NAMESPACE_URL, uuid5
 from src.core.models import ExecutionResult, ExecutionTiming, MarketSnapshot, OrderIntent, Side
 from src.core.numbers import quantize
 from src.execution.base import Executor
-from src.risk.engine import BPS
+from src.risk.engine import BPS, lp_control_refusal
 
 
 class PaperExecutor(Executor):
@@ -18,6 +18,11 @@ class PaperExecutor(Executor):
             raise ValueError("Execution must use the approved market snapshot")
         if order.risk.market_fingerprint != market.fingerprint():
             raise ValueError("Market snapshot changed after approval")
+        if order.intent.side == Side.BUY and lp_control_refusal(market) is not None:
+            # Issue #92, at the last boundary: whatever approved this order, a
+            # purchase without established LP control is not filled. A sale is
+            # never held to it.
+            raise ValueError("A purchase requires established LP control")
         slippage = market.liquidity.estimated_slippage_bps
         if slippage is None or market.fee_bps is None:
             raise ValueError("Unknown fill costs fail closed")

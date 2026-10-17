@@ -172,7 +172,7 @@ async def test_missing_portfolio_mark_fails_closed(sessions, intent, market, now
     new_asset = "paper:SECOND"
     data = market.model_dump()
     data.update(id=uuid4(), asset_id=new_asset)
-    for key in ("token", "liquidity", "holders"):
+    for key in ("token", "liquidity", "holders", "lp_control"):
         data[key].update(id=uuid4(), asset_id=new_asset)
     new_market = type(market).model_validate(data)
     new_intent = intent.model_copy(update={"id": uuid4(), "asset_id": new_asset})

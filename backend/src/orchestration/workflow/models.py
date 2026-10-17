@@ -419,6 +419,7 @@ POOL_CONTROL_ADDED_KEYS = (
     "unknown_custody_pool_supply_fraction",
     "position_control_states",
     "economic_top_ten_floor_fraction",
+    "snapshot_block_timestamp",
 )
 
 
@@ -505,6 +506,9 @@ class PoolControlSummary(Immutable):
     position_managers: tuple[PoolControlAddress, ...] = Field(default=(), max_length=4)
     scan_from_block: int | None = Field(default=None, strict=True, ge=0)
     snapshot_block: int | None = Field(default=None, strict=True, ge=0)
+    # The chain time of `snapshot_block`: how old the census is. Absent on
+    # evidence recorded before it was carried, and then omitted entirely.
+    snapshot_block_timestamp: AwareDatetime | None = None
     total_supply_raw: RawAmount | None = None
     pool_manager_balance_raw: RawAmount | None = None
     attributed_raw: RawAmount | None = None
