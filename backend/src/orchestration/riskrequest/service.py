@@ -935,7 +935,9 @@ def unresolved_custody(control: PoolControlSummary) -> str | None:
         # census misread something, whatever the remainder looks like.
         return "V4_POOL_BALANCE_INCONSISTENT"
     if control.unattributed_raw != "0":
-        return unexplained_remainder(control)
+        unexplained = unexplained_remainder(control)
+        if unexplained is not None:
+            return unexplained
     if control.basis != "EXACT":
         return "V4_CONCENTRATION_NOT_EXACT"
     states = control.position_control_states
@@ -977,24 +979,47 @@ def withdrawal_unrestricted(pool: PoolControlPool) -> str | None:
     return None
 
 
-def unexplained_remainder(control: PoolControlSummary) -> str:
-    """Why a PoolManager remainder beyond the positions' principal blocks a PASS.
+def credit_adds_up(control: PoolControlSummary) -> bool:
+    """Whether a COMPLETE remainder credit is consistent with the rest of the evidence.
 
-    Issue #96. The census reconciles the balance against every liability of
-    the positions it found -- their uncollected fees, the protocol's fees and
-    the ERC-6909 claims -- so the reason is exact. None of them passes yet:
+    Re-checked here, not taken from the status alone: nothing uncredited, the
+    credited and unowned parts make up the remainder exactly, and an unowned
+    part is never more than the surplus and exists only over a discovery that
+    covers the PoolManager's whole history.
+    """
+    figures = (
+        control.unattributed_raw,
+        control.remainder_credited_raw,
+        control.remainder_unowned_raw,
+        control.remainder_uncredited_raw,
+        control.surplus_raw,
+    )
+    if any(value is None for value in figures):
+        return False
+    unattributed, credited, unowned, uncredited, surplus = (
+        int(value) for value in figures if value is not None
+    )
+    return (
+        uncredited == 0
+        and credited + unowned == unattributed
+        and unowned <= surplus
+        and (unowned == 0 or control.pool_discovery_basis == "MANAGER_HISTORY")
+    )
 
-    * claims are held by accounts nobody here enumerated;
-    * a surplus beyond those liabilities is not provably nobody's: v4-core
-      lets a pool be initialized for a token address before the token exists,
-      and the census finds pools only from the token's creation block, so a
-      position in such a pool would sit exactly there (until pool discovery
-      covers the PoolManager's whole history, #94);
-    * fees and protocol fees are known exactly, but the economic concentration
-      still ranks them as one unattributed holder rather than with whoever can
-      collect them, so the figure is not exact.
 
-    No tolerance, no estimate. Called only with every position attributed.
+def unexplained_remainder(control: PoolControlSummary) -> str | None:
+    """Why a PoolManager remainder beyond the positions' principal blocks a PASS, if it does.
+
+    Issue #96: the census reconciles the balance against every liability of
+    the positions it found -- uncollected fees, protocol fees, ERC-6909 claims
+    -- and whatever lies beyond. Issue #103: the economic split credits each
+    part to who can take it. A remainder passes only when that credit is
+    COMPLETE: fees to the collector of a withdrawable position, protocol fees
+    to the protocol, claims to the holders their transfers name, and a surplus
+    to nobody only over a discovery covering the PoolManager's whole history
+    (#94; v4-core lets a pool be initialized before its token exists).
+    Otherwise the reason is exact. No tolerance, no estimate. Called only with
+    every position attributed.
     """
     if control.reconciliation_status != "COMPLETE":
         return "V4_POOL_BALANCE_UNATTRIBUTED"
@@ -1009,6 +1034,13 @@ def unexplained_remainder(control: PoolControlSummary) -> str:
     if int(control.unattributed_raw) != sum(int(part) for part in parts if part is not None):
         # The reconciliation and the economic split describe different states.
         return "V4_POOL_BALANCE_UNATTRIBUTED"
+    if control.remainder_credit_status == "COMPLETE" and credit_adds_up(control):
+        # Issue #103: every part credited to who can take it -- fees to their
+        # collector, protocol fees to the protocol, claims to their holders --
+        # or provably nobody's, and the economic figure ranks each with its
+        # holder. The concentration and every position's control are still
+        # judged below.
+        return None
     if control.claims_raw != "0":
         return "V4_POOL_CLAIMS_UNATTRIBUTED"
     if control.surplus_raw != "0" and control.pool_discovery_basis != "MANAGER_HISTORY":
@@ -1018,7 +1050,7 @@ def unexplained_remainder(control: PoolControlSummary) -> str:
     if control.uncollected_fees_raw != "0" or control.protocol_fees_raw != "0":
         return "V4_POOL_FEES_NOT_CREDITED"
     # Only a surplus is left, over a discovery covering the PoolManager's whole
-    # history: owed to nobody, but the economic figure still ranks it (#103).
+    # history, but no credit was recorded for it (evidence before #103).
     return "V4_POOL_SURPLUS_NOT_CREDITED"
 
 

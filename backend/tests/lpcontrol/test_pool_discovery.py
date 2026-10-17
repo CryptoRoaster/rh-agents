@@ -90,19 +90,29 @@ async def test_with_the_index_the_early_pool_is_found_and_nothing_hides(now) -> 
     assert found[0] is LpControlStatus.PASS, found.detail
 
 
-async def test_a_surplus_over_complete_discovery_is_nobodys_but_not_yet_credited(now) -> None:
+async def test_a_surplus_over_complete_discovery_is_nobodys(now) -> None:
+    # Since issue #103 the economic figure credits it to nobody, and it passes.
     chain, pool = launch_chain(early=False, surplus=13)
     control, found = await judged(now, chain, pool, indexed=True)
     assert control.pool_discovery_basis == "MANAGER_HISTORY"
     assert control.surplus_raw == "13"
-    assert found[:2] == (LpControlStatus.UNKNOWN, "V4_POOL_SURPLUS_NOT_CREDITED")
+    assert control.remainder_unowned_raw == "13"
+    assert found[0] is LpControlStatus.PASS, found.detail
 
 
 async def test_legacy_evidence_without_a_discovery_basis_is_unexplained(now) -> None:
     chain, pool = launch_chain(early=False, surplus=13)
     control, _ = await judged(now, chain, pool, indexed=True)
+    # Evidence recorded before #94 carries neither a discovery basis nor a credit.
     payload_control = control.model_copy(
-        update={"pool_discovery_basis": None, "pool_discovery_from_block": None}
+        update={
+            "pool_discovery_basis": None,
+            "pool_discovery_from_block": None,
+            "remainder_credit_status": None,
+            "remainder_credited_raw": None,
+            "remainder_unowned_raw": None,
+            "remainder_uncredited_raw": None,
+        }
     )
     assert "pool_discovery_basis" not in payload_control.model_dump(mode="json")
     from src.orchestration.riskrequest.service import unresolved_custody

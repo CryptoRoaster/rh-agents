@@ -26,6 +26,7 @@ result may overstate concentration but can never understate it, and is labelled
 and rounding makes the whole figure unknown instead of falsely precise.
 """
 
+from dataclasses import dataclass
 from decimal import Decimal, localcontext
 
 from src.agents.atlas.models import (
@@ -39,6 +40,7 @@ from src.agents.atlas.models import (
 from src.agents.atlas.sources.normalize import RETAINED_HOLDERS, TOP_N
 from src.agents.atlas.v4.control import UNRESOLVED_STATES, PositionControlState
 from src.agents.atlas.v4.models import (
+    PROTOCOL_FEES_HOLDER,
     UNATTRIBUTED_POOL_BALANCE,
     ConcentrationBasis,
     EconomicHolder,
@@ -199,6 +201,18 @@ def pool_control(
             f"{field}_raw": buckets[state],
             f"{field}_pool_supply_fraction": _share(buckets[state], supply),
         }
+    credit = remainder_credit(census, unattributed_raw)
+    if credit is not None:
+        figures |= {
+            "remainder_credit_status": "COMPLETE" if credit.complete else "INCOMPLETE",
+            "remainder_credited_raw": credit.credited,
+            "remainder_unowned_raw": credit.unowned,
+            "remainder_uncredited_raw": credit.uncredited,
+        }
+    # A remainder credited part by part is no longer unattributed: each part is
+    # ranked with its holder below, or is nobody's. Otherwise it stays one row.
+    if credit is not None and credit.complete:
+        unattributed_raw = 0
     if Decimal(unattributed_raw) > MAX_UNATTRIBUTED_POOL_FRACTION * supply:
         gap = (
             PoolControlGap.POSITION_OWNER_UNKNOWN
@@ -220,6 +234,11 @@ def pool_control(
         for item in attributed
         if item.controller is not None
     ]
+    rows: dict[str, int] = {}
+    if credit is not None and credit.complete:
+        controlled += list(credit.collectors)
+        if credit.protocol:
+            rows[PROTOCOL_FEES_HOLDER] = credit.protocol
     if any(buckets[state] for state in UNRESOLVED_STATES):
         # Supply nobody can be named for and nobody may call locked. Whatever
         # figure is put on it is a guess, so the concentration is unknown. What
@@ -233,7 +252,9 @@ def pool_control(
             **figures,  # type: ignore[arg-type]
         )
 
-    ranked = _ranked(holders, census, controlled, unseen=unseen, unattributed_raw=unattributed_raw)
+    ranked = _ranked(
+        holders, census, controlled, unseen=unseen, unattributed_raw=unattributed_raw, rows=rows
+    )
     basis = (
         ConcentrationBasis.UPPER_BOUND
         if unattributed_raw
@@ -371,6 +392,7 @@ def _ranked(
     *,
     unseen: int,
     unattributed_raw: int,
+    rows: dict[str, int] | None = None,
 ) -> list[tuple[str, int]]:
     """Holders ranked by what they control, largest first, ties by address.
 
@@ -386,4 +408,83 @@ def _ranked(
         balances[owner] += amount
     if unattributed_raw:
         balances[UNATTRIBUTED_POOL_BALANCE] = unattributed_raw
+    # Exact claimants that are no address holder, such as the protocol.
+    balances.update(rows or {})
     return sorted(balances.items(), key=lambda pair: (-pair[1], pair[0]))
+
+
+@dataclass(frozen=True)
+class RemainderCredit:
+    """The PoolManager remainder, part by part (issue #103)."""
+
+    # (collector, amount): fees to whoever can collect them now, claims to
+    # their holders. Ranked like controlled supply.
+    collectors: tuple[tuple[str, int], ...]
+    protocol: int
+    # Beyond every liability, over a discovery covering the PoolManager's
+    # whole history: owed to nobody.
+    unowned: int
+    uncredited: int
+
+    @property
+    def credited(self) -> int:
+        return sum(amount for _, amount in self.collectors) + self.protocol
+
+    @property
+    def complete(self) -> bool:
+        return self.uncredited == 0
+
+
+def remainder_credit(census: V4Census, unattributed_raw: int) -> RemainderCredit | None:
+    """Credit every part of the remainder to who can take it, or say how much has nobody.
+
+    Only with a complete reconciliation (#96). Fees owed to a position go to
+    whoever can collect them now -- the controller of a withdrawable position;
+    a permanently locked position's fees go to fee recipients this code does
+    not read, and anything else has no collector established. Claims go to the
+    holders the claim transfers name. A surplus is nobody's only over a
+    discovery that covers the PoolManager's whole history (#94). The parts
+    must add up to the remainder exactly; whatever does not is uncredited.
+    """
+    found = census.reconciliation
+    if (
+        found is None
+        or found.status != "COMPLETE"
+        or found.protocol_fees_raw is None
+        or found.claims_raw is None
+        or found.surplus_raw is None
+    ):
+        return None
+    collectors: dict[str, int] = {}
+    uncredited = 0
+    for item in census.positions:
+        fee = item.uncollected_token_raw
+        if fee is None:
+            return None
+        if not fee:
+            continue
+        collector = item.controller if item.withdrawal == "WITHDRAWABLE" else None
+        if collector is None:
+            uncredited += fee
+        else:
+            collectors[collector] = collectors.get(collector, 0) + fee
+    if found.claim_holders is None:
+        uncredited += found.claims_raw
+    else:
+        for claim in found.claim_holders:
+            collectors[claim.holder] = collectors.get(claim.holder, 0) + claim.balance_raw
+    unowned = found.surplus_raw if census.pool_discovery_basis == "MANAGER_HISTORY" else 0
+    uncredited += found.surplus_raw - unowned
+    credited = sum(collectors.values()) + found.protocol_fees_raw
+    # The remainder also holds the principal of positions without an owner;
+    # whatever the parts do not cover is uncredited, never assumed away.
+    uncredited = max(uncredited, unattributed_raw - credited - unowned)
+    if credited + unowned > unattributed_raw:
+        # The parts exceed the remainder: the census and the split disagree.
+        uncredited = max(uncredited, 1)
+    return RemainderCredit(
+        collectors=tuple(sorted(collectors.items())),
+        protocol=found.protocol_fees_raw,
+        unowned=unowned,
+        uncredited=uncredited,
+    )

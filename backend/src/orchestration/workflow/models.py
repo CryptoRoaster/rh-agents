@@ -453,6 +453,10 @@ POOL_CONTROL_ADDED_KEYS = (
     "surplus_raw",
     "pool_discovery_basis",
     "pool_discovery_from_block",
+    "remainder_credit_status",
+    "remainder_credited_raw",
+    "remainder_unowned_raw",
+    "remainder_uncredited_raw",
 )
 
 
@@ -598,6 +602,12 @@ class PoolControlSummary(Immutable):
     # discovery started at. Absent on evidence recorded before, and omitted.
     pool_discovery_basis: Code | None = None
     pool_discovery_from_block: int | None = Field(default=None, strict=True, ge=0)
+    # Issue #103: the remainder credited part by part (COMPLETE or INCOMPLETE),
+    # what went to named claimants, to nobody, and to no one established.
+    remainder_credit_status: Code | None = None
+    remainder_credited_raw: RawAmount | None = None
+    remainder_unowned_raw: RawAmount | None = None
+    remainder_uncredited_raw: RawAmount | None = None
 
     @model_validator(mode="after")
     def figures_match_status(self) -> Self:
