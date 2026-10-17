@@ -346,7 +346,7 @@ class V4PoolCensus:
         token: str,
         remaining: float,
     ) -> V4Census:
-        """The census, with its balance reconciled against every liability -- or why not.
+        """The census, its balance reconciled against its positions' liabilities -- or why not.
 
         A separate stage on what is left of the same budget and deadline. It
         can only add to the census: whatever stops it is recorded on the
@@ -386,7 +386,7 @@ class V4PoolCensus:
                 uncollected_fees_raw=fees,
                 protocol_fees_raw=protocol,
                 claims_raw=claims,
-                unowned_surplus_raw=surplus if complete else None,
+                surplus_raw=surplus if complete else None,
             )
             positions = census.positions
             if complete:

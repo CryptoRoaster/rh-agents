@@ -200,12 +200,16 @@ class V4BalanceReconciliation(Immutable):
     claimant outside an unlock: liquidity positions (principal plus the fees
     they are owed), the protocol (`protocolFeesAccrued`) and ERC-6909 claim
     holders. Rounding always goes the PoolManager's way, so its balance covers
-    all of them; whatever it holds beyond them -- rounding dust, a transfer that
-    was never settled -- is owed to nobody and no account can withdraw it.
+    all of them.
 
-    COMPLETE means every liability was read at the census block and the
-    balance covers them. Anything else is INCOMPLETE with its reason and no
-    surplus, because a remainder nobody fully accounted for is not "nobody's".
+    COMPLETE means every liability *of the positions the census found* was read
+    at the census block and the balance covers them; ``surplus_raw`` is what
+    the PoolManager holds beyond that. It is not "nobody's": v4-core lets a pool
+    be initialized for a token address before the token exists, and the census
+    finds pools only from the token's creation block, so a position in such a
+    pool would sit in the surplus. Rounding dust and unsettled transfers do too.
+    Anything that stops the reconciliation is INCOMPLETE with its reason and no
+    surplus.
     """
 
     status: Literal["COMPLETE", "INCOMPLETE"]
@@ -215,7 +219,8 @@ class V4BalanceReconciliation(Immutable):
     uncollected_fees_raw: int | None = Field(default=None, ge=0)
     protocol_fees_raw: int | None = Field(default=None, ge=0)
     claims_raw: int | None = Field(default=None, ge=0)
-    unowned_surplus_raw: int | None = Field(default=None, ge=0)
+    # Beyond every liability of the positions found. Not attributed to anyone.
+    surplus_raw: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def figures_match_status(self) -> Self:
@@ -224,12 +229,12 @@ class V4BalanceReconciliation(Immutable):
             self.uncollected_fees_raw,
             self.protocol_fees_raw,
             self.claims_raw,
-            self.unowned_surplus_raw,
+            self.surplus_raw,
         )
         if self.status == "COMPLETE":
             if self.gap is not None or any(value is None for value in figures):
                 raise ValueError("A complete reconciliation names every liability and no gap")
-        elif self.gap is None or self.unowned_surplus_raw is not None:
+        elif self.gap is None or self.surplus_raw is not None:
             raise ValueError("An incomplete reconciliation says why and claims no surplus")
         return self
 
@@ -320,9 +325,6 @@ class PoolControlFacts(Immutable):
     # so the true concentration is this or higher.
     economic_top10_floor: Ratio | None = None
     basis: ConcentrationBasis | None = None
-    # The basis with the unattributed remainder left aside: UPPER_BOUND only
-    # when some controller's holdings outside the pools could only be bounded.
-    basis_excluding_remainder: ConcentrationBasis | None = None
     economic_top1_share: Ratio | None = None
     economic_top5_share: Ratio | None = None
     economic_top10_share: Ratio | None = None

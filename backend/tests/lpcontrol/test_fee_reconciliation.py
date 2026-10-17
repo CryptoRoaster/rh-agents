@@ -2,18 +2,19 @@
 
 A traded V4 pool always leaves the PoolManager holding more token than its
 positions' principal: swap fees owed to those positions, protocol fees, ERC-6909
-claims and rounding the protocol keeps in its own favour. LP control asks who
-can withdraw a pool's liquidity, so the remainder does not need a tolerance --
-it needs every liability named:
+claims, and rounding the protocol keeps in its own favour. The census now reads
+each of these at the census block, so a remainder is no longer one opaque
+number -- but none of its parts lets a purchase pass yet, and each says why:
 
-* fees owed to a position follow that position's control;
-* protocol fees are the protocol's;
-* claims belong to accounts nobody here enumerated, so any is UNKNOWN;
-* what the PoolManager holds beyond all of them is owed to nobody -- the
-  PoolManager's own solvency invariant -- and no account can withdraw it.
+* claims are held by accounts nobody here enumerated;
+* a surplus beyond every liability of the positions found is not provably
+  nobody's: v4-core lets a pool be initialized for a token address before the
+  token exists, and the census finds pools from the token's creation block, so
+  liquidity in such a pool would sit exactly there (review finding B1);
+* fees owed and protocol fees are exact, but the economic concentration still
+  ranks them as one unattributed holder, not with whoever can collect them.
 
-Only a reconciliation that read every one of these at the census block lets a
-remainder pass; anything missing, inconsistent or unreadable stays UNKNOWN.
+Anything missing, inconsistent or unreadable stays V4_POOL_BALANCE_UNATTRIBUTED.
 Every scenario runs through the real ATLAS census and payload.
 """
 
@@ -28,8 +29,7 @@ from tests.atlas.v4.chain import NATIVE, POOL_MANAGER, FakeV4Chain, Pool
 from tests.atlas.v4.scenarios import HIDDEN_RANGE, UNIT, build, official_launch
 from tests.lpcontrol.test_lp_control import recorded, sentinel
 
-# Token-side fee growth: about 0.4 % of the launch position's liquidity per
-# unit, so the owed amount is material and nowhere near rounding.
+# Token-side fee growth large enough that the owed amount is material.
 GROWTH = 1 << 120
 CLAIMANT = "0x" + "c1" * 20
 
@@ -59,166 +59,51 @@ def census(payload: OnchainPayload) -> PoolControlSummary:
     return payload.intelligence.pool_control
 
 
-def judged(now, intent, context, payload: OnchainPayload, pool_id: str):
+def refused(now, intent, context, payload: OnchainPayload, pool_id: str, detail: str) -> None:
     market, decision = sentinel(now, intent, context, payload, pool_id=pool_id)
     assert market.lp_control is not None
-    return market.lp_control, decision
+    assert (market.lp_control.status, market.lp_control.detail) == (
+        LpControlStatus.UNKNOWN,
+        detail,
+    )
+    assert decision.outcome is RiskOutcome.REJECT
+    assert "LP_CONTROL_UNKNOWN" in decision.reason_codes
 
 
 def fees(chain: FakeV4Chain, pool) -> None:
     chain.accrue(pool, GROWTH)
 
 
-async def test_a_remainder_of_fees_owed_to_resolved_positions_passes(now, intent, context) -> None:
+async def test_fees_owed_are_read_exactly_and_still_not_credited(now, intent, context) -> None:
     payload, pool_id, chain = await launch(now, fees)
     owed = sum(chain.owed(chain.head).values())
     assert owed > UNIT
-    lp, decision = judged(now, intent, context, payload, pool_id)
-    assert lp.status is LpControlStatus.PASS, lp.detail
-    assert decision.outcome is RiskOutcome.APPROVE, decision.reason_codes
     control = census(payload)
     assert control.unattributed_raw == str(owed)
     assert control.reconciliation_status == "COMPLETE"
     assert control.uncollected_fees_raw == str(owed)
-    assert (control.protocol_fees_raw, control.claims_raw) == ("0", "0")
-    assert control.unowned_surplus_raw == "0"
+    assert (control.protocol_fees_raw, control.claims_raw, control.surplus_raw) == ("0", "0", "0")
+    refused(now, intent, context, payload, pool_id, "V4_POOL_FEES_NOT_CREDITED")
 
 
-async def test_protocol_fees_are_the_protocols_and_pass(now, intent, context) -> None:
+async def test_protocol_fees_are_read_exactly_and_still_not_credited(now, intent, context) -> None:
     def configure(chain: FakeV4Chain, pool) -> None:
         fees(chain, pool)
         chain.protocol_fees = 7 * UNIT
 
     payload, pool_id, _ = await launch(now, configure)
-    lp, _ = judged(now, intent, context, payload, pool_id)
-    assert lp.status is LpControlStatus.PASS, lp.detail
     assert census(payload).protocol_fees_raw == str(7 * UNIT)
+    refused(now, intent, context, payload, pool_id, "V4_POOL_FEES_NOT_CREDITED")
 
 
-async def test_a_balance_beyond_every_liability_is_owed_to_nobody(now, intent, context) -> None:
-    # Rounding dust and stray transfers: no account holds a claim on them.
+async def test_a_surplus_beyond_every_liability_found_is_unexplained(now, intent, context) -> None:
     def configure(chain: FakeV4Chain, pool) -> None:
         fees(chain, pool)
         chain.extra_pool_balance = 13
 
     payload, pool_id, _ = await launch(now, configure)
-    lp, _ = judged(now, intent, context, payload, pool_id)
-    assert lp.status is LpControlStatus.PASS, lp.detail
-    assert census(payload).unowned_surplus_raw == "13"
-
-
-async def test_outstanding_claims_are_unknown(now, intent, context) -> None:
-    def configure(chain: FakeV4Chain, pool) -> None:
-        fees(chain, pool)
-        chain.claim_transfers.append((NATIVE, CLAIMANT, 5 * UNIT, pool.created_block + 3))
-
-    payload, pool_id, _ = await launch(now, configure)
-    lp, decision = judged(now, intent, context, payload, pool_id)
-    assert (lp.status, lp.detail) == (LpControlStatus.UNKNOWN, "V4_POOL_CLAIMS_UNATTRIBUTED")
-    assert decision.outcome is RiskOutcome.REJECT
-    assert census(payload).claims_raw == str(5 * UNIT)
-
-
-async def test_claims_minted_and_burned_again_leave_nothing(now, intent, context) -> None:
-    def configure(chain: FakeV4Chain, pool) -> None:
-        fees(chain, pool)
-        chain.claim_transfers += [
-            (NATIVE, CLAIMANT, 5 * UNIT, pool.created_block + 3),
-            (CLAIMANT, NATIVE, 5 * UNIT, pool.created_block + 4),
-        ]
-
-    payload, pool_id, _ = await launch(now, configure)
-    lp, _ = judged(now, intent, context, payload, pool_id)
-    assert lp.status is LpControlStatus.PASS, lp.detail
-    assert census(payload).claims_raw == "0"
-
-
-async def test_a_balance_below_the_liabilities_is_unknown(now, intent, context) -> None:
-    # The PoolManager cannot owe more than it holds; a census that says so
-    # missed or misread something.
-    def configure(chain: FakeV4Chain, pool) -> None:
-        fees(chain, pool)
-        chain.extra_pool_balance = -1
-
-    payload, pool_id, _ = await launch(now, configure)
-    control = census(payload)
-    assert control.reconciliation_status == "INCOMPLETE"
-    assert control.reconciliation_gap == "V4_POOL_BALANCE_DEFICIT"
-    lp, decision = judged(now, intent, context, payload, pool_id)
-    assert (lp.status, lp.detail) == (LpControlStatus.UNKNOWN, "V4_POOL_BALANCE_UNATTRIBUTED")
-    assert decision.outcome is RiskOutcome.REJECT
-
-
-async def test_an_unreadable_liability_leaves_the_remainder_unknown(now, intent, context) -> None:
-    def configure(chain: FakeV4Chain, pool) -> None:
-        fees(chain, pool)
-        chain.protocol_fees = None
-
-    payload, pool_id, _ = await launch(now, configure)
-    control = census(payload)
-    # The census itself, and with it the economic figure, is unaffected.
-    assert control.status == "AVAILABLE"
-    assert control.reconciliation_status == "INCOMPLETE"
-    lp, decision = judged(now, intent, context, payload, pool_id)
-    assert (lp.status, lp.detail) == (LpControlStatus.UNKNOWN, "V4_POOL_BALANCE_UNATTRIBUTED")
-    assert decision.outcome is RiskOutcome.REJECT
-
-
-def with_census(payload: OnchainPayload, **changes: object) -> OnchainPayload:
-    assert payload.intelligence is not None
-    control = census(payload).model_copy(update=changes)
-    intelligence = payload.intelligence.model_copy(update={"pool_control": control})
-    return payload.model_copy(update={"intelligence": intelligence})
-
-
-async def test_every_other_gap_in_the_reconciliation_is_unknown(now) -> None:
-    payload, pool_id, _ = await launch(now, fees)
-    snapshot = recorded(now, pool_id=pool_id)
-    assert lp_control_view(snapshot=snapshot, onchain=payload)[0] is LpControlStatus.PASS
-    control = census(payload)
-    assert control.basis == "UPPER_BOUND" and control.basis_excluding_remainder == "EXACT"
-    off_by_one = str(int(control.uncollected_fees_raw or "0") + 1)
-    cases = {
-        # Evidence recorded before the reconciliation existed.
-        "legacy": {
-            key: None
-            for key in (
-                "reconciliation_status",
-                "uncollected_fees_raw",
-                "protocol_fees_raw",
-                "claims_raw",
-                "unowned_surplus_raw",
-            )
-        },
-        "incomplete": {"reconciliation_status": "INCOMPLETE"},
-        "claims_unread": {"claims_raw": None},
-        "fees_unread": {"uncollected_fees_raw": None},
-        "surplus_absent": {"unowned_surplus_raw": None},
-        # The reconciliation and the economic split disagree by one unit.
-        "inconsistent": {"uncollected_fees_raw": off_by_one},
-        # Bounded for a reason the reconciliation does not touch.
-        "bounded_holdings": {"basis_excluding_remainder": "UPPER_BOUND"},
-        "basis_unrecorded": {"basis_excluding_remainder": None},
-    }
-    for label, changes in cases.items():
-        status, detail = lp_control_view(
-            snapshot=snapshot, onchain=with_census(payload, **changes)
-        )[:2]
-        assert status is LpControlStatus.UNKNOWN, label
-        assert detail in {
-            "V4_POOL_BALANCE_UNATTRIBUTED",
-            "V4_POOL_CLAIMS_UNATTRIBUTED",
-            "V4_CONCENTRATION_NOT_EXACT",
-        }, (label, detail)
-
-
-async def test_fees_owed_to_an_unresolved_position_do_not_pass(now, intent, context) -> None:
-    # The fees follow the position: a timelocked launch NFT is unresolved.
-    payload, pool_id, _ = await launch(now, fees)
-    unresolved = with_census(payload, position_control_states={"TIMELOCKED": 1})
-    lp, decision = judged(now, intent, context, unresolved, pool_id)
-    assert (lp.status, lp.detail) == (LpControlStatus.UNKNOWN, "V4_POSITION_CONTROL_UNRESOLVED")
-    assert decision.outcome is RiskOutcome.REJECT
+    assert census(payload).surplus_raw == "13"
+    refused(now, intent, context, payload, pool_id, "V4_POOL_SURPLUS_UNEXPLAINED")
 
 
 async def test_a_pool_initialized_before_the_token_cannot_hide_in_the_surplus(
@@ -248,7 +133,112 @@ async def test_a_pool_initialized_before_the_token_cannot_hide_in_the_surplus(
         )
 
     payload, pool_id, chain = await launch(now, configure)
-    assert len(census(payload).pools) == 1  # the early pool was never found
-    lp, decision = judged(now, intent, context, payload, pool_id)
-    assert lp.status is LpControlStatus.UNKNOWN, lp.detail
-    assert decision.outcome is RiskOutcome.REJECT
+    control = census(payload)
+    assert len(control.pools) == 1  # the early pool was never found
+    assert control.reconciliation_status == "COMPLETE"
+    assert int(control.surplus_raw or "0") > 0
+    refused(now, intent, context, payload, pool_id, "V4_POOL_SURPLUS_UNEXPLAINED")
+
+
+async def test_outstanding_claims_are_unknown(now, intent, context) -> None:
+    def configure(chain: FakeV4Chain, pool) -> None:
+        fees(chain, pool)
+        chain.claim_transfers.append((NATIVE, CLAIMANT, 5 * UNIT, pool.created_block + 3))
+
+    payload, pool_id, _ = await launch(now, configure)
+    assert census(payload).claims_raw == str(5 * UNIT)
+    refused(now, intent, context, payload, pool_id, "V4_POOL_CLAIMS_UNATTRIBUTED")
+
+
+async def test_claims_minted_and_burned_again_leave_nothing(now, intent, context) -> None:
+    def configure(chain: FakeV4Chain, pool) -> None:
+        fees(chain, pool)
+        chain.claim_transfers += [
+            (NATIVE, CLAIMANT, 5 * UNIT, pool.created_block + 3),
+            (CLAIMANT, NATIVE, 5 * UNIT, pool.created_block + 4),
+        ]
+
+    payload, pool_id, _ = await launch(now, configure)
+    assert census(payload).claims_raw == "0"
+    refused(now, intent, context, payload, pool_id, "V4_POOL_FEES_NOT_CREDITED")
+
+
+async def test_a_balance_below_the_liabilities_is_unattributed(now, intent, context) -> None:
+    # The PoolManager cannot owe more than it holds; a census that says so
+    # missed or misread something.
+    def configure(chain: FakeV4Chain, pool) -> None:
+        fees(chain, pool)
+        chain.extra_pool_balance = -1
+
+    payload, pool_id, _ = await launch(now, configure)
+    control = census(payload)
+    assert control.reconciliation_status == "INCOMPLETE"
+    assert control.reconciliation_gap == "V4_POOL_BALANCE_DEFICIT"
+    refused(now, intent, context, payload, pool_id, "V4_POOL_BALANCE_UNATTRIBUTED")
+
+
+async def test_an_unreadable_liability_leaves_the_remainder_unattributed(
+    now, intent, context
+) -> None:
+    def configure(chain: FakeV4Chain, pool) -> None:
+        fees(chain, pool)
+        chain.protocol_fees = None
+
+    payload, pool_id, _ = await launch(now, configure)
+    control = census(payload)
+    # The census itself, and with it the economic figure, is unaffected.
+    assert control.status == "AVAILABLE"
+    assert control.reconciliation_status == "INCOMPLETE"
+    refused(now, intent, context, payload, pool_id, "V4_POOL_BALANCE_UNATTRIBUTED")
+
+
+def with_census(payload: OnchainPayload, **changes: object) -> OnchainPayload:
+    assert payload.intelligence is not None
+    control = census(payload).model_copy(update=changes)
+    intelligence = payload.intelligence.model_copy(update={"pool_control": control})
+    return payload.model_copy(update={"intelligence": intelligence})
+
+
+async def test_no_remainder_ever_passes(now) -> None:
+    payload, pool_id, _ = await launch(now, fees)
+    snapshot = recorded(now, pool_id=pool_id)
+    control = census(payload)
+    off_by_one = str(int(control.uncollected_fees_raw or "0") + 1)
+    cases = {
+        "reconciled": ({}, "V4_POOL_FEES_NOT_CREDITED"),
+        # Evidence recorded before the reconciliation existed.
+        "legacy": (
+            {
+                key: None
+                for key in (
+                    "reconciliation_status",
+                    "uncollected_fees_raw",
+                    "protocol_fees_raw",
+                    "claims_raw",
+                    "surplus_raw",
+                )
+            },
+            "V4_POOL_BALANCE_UNATTRIBUTED",
+        ),
+        "incomplete": ({"reconciliation_status": "INCOMPLETE"}, "V4_POOL_BALANCE_UNATTRIBUTED"),
+        "claims_unread": ({"claims_raw": None}, "V4_POOL_BALANCE_UNATTRIBUTED"),
+        "fees_unread": ({"uncollected_fees_raw": None}, "V4_POOL_BALANCE_UNATTRIBUTED"),
+        "surplus_absent": ({"surplus_raw": None}, "V4_POOL_BALANCE_UNATTRIBUTED"),
+        # The reconciliation and the economic split disagree by one unit.
+        "inconsistent": ({"uncollected_fees_raw": off_by_one}, "V4_POOL_BALANCE_UNATTRIBUTED"),
+    }
+    for label, (changes, detail) in cases.items():
+        found = lp_control_view(snapshot=snapshot, onchain=with_census(payload, **changes))
+        assert found[:2] == (LpControlStatus.UNKNOWN, detail), label
+
+
+async def test_without_any_remainder_the_launch_still_passes(now, intent, context) -> None:
+    # The positive counterpart: nothing beyond principal, nothing to explain.
+    payload, pool_id, _ = await launch(now)
+    control = census(payload)
+    assert control.unattributed_raw == "0"
+    assert control.reconciliation_status == "COMPLETE"
+    market, decision = sentinel(now, intent, context, payload, pool_id=pool_id)
+    assert market.lp_control is not None
+    assert market.lp_control.status is LpControlStatus.PASS, market.lp_control.detail
+    assert decision.outcome is RiskOutcome.APPROVE, decision.reason_codes

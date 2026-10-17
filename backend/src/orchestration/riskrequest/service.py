@@ -908,16 +908,9 @@ def unresolved_custody(control: PoolControlSummary) -> str | None:
     """
     if control.positions_unattributed != 0:
         return "V4_POSITION_OWNER_UNKNOWN"
-    remainder = control.unattributed_raw != "0"
-    if remainder:
-        unexplained = unexplained_remainder(control)
-        if unexplained is not None:
-            return unexplained
-    if control.basis != "EXACT" and not (
-        # A remainder the reconciliation accounted for makes the economic
-        # figure an upper bound by itself; nothing else may.
-        remainder and control.basis_excluding_remainder == "EXACT"
-    ):
+    if control.unattributed_raw != "0":
+        return unexplained_remainder(control)
+    if control.basis != "EXACT":
         return "V4_CONCENTRATION_NOT_EXACT"
     states = control.position_control_states
     if not states and control.positions_total:
@@ -931,30 +924,43 @@ def unresolved_custody(control: PoolControlSummary) -> str | None:
     return None
 
 
-def unexplained_remainder(control: PoolControlSummary) -> str | None:
-    """Why the PoolManager's token beyond the positions' principal is not accounted for.
+def unexplained_remainder(control: PoolControlSummary) -> str:
+    """Why a PoolManager remainder beyond the positions' principal blocks a PASS.
 
-    Issue #96. Accounted for means the census reconciled the balance against
-    every liability the PoolManager has in the token, at the census block:
-    fees owed to the positions (which follow those positions' control, judged
-    below), protocol fees (the protocol's) and ERC-6909 claims; whatever is
-    left is owed to nobody and no account can withdraw it. Claims are held by
-    accounts nobody here enumerated, so any outstanding claim is unknown. The
-    remainder must be exactly those parts -- no tolerance, no estimate.
-    Called only with every position attributed, so the remainder holds no
-    unknown owner's principal.
+    Issue #96. The census reconciles the balance against every liability of
+    the positions it found -- their uncollected fees, the protocol's fees and
+    the ERC-6909 claims -- so the reason is exact. None of them passes yet:
+
+    * claims are held by accounts nobody here enumerated;
+    * a surplus beyond those liabilities is not provably nobody's: v4-core
+      lets a pool be initialized for a token address before the token exists,
+      and the census finds pools only from the token's creation block, so a
+      position in such a pool would sit exactly there (until pool discovery
+      covers the PoolManager's whole history, #94);
+    * fees and protocol fees are known exactly, but the economic concentration
+      still ranks them as one unattributed holder rather than with whoever can
+      collect them, so the figure is not exact.
+
+    No tolerance, no estimate. Called only with every position attributed.
     """
     if control.reconciliation_status != "COMPLETE":
         return "V4_POOL_BALANCE_UNATTRIBUTED"
-    if control.claims_raw != "0":
-        return "V4_POOL_CLAIMS_UNATTRIBUTED"
-    parts = (control.uncollected_fees_raw, control.protocol_fees_raw, control.unowned_surplus_raw)
+    parts = (
+        control.uncollected_fees_raw,
+        control.protocol_fees_raw,
+        control.claims_raw,
+        control.surplus_raw,
+    )
     if control.unattributed_raw is None or any(part is None for part in parts):
         return "V4_POOL_BALANCE_UNATTRIBUTED"
     if int(control.unattributed_raw) != sum(int(part) for part in parts if part is not None):
         # The reconciliation and the economic split describe different states.
         return "V4_POOL_BALANCE_UNATTRIBUTED"
-    return None
+    if control.claims_raw != "0":
+        return "V4_POOL_CLAIMS_UNATTRIBUTED"
+    if control.surplus_raw != "0":
+        return "V4_POOL_SURPLUS_UNEXPLAINED"
+    return "V4_POOL_FEES_NOT_CREDITED"
 
 
 def market_view(

@@ -70,13 +70,13 @@ async def test_every_liability_is_read_and_the_rest_is_owed_to_nobody(now) -> No
     assert found.uncollected_fees_raw == sum(owed.values())
     assert found.protocol_fees_raw == 11 * UNIT
     assert found.claims_raw == 3 * UNIT
-    assert found.unowned_surplus_raw == 12_345 * UNIT
+    assert found.surplus_raw == 12_345 * UNIT
     assert census.pool_manager_balance_raw == (
         found.principal_raw
         + found.uncollected_fees_raw
         + found.protocol_fees_raw
         + found.claims_raw
-        + found.unowned_surplus_raw
+        + found.surplus_raw
     )
 
 
@@ -106,7 +106,7 @@ async def test_a_budget_that_ends_inside_the_reconciliation_leaves_the_census(no
         "INCOMPLETE",
         "V4_RECONCILIATION_BOUNDS_EXCEEDED",
     )
-    assert short.reconciliation.unowned_surplus_raw is None
+    assert short.reconciliation.surplus_raw is None
 
 
 async def test_an_unreadable_protocol_fee_is_incomplete(now) -> None:
@@ -156,7 +156,7 @@ async def test_a_balance_below_the_liabilities_is_a_deficit(now) -> None:
         "INCOMPLETE",
         "V4_POOL_BALANCE_DEFICIT",
     )
-    assert census.reconciliation.unowned_surplus_raw is None
+    assert census.reconciliation.surplus_raw is None
 
 
 async def test_a_transport_failure_inside_the_reconciliation_leaves_the_census(now) -> None:

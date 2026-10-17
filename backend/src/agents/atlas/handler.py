@@ -425,17 +425,12 @@ def pool_control_summary(
         unknown_custody_pool_supply_fraction=control.unknown_custody_pool_supply_fraction,
         position_control_states=dict(sorted(states.items())) or None,
         economic_top_ten_floor_fraction=control.economic_top10_floor,
-        basis_excluding_remainder=(
-            None
-            if control.basis_excluding_remainder is None
-            else control.basis_excluding_remainder.value
-        ),
         reconciliation_status=None if found is None else found.status,
         reconciliation_gap=None if found is None or found.gap is None else found.gap.value,
         uncollected_fees_raw=None if found is None else raw(found.uncollected_fees_raw),
         protocol_fees_raw=None if found is None else raw(found.protocol_fees_raw),
         claims_raw=None if found is None else raw(found.claims_raw),
-        unowned_surplus_raw=None if found is None else raw(found.unowned_surplus_raw),
+        surplus_raw=None if found is None else raw(found.surplus_raw),
     )
 
 
