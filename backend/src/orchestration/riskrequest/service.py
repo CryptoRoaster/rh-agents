@@ -979,6 +979,34 @@ def withdrawal_unrestricted(pool: PoolControlPool) -> str | None:
     return None
 
 
+def credit_adds_up(control: PoolControlSummary) -> bool:
+    """Whether a COMPLETE remainder credit is consistent with the rest of the evidence.
+
+    Re-checked here, not taken from the status alone: nothing uncredited, the
+    credited and unowned parts make up the remainder exactly, and an unowned
+    part is never more than the surplus and exists only over a discovery that
+    covers the PoolManager's whole history.
+    """
+    figures = (
+        control.unattributed_raw,
+        control.remainder_credited_raw,
+        control.remainder_unowned_raw,
+        control.remainder_uncredited_raw,
+        control.surplus_raw,
+    )
+    if any(value is None for value in figures):
+        return False
+    unattributed, credited, unowned, uncredited, surplus = (
+        int(value) for value in figures if value is not None
+    )
+    return (
+        uncredited == 0
+        and credited + unowned == unattributed
+        and unowned <= surplus
+        and (unowned == 0 or control.pool_discovery_basis == "MANAGER_HISTORY")
+    )
+
+
 def unexplained_remainder(control: PoolControlSummary) -> str | None:
     """Why a PoolManager remainder beyond the positions' principal blocks a PASS, if it does.
 
@@ -1006,7 +1034,7 @@ def unexplained_remainder(control: PoolControlSummary) -> str | None:
     if int(control.unattributed_raw) != sum(int(part) for part in parts if part is not None):
         # The reconciliation and the economic split describe different states.
         return "V4_POOL_BALANCE_UNATTRIBUTED"
-    if control.remainder_credit_status == "COMPLETE":
+    if control.remainder_credit_status == "COMPLETE" and credit_adds_up(control):
         # Issue #103: every part credited to who can take it -- fees to their
         # collector, protocol fees to the protocol, claims to their holders --
         # or provably nobody's, and the economic figure ranks each with its
