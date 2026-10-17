@@ -262,3 +262,37 @@ async def test_a_window_whose_last_block_changed_while_it_was_read_is_not_stored
     assert result.status == "FAILED"
     coverage = await store.coverage(chain.network_id, chain.pool_manager)
     assert coverage is not None and coverage.through_block < first_end[0]
+
+
+async def test_a_window_whose_parent_is_no_longer_the_confirmed_block_is_not_stored(now) -> None:
+    # Re-review: a reorganisation between the tip check and a window.
+    chain, _, _ = indexed_chain()
+    store = MemoryPoolIndexStore()
+    first = await indexer(chain, store, max_requests=34).advance()
+    assert first.status == "PARTIAL"
+    coverage = await store.coverage(chain.network_id, chain.pool_manager)
+    assert coverage is not None
+    original = chain.logs
+    calls: list[int] = []
+
+    async def reorganising(address, topics, start, end):
+        if not calls:
+            calls.append(start)
+        return await original(address, topics, start, end)
+
+    original_hash = chain.block_hash
+    checked: list[int] = []
+
+    async def moving_hash(number):
+        # The tip check sees the confirmed block; any later read does not.
+        if number == coverage.through_block:
+            checked.append(number)
+            if len(checked) > 1:
+                return "0x" + "ce" * 32
+        return await original_hash(number)
+
+    chain.block_hash = moving_hash  # type: ignore[method-assign]
+    chain.logs = reorganising  # type: ignore[method-assign]
+    result = await indexer(chain, store).advance()
+    assert result.status == "FAILED"
+    assert await store.coverage(chain.network_id, chain.pool_manager) == coverage
