@@ -296,3 +296,15 @@ async def test_a_window_whose_parent_is_no_longer_the_confirmed_block_is_not_sto
     result = await indexer(chain, store).advance()
     assert result.status == "FAILED"
     assert await store.coverage(chain.network_id, chain.pool_manager) == coverage
+
+
+async def test_a_provider_window_cap_is_learned_once_per_run(now) -> None:
+    # A provider answering at most 25 000 blocks: the first window narrows
+    # 100k -> 50k -> 25k, and every later window starts at 25k.
+    chain, _, _ = indexed_chain()
+    chain.max_log_span = 25_000
+    store = MemoryPoolIndexStore()
+    result = await indexer(chain, store, max_requests=1_000).advance()
+    assert result.status == "COMPLETE"
+    refused = [item for item in chain.log_requests if item[3] - item[2] + 1 > 25_000]
+    assert len(refused) == 2
