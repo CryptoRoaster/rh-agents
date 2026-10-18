@@ -21,8 +21,9 @@ from src.core.models import (
 
 # A fixture 32-byte pool id; no such pool exists anywhere.
 FIXTURE_POOL_ID = "0x" + "ab" * 32
-# Tests that judge LP control themselves and so must see the real derivation.
-REAL_LP_CONTROL = "tests/lpcontrol/"
+# Tests that judge LP control themselves and so must see the real derivation:
+# the LP-control suite and the offline acceptance of the early entry path.
+REAL_LP_CONTROL = ("tests/lpcontrol/", "tests/acceptance/")
 
 
 @pytest.fixture(autouse=True)
@@ -38,7 +39,8 @@ def fixture_lp_control(request):
     every BUY there; `tests/lpcontrol/` runs the real derivation and the red
     regression, unpatched.
     """
-    if REAL_LP_CONTROL in str(request.node.path).replace("\\", "/"):
+    path = str(request.node.path).replace("\\", "/")
+    if any(prefix in path for prefix in REAL_LP_CONTROL):
         yield
         return
     from src.orchestration.riskrequest import service
