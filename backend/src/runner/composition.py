@@ -494,7 +494,11 @@ def build_stack(
     early_promotion: PromotionRefresh | None = None
     if settings.pre_vector_early_entry_enabled and watches is not None:
         early_source = EarlyWatchCandidates(
-            sessions=sessions, markets=markets, watches=watches, clock=tick
+            sessions=sessions,
+            markets=markets,
+            watches=watches,
+            clock=tick,
+            v4_only=settings.early_scout_v4_prefilter_enabled,
         )
         early_promotion = PromotionRefresh(
             settings=settings,

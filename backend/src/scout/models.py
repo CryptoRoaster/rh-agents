@@ -174,6 +174,13 @@ class ScoutSummary(Immutable):
     history_backoff_set: int = Field(default=0, ge=0)
     history_rate_limited: int = Field(default=0, ge=0)
     oldest_history_due_age_seconds: int | None = Field(default=None, ge=0)
+    # Early discovery page coverage (issue #77): chain polls whose full page 1
+    # shared no pool with anything recorded before the run, page-2 reads made,
+    # polls left as a possible gap, and why each gap was not closed.
+    discovery_no_overlap_polls: int = Field(default=0, ge=0)
+    discovery_page2_requests: int = Field(default=0, ge=0)
+    discovery_possible_gaps: int = Field(default=0, ge=0)
+    discovery_gap_reasons: tuple[Code, ...] = Field(default=(), max_length=16)
     reviews: tuple[ScoutReview, ...] = Field(default=(), max_length=16)
     # Every model failure of this run, counted by provider, category and code.
     model_failure_reasons: tuple[ModelFailureCount, ...] = Field(default=(), max_length=32)
@@ -255,6 +262,9 @@ class ScoutRun(Immutable):
     history_backoff_set: int = 0
     history_rate_limited: int = 0
     oldest_history_due_age_seconds: int | None = None
+    discovery_no_overlap_polls: int = 0
+    discovery_page2_requests: int = 0
+    discovery_possible_gaps: int = 0
     model_failure_reasons: tuple[ModelFailureCount, ...] = ()
 
     @property

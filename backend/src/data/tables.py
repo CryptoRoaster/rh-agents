@@ -1064,6 +1064,13 @@ class ScoutRunRow(Base):
     history_backoff_set: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     history_rate_limited: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     oldest_history_due_age_seconds: Mapped[int | None] = mapped_column(Integer)
+    # Early discovery page coverage (migration 0025): polls whose page 1 shared
+    # no pool with anything recorded before the run, page-2 reads made, and
+    # polls left as a possible gap. The page-2 count is also the durable basis
+    # of the daily page-2 budget.
+    discovery_no_overlap_polls: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    discovery_page2_requests: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    discovery_possible_gaps: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     # Model failures by provider, category and reason code: a list of
     # {"provider", "category", "reason_code", "count"}. Codes only.
     model_failure_reasons: Mapped[list[dict[str, Any]]] = mapped_column(

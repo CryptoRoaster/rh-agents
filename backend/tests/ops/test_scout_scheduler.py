@@ -11,6 +11,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[3]
 SCOUT = REPO / "ops" / "scout"
 FILES = ("run-scout.sh", "install.sh", "uninstall.sh", "com.rh-agents.scout.plist.template")
@@ -248,3 +250,42 @@ def test_the_agent_is_never_installed_from_a_feature_branch(tmp_path):
     assert result.returncode == 1
     assert "refusing to install from branch feat/anything" in result.stderr
     assert not (tmp_path / "agents").exists()
+
+
+def render(tmp_path: Path, **extra: str) -> subprocess.CompletedProcess[str]:
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "RH_AGENTS_UV": str(fake_uv(tmp_path, 0)),
+        "RH_AGENTS_LAUNCH_AGENTS": str(tmp_path / "agents"),
+        "RH_AGENTS_SCOUT_LOG_DIR": str(tmp_path / "logs"),
+        **extra,
+    }
+    return subprocess.run(
+        ["/bin/bash", str(SCOUT / "install.sh"), "--dry-run"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_a_five_minute_cadence_is_an_explicit_install_choice(tmp_path):
+    """Issue #77: 300 s only when the operator asks for it at install time."""
+    result = render(tmp_path, RH_AGENTS_SCOUT_INTERVAL_SECONDS="300")
+    assert result.returncode == 0, result.stderr
+    assert plistlib.loads(result.stdout.encode())["StartInterval"] == 300
+    assert not (tmp_path / "agents").exists()
+
+
+def test_the_cadence_stays_fifteen_minutes_without_a_choice(tmp_path):
+    result = render(tmp_path)
+    assert plistlib.loads(result.stdout.encode())["StartInterval"] == 900
+
+
+@pytest.mark.parametrize("value", ["60", "299", "3601", "abc", "300s", ""])
+def test_a_cadence_outside_five_to_sixty_minutes_is_refused(tmp_path, value):
+    result = render(tmp_path, RH_AGENTS_SCOUT_INTERVAL_SECONDS=value)
+    assert result.returncode != 0
+    assert "RH_AGENTS_SCOUT_INTERVAL_SECONDS" in result.stderr
+    assert result.stdout == ""

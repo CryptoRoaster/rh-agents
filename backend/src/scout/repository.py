@@ -192,10 +192,26 @@ def selection_key(policy_version: str, watch: DiscoveryWatch) -> str:
     return sha256(identity.encode()).hexdigest()
 
 
+# A 32-byte V4 pool id, as its pair identifier spells it. The pair identifier
+# is derived from the pool locator (`PoolLocatorIdentity.pair_id`), so this is
+# the locator kind itself, readable in SQL on every dialect.
+V4_PAIR = "%:bytes32_pool_id:%"
+
+
+def v4_pool() -> Any:
+    """Only watches on a 32-byte V4 pool id: the one kind LP control can pass."""
+    return DiscoveryWatchRow.pair_id.like(V4_PAIR)
+
+
 @dataclass(frozen=True)
 class WatchRepository:
     sessions: async_sessionmaker[AsyncSession]
     policy: EarlyScoutPolicy = EARLY_SCOUT_V2
+    # The V4 prefilter (`EARLY_SCOUT_V4_PREFILTER_ENABLED`): ORBIT review is
+    # due only for watches on a 32-byte pool id. A 20-byte pool stays a watch
+    # with its observations and history schedule; it is just never offered to
+    # a paid review, and it is not counted as review debt.
+    orbit_v4_only: bool = False
 
     # ------------------------------------------------------------------ reads
 
@@ -244,6 +260,11 @@ class WatchRepository:
             column <= now,
         )
 
+    def _orbit_due(self, now: datetime) -> Any:
+        """Due for ORBIT, narrowed to V4 pools when the prefilter is on."""
+        due = self._due(DiscoveryWatchRow.next_orbit_review_at, REVIEWABLE, now)
+        return and_(due, v4_pool()) if self.orbit_v4_only else due
+
     async def due_for_orbit(self, now: datetime, limit: int) -> tuple[DiscoveryWatch, ...]:
         """Due reviews, in an order no market figure or opinion can influence.
 
@@ -254,9 +275,21 @@ class WatchRepository:
         a hidden strategy.
         """
         if not self.policy.fresh_first_only:
-            return await self._select_due(
-                DiscoveryWatchRow.next_orbit_review_at, REVIEWABLE, now, limit
-            )
+            if limit <= 0:
+                return ()
+            column = DiscoveryWatchRow.next_orbit_review_at
+            async with self.sessions() as session:
+                rows = (
+                    await session.scalars(
+                        select(DiscoveryWatchRow)
+                        .where(self._orbit_due(now))
+                        .order_by(
+                            column, DiscoveryWatchRow.first_seen_at, DiscoveryWatchRow.pair_id
+                        )
+                        .limit(limit)
+                    )
+                ).all()
+                return tuple(_watch(row) for row in rows)
         if limit <= 0:
             return ()
         async with self.sessions() as session:
@@ -277,7 +310,7 @@ class WatchRepository:
         window = self.policy.first_review_window
         assert window is not None  # only called under a fresh-first policy
         return and_(
-            self._due(DiscoveryWatchRow.next_orbit_review_at, REVIEWABLE, now),
+            self._orbit_due(now),
             DiscoveryWatchRow.orbit_checkpoint_index.is_(None),
             DiscoveryWatchRow.orbit_state.is_(None),
             DiscoveryWatchRow.first_seen_at >= now - window,
@@ -358,9 +391,7 @@ class WatchRepository:
         """How many watches are due for ORBIT and for history, before any budget."""
         async with self.sessions() as session:
             orbit = await session.scalar(
-                select(func.count())
-                .select_from(DiscoveryWatchRow)
-                .where(self._due(DiscoveryWatchRow.next_orbit_review_at, REVIEWABLE, now))
+                select(func.count()).select_from(DiscoveryWatchRow).where(self._orbit_due(now))
             )
             history = await session.scalar(
                 select(func.count())
@@ -381,8 +412,11 @@ class WatchRepository:
         Counts over the reviewable set only. DORMANT and RETIRED watches cause no
         traffic and are not work anybody owes.
         """
-        reviewable = DiscoveryWatchRow.status.in_([item.value for item in REVIEWABLE])
-        due = self._due(DiscoveryWatchRow.next_orbit_review_at, REVIEWABLE, now)
+        reviewable: Any = DiscoveryWatchRow.status.in_([item.value for item in REVIEWABLE])
+        if self.orbit_v4_only:
+            # A 20-byte pool owes no review under the prefilter.
+            reviewable = and_(reviewable, v4_pool())
+        due = self._orbit_due(now)
         async with self.sessions() as session:
             count = await session.scalar(
                 select(func.count()).select_from(DiscoveryWatchRow).where(due)
@@ -419,23 +453,28 @@ class WatchRepository:
         )
 
     async def young_watching(
-        self, limit: int, *, seen_since: datetime, chain: str
+        self, limit: int, *, seen_since: datetime, chain: str, v4_only: bool = False
     ) -> tuple[DiscoveryWatch, ...]:
         """WATCHING watches on one chain first seen no earlier than `seen_since`.
 
         Youngest first. A necessary condition only: a pool first seen inside the
         window may still be older on chain, which the early strategy decides
         from the chain-side creation time. Never ranked by market size.
+        `v4_only` keeps 32-byte V4 pools only, in the query itself, so 20-byte
+        pools can never fill the scan.
         """
+        conditions = [
+            DiscoveryWatchRow.status == WatchStatus.WATCHING.value,
+            DiscoveryWatchRow.chain == chain,
+            DiscoveryWatchRow.first_seen_at >= seen_since,
+        ]
+        if v4_only:
+            conditions.append(v4_pool())
         async with self.sessions() as session:
             rows = (
                 await session.scalars(
                     select(DiscoveryWatchRow)
-                    .where(
-                        DiscoveryWatchRow.status == WatchStatus.WATCHING.value,
-                        DiscoveryWatchRow.chain == chain,
-                        DiscoveryWatchRow.first_seen_at >= seen_since,
-                    )
+                    .where(*conditions)
                     .order_by(DiscoveryWatchRow.first_seen_at.desc(), DiscoveryWatchRow.pair_id)
                     .limit(limit)
                 )
