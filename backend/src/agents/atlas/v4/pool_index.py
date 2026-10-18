@@ -141,6 +141,9 @@ class V4PoolIndexer:
     max_requests: int
     window: int = MAX_WINDOW
     requests: int = 0
+    # The widest window the provider answered in this run; narrowed spans are
+    # kept for the rest of the run, as the census keeps them per stream.
+    span: int = MAX_WINDOW
 
     def __post_init__(self) -> None:
         if self.confirmations < 0 or not 0 < self.window <= MAX_WINDOW or self.max_requests <= 0:
@@ -153,6 +156,7 @@ class V4PoolIndexer:
 
     async def advance(self) -> IndexAdvance:
         self.requests = 0
+        self.span = self.window
         coverage: IndexCoverage | None = None
         rewound = False
         try:
@@ -234,12 +238,7 @@ class V4PoolIndexer:
 
     async def _window(self, coverage: IndexCoverage, safe: int) -> IndexCoverage:
         start = coverage.through_block + 1
-        if coverage.through_block >= 0:
-            # The window must extend the branch the coverage was confirmed on.
-            self._spend()
-            if await self.reads.block_hash(coverage.through_block) != coverage.through_hash:
-                raise IndexConflict("the confirmed block changed before the window was read")
-        span = self.window
+        span = self.span
         while True:
             end = min(start + span - 1, safe)
             self._spend()
@@ -255,6 +254,7 @@ class V4PoolIndexer:
                 span = max(1, (end - start + 1) // 2)
                 continue
             break
+        self.span = span
         pools = _pools(logs, start, end)
         self._spend()
         after = await self.reads.block_hash(end)
@@ -262,6 +262,12 @@ class V4PoolIndexer:
             # The window's last block changed while its logs were read: they may
             # belong to a branch the chain no longer has.
             raise IndexConflict("the window's last block changed while it was read")
+        if coverage.through_block >= 0:
+            # Read after the logs: the window extends the branch the coverage
+            # was confirmed on, or nothing is stored.
+            self._spend()
+            if await self.reads.block_hash(coverage.through_block) != coverage.through_hash:
+                raise IndexConflict("the confirmed block changed while the window was read")
         extended = replace(coverage, through_block=end, through_hash=after)
         await self.store.extend(extended, pools, expected_through=coverage.through_block)
         return extended
