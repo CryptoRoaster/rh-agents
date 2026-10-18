@@ -58,6 +58,7 @@ from src.data.tables import MarketObservationRow, TradeCaseExecutionRow, TradeCa
 from src.markets.geckoterminal.networks import VerifiedNetworkRegistry
 from src.markets.models import Availability, MarketSnapshot
 from src.markets.scope import MarketScope
+from src.orchestration.commander.context import SystemPauseUnavailable
 from src.orchestration.exitpolicy.drive import (
     PLAN_TIME_BUDGET,
     ExitCandidate,
@@ -65,6 +66,7 @@ from src.orchestration.exitpolicy.drive import (
     alone,
     attempt_exits,
     exit_order,
+    judgement_failed,
 )
 from src.orchestration.exitpolicy.policy import Immutable
 from src.orchestration.exitpolicy.refresh import (
@@ -427,8 +429,15 @@ class EarlyExitService:
                 break
             entry = entries[position.cycle_id]
             now = self.clock.now()
-            inputs, _ = await self._inputs(position, entry, now)
-            verdict = evaluate_early(self.policy, inputs)
+            try:
+                inputs, _ = await self._inputs(position, entry, now)
+                verdict = evaluate_early(self.policy, inputs)
+            except SystemPauseUnavailable:
+                raise
+            except Exception:
+                # Issue #111: one position nobody can judge holds up no other.
+                judgement_failed(result, position.id)
+                continue
             result.unevaluated -= 1
             result.evaluated += 1
             if verdict.trigger is None:

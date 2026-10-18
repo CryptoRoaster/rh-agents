@@ -183,3 +183,27 @@ def assess_exit_run_for(result: ExitSweep) -> ExitHealth | None:
         )
     )
     return assessment.reason
+
+
+async def test_an_early_judgement_that_raises_is_failed_and_retried(risk_db, now) -> None:
+    from tests.early.test_exit import early_entry, observe
+    from tests.early.test_exit import sweeper as early_sweeper
+
+    _, sessions = risk_db
+    await early_entry(sessions, now)
+    at = now + timedelta(minutes=10)
+    await observe(sessions, at, price="0.40")
+    service = early_sweeper(sessions, at)
+
+    async def broken(position, entry, instant):
+        raise ValueError("a position nobody can judge")
+
+    object.__setattr__(service, "_inputs", broken)
+    result = await service.sweep()
+    assert (result.evaluated, result.failed, result.executed) == (0, 1, 0), result
+    assert result.refusals == {"EXIT_JUDGEMENT_FAILED": 1}
+
+    later = at + timedelta(minutes=1)
+    await observe(sessions, later, price="0.40")
+    again = await early_sweeper(sessions, later).sweep()
+    assert again.executed == 1
