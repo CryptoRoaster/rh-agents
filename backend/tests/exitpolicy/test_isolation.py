@@ -207,3 +207,41 @@ async def test_an_early_judgement_that_raises_is_failed_and_retried(risk_db, now
     await observe(sessions, later, price="0.40")
     again = await early_sweeper(sessions, later).sweep()
     assert again.executed == 1
+
+
+async def test_a_booked_sale_whose_confirmation_fails_is_never_sold_again(
+    risk_db, now, monkeypatch
+) -> None:
+    # The sale was booked, then the attempt raised, and the settling read also
+    # failed: counted failed, conservatively -- and still never sold twice.
+    import src.orchestration.exitpolicy.drive as drive
+
+    _, sessions = risk_db
+    await three_holdings(sessions, now)
+    at = now + LATER
+    result = ExitSweep()
+    planned = await sweeper(sessions, at, healthy_read(at)).plan(result)
+    first = planned[0]
+
+    async def booked_then_raises(context):
+        await first.start(context)
+        raise ValueError("after the commit")
+
+    async def unconfirmed(sessions, request_key, seconds):
+        return False
+
+    monkeypatch.setattr(drive, "_booked", unconfirmed)
+    await attempt_exits(
+        [replace(first, start=booked_then_raises)],
+        alone(max_exits=5, max_attempts=5, max_refreshes=5),
+        sessions=sessions,
+    )
+    assert (result.executed, result.failed) == (0, 1), result
+    assert (await counts(sessions))[0] == 1
+    monkeypatch.undo()
+
+    later = at + timedelta(minutes=1)
+    again = await sweeper(sessions, later, healthy_read(later)).sweep()
+    # The booked holding is closed: only the other two are sold, once each.
+    assert (again.triggered, again.executed) == (2, 2), again
+    assert (await counts(sessions))[0] == 3
