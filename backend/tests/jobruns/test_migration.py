@@ -112,8 +112,9 @@ async def run(
 
 def test_0024_follows_0023():
     assert load(MODULE).down_revision == "0023"
-    # A later revision may follow; the head is asserted by the newest one.
-    assert expected_revision() >= "0024"
+    # 0025 (scout discovery gaps) and 0026 (the V4 pool index, issue #94)
+    # follow it; 0026 is the head.
+    assert expected_revision() == "0026"
 
 
 async def test_an_existing_pause_survives_the_upgrade_untouched(at_0023):

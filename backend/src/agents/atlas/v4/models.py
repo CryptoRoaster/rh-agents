@@ -285,6 +285,12 @@ class V4Census(Immutable):
     pools_found: int = Field(default=0, ge=0)
     # Only on an available census, and then always: complete or why not.
     reconciliation: V4BalanceReconciliation | None = None
+    # Where pool discovery started (issue #94): TOKEN_CREATION from the token's
+    # creation block, which can miss a pool initialized before the token
+    # existed; MANAGER_HISTORY from the PoolManager's verified deployment
+    # block, through the pool index, which cannot.
+    pool_discovery_basis: Literal["TOKEN_CREATION", "MANAGER_HISTORY"] = "TOKEN_CREATION"
+    pool_discovery_from_block: int | None = Field(default=None, ge=0)
 
     @property
     def has_pools(self) -> bool:

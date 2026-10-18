@@ -141,6 +141,12 @@ class FakeV4Chain:
     protocol_fees: int | None = 0
     # ERC-6909 claim transfers of the token's id: (from, to, amount, block).
     claim_transfers: list[tuple[str, str, int, int]] = field(default_factory=list)
+    # The PoolManager's deployment block, and pools of *other* tokens it
+    # initialized, for the PoolManager-wide pool index (issue #94).
+    manager_deployed_block: int = 1_000
+    foreign_pools: list[Pool] = field(default_factory=list)
+    # Block hashes that differ from the canonical ones: a reorganisation.
+    reorged: dict[int, str] = field(default_factory=dict)
     # Fail the n-th request (1-based) with this error.
     fail_at: int | None = None
     fail_with: ErrorCode = ErrorCode.TIMEOUT
@@ -298,10 +304,12 @@ class FakeV4Chain:
             return ()
         found: list[ChainLog] = []
         if topics[0] == INITIALIZE_TOPIC:
-            side = len(topics) - 3  # 0: token as currency0, 1: token as currency1
-            for pool in self.pools:
-                currency = (pool.currency0, pool.currency1)[side]
-                if currency != self.token or not start <= pool.created_block <= end:
+            # (topic,) asks for every pool; otherwise the token is currency0 or 1.
+            side = None if len(topics) == 1 else len(topics) - 3
+            for pool in self.pools + self.foreign_pools:
+                if not start <= pool.created_block <= end:
+                    continue
+                if side is not None and (pool.currency0, pool.currency1)[side] != self.token:
                     continue
                 found.append(
                     ChainLog(
@@ -374,9 +382,19 @@ class FakeV4Chain:
         self._tick()
         return GENESIS_TIME + number // 10
 
+    async def head_block(self) -> int:
+        self._tick()
+        return self.head
+
+    async def block_hash(self, number: int) -> str:
+        self._tick()
+        return self.reorged.get(number, hex_word(number ^ 0x5A5A))
+
     def _has_code(self, address: str, block: int) -> bool:
         if address == self.token:
             return block >= self.created_block
+        if address == self.pool_manager:
+            return block >= self.manager_deployed_block
         return (
             address in self.contracts
             or address in self.codes
