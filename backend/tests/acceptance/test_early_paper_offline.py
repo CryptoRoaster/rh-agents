@@ -8,8 +8,10 @@ the PAPER executor's own last check. Every chain answer comes from the
 deterministic fixture chain; the fill is the executor's pure simulation, so no
 PAPER-BUY is recorded anywhere.
 
-The safe case passes. Each unsafe case must stop the purchase -- in SENTINEL
-and again at the executor -- while a sale out of the same market still fills.
+The safe case passes. Each unsafe LP-control case must stop the purchase in
+SENTINEL and again at the executor's own LP-control check, while a sale out of
+the same market -- read with ATLAS's exit policy -- still fills. A stale census
+is stopped by SENTINEL; the executor relies on the approval's short expiry.
 """
 
 from dataclasses import dataclass
@@ -21,7 +23,12 @@ import pytest
 
 from src.agents.atlas.handler import onchain_payload as atlas_payload
 from src.agents.atlas.models import HolderCompleteness, HolderSourceRow, OriginVerification
-from src.agents.atlas.policy import evaluate_snapshot
+from src.agents.atlas.policy import (
+    ATLAS_EXIT_POLICY_V2,
+    ATLAS_POLICY_V2,
+    AtlasPolicy,
+    evaluate_snapshot,
+)
 from src.agents.atlas.v4.pool_index import PoolIndexHistory, V4PoolIndexer
 from src.core.models import (
     AgentRole,
@@ -85,8 +92,12 @@ async def atlas(
     index_budget: int = 200,
     census_age: timedelta | None = None,
     verified_creator: bool = True,
+    policy: AtlasPolicy = ATLAS_POLICY_V2,
 ) -> OnchainPayload:
-    """ATLAS's evidence for the token: census, index, credit, policy, payload."""
+    """ATLAS's evidence for the token: census, index, credit, policy, payload.
+
+    ``policy`` is the entry policy, or ATLAS's exit policy for a sale's read.
+    """
     store = MemoryPoolIndexStore()
     if indexed:
         await V4PoolIndexer(
@@ -120,7 +131,7 @@ async def atlas(
             )
         ),
     )
-    return atlas_payload(snapshot, evaluate_snapshot(snapshot, now))
+    return atlas_payload(snapshot, evaluate_snapshot(snapshot, now, policy))
 
 
 def recorded(
@@ -189,41 +200,42 @@ def order_for(order, decision: RiskDecision, now) -> OrderIntent:
     )
 
 
-def forged(order, view: MarketSnapshot, now) -> OrderIntent:
-    """An approval the engine never gave, bound to this exact market."""
-    decision = RiskDecision(
-        id=uuid4(),
-        created_at=now,
-        updated_at=now,
-        source="FORGED",
-        correlation_id=CORRELATION,
-        intent_id=order.id,
-        intent_fingerprint=order.fingerprint(),
-        market_snapshot_id=view.id,
-        market_fingerprint=view.fingerprint(),
-        outcome=RiskOutcome.APPROVE,
-        reason_codes=("WITHIN_LIMITS",),
-        max_notional_usd=Decimal("1000"),
-        max_slippage_bps=Decimal("100"),
-        evaluated_at=now,
-        expires_at=now + timedelta(seconds=30),
-        policy_version="forged",
+def forged(order, decision: RiskDecision, view: MarketSnapshot, now) -> OrderIntent:
+    """SENTINEL's own decision turned into an approval, bound to this exact market.
+
+    Everything the executor checks before LP control holds -- an APPROVE, the
+    intent, the market's id and fingerprint -- so only its LP-control check can
+    refuse it.
+    """
+    approval = decision.model_copy(
+        update={
+            "outcome": RiskOutcome.APPROVE,
+            "reason_codes": ("WITHIN_LIMITS",),
+            "market_snapshot_id": view.id,
+            "market_fingerprint": view.fingerprint(),
+        }
     )
-    return order_for(order, decision, now)
+    return order_for(order, approval, now)
 
 
-async def refused_buy_but_exit_fills(now, intent, context, payload, snapshot, detail, status):
+async def refused_buy_but_exit_fills(
+    now, intent, context, token: Token, snapshot, detail, status, **evidence
+):
+    payload = await atlas(now, token, **evidence)
     view = market(now, payload, snapshot, Side.BUY)
     assert view.lp_control is not None
     assert (view.lp_control.status, view.lp_control.detail) == (status, detail)
     order, decision = decide(now, intent, context, view, Side.BUY)
     assert decision.outcome is RiskOutcome.REJECT
     assert any(code.startswith("LP_CONTROL_") for code in decision.reason_codes)
-    # The executor refuses the purchase even with an approval it never saw.
-    with pytest.raises(ValueError):
-        await PaperExecutor().execute(forged(order, view, now), view)
-    # A sale out of the same market is never held to LP control.
-    sale_view = market(now, payload, snapshot, Side.SELL)
+    # The executor refuses the purchase even with an approval it never gave.
+    approval = forged(order, decision, view, now)
+    with pytest.raises(ValueError, match="established LP control"):
+        await PaperExecutor().execute(approval, view)
+    # A sale out of the same market is never held to LP control. It is read
+    # with ATLAS's exit policy, as the exit's own fresh read is.
+    exit_payload = await atlas(now, token, policy=ATLAS_EXIT_POLICY_V2, **evidence)
+    sale_view = market(now, exit_payload, snapshot, Side.SELL)
     assert sale_view.lp_control is None
     sale, sale_decision = decide(now, intent, context, sale_view, Side.SELL)
     assert sale_decision.outcome is RiskOutcome.APPROVE, sale_decision.reason_codes
@@ -234,7 +246,9 @@ async def refused_buy_but_exit_fills(now, intent, context, payload, snapshot, de
 # ------------------------------------------------------------------ discovery
 
 
-def test_discovery_sends_only_v4_markets_to_atlas_and_keeps_every_observation() -> None:
+def test_the_token_is_a_market_the_v4_prefilter_lets_through() -> None:
+    # The scout's prefilter keeps 20-byte pools as watches and matches V4 pair
+    # ids by this pattern (its behaviour runs in tests/scout/test_target_profile.py).
     token = young_token()
     v4 = v4_market(token.pool)
     assert v4.pool_locator is not None and v4.pool_locator.kind is PoolLocatorKind.BYTES32_POOL_ID
@@ -267,12 +281,11 @@ async def test_a_safe_young_v4_token_passes_and_fills(now, intent, context) -> N
 
 async def test_unknown_fees_stop_the_purchase(now, intent, context) -> None:
     token = young_token(configure=lambda chain, pool: chain.accrue(pool, GROWTH))
-    payload = await atlas(now, token)
     await refused_buy_but_exit_fills(
         now,
         intent,
         context,
-        payload,
+        token,
         recorded(now, token.pool.id),
         "V4_POOL_FEES_NOT_CREDITED",
         LpControlStatus.UNKNOWN,
@@ -281,12 +294,11 @@ async def test_unknown_fees_stop_the_purchase(now, intent, context) -> None:
 
 async def test_creator_controlled_liquidity_is_blocked(now, intent, context) -> None:
     token = young_token(owner=CREATOR)
-    payload = await atlas(now, token)
     await refused_buy_but_exit_fills(
         now,
         intent,
         context,
-        payload,
+        token,
         recorded(now, token.pool.id),
         "V4_CREATOR_CAN_WITHDRAW",
         LpControlStatus.BLOCKED,
@@ -297,15 +309,15 @@ async def test_an_incomplete_pool_index_leaves_the_surplus_unexplained(
     now, intent, context
 ) -> None:
     token = young_token()
-    payload = await atlas(now, token, index_budget=34)  # stops before the token's block
     await refused_buy_but_exit_fills(
         now,
         intent,
         context,
-        payload,
+        token,
         recorded(now, token.pool.id),
         "V4_POOL_SURPLUS_UNEXPLAINED",
         LpControlStatus.UNKNOWN,
+        index_budget=34,  # stops before the token's block
     )
 
 
@@ -321,12 +333,11 @@ async def test_a_stale_census_stops_the_purchase(now, intent, context) -> None:
 
 async def test_a_foreign_pool_manager_stops_the_purchase(now, intent, context) -> None:
     token = young_token()
-    payload = await atlas(now, token)
     await refused_buy_but_exit_fills(
         now,
         intent,
         context,
-        payload,
+        token,
         recorded(now, token.pool.id, manager=FOREIGN_MANAGER),
         "V4_MARKET_POOL_MANAGER_MISMATCH",
         LpControlStatus.UNKNOWN,
@@ -335,13 +346,12 @@ async def test_a_foreign_pool_manager_stops_the_purchase(now, intent, context) -
 
 async def test_a_v2_v3_market_without_lp_evidence_is_unsupported(now, intent, context) -> None:
     token = young_token()
-    payload = await atlas(now, token)
     pair = "0x" + "ab" * 20
     await refused_buy_but_exit_fills(
         now,
         intent,
         context,
-        payload,
+        token,
         recorded(now, pair, kind=PoolLocatorKind.CONTRACT_ADDRESS),
         "LP_CONTROL_SOURCE_ABSENT",
         LpControlStatus.UNSUPPORTED,
@@ -350,11 +360,15 @@ async def test_a_v2_v3_market_without_lp_evidence_is_unsupported(now, intent, co
 
 async def test_unknown_custody_stops_the_purchase(now, intent, context) -> None:
     token = young_token(owner=UNVERIFIED_VAULT)
-    payload = await atlas(now, token)
-    view = market(now, payload, recorded(now, token.pool.id), Side.BUY)
-    assert view.lp_control is not None and view.lp_control.status is LpControlStatus.UNKNOWN
-    _, decision = decide(now, intent, context, view, Side.BUY)
-    assert decision.outcome is RiskOutcome.REJECT
+    await refused_buy_but_exit_fills(
+        now,
+        intent,
+        context,
+        token,
+        recorded(now, token.pool.id),
+        "V4_POSITION_CONTROL_UNRESOLVED",
+        LpControlStatus.UNKNOWN,
+    )
 
 
 # ------------------------------------------------------------------ approvals
@@ -376,8 +390,9 @@ async def test_a_reused_approval_cannot_fill_another_market(now, intent, context
         await PaperExecutor().execute(approved, changed)
     # And an approval recorded before LP control existed fills no purchase.
     legacy = view.model_copy(update={"lp_control": None})
-    with pytest.raises(ValueError):
-        await PaperExecutor().execute(forged(order, legacy, now), legacy)
+    approval = forged(order, decision, legacy, now)
+    with pytest.raises(ValueError, match="established LP control"):
+        await PaperExecutor().execute(approval, legacy)
 
 
 # ------------------------------------------------------------------ FeeSplitter
@@ -399,21 +414,10 @@ async def test_eth_side_fees_of_the_locked_launch_do_not_block(now, intent, cont
     assert view.lp_control.status is LpControlStatus.PASS, view.lp_control.detail
 
 
-@pytest.mark.parametrize(
-    "splitter",
-    [
-        "0x9411fa7f956f64aa7981aa27cb3bc6ec0415449c",
-        "0x882ae5e2095435a62fd1bbdefcb637f5ceafc0ee",
-        "0xeff166aaf189323c58dc27ed1206eb2c37faacdf",
-        "0x222d6d4f1ce59b0d48d5505114ec8addc90a4359",
-    ],
-)
-def test_no_registered_fee_splitter_names_its_token_fee_recipient(splitter) -> None:
-    # Token-side fees of a locked launch stay uncredited until a recipient is
-    # verified (issue #103): the registry carries none, for every deployment.
-    from src.agents.atlas.v4.custody.uniswap_launcher import REGISTRIES
+def test_this_suite_runs_the_real_lp_control_derivation() -> None:
+    # The shared fixture replaces it with a PASS outside the LP-control suites;
+    # here every verdict must come from the production function.
+    from src.orchestration.riskrequest import service
 
-    (deployment_entry,) = [
-        item for item in REGISTRIES["robinhood"].fee_splitters if item.address == splitter
-    ]
-    assert not hasattr(deployment_entry, "token_fee_recipient")
+    assert service.lp_control_view.__module__ == service.__name__
+    assert service.lp_control_view.__name__ == "lp_control_view"

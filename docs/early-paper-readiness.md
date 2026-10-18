@@ -21,9 +21,11 @@ approval.
 | Exit continuity | runner | `PAPER_ENTRY_REQUIRES_EXIT_JOB`: every BUY needs a recent ready exit-job run (`EXIT_JOB_STALE` otherwise) |
 
 The offline acceptance (`tests/acceptance/test_early_paper_offline.py`) runs
-this chain with the production components and shows each unsafe case stopped
-at SENTINEL and again at the executor, while a sale out of the same market
-still fills.
+this chain with the production components and shows each unsafe LP-control
+case stopped at SENTINEL and again at the executor's own LP-control check
+(with an approval forged to pass every earlier executor check), while a sale
+out of the same market, read with ATLAS's exit policy, still fills. A stale
+census is stopped by SENTINEL; the executor relies on the approval's expiry.
 
 ## Which token can pass today, realistically
 
