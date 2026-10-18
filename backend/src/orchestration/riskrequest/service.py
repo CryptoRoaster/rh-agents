@@ -107,7 +107,14 @@ from src.risk.engine import evaluate
 # The two verdicts this system maps onto SENTINEL's safety status. `UNKNOWN` is
 # deliberately absent: an unestablished domain is a completeness gap the
 # readiness check already refuses on, never a value handed to a risk evaluation.
-SAFETY_STATUS = {"PASS": SafetyStatus.PASS, "FAIL": SafetyStatus.FAIL}
+# An ATLAS domain verdict as SENTINEL reads it. UNKNOWN stays unknown -- every
+# BUY and every sale fails closed on it -- and is never a missing key: an exit's
+# fresh read can carry it beside measured holder figures.
+SAFETY_STATUS = {
+    "PASS": SafetyStatus.PASS,
+    "FAIL": SafetyStatus.FAIL,
+    "UNKNOWN": SafetyStatus.UNKNOWN,
+}
 
 
 class RiskRequestUnavailable(Exception):
