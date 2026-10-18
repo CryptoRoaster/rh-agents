@@ -436,6 +436,10 @@ def pool_control_summary(
             census.pool_discovery_basis if census.status == Availability.AVAILABLE else None
         ),
         pool_discovery_from_block=census.pool_discovery_from_block,
+        remainder_credit_status=control.remainder_credit_status,
+        remainder_credited_raw=raw(control.remainder_credited_raw),
+        remainder_unowned_raw=raw(control.remainder_unowned_raw),
+        remainder_uncredited_raw=raw(control.remainder_uncredited_raw),
     )
 
 
