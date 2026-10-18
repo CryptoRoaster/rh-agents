@@ -39,21 +39,21 @@ v3.3.0 addresses:
 | A | 40 % to `UERC20BeneficiaryVault` `0x26d2f7acb07707034406a0dc458351bb63c02553` (credits the creator), 60 % to `CompoundingClaimRecipient` `0xf585…c58d` | 100 % to `CompoundingClaimRecipient` `0xf585…c58d` |
 | B | 100 % to the compounder | 100 % to the compounder |
 
-Not recorded here: which of the two v3.3.0 addresses uses which variant, the
-compounder's full address, and the v3.2.0 splits.
+Verified offline since (`docs/fee-splitter-verification.md`): splitter
+`0x9411…449c` uses variant A and `0x882a…f0ee` variant B, and the full vault and
+compounder addresses are below. The v3.2.0 splits remain unverified.
 
 ## Token side and ETH side, separately
 
 - **ETH side.** Not token supply and not principal. It changes nobody's
   control of the pool's liquidity, so it never blocks LP control (offline
   regression: `tests/acceptance/test_early_paper_offline.py::test_eth_side_fees_of_the_locked_launch_do_not_block`).
-- **Token side.** Token supply that leaves the PoolManager to whoever the
-  splits name when `collectFees` runs. It belongs in the economic
-  concentration with that recipient. Until the recipient is verified, the
-  remainder credit cannot place it: the fee stays *uncredited*, the economic
-  figure keeps one unattributed row, and LP control is `UNKNOWN`
-  (`V4_POOL_FEES_NOT_CREDITED`). Any sell into the pool charges its fee in the
-  token, so this applies to every traded official launch.
+- **Token side.** Token supply that leaves the PoolManager when `collectFees`
+  runs, 100 % to the compounder, where anyone may claim it. No holder can be
+  named for it, so the remainder credit cannot place it: the fee stays
+  *uncredited*, the economic figure keeps one unattributed row, and LP control
+  is `UNKNOWN` (`V4_POOL_FEES_NOT_CREDITED`). Any sell into the pool charges its
+  fee in the token, so this applies to every traded official launch.
 
 ## Recipients and withdrawal rights (verified offline, 2026-10-18)
 
@@ -66,7 +66,7 @@ the live reads still needed.
 | `CompoundingClaimRecipient` `0xf585b5D728A8fdE743027307BF5F3556E3B9C58D` | 100 % of token fees (both variants), 60–100 % of native fees | **anyone**: `claim()` is permissionless and pays the caller, who must only raise the position's liquidity by `minLiquidityIncrease` (1e20) | VERIFIED from source and CREATE2; on-chain code match UNKNOWN until a live read |
 
 Token-side fees of a FeeSplitter position are therefore claimable by an
-arbitrary party and become nobody's locked principal. They cannot be credited
+arbitrary party; they never become locked principal. They cannot be credited
 to a holder, and `V4_POOL_FEES_NOT_CREDITED` stays the correct outcome. The
 v3.2.0 splitters (`0xeff1…`, `0x222d…`) remain PARTIALLY_VERIFIED.
 

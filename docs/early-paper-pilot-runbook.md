@@ -96,17 +96,28 @@ Required before any entry:
   `ops/exit-supervisor/linux`), not the Mac, not the `VPS_NO_GO` host.
 - Exit job interval well under `PAPER_EXIT_LIVENESS_MAX_AGE_SECONDS` (180 s);
   `PAPER_ENTRY_REQUIRES_EXIT_JOB=true`.
+- The runtime PostgreSQL instance and the network path to the RPC and market
+  providers fall under the same 72-hour condition: a Linux exit host is of no
+  use while the database lives on the Mac.
+- `ops/exit-supervisor/linux/install.sh` defaults to `--host-alias rh-vps`,
+  which is the `VPS_NO_GO` host: always pass the target host explicitly.
 - Alerting through the rh-agents Telegram bot (single chat) on any exit run
-  that is not ready (`EXIT_BLOCKED`, `ATTEMPT_FAILED`, `OUTCOME_UNKNOWN`,
-  `TECHNICAL_FAILURE`, coverage missing) and a dead-man alert when no exit
-  run finished within twice its interval.
-- A tested manual stop (`python -m src.runner.control --halt-entries`).
+  that is not ready (`EXIT_BLOCKED`, `EXIT_ATTEMPT_FAILED`,
+  `EXIT_OUTCOME_UNKNOWN`, `EXIT_JOB_TECHNICAL_FAILURE`,
+  `EXIT_POLICY_COVERAGE_MISSING`) and a dead-man alert when no exit run
+  finished within twice its interval.
+- A tested manual stop
+  (`python -m src.runner.control --halt-entries --reason PILOT_STOP_TEST`).
+- Scheduler units for the index job and the entry job (`--entries-once`) do
+  not exist in `ops/` yet; they are built and reviewed before this step.
 *Go:* 24 hours of exit runs on the target host, every one `exit_ready=true`,
 one deliberately failed run alerted within its interval.
 
 ## 9. Controlled early PAPER pilot
 
-- `PAPER_EARLY_ONLY=true`, `PRE_VECTOR_EARLY_ENTRY_ENABLED=true`,
+- `PAPER_RUNNER_ENABLED=true`, `EARLY_SCOUT_ENABLED=true`,
+  `ATLAS_FUNDING_GRAPH_ENABLED=true` (all required by the early entry flag's
+  validation), `PAPER_EARLY_ONLY=true`, `PRE_VECTOR_EARLY_ENTRY_ENABLED=true`,
   `EARLY_PAPER_EXIT_ENABLED=true`, `ATLAS_V4_POOL_CONTROL_ENABLED=true`,
   `ATLAS_V4_POOL_INDEX_ENABLED=true`; strategy limits unchanged (10 USD per
   entry, 5 open, 50 USD exposure, one entry per run).
@@ -129,8 +140,11 @@ one deliberately failed run alerted within its interval.
 
 1. `python -m src.runner.control --halt-entries --reason PILOT_STOP`; unload
    the entry job. Exits keep running.
-2. If exits themselves misbehave: system pause / kill switch per
-   `docs/paper-minimum-release-gate.md`; open positions are PAPER only.
+2. If exits themselves misbehave: the durable system pause (set by SENTINEL)
+   or `COMMANDER_KILL_SWITCH=true` in the runtime settings stop **exits as
+   well as entries**; use them only when continuing to sell is itself unsafe.
+   Lifting a pause follows `docs/paper-minimum-release-gate.md`. Open positions
+   are PAPER only.
 3. Code rollback: redeploy the previous commit; the new tables stay. Schema
    rollback only with every job stopped, from the backup of step 2.
 

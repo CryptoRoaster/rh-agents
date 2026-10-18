@@ -12,7 +12,7 @@ approval.
 | Discovery | scout (`EARLY_SCOUT_*`) | a young pool, observed; with the V4 prefilter only 32-byte V4 ids go on to ORBIT and the early intake |
 | ATLAS V4 census | `agents/atlas/v4/census.py` | complete census bound to the verified PoolManager, chain and ATLAS block; dated by its block time (≤ 30 s at SENTINEL) |
 | Pool discovery | pool index (#94) | `MANAGER_HISTORY`: the index covers the PoolManager from its deployment to the token's creation, and the chain still has its tip |
-| Reconciliation and credit | #96, #103 | every unit of the PoolManager remainder credited exactly: fees to a withdrawable position's controller, protocol fees, named claim holders, surplus to nobody; FeeSplitter token fees are **not** creditable yet |
+| Reconciliation and credit | #96, #103 | every unit of the PoolManager remainder credited exactly: fees to a withdrawable position's controller, protocol fees, named claim holders, surplus to nobody; FeeSplitter token fees are **not** creditable (anyone may claim them) |
 | Position control | #97 | every position in the market pool `PERMANENTLY_LOCKED`; creator-withdrawable → BLOCKED; anything else withdrawable or unresolved → UNKNOWN |
 | Hook | `lp_control_view` | the market pool has no hook (a creator-owned hook → BLOCKED, any other → UNKNOWN) |
 | Binding | #98/#105 | market pool pairs the market's token; a named PoolManager is the verified one; 20-byte pools are `UNSUPPORTED` |
