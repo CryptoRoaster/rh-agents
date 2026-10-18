@@ -124,7 +124,8 @@ budget, not the provider, bounds every call.
 | Event | Effect |
 |---|---|
 | budget exhausted | `PARTIAL`; everything confirmed so far is kept; next call resumes |
-| rate limit, timeout, transport | `FAILED`; confirmed coverage kept; next call resumes |
+| rate limit, credentials, connectivity | `FAILED`; confirmed coverage kept; next call resumes |
+| timeout or provider error on a window | the window is narrowed for the rest of the call; `FAILED` only if even one block fails |
 | forged or malformed Initialize | `FAILED`; that window is not stored |
 | window's last block changed during the read | `FAILED`; not stored |
 | parent block changed during the read | `FAILED`; not stored |
