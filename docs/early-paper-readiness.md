@@ -34,19 +34,20 @@ FeeSplitter, with no other position in its pool, no hook, a receipt-verified
 creator, a holder distribution under the limit — **and no token-side swap fee
 owed to the locked position yet**. Token-side fees accrue on every sell into
 the pool and cannot be credited until the FeeSplitter's token-fee recipient is
-verified (`docs/fee-splitter-fee-credit.md`). With a discovery delay of about
-four minutes (shadow run B, p50) most pools will have seen a sell before ATLAS
-reads them, so in practice the FeeSplitter evidence is the gating item.
+verified (`docs/fee-splitter-fee-credit.md`). They cannot be: the compounder
+lets anyone claim them (`docs/fee-splitter-verification.md`). With a discovery
+delay of about four minutes (shadow run B, p50) most pools will have seen a
+sell before ATLAS reads them, so in practice only launches read before their
+first sell can pass, unless a worst-case treatment of claimable fees is decided.
 
 ## Shortest safe path to a releasable early PAPER candidate
 
 1. **Code** (no approval beyond review): merge the open acceptance and
    backfill-readiness PRs.
-2. **FeeSplitter evidence** (offline source work; one code/RPC read per
-   splitter later): compounder full address, its source and custody verdict,
-   each splitter's splits. Then a registry entry per splitter and an exact
-   credit for locked-position token fees. Without it only pre-sell launches
-   can pass.
+2. **FeeSplitter evidence**: done offline — token fees are permissionlessly
+   claimable, never creditable; a 13-read live confirmation remains. A
+   decision on a worst-case treatment of claimable fees (an exact upper bound,
+   not a tolerance) is the only way traded launches could pass.
 3. **Runtime deploy and migrations** (approval): deploy main, then
    `alembic upgrade head` for 0025 (scout discovery gaps) and 0026 (pool index)
    on the runtime database; the preflight refuses the new code until then.
@@ -82,8 +83,8 @@ the scout-unload gate (`ops/scout/install.sh` still has an unconditional
 
 ## Required approvals
 
-1. Merging the open PRs (acceptance, backfill readiness, V2/V3 architecture).
-2. FeeSplitter evidence work (public source) and, later, the per-splitter reads.
+1. Merging the open exit-isolation PR (#115); acceptance, backfill readiness and the V2/V3 architecture are merged.
+2. The FeeSplitter live reads (13 reads, `docs/fee-splitter-verification.md`); the public-source work is done.
 3. Runtime deploy plus migrations 0025 and 0026.
 4. RPC budget for the index backfill (≈ 4 000 reads, ≈ 13 000 worst case) and
    for its 5-minute incremental runs (≈ 2 000 reads a day).
