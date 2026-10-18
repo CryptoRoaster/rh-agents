@@ -104,12 +104,11 @@ from src.orchestration.workflow.service import TradeCaseService, case_from_row
 from src.risk.authorization import RiskAuthorization, classify_decision
 from src.risk.engine import evaluate
 
-# The two verdicts this system maps onto SENTINEL's safety status. `UNKNOWN` is
-# deliberately absent: an unestablished domain is a completeness gap the
-# readiness check already refuses on, never a value handed to a risk evaluation.
-# An ATLAS domain verdict as SENTINEL reads it. UNKNOWN stays unknown -- every
-# BUY and every sale fails closed on it -- and is never a missing key: an exit's
-# fresh read can carry it beside measured holder figures.
+# An ATLAS domain verdict as SENTINEL reads it. For an entry an unestablished
+# domain is a completeness gap the readiness check refuses on first; an exit's
+# fresh read has no such check and can carry UNKNOWN beside measured holder
+# figures. UNKNOWN therefore stays unknown -- every BUY and every sale fails
+# closed on it -- and is never a missing key.
 SAFETY_STATUS = {
     "PASS": SafetyStatus.PASS,
     "FAIL": SafetyStatus.FAIL,
