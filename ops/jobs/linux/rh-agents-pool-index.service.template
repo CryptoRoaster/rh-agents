@@ -1,0 +1,64 @@
+# V4 pool-index increment (bounded RPC reads per run)
+# Rendered by install.sh; never edit the installed copy by hand. No secrets here.
+# Started only by its timer, which install.sh leaves disabled and stopped:
+# start.sh --job index is the one action that enables it.
+[Unit]
+Description=RH Agents V4 pool-index increment (bounded RPC reads per run)
+Documentation=file://__REPO__/docs/runtime-host-readiness.md
+After=network-online.target postgresql.service postgresql@17-main.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+Group=__USER__
+WorkingDirectory=__REPO__/backend
+ExecStart=/bin/bash __REPO__/ops/jobs/linux/run-job.sh index
+Environment=RH_AGENTS_JOB_REQUIRE_BRANCH=main
+Environment=RH_AGENTS_JOB_LOCK_DIR=/var/lib/rh-agents/jobs
+Environment=RH_AGENTS_SUPERVISOR_BACKEND=systemd
+Environment=GIT_OPTIONAL_LOCKS=0
+Environment=RH_AGENTS_INDEX_MAX_REQUESTS=__INDEX_MAX_REQUESTS__
+# 3 = PARTIAL: the read budget was reached; the next run resumes. Not a failure.
+SuccessExitStatus=3
+StateDirectory=rh-agents/jobs
+StateDirectoryMode=0700
+# Logging: codes and JSON summaries to the journal under one identifier.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rh-agents-pool-index
+# Stop: SIGINT first -- the runner records RUN_INTERRUPTED and every write is
+# idempotent by its key -- then the whole control group after the grace.
+TimeoutStartSec=600
+TimeoutStopSec=30
+KillMode=control-group
+KillSignal=SIGINT
+FinalKillSignal=SIGKILL
+# Resource limits: a job cannot starve the exit supervisor or the database.
+MemoryHigh=300M
+MemoryMax=400M
+CPUQuota=50%
+TasksMax=64
+Nice=10
+IOWeight=30
+# Process restrictions (as the exit supervisor).
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

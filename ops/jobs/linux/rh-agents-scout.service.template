@@ -1,0 +1,63 @@
+# early scout (discovery, budgeted ORBIT reviews)
+# Rendered by install.sh; never edit the installed copy by hand. No secrets here.
+# Started only by its timer, which install.sh leaves disabled and stopped:
+# start.sh --job scout is the one action that enables it.
+[Unit]
+Description=RH Agents early scout (discovery, budgeted ORBIT reviews)
+Documentation=file://__REPO__/docs/runtime-host-readiness.md
+After=network-online.target postgresql.service postgresql@17-main.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+Group=__USER__
+WorkingDirectory=__REPO__/backend
+ExecStart=/bin/bash __REPO__/ops/jobs/linux/run-job.sh scout
+Environment=RH_AGENTS_JOB_REQUIRE_BRANCH=main
+Environment=RH_AGENTS_JOB_LOCK_DIR=/var/lib/rh-agents/jobs
+Environment=RH_AGENTS_SUPERVISOR_BACKEND=systemd
+Environment=GIT_OPTIONAL_LOCKS=0
+# ORBIT through the Codex CLI reads its login from CODEX_HOME; ProtectHome
+# hides ~/.codex, so CODEX_HOME=/var/lib/rh-agents/codex (service user, 0700).
+StateDirectory=rh-agents/jobs rh-agents/codex
+StateDirectoryMode=0700
+# Logging: codes and JSON summaries to the journal under one identifier.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rh-agents-scout
+# Stop: SIGINT first -- the runner records RUN_INTERRUPTED and every write is
+# idempotent by its key -- then the whole control group after the grace.
+TimeoutStartSec=900
+TimeoutStopSec=30
+KillMode=control-group
+KillSignal=SIGINT
+FinalKillSignal=SIGKILL
+# Resource limits: a job cannot starve the exit supervisor or the database.
+MemoryHigh=500M
+MemoryMax=700M
+CPUQuota=50%
+TasksMax=64
+Nice=10
+IOWeight=30
+# Process restrictions (as the exit supervisor).
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

@@ -1,0 +1,14 @@
+# early PAPER entry job, every 5 minutes, after the exit supervisor. Enabled only by start.sh --confirm --reason.
+# systemd never starts the oneshot job again while it still runs: no overlap.
+[Unit]
+Description=RH Agents early PAPER entry job, every 5 minutes, after the exit supervisor.
+
+[Timer]
+Unit=rh-agents-entry.service
+OnBootSec=300
+OnUnitActiveSec=300
+AccuracySec=5s
+RandomizedDelaySec=10s
+
+[Install]
+WantedBy=timers.target
