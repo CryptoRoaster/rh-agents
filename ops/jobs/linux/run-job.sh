@@ -9,9 +9,12 @@
 #   2. the backend's Python exists (exit 127 otherwise);
 #   3. no other run of the same job holds its lock (a second run is skipped,
 #      exit 0: systemd already never overlaps a oneshot unit, this also covers
-#      a manual run next to the timer);
+#      a manual run next to the timer); a lock that fails otherwise is refused
+#      as LOCK_FAILED;
 #   4. entry only: the exit supervisor and its alert pass are active, and the
-#      runner's --preflight reports ready (exit 0). Anything else refuses.
+#      runner's --preflight reports ready (exit 0). Anything else refuses; a
+#      stop arriving during these checks ends the wrapper (exit 130) before
+#      the entry run.
 # Then exactly one command, never another mode:
 #   index  python -m src.agents.atlas.v4.index_job --chain robinhood --max-requests N
 #   scout  python -m src.runner.main --scout-once

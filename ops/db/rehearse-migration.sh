@@ -44,6 +44,11 @@ name_re='^[a-z_][a-z0-9_]{0,62}$'
   refuse "the scratch database name must contain 'rehearsal' or 'scratch'"
 [[ -n "$out" ]] || refuse "--out FILE is required"
 [[ ! -e "$out" ]] || refuse "$out exists; never overwrite a backup"
+# Only plain values go into the URL (no IPv6 literal, host list or quoting).
+[[ -z "${PGHOST:-}" || "$PGHOST" =~ ^[A-Za-z0-9._/-]+$ ]] ||
+  refuse "PGHOST must be a plain host name or socket directory for this script"
+[[ -z "${PGPORT:-}" || "$PGPORT" =~ ^[0-9]{1,5}$ ]] || refuse "PGPORT must be a number"
+[[ -z "${PGUSER:-}" || "$PGUSER" =~ ^[a-z_][a-z0-9_-]{0,62}$ ]] || refuse "PGUSER must be a plain role name"
 
 tool() { if [[ -n "$pg_bin" ]]; then printf '%s/%s\n' "$pg_bin" "$1"; else printf '%s\n' "$1"; fi; }
 PG_DUMP="$(tool pg_dump)" PG_RESTORE="$(tool pg_restore)" CREATEDB="$(tool createdb)" PSQL="$(tool psql)"
@@ -63,13 +68,15 @@ exists="$("$PSQL" -X -A -t -d "$source_db" -c "SELECT count(*) FROM pg_database 
   refuse "cannot check whether $scratch_db exists"
 [[ "$exists" == "0" ]] || refuse "$scratch_db exists; a rehearsal never reuses a database"
 
-# 1. Backup (read-only on the source), written under a temporary name and moved
-#    into place only when complete and only if nothing appeared there meanwhile.
-partial="$out.partial.$$"
-(umask 077 && "$PG_DUMP" -Fc --no-owner -d "$source_db" -f "$partial") ||
-  refuse "pg_dump failed; an incomplete file may remain at $partial, no database was created"
-[[ ! -e "$out" ]] || refuse "$out appeared during the dump; the new dump stays at $partial"
-mv "$partial" "$out" || refuse "could not move the dump into place; it stays at $partial"
+# 1. Backup (read-only on the source) into a file created exclusively (mktemp:
+#    no symlink is followed), linked to its final name only when complete; the
+#    link fails if anything appeared there meanwhile, so nothing is clobbered.
+partial="$(umask 077 && mktemp "$out.partial.XXXXXX")" || refuse "cannot create a file next to $out"
+"$PG_DUMP" -Fc --no-owner -d "$source_db" -f "$partial" ||
+  refuse "pg_dump failed; an incomplete file remains at $partial, no database was created"
+[[ ! -e "$out" && ! -L "$out" ]] || refuse "$out appeared during the dump; the new dump stays at $partial"
+ln "$partial" "$out" || refuse "could not link the dump into place; it stays at $partial"
+rm -f -- "$partial"
 echo "1 backup: $(wc -c <"$out" | tr -d ' ') bytes, $("$PG_RESTORE" -l "$out" | grep -c 'TABLE DATA') tables with data"
 
 # 2. Restore probe into a new scratch database.

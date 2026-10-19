@@ -158,3 +158,25 @@ def test_alembic_reaches_the_same_server_as_the_libpq_tools(tmp_path, host, url)
 
 def test_a_rehearsal_never_syncs_the_runtime_virtualenv(tmp_path):
     assert "uv run" not in SCRIPT.read_text().replace("never `uv run`", "")
+
+
+@pytest.mark.parametrize("host", ["::1", "db1,db2", "/tmp/a b"], ids=["ipv6", "host-list", "space"])
+def test_a_host_that_cannot_be_put_into_a_url_is_refused_before_the_backup(tmp_path, host):
+    bin_dir, env = tools(tmp_path, host=host)
+    assert rehearse(env, *arguments(tmp_path, bin_dir)).returncode == 2
+    assert calls(tmp_path, "pg_dump") == []
+
+
+def test_a_backup_that_appeared_during_the_dump_is_never_replaced(tmp_path):
+    bin_dir, env = tools(tmp_path)
+    # pg_dump stand-in that lets another backup appear under the final name.
+    executable(
+        bin_dir / "pg_dump",
+        '[[ "$1" == --version ]] && { echo "pg_dump (PostgreSQL) 17.2"; exit 0; }\n'
+        f'echo other > "{tmp_path / "backup.dump"}"\n'
+        'while (($#)); do [[ "$1" == -f ]] && { echo dump > "$2"; }; shift; done\n',
+    )
+    result = rehearse(env, *arguments(tmp_path, bin_dir))
+    assert result.returncode == 2
+    assert (tmp_path / "backup.dump").read_text() == "other\n"
+    assert calls(tmp_path, "createdb") == []

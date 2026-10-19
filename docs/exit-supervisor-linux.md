@@ -179,20 +179,23 @@ Both refuse (`DEPLOY_REFUSED`, exit 2) when any of these holds:
 | Supervisor loaded, or its state unknown | `DEPLOY_REFUSED_SUPERVISOR_LOADED`, `…_SERVICE_STATUS_UNKNOWN` |
 | Position open, or positions unknown | `DEPLOY_REFUSED_OPEN_POSITIONS`, `…_POSITIONS_UNKNOWN` |
 | Exit or entry run recorded as going | `DEPLOY_REFUSED_EXIT_RUN_ACTIVE`, `…_ENTRY_RUN_ACTIVE` |
-| Runner or tick process alive, or the process list unreadable | `DEPLOY_REFUSED_RUNNER_PROCESS_ALIVE`, `…_PROCESS_LIST_UNKNOWN` |
+| Runner, tick or V4 index-job process alive, or the process list unreadable | `DEPLOY_REFUSED_RUNNER_PROCESS_ALIVE`, `…_PROCESS_LIST_UNKNOWN` |
+| Linux: a job unit of `ops/jobs/linux` with its timer not stopped or a run going (or either unknown) | `DEPLOY_REFUSED_JOB_UNIT_ACTIVE` |
 | The check itself crashes | non-zero exit, refused |
 
 The minimal runbook on either host:
 
 1. Empty book.
 2. Entries halted (`python -m src.runner.control --halt-entries --reason DEPLOY`).
-3. `stop.sh --reason DEPLOY`.
-4. `deploy-check.sh` must exit 0.
-5. On macOS only: the scout unload gate.
-6. `git pull --ff-only`, then `uv sync --locked`, then `alembic upgrade head`.
-7. Verify.
-8. `start.sh --confirm --reason DEPLOY_DONE`.
-9. `health.sh`.
+3. Linux, once the job units are installed: `ops/jobs/linux/stop.sh --job all --reason DEPLOY`.
+4. `stop.sh --reason DEPLOY`.
+5. `deploy-check.sh` must exit 0.
+6. On macOS only: the scout unload gate.
+7. `git pull --ff-only`, then `uv sync --locked`, then `alembic upgrade head`.
+8. Verify.
+9. `start.sh --confirm --reason DEPLOY_DONE`.
+10. `health.sh`.
+11. Linux: restart the jobs one by one, entry last (`ops/jobs/linux/start.sh --job index|scout|entry --confirm --reason DEPLOY_DONE`), then lift the entry halt.
 
 The first deploy that brings this code to a host still runs the old code, which has no gate: do the same checks by hand, once. Nothing here changes any deploy pipeline; the RH Agents runtime deploy is a manual runbook today.
 
