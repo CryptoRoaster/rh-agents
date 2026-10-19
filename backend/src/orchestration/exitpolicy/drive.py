@@ -37,6 +37,7 @@ restarts — nothing here is persisted — only the absence of a systematic lose
 
 import asyncio
 import hashlib
+import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -51,6 +52,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.core.config import EXIT_SETTLE_SECONDS
 from src.data.tables import TradeCaseExitRow
 from src.markets.geckoterminal.networks import VerifiedNetworkRegistry
+from src.orchestration.commander.context import SystemPauseUnavailable
 from src.orchestration.exitpolicy.refresh import (
     PreExitMarketRefresh,
     RefreshBudget,
@@ -61,12 +63,20 @@ from src.orchestration.exitpolicy.refresh import (
 from src.orchestration.paperexit.models import ExitReading, ExitRefusal, PaperExitRecorded
 from src.orchestration.paperexit.service import PaperExitUnavailable
 
+logger = logging.getLogger(__name__)
+
 # What a position that was not attempted is reported as, by reason.
 DEFERRED_RUN_BUDGET = "EXIT_DEFERRED_RUN_BUDGET"
 DEFERRED_ATTEMPT_LIMIT = "EXIT_ATTEMPT_LIMIT_REACHED"
 DEFERRED_EXIT_BUDGET = "EXIT_BUDGET_REACHED"
 # An attempt cut off by its bound whose booking could not be confirmed either way.
 OUTCOME_UNKNOWN = "EXIT_OUTCOME_UNKNOWN"
+# Issue #111: a failure no code path names, isolated to its own position. The
+# attempt is settled by its key like a cut-off one; a judgement that failed is
+# asked again next sweep. Both count as `failed`, so the run is not ready --
+# which alarms and holds every new entry -- and neither stops the others.
+ATTEMPT_FAILED = "EXIT_ATTEMPT_FAILED"
+JUDGEMENT_FAILED = "EXIT_JUDGEMENT_FAILED"
 # Why a policy's judgement stopped short: its share of the run's time ran out
 # between two positions, or a read inside it outlived the share and was cut off.
 PLAN_TIME_BUDGET = "EXIT_PLAN_TIME_BUDGET_REACHED"
@@ -382,6 +392,9 @@ async def _attempt(
         result.failed += 1
         result.refused(str(failure))
         return
+    except SystemPauseUnavailable:
+        # The stop is unreadable: that ends the phase, as it always did.
+        raise
     except TimeoutError:
         result.timed_out += 1
         if await _booked(sessions, candidate.request_key, budget.limits.settle_seconds):
@@ -392,6 +405,21 @@ async def _attempt(
             result.unknown += 1
             budget.unknown += 1
             result.refused(OUTCOME_UNKNOWN)
+        return
+    except Exception:
+        # Isolated to this position: logged with its identity (never a payload),
+        # settled by its key -- a sale booked before the failure is counted once
+        # and never made again -- and otherwise failed, to be asked again next run.
+        logger.exception(
+            "exit_attempt_failed",
+            extra={"position_id": str(candidate.position_id), "request_key": candidate.request_key},
+        )
+        if await _booked(sessions, candidate.request_key, budget.limits.settle_seconds):
+            result.executed += 1
+            budget.exits += 1
+        else:
+            result.failed += 1
+            result.refused(ATTEMPT_FAILED)
         return
     result.measured(reading)
     if isinstance(reading, PaperExitRecorded):
@@ -412,6 +440,9 @@ async def _booked(
 ) -> bool:
     """Whether an exit row exists under this key. A read that fails confirms nothing."""
 
+    if sessions is None:
+        return False
+
     async def read() -> Any:
         async with sessions() as session:
             return await session.scalar(
@@ -422,6 +453,14 @@ async def _booked(
         return await asyncio.wait_for(read(), timeout=seconds) is not None
     except (TimeoutError, SQLAlchemyError, OSError):
         return False
+
+
+def judgement_failed(result: ExitSweep, position_id: UUID) -> None:
+    """Record a position whose judgement raised, and leave the others to be judged."""
+    logger.exception("exit_judgement_failed", extra={"position_id": str(position_id)})
+    result.unevaluated -= 1
+    result.failed += 1
+    result.refused(JUDGEMENT_FAILED)
 
 
 def alone(
@@ -441,6 +480,7 @@ def alone(
 
 
 __all__ = [
+    "ATTEMPT_FAILED",
     "DEFERRED_ATTEMPT_LIMIT",
     "DEFERRED_EXIT_BUDGET",
     "DEFERRED_RUN_BUDGET",
@@ -453,8 +493,10 @@ __all__ = [
     "ExitLimits",
     "ExitPlanner",
     "ExitSweep",
+    "JUDGEMENT_FAILED",
     "alone",
     "attempt_exits",
     "exit_order",
+    "judgement_failed",
     "plan_exits",
 ]
