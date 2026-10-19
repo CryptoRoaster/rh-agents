@@ -32,9 +32,13 @@ opened. Step 8 is therefore a hard gate.
 ## 2. Backup
 
 1. Stop every job (respect the scout-unload gate: never stop a scout mid-run).
-2. `pg_dump -Fc` of the runtime database to an encrypted location outside the
-   repository; restore into a scratch database; `alembic upgrade head` and
-   `alembic check` on the scratch copy; drop it.
+2. `ops/db/rehearse-migration.sh --source-db <runtime db> --scratch-db
+   rh_agents_rehearsal_<date> --out <backup file> --pg-bin <PostgreSQL 17 bin>`:
+   dump (read-only on the source, 0600), restore into a new scratch database,
+   `alembic upgrade head` and `alembic check` on the copy; copy the dump to
+   an encrypted location outside the repository; drop the scratch database.
+   pg_dump must have the server's major version
+   (`docs/runtime-host-readiness.md` §4).
 *Go:* backup restorable, migrations clean on the copy.
 
 ## 3. Migrations 0025 and 0026
@@ -114,8 +118,10 @@ Required before any entry:
   finished within twice its interval.
 - A tested manual stop
   (`python -m src.runner.control --halt-entries --reason PILOT_STOP_TEST`).
-- Scheduler units for the index job and the entry job (`--entries-once`) do
-  not exist in `ops/` yet; they are built and reviewed before this step.
+- The index, scout and entry units (`ops/jobs/linux`, installed disabled,
+  started one by one with `start.sh --job … --confirm --reason`; the entry
+  job is refused while the exit supervisor and its alerts are not active):
+  `docs/runtime-host-readiness.md` §3.
 *Go:* 24 hours of exit runs on the target host, every one `exit_ready=true`,
 one deliberately failed run alerted within its interval.
 

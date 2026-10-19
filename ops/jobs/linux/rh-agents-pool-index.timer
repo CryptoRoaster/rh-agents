@@ -1,0 +1,14 @@
+# V4 pool-index increment, every 5 minutes. Enabled only by start.sh --confirm --reason.
+# systemd never starts the oneshot job again while it still runs: no overlap.
+[Unit]
+Description=RH Agents V4 pool-index increment, every 5 minutes.
+
+[Timer]
+Unit=rh-agents-pool-index.service
+OnBootSec=120
+OnUnitActiveSec=300
+AccuracySec=5s
+RandomizedDelaySec=10s
+
+[Install]
+WantedBy=timers.target

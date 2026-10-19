@@ -135,7 +135,7 @@ Key acceptance suites:
 | Early-only mode, pre-VECTOR early entry, early exit policy | done, off |
 | Scout with discovery profile | done; runtime runs an older profile |
 | Exit supervisor (macOS launchd, Linux systemd), alerts, dead-man | code and tests done; **nothing installed on Linux, no receiver host** |
-| Index job and entry job scheduler units | **missing** |
+| Index, scout and entry job units (`ops/jobs/linux`) | code and tests done; nothing installed |
 | V2/V3 LP control (#102), defense-in-depth binding (#98) | prepared / open |
 | LIVE execution | not in Phase 0 |
 
@@ -205,11 +205,11 @@ This is a decision for the owner; it does not block the PAPER pilot.
 | 72-hour exit continuity | **NO-GO** | no host; Mac not continuous, VPS `VPS_NO_GO` |
 | Isolated Linux host | **NO-GO** | not procured (out of scope of this handover) |
 | systemd exit job | **NO-GO** (code ready) | units, scripts and tests exist; nothing installed |
-| systemd index job | **NO-GO** | no unit exists yet |
-| systemd entry job | **NO-GO** | no unit exists yet |
+| systemd index job | **NO-GO** (code ready) | `ops/jobs/linux`, tested; nothing installed |
+| systemd entry job | **NO-GO** (code ready) | `ops/jobs/linux`, refuses without watched exits and a ready preflight; nothing installed |
 | Database availability | **NO-GO** | runtime PostgreSQL lives on the Mac; must move with the exit host |
 | Alerting and dead-man | **NO-GO** (code ready) | no credentials provisioned, no receiver host |
-| Backup and restore | **NO-GO** (procedure ready) | runbook step 2; never rehearsed on the runtime database |
+| Backup and restore | **NO-GO** (procedure ready) | `ops/db/rehearse-migration.sh` rehearsed on scratch databases; never run on the runtime database |
 | Migrations 0025/0026 | **NO-GO** (code ready) | runtime at `0024`; needs deploy approval |
 | V4 pool index | **NO-GO** (code ready) | not backfilled; RPC budget approval needed |
 | FeeSplitter evidence | **PARTIAL** | offline VERIFIED; 13 live reads outstanding |
@@ -224,7 +224,6 @@ This is a decision for the owner; it does not block the PAPER pilot.
 |---|---|
 | No isolated Linux host with 72-hour exit continuity (exit job, database, network path) | an early position lives up to 72 h; without continuous exits no entry may open |
 | No dead-man receiver host and no provisioned alert credentials | a silent host must raise an alarm from elsewhere |
-| Scheduler units for the index job and the entry job | the pilot needs both under systemd |
 | Runtime deploy plus migrations 0025/0026 | the preflight refuses the new code until applied |
 | Pool index backfill and its verification | without `MANAGER_HISTORY` no V4 PASS |
 | FeeSplitter live reads (13) | template match on chain is UNKNOWN until read |

@@ -1,0 +1,68 @@
+# early PAPER entry job (entries-once; never sells, never runs exits)
+# Rendered by install.sh; never edit the installed copy by hand. No secrets here.
+# Started only by its timer, which install.sh leaves disabled and stopped:
+# start.sh --job entry is the one action that enables it.
+[Unit]
+Description=RH Agents early PAPER entry job (entries-once; never sells, never runs exits)
+Documentation=file://__REPO__/docs/runtime-host-readiness.md
+After=network-online.target postgresql.service postgresql@17-main.service rh-agents-exit-supervisor.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+Group=__USER__
+WorkingDirectory=__REPO__/backend
+ExecStart=/bin/bash __REPO__/ops/jobs/linux/run-job.sh entry
+Environment=RH_AGENTS_JOB_REQUIRE_BRANCH=main
+Environment=RH_AGENTS_JOB_LOCK_DIR=/var/lib/rh-agents/jobs
+Environment=RH_AGENTS_SUPERVISOR_BACKEND=systemd
+Environment=GIT_OPTIONAL_LOCKS=0
+# A model provider run through the Codex CLI keeps its login in CODEX_HOME and
+# writes it back on refresh. ProtectHome hides ~/.codex and ProtectSystem makes
+# everything else read-only, so the login lives in its own writable state
+# directory (service user, 0700). Unused with any other reasoning provider.
+Environment=CODEX_HOME=/var/lib/rh-agents/codex
+StateDirectory=rh-agents/jobs rh-agents/codex
+StateDirectoryMode=0700
+# Logging: codes and JSON summaries to the journal under one identifier.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rh-agents-entry
+# Stop: SIGINT first -- the job reports RUN_INTERRUPTED, SCOUT_INTERRUPTED or
+# INDEX_INTERRUPTED and every write is idempotent by its key or committed per
+# window -- then the whole control group after the grace.
+# Preflight plus one entry run: keep PAPER_RUNNER_MAX_SECONDS at 600 or less.
+TimeoutStartSec=900
+TimeoutStopSec=30
+KillMode=control-group
+KillSignal=SIGINT
+FinalKillSignal=SIGKILL
+# Resource limits: a job cannot starve the exit supervisor or the database.
+MemoryHigh=500M
+MemoryMax=700M
+CPUQuota=50%
+TasksMax=64
+Nice=10
+IOWeight=30
+# Process restrictions (as the exit supervisor).
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

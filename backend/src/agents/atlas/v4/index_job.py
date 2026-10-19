@@ -69,7 +69,13 @@ def main() -> None:
     if not 0 < arguments.max_requests <= MAX_REQUESTS_CAP:
         print(json.dumps({"status": "FAILED", "reason": "MAX_REQUESTS_OUT_OF_RANGE"}))
         raise SystemExit(FAILED)
-    code, output = asyncio.run(run(arguments.chain, arguments.max_requests))
+    try:
+        code, output = asyncio.run(run(arguments.chain, arguments.max_requests))
+    except KeyboardInterrupt:
+        # systemd stops the unit with SIGINT. Each window commits on its own,
+        # so nothing is half-stored; the next run resumes from the last one.
+        print(json.dumps({"status": "FAILED", "reason": "INDEX_INTERRUPTED"}))
+        raise SystemExit(FAILED) from None
     print(json.dumps(output, sort_keys=True))
     raise SystemExit(code)
 
