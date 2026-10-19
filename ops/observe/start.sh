@@ -27,9 +27,7 @@ reason="$(observe_load)" || refuse "$reason"
 observe_load >/dev/null
 reason="$(observe_check)" || refuse "$reason"
 observe_code_clean || refuse OBSERVE_WORKTREE_MODIFIED
-if ! git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
-  refuse OBSERVE_COMMIT_NOT_ON_MAIN
-fi
+observe_code_merged || refuse OBSERVE_COMMIT_NOT_ON_MAIN
 
 # Rendered paths must stay plain: no sed or XML metacharacter, no backslash.
 plain_path='^/[-A-Za-z0-9 ._/@+]+$'

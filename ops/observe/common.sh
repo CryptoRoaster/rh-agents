@@ -11,8 +11,11 @@
 # function, PATH, GIT_* or PG* variable could otherwise change what the checks
 # below see. Until only these names are exported, PATH is the system one and no
 # function is defined, the calling script re-executes itself once under
-# `env -i` with just them. No kept variable chooses a command: git, ps,
-# Python, launchctl, plutil and psql are fixed or come from the profile.
+# `env -i` with just them. No inherited variable chooses a command: git and ps
+# come from the system PATH, launchctl, plutil and Python are fixed, and psql
+# and Codex are absolute paths from the profile. A BASH_ENV file of the shell
+# that calls a script is still read once before this re-exec (bash reads it at
+# startup); it cannot change the checks, and launchd sets none.
 OBSERVE_PATH=/usr/bin:/bin:/usr/sbin:/sbin
 OBSERVE_INHERIT_RE='^(HOME|USER|LOGNAME|TMPDIR|LANG|TERM|RH_AGENTS_OBSERVE_(ENV|STATE_DIR|LOG_DIR|INTERVAL_SECONDS|STOP_WAIT_SECONDS))$'
 observe_keep=()
@@ -123,7 +126,14 @@ observe_check() {
   # mix the runtime configuration into the observation profile.
   [[ ! -e "$REPO/.env" && ! -L "$REPO/.env" ]] || { echo "OBSERVE_REPOSITORY_ENV_PRESENT"; return 1; }
   [[ "$PYTHON" == /* && -x "$PYTHON" ]] || { echo "OBSERVE_PYTHON_MISSING"; return 1; }
+  # Commands named in the profile are absolute, never resolved from a cwd.
+  for key in CODEX_EXECUTABLE RH_AGENTS_OBSERVE_PSQL; do
+    [[ -z "$(observe_get "$key")" || "$(observe_get "$key")" == /* ]] || { echo "OBSERVE_${key}_NOT_ABSOLUTE"; return 1; }
+  done
 }
+
+# Only merged code runs: the checkout's commit must be on origin/main.
+observe_code_merged() { git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; }
 
 # The database name of the checked profile (no credentials are ever printed).
 observe_db() { local url; url="$(observe_get DATABASE_URL)"; printf '%s\n' "${url##*/}"; }

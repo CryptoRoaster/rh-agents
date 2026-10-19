@@ -24,7 +24,8 @@ chmod 0700 "$STATE_DIR"
 touch "$STOP_FILE"
 
 if pid="$(observe_running_pid)"; then
-  if [[ "$mode" == "--now" ]]; then
+  # Identity checked again right before the signal, never on a stale reading.
+  if [[ "$mode" == "--now" ]] && [[ "$(observe_running_pid)" == "$pid" ]]; then
     kill -TERM "$pid" 2>/dev/null || true
   fi
   waited=0

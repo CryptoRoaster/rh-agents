@@ -40,6 +40,9 @@ reason="$(observe_load)" || refuse "$reason"
 observe_load >/dev/null
 reason="$(observe_check)" || refuse "$reason"
 observe_code_clean || refuse OBSERVE_WORKTREE_MODIFIED
+# Checked on every run, not only at start: a checkout moved to another commit
+# after loading the agent never runs unmerged code.
+observe_code_merged || refuse OBSERVE_COMMIT_NOT_ON_MAIN
 
 env_args=()
 while IFS= read -r line; do env_args+=("$line"); done < <(observe_env_args)

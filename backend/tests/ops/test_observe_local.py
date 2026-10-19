@@ -613,7 +613,7 @@ def dirty_checkout(box: dict[str, Path]) -> None:
     )
 
 
-def test_an_inherited_bash_env_never_reaches_the_checks(box):
+def test_a_function_from_bash_env_never_reaches_the_checks(box):
     hook = box["tmp"] / "hook.sh"
     hook.write_text(f'env() {{ touch "{box["record"]}/hijacked"; command env "$@"; }}\n')
     result = script(box, "run-observe.sh", BASH_ENV=str(hook))
@@ -755,3 +755,19 @@ def test_an_inherited_allow_unmerged_never_skips_the_main_check(box):
     assert result.returncode == 78
     assert "OBSERVE_COMMIT_NOT_ON_MAIN" in result.stderr
     assert not (box["record"] / "launchctl").exists()
+
+
+def test_a_run_refuses_a_commit_that_is_not_on_main(box):
+    not_on_main(box)
+    result = script(box, "run-observe.sh")
+    assert result.returncode == 78
+    assert "OBSERVE_COMMIT_NOT_ON_MAIN" in result.stderr
+    assert not (box["record"] / "args").exists()
+
+
+@pytest.mark.parametrize("key", ["CODEX_EXECUTABLE", "RH_AGENTS_OBSERVE_PSQL"])
+def test_a_command_in_the_profile_must_be_absolute(box, key):
+    profile_with(box, **{key: "./bin/tool"})
+    result = script(box, "run-observe.sh", "--check")
+    assert result.returncode == 78
+    assert f"OBSERVE_{key}_NOT_ABSOLUTE" in result.stderr

@@ -51,15 +51,21 @@ every run:
   `GIT_*` or `PG*` variable therefore never reaches the checks below, and no
   inherited variable chooses a command: git and ps come from the system
   `PATH`, launchctl and plutil are absolute, Python is always the checkout's
-  `backend/.venv/bin/python` and psql comes from the profile. There is no
-  override of the `origin/main` check.
+  `backend/.venv/bin/python`, and psql and Codex are absolute paths from the
+  profile (`OBSERVE_*_NOT_ABSOLUTE`).
 - Only committed code runs. Refused (`OBSERVE_WORKTREE_MODIFIED`):
   - a tracked change, also one hidden by `--assume-unchanged` or
     `--skip-worktree`;
   - an untracked or ignored file under `ops/` or `backend/`, except the
     virtualenv and tool caches. `python -m` puts `backend/` first on `sys.path`.
 
-  `start.sh` also requires a commit on `origin/main`.
+  The commit must be on `origin/main` (`OBSERVE_COMMIT_NOT_ON_MAIN`), checked
+  by `start.sh` and again by every run. There is no override.
+
+  Not covered: the contents of `backend/.venv`. It is built by
+  `uv sync --locked` and not versioned; rebuild it after any doubt. Likewise a
+  `BASH_ENV` file of the calling shell is read once before the re-exec (launchd
+  sets none); it cannot change the checks.
 
 ## 2. Setup (once)
 
