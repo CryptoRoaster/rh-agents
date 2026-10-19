@@ -34,10 +34,32 @@ EXIT_UNITS = (
     "rh-agents-heartbeat.timer",
 )
 SUPERVISED = {"rh-agents-exit-supervisor.timer": "active", "rh-agents-exit-alert.timer": "active"}
+HARDENING = (
+    "UMask",
+    "NoNewPrivileges",
+    "CapabilityBoundingSet",
+    "AmbientCapabilities",
+    "PrivateTmp",
+    "PrivateDevices",
+    "ProtectSystem",
+    "ProtectHome",
+    "ProtectKernelTunables",
+    "ProtectKernelModules",
+    "ProtectKernelLogs",
+    "ProtectControlGroups",
+    "ProtectClock",
+    "ProtectHostname",
+    "RestrictSUIDSGID",
+    "RestrictRealtime",
+    "RestrictNamespaces",
+    "LockPersonality",
+    "SystemCallArchitectures",
+    "RestrictAddressFamilies",
+)
 SCRIPTS = ("install.sh", "start.sh", "stop.sh", "uninstall.sh", "run-job.sh")
 
 
-def stand_ins(tmp_path: Path, *, states=None, codes=None, locked=False):
+def stand_ins(tmp_path: Path, *, states=None, codes=None, flock=0, preflight=""):
     """`systemctl` with unit states in files; a Python and a `flock` that record their calls."""
     units = tmp_path / "units.state"
     units.mkdir()
@@ -47,17 +69,19 @@ def stand_ins(tmp_path: Path, *, states=None, codes=None, locked=False):
     cases = "".join(f"  *' {mode}'*) exit {code} ;;\n" for mode, code in (codes or {}).items())
     executable(
         tmp_path / "python",
-        f'echo "$PWD|$*" >> "{tmp_path}/python.calls"\ncase " $*" in\n{cases}esac\nexit 0\n',
+        f'echo "$PWD|$*" >> "{tmp_path}/python.calls"\n'
+        f'case " $*" in *" --preflight"*) {preflight or ":"} ;; esac\n'
+        f'case " $*" in\n{cases}esac\nexit 0\n',
     )
-    executable(
-        tmp_path / "flock", f'echo "$*" >> "{tmp_path}/flock.calls"\nexit {1 if locked else 0}\n'
-    )
+    executable(tmp_path / "pgrep", f'echo "$*" >> "{tmp_path}/pgrep.calls"\nexit 1\n')
+    executable(tmp_path / "flock", f'echo "$*" >> "{tmp_path}/flock.calls"\nexit {flock}\n')
     return {
         "PATH": "/usr/bin:/bin",
         "HOME": str(tmp_path),
         "RH_AGENTS_SYSTEMCTL": str(tmp_path / "systemctl"),
         "RH_AGENTS_PYTHON": str(tmp_path / "python"),
         "RH_AGENTS_FLOCK": str(tmp_path / "flock"),
+        "RH_AGENTS_PGREP": str(tmp_path / "pgrep"),
         "RH_AGENTS_SYSTEMD_UNIT_DIR": str(tmp_path / "systemd"),
         "RH_AGENTS_STATE_ROOT": str(tmp_path / "state"),
         "RH_AGENTS_JOB_LOCK_DIR": str(tmp_path / "locks"),
@@ -117,7 +141,7 @@ def test_each_job_unit_runs_its_wrapper_only_bounded_logged_and_confined(tmp_pat
     assert parsed["Unit"]["Wants"] == "network-online.target"
     assert (section["KillSignal"], section["KillMode"]) == ("SIGINT", "control-group")
     assert int(section["TimeoutStopSec"]) <= 60
-    assert 300 <= int(section["TimeoutStartSec"]) <= 900
+    assert 300 <= int(section["TimeoutStartSec"]) <= 1800
     assert section["StandardOutput"] == "journal"
     assert section["SyslogIdentifier"].startswith("rh-agents-")
     for key in (
@@ -132,6 +156,10 @@ def test_each_job_unit_runs_its_wrapper_only_bounded_logged_and_confined(tmp_pat
     assert section["MemoryMax"].endswith("M") and section["CPUQuota"].endswith("%")
     # Jobs hold no alert or heartbeat secret.
     assert "LoadCredential" not in section
+    exit_service = (EXIT_OPS / "rh-agents-exit-supervisor.service.template").read_text()
+    for key in HARDENING:
+        expected = re.search(rf"^{key}=(.*)$", exit_service, re.MULTILINE)
+        assert expected is not None and section[key] == expected.group(1), key
     lines = [
         line
         for line in run("install.sh", env, "--dry-run").stdout.splitlines()
@@ -294,14 +322,12 @@ def test_the_entry_job_is_refused_when_the_preflight_is_not_ready(tmp_path, code
 
 @pytest.mark.parametrize("job", ["index", "scout", "entry"])
 def test_a_second_run_of_the_same_job_is_skipped(tmp_path, job):
-    env = stand_ins(tmp_path, states=SUPERVISED, locked=True) | {
-        "RH_AGENTS_INDEX_MAX_REQUESTS": "50"
-    }
+    env = stand_ins(tmp_path, states=SUPERVISED, flock=75) | {"RH_AGENTS_INDEX_MAX_REQUESTS": "50"}
     result = run("run-job.sh", env, job)
     assert result.returncode == 0
     assert "ALREADY_RUNNING" in result.stdout
     assert python_modes(tmp_path) == []
-    assert calls(tmp_path, "flock") == ["-n 9"]
+    assert calls(tmp_path, "flock") == ["-n -E 75 9"]
 
 
 @pytest.mark.parametrize("job", ["index", "scout", "entry"])
@@ -361,7 +387,7 @@ def test_a_start_is_audited_and_enables_that_job_only(tmp_path):
     result = run("start.sh", env, "--job", "entry", "--confirm", "--reason", "PILOT_START")
     assert result.returncode == 0, result.stderr
     assert changes(tmp_path) == [f"enable --now {ENTRY[1]}"]
-    audit = (tmp_path / "state" / "jobs" / "audit.jsonl").read_text()
+    audit = (tmp_path / "state" / "audit" / "jobs.jsonl").read_text()
     assert '"action":"start","job":"entry","reason":"PILOT_START"' in audit
 
 
@@ -451,3 +477,63 @@ def test_every_job_script_is_executable():
 def test_the_deploy_gate_also_waits_for_a_running_index_job():
     text = (EXIT_OPS / "deploy-check.sh").read_text()
     assert r"src\.agents\.atlas\.v4\.index_job" in text
+
+
+@pytest.mark.parametrize("service", [SCOUT[0], ENTRY[0]])
+def test_a_codex_login_lives_in_a_writable_state_directory(tmp_path, service):
+    section = unit(stand_ins(tmp_path), service)["Service"]
+    assert "CODEX_HOME=/var/lib/rh-agents/codex" in section["Environment"]
+    assert "rh-agents/codex" in section["StateDirectory"].split()
+
+
+@pytest.mark.parametrize("code", [1, 64, 127])
+def test_a_lock_that_fails_for_another_reason_is_refused_not_skipped(tmp_path, code):
+    env = stand_ins(tmp_path, flock=code)
+    result = run("run-job.sh", env, "scout")
+    assert result.returncode == 78
+    assert "LOCK_FAILED" in result.stderr
+    assert python_modes(tmp_path) == []
+
+
+def test_a_stop_during_the_preflight_never_starts_the_entry_run(tmp_path):
+    # The preflight passes, but the unit was told to stop while it ran.
+    env = stand_ins(tmp_path, states=SUPERVISED, preflight="kill -INT $PPID; sleep 0.2")
+    result = run("run-job.sh", env, "entry")
+    assert result.returncode == 130
+    assert python_modes(tmp_path) == ["-m src.runner.main --preflight"]
+
+
+def test_uninstall_is_refused_while_a_job_runs(tmp_path):
+    env = stand_ins(tmp_path)
+    installed(tmp_path, env)
+    (tmp_path / "units.state" / ENTRY[0]).write_text("activating")
+    assert run("uninstall.sh", env).returncode == 1
+    assert sorted(path.name for path in (tmp_path / "systemd").iterdir()) == sorted(UNITS)
+
+
+def deploy_check(env) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/bin/bash", str(EXIT_OPS / "deploy-check.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+@pytest.mark.parametrize(
+    "states",
+    [{INDEX[1]: "active"}, {SCOUT[0]: "activating"}, {ENTRY[0]: "active"}, {ENTRY[1]: "unknown"}],
+    ids=["index-timer", "scout-running", "entry-running", "entry-timer-unknown"],
+)
+def test_the_deploy_gate_refuses_while_a_job_unit_runs(tmp_path, states):
+    env = stand_ins(tmp_path, states=states)
+    result = deploy_check(env)
+    assert result.returncode == 2
+    assert "DEPLOY_REFUSED_JOB_UNIT_ACTIVE" in result.stdout
+
+
+def test_the_deploy_gate_allows_idle_or_absent_job_units(tmp_path):
+    env = stand_ins(tmp_path, states={ENTRY[0]: "failed"})
+    result = deploy_check(env)
+    assert result.returncode == 0, result.stdout + result.stderr

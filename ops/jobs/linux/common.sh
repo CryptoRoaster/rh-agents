@@ -12,6 +12,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/../../exit-supervisor/linux/common.sh"
 
 FLOCK="${RH_AGENTS_FLOCK:-flock}"
 JOBS_STATE_DIR="$STATE_ROOT/jobs"
+# Operator audit, written by root only: not the jobs' own state directory,
+# which systemd hands to the service user on every start.
+JOBS_AUDIT_DIR="$STATE_ROOT/audit"
 
 INDEX_SERVICE="rh-agents-pool-index.service"
 INDEX_TIMER="rh-agents-pool-index.timer"
@@ -55,10 +58,10 @@ exits_supervised() {
 # One audit line per operator action, codes only (no secret ever reaches here).
 audit_job() {
   local action="$1" job="$2" reason="$3"
-  mkdir -p "$JOBS_STATE_DIR" && chmod 0700 "$JOBS_STATE_DIR" &&
+  mkdir -p "$JOBS_AUDIT_DIR" && chmod 0700 "$JOBS_AUDIT_DIR" &&
     printf '{"at":"%s","action":"%s","job":"%s","reason":"%s","actor":"%s"}\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$action" "$job" "$reason" "${SUDO_USER:-${USER:-UNKNOWN}}" \
-      >>"$JOBS_STATE_DIR/audit.jsonl"
+      >>"$JOBS_AUDIT_DIR/jobs.jsonl"
 }
 
 REASON_RE='^[A-Z][A-Z0-9_]{2,63}$'

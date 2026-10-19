@@ -32,7 +32,7 @@ or other application server: nothing else runs there.
 | Monitoring | alert pass every 60 s (Telegram), heartbeat to the receiver every 60 s, disk usage below 80 % | section 2 |
 | Backups | nightly `pg_dump -Fc` (same major), encrypted off-site copy, 14 days kept, restore probe weekly with `ops/db/rehearse-migration.sh` | section 4 |
 
-Service user `rh-agents`, runtime checkout `/opt/rh-agents` on `main`
+Service user `rh-agents`, runtime checkout `/srv/rh-agents/app` on `main` (as in `docs/exit-supervisor-linux.md`)
 (the wrappers refuse anything else, including untracked files),
 virtualenv at `backend/.venv` built with `uv sync --locked`.
 
@@ -71,9 +71,15 @@ apart from the deploy gate now also waiting for a running index job).
 Common to all three: `After=network-online.target postgresql.service`,
 `User=rh-agents`, the exit supervisor's hardening, `MemoryMax`/`CPUQuota`
 limits, `StandardOutput=journal` with `SyslogIdentifier=rh-agents-<job>`,
-`KillSignal=SIGINT` (the runner records `RUN_INTERRUPTED`; every write is
-idempotent by its key) and `KillMode=control-group` after 30 s, no
-credentials. Rate limits are the code's own settings (index requests per run,
+`KillSignal=SIGINT` (the jobs report `RUN_INTERRUPTED`, `SCOUT_INTERRUPTED`
+or `INDEX_INTERRUPTED`; every write is idempotent by its key or committed per
+index window) and `KillMode=control-group` after 30 s, no credentials except
+`CODEX_HOME` in its own state directory for scout and entry. A stop that
+arrives while the entry wrapper still checks never starts the entry run.
+Hard bounds: index 600 s, entry 900 s (preflight plus one run: keep
+`PAPER_RUNNER_MAX_SECONDS` ≤ 600), scout 1 800 s (no deadline of its own;
+about 840 s at the default caps). The operator audit goes to the root-owned
+`/var/lib/rh-agents/audit/jobs.jsonl`, not to the jobs' state directory. Rate limits are the code's own settings (index requests per run,
 scout page-2 and ORBIT caps, exit attempts per run) plus the timers' cadence.
 
 Order of operation: exit supervisor installed and started (alerts first, its
@@ -82,14 +88,19 @@ own `start.sh`), then `ops/jobs/linux/install.sh`, then `start.sh --job index`
 refused while exits are not watched and alarmed. After a boot the timers start
 in the same order (`OnBootSec` exit 60 s, index 120 s, scout 180 s, entry 300 s).
 `stop.sh --job all --reason CODE` stops entries first and never touches the
-exit supervisor. Tested in `tests/ops/test_jobs_linux.py` (60 tests; stand-ins
-for systemctl, Python and flock; mutation-checked).
+exit supervisor. Tested in `tests/ops/test_jobs_linux.py` (72 tests; stand-ins
+for systemctl, Python, flock and pgrep). Removing the entry gates, the
+preflight check or the stop trap turns tests red (checked during review).
+The exit supervisor's deploy gate also refuses while a job timer runs or a
+job is running.
 
 ## 4. Database: backup, restore probe, migrations, backfill, rollback
 
 `ops/db/rehearse-migration.sh --source-db NAME --scratch-db NAME --out FILE --pg-bin DIR`
-dumps the source (read-only), restores into a **new** scratch database,
-migrates the copy to head and verifies it. It refuses a scratch name equal to
+dumps the source (read-only, written under a temporary name and moved into
+place when complete), restores into a **new** scratch database,
+migrates the copy to head with the checkout's own virtualenv (never `uv run`,
+which could sync the runtime's environment) and verifies it. It refuses a scratch name equal to
 the source or without `rehearsal`/`scratch` in it, an existing scratch
 database, an existing backup file, and a `pg_dump` whose major version is not
 the server's (`tests/ops/test_db_rehearsal.py`).
@@ -160,7 +171,7 @@ chain data, **GESCHÄTZT** estimated, **NICHT VERIFIZIERT** not checked
 | Process restart | `runner/test_exits_once.py` (cancelled run and dead connection release their lock); `supervisor/test_tick.py::test_a_restart_continues_from_the_recorded_state` (`PREVIOUS_TICK_ABANDONED`) |
 | Power loss (simulated) | boot-identity change → `HOST_RESTART_DETECTED`; abandoned tick detected; every sale idempotent by key and settled by reading it (`exitpolicy/test_isolation.py`, `test_drive.py`) |
 | No duplicate orders | `paperexit/test_concurrency.py`, `runner/test_exit_phase.py` and `test_exits_once.py` (PostgreSQL races), request-key replay tests |
-| No lost exit orders | `exitpolicy/test_isolation.py` (failed position retried next run), coverage gate `EXIT_POLICY_COVERAGE_MISSING` (`jobruns/test_liveness.py`) |
+| No lost exit orders | `exitpolicy/test_isolation.py` (failed position retried next run), coverage gate `EXIT_POLICY_COVERAGE_MISSING` (`jobruns/test_split_jobs.py`) |
 | Restore from backup | the rehearsal in section 4 (real, scratch databases); `tests/ops/test_db_rehearsal.py` |
 
 ## 7. Still open: the 72-hour host acceptance

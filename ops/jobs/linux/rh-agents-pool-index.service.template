@@ -27,8 +27,9 @@ StateDirectoryMode=0700
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=rh-agents-pool-index
-# Stop: SIGINT first -- the runner records RUN_INTERRUPTED and every write is
-# idempotent by its key -- then the whole control group after the grace.
+# Stop: SIGINT first -- the job reports RUN_INTERRUPTED, SCOUT_INTERRUPTED or
+# INDEX_INTERRUPTED and every write is idempotent by its key or committed per
+# window -- then the whole control group after the grace.
 TimeoutStartSec=600
 TimeoutStopSec=30
 KillMode=control-group

@@ -16,7 +16,14 @@ REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "ops" / "db" / "rehearse-migration.sh"
 
 
-def tools(tmp_path: Path, *, server: int = 170011, dump_version: str = "17.2", exists: str = "0"):
+def tools(
+    tmp_path: Path,
+    *,
+    server: int = 170011,
+    dump_version: str = "17.2",
+    exists: str = "0",
+    host: str | None = "localhost",
+):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     executable(
@@ -37,17 +44,16 @@ def tools(tmp_path: Path, *, server: int = 170011, dump_version: str = "17.2", e
     )
     executable(bin_dir / "createdb", f'echo "$*" >> "{tmp_path}/createdb.calls"\n')
     executable(
-        tmp_path / "uv",
-        f'echo "$*" >> "{tmp_path}/uv.calls"\n'
+        tmp_path / "python",
+        f'echo "$DATABASE_URL|$*" >> "{tmp_path}/python.calls"\n'
         'case "$*" in *current*|*heads*) echo "0026 (head)" ;; esac\n',
     )
     return bin_dir, {
         "PATH": "/usr/bin:/bin",
         "HOME": str(tmp_path),
-        "RH_AGENTS_UV": str(tmp_path / "uv"),
-        "PGHOST": "localhost",
+        "RH_AGENTS_PYTHON": str(tmp_path / "python"),
         "PGUSER": "tester",
-    }
+    } | ({"PGHOST": host} if host is not None else {})
 
 
 def rehearse(env, *args: str) -> subprocess.CompletedProcess[str]:
@@ -78,10 +84,17 @@ def test_a_rehearsal_backs_up_restores_and_migrates_the_scratch_copy_only(tmp_pa
         if "-l" not in call
     )
     # The source is only ever dumped; every migration targets the scratch copy.
-    assert [call for call in calls(tmp_path, "pg_dump") if "--version" not in call] == [
-        f"-Fc --no-owner -d rh_agents -f {tmp_path / 'backup.dump'}"
-    ]
-    assert "upgrade head" in "\n".join(calls(tmp_path, "uv"))
+    dumps = [call for call in calls(tmp_path, "pg_dump") if "--version" not in call]
+    assert len(dumps) == 1
+    assert dumps[0].startswith(
+        f"-Fc --no-owner -d rh_agents -f {tmp_path / 'backup.dump'}.partial."
+    )
+    assert (tmp_path / "backup.dump").exists()
+    migrations = calls(tmp_path, "python")
+    assert any("-m alembic upgrade head" in call for call in migrations)
+    # Every alembic call addresses the scratch copy, never the source.
+    urls = {call.split("|", 1)[0] for call in migrations}
+    assert urls == {"postgresql+asyncpg://tester@localhost/rh_agents_rehearsal_1"}
     assert (tmp_path / "backup.dump").stat().st_mode & 0o077 == 0
     assert "postgresql+asyncpg" not in result.stdout + result.stderr
 
@@ -124,3 +137,24 @@ def test_an_existing_scratch_database_is_never_reused(tmp_path):
     assert rehearse(env, *arguments(tmp_path, bin_dir)).returncode == 2
     assert calls(tmp_path, "createdb") == []
     assert not (tmp_path / "backup.dump").exists()
+
+
+@pytest.mark.parametrize(
+    ("host", "url"),
+    [
+        (
+            "/var/run/postgresql",
+            "postgresql+asyncpg://tester@/rh_agents_rehearsal_1?host=/var/run/postgresql",
+        ),
+        (None, "postgresql+asyncpg://tester@/rh_agents_rehearsal_1"),
+    ],
+    ids=["socket-directory", "default-socket"],
+)
+def test_alembic_reaches_the_same_server_as_the_libpq_tools(tmp_path, host, url):
+    bin_dir, env = tools(tmp_path, host=host)
+    assert rehearse(env, *arguments(tmp_path, bin_dir)).returncode == 0
+    assert {call.split("|", 1)[0] for call in calls(tmp_path, "python")} == {url}
+
+
+def test_a_rehearsal_never_syncs_the_runtime_virtualenv(tmp_path):
+    assert "uv run" not in SCRIPT.read_text().replace("never `uv run`", "")

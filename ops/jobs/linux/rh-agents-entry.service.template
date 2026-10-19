@@ -18,14 +18,21 @@ Environment=RH_AGENTS_JOB_REQUIRE_BRANCH=main
 Environment=RH_AGENTS_JOB_LOCK_DIR=/var/lib/rh-agents/jobs
 Environment=RH_AGENTS_SUPERVISOR_BACKEND=systemd
 Environment=GIT_OPTIONAL_LOCKS=0
-StateDirectory=rh-agents/jobs
+# A model provider run through the Codex CLI keeps its login in CODEX_HOME and
+# writes it back on refresh. ProtectHome hides ~/.codex and ProtectSystem makes
+# everything else read-only, so the login lives in its own writable state
+# directory (service user, 0700). Unused with any other reasoning provider.
+Environment=CODEX_HOME=/var/lib/rh-agents/codex
+StateDirectory=rh-agents/jobs rh-agents/codex
 StateDirectoryMode=0700
 # Logging: codes and JSON summaries to the journal under one identifier.
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=rh-agents-entry
-# Stop: SIGINT first -- the runner records RUN_INTERRUPTED and every write is
-# idempotent by its key -- then the whole control group after the grace.
+# Stop: SIGINT first -- the job reports RUN_INTERRUPTED, SCOUT_INTERRUPTED or
+# INDEX_INTERRUPTED and every write is idempotent by its key or committed per
+# window -- then the whole control group after the grace.
+# Preflight plus one entry run: keep PAPER_RUNNER_MAX_SECONDS at 600 or less.
 TimeoutStartSec=900
 TimeoutStopSec=30
 KillMode=control-group

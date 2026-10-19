@@ -47,9 +47,15 @@ fi
 lock_dir="${RH_AGENTS_JOB_LOCK_DIR:-$JOBS_STATE_DIR}"
 mkdir -p "$lock_dir" || refused LOCK_DIR_UNAVAILABLE
 exec 9>"$lock_dir/$job.lock" || refused LOCK_UNAVAILABLE
-if ! "$FLOCK" -n 9; then
+# 75 = another run holds the lock: skipped. Any other failure of flock is not
+# "already running" -- a job that silently never runs must not look healthy.
+lock_status=0
+"$FLOCK" -n -E 75 9 || lock_status=$?
+if ((lock_status == 75)); then
   echo "run-job $job: skipped ALREADY_RUNNING"
   exit 0
+elif ((lock_status != 0)); then
+  refused LOCK_FAILED
 fi
 
 cd "$REPO/backend"
@@ -65,6 +71,9 @@ case "$job" in
     exec "$PYTHON" -m src.runner.main --scout-once
     ;;
   entry)
+    # A stop (SIGINT/SIGTERM) that arrives while the checks run ends this
+    # wrapper; it never goes on to start the entry run afterwards.
+    trap 'echo "run-job entry: stopped before the entry run" >&2; exit 130' INT TERM
     exits_supervised || refused EXIT_SUPERVISION_NOT_ACTIVE
     # Fail closed: the entry job starts only on a configuration the preflight
     # calls ready. Its output (codes only) goes to the journal.
