@@ -102,9 +102,15 @@ Required before any entry:
 - `ops/exit-supervisor/linux/install.sh` defaults to `--host-alias rh-vps`,
   which is the `VPS_NO_GO` host: always pass the target host explicitly.
 - Alerting through the rh-agents Telegram bot (single chat) on any exit run
-  that is not ready (`EXIT_BLOCKED`, `EXIT_ATTEMPT_FAILED`,
-  `EXIT_OUTCOME_UNKNOWN`, `EXIT_JOB_TECHNICAL_FAILURE`,
-  `EXIT_POLICY_COVERAGE_MISSING`) and a dead-man alert when no exit run
+  that is not ready -- every `ExitHealth` reason other than ready
+  (`backend/src/orchestration/jobruns/models.py`), among them `EXIT_BLOCKED`,
+  `EXIT_ATTEMPT_FAILED` (also for a failed judgement, #111),
+  `EXIT_OUTCOME_UNKNOWN`, `EXIT_ATTEMPT_TIMED_OUT`, `EXIT_PLAN_INCOMPLETE`,
+  `EXIT_BACKLOG`, `EXIT_MARK_UNKNOWN`, `EXIT_ACQUISITION_INCOMPLETE`,
+  `EXIT_ACQUISITION_DISABLED`, `EXIT_JOB_TECHNICAL_FAILURE`,
+  `EXIT_JOB_SYSTEM_STOPPED`, `EXIT_JOB_TIMED_OUT`, `EXIT_JOB_ALREADY_RUNNING`,
+  `EXIT_JOB_LOCK_NOT_HELD`, `EXIT_POLICY_NOT_CONFIGURED`,
+  `EXIT_POLICY_COVERAGE_MISSING` and `EXIT_POLICY_COVERAGE_UNKNOWN` -- and a dead-man alert when no exit run
   finished within twice its interval.
 - A tested manual stop
   (`python -m src.runner.control --halt-entries --reason PILOT_STOP_TEST`).

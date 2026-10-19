@@ -9,13 +9,17 @@ again by the next sweep. Real chain from `tests/paperexit/test_exit_rpc_failures
 the real exit service, ledger and ATLAS read; nothing calls a provider.
 """
 
+import asyncio
 from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
+import pytest
+
 from src.core.clock import FixedClock
 from src.core.models import RiskLimits
+from src.orchestration.commander.context import SystemPauseUnavailable
 from src.orchestration.exitpolicy.drive import ExitSweep, alone, attempt_exits
 from src.orchestration.exitpolicy.service import AutoExitService
 from src.orchestration.jobruns.models import (
@@ -43,15 +47,22 @@ MARKETS = (IDENTITY, SECOND, THIRD)
 
 
 class Breaking:
-    """The real exit read, raising an unnamed error for one market's holding."""
+    """The real exit read, raising for the first holding asked, whichever it is.
 
-    def __init__(self, inner: Any, broken: str, *, times: int = 1) -> None:
-        self.inner, self.broken, self.remaining = inner, broken, times
+    Breaking the first attempt rather than one named market keeps the failure
+    ahead of the other two whatever order the sweep chooses, so every run shows
+    sales made *after* the failure.
+    """
+
+    def __init__(self, inner: Any, error: BaseException | None = None) -> None:
+        self.inner = inner
+        self.error = error or ValueError("an error no code path names")
+        self.asked: list[str] = []
 
     async def read(self, trade_case_id, market, request_key):
-        if market.base_asset_id == self.broken and self.remaining > 0:
-            self.remaining -= 1
-            raise ValueError("an error no code path names")
+        self.asked.append(market.base_asset_id)
+        if len(self.asked) == 1:
+            raise self.error
         return await self.inner.read(trade_case_id, market, request_key)
 
 
@@ -83,11 +94,13 @@ async def test_an_attempt_that_raises_does_not_stop_the_other_sales(risk_db, now
     _, sessions = risk_db
     await three_holdings(sessions, now)
     at = now + LATER
-    read = Breaking(healthy_read(at), SECOND.base_asset_id)
+    read = Breaking(healthy_read(at))
 
     result = await sweeper(sessions, at, read).sweep()
 
     assert (result.triggered, result.executed, result.failed) == (3, 2, 1), result
+    # The failing holding was asked first; both others were sold after it.
+    assert len(read.asked) == 3 and len(set(read.asked)) == 3
     assert result.refusals == {"EXIT_ATTEMPT_FAILED": 1}
     assert (await counts(sessions))[0] == 2
     assert (await read_account(sessions)).paused is False
@@ -245,3 +258,44 @@ async def test_a_booked_sale_whose_confirmation_fails_is_never_sold_again(
     # The booked holding is closed: only the other two are sold, once each.
     assert (again.triggered, again.executed) == (2, 2), again
     assert (await counts(sessions))[0] == 3
+
+
+# ------------------------------------------- what isolation must never swallow
+
+
+@pytest.mark.parametrize(
+    "error",
+    [SystemPauseUnavailable("PAUSE_STATE_UNAVAILABLE"), asyncio.CancelledError()],
+    ids=["stop-unreadable", "cancelled"],
+)
+async def test_an_unreadable_stop_or_a_cancellation_still_ends_the_sweep(
+    risk_db, now, error
+) -> None:
+    # Isolation is for failures nobody named. An unreadable stop ends the exit
+    # phase (fail closed), and a cancellation is the run's own bound: neither
+    # may be turned into one failed position while the others are still sold.
+    _, sessions = risk_db
+    await three_holdings(sessions, now)
+    at = now + LATER
+    read = Breaking(healthy_read(at), error)
+
+    with pytest.raises(type(error)):
+        await sweeper(sessions, at, read).sweep()
+
+    assert len(read.asked) == 1
+    assert (await counts(sessions))[0] == 0
+
+
+async def test_an_unreadable_stop_while_judging_still_ends_the_sweep(risk_db, now) -> None:
+    _, sessions = risk_db
+    await three_holdings(sessions, now)
+    at = now + LATER
+    service = sweeper(sessions, at, healthy_read(at))
+
+    async def unreadable(position, entry, instant):
+        raise SystemPauseUnavailable("PAUSE_STATE_UNAVAILABLE")
+
+    object.__setattr__(service, "_inputs", unreadable)
+    with pytest.raises(SystemPauseUnavailable):
+        await service.sweep()
+    assert (await counts(sessions))[0] == 0

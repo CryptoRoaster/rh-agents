@@ -19,12 +19,12 @@ jobs:
     # and 788s on identical work, a factor of three that is the hosted runner's
     # and not this repository's.
     #
-    # 25 minutes is 1.7x the slowest complete job ever observed and 1.4x the
-    # sum of every step's own observed maximum, so the full suites, both lint
-    # gates and mypy finish even on a runner as slow as the worst one seen. It
-    # is deliberately not larger: this bound still exists to end a genuine
-    # deadlock, and nothing here weakens a check or skips a step.
-    timeout-minutes: 25
+    # 40 minutes: complete jobs now take 16-25 minutes (October 2026) and two
+    # pull-request runs were cut off at the former 25-minute bound inside the
+    # SQLite step, after PostgreSQL had passed. 40 is 1.6x the slowest complete
+    # job observed. It is deliberately not larger: this bound still exists to
+    # end a genuine deadlock, and nothing here weakens a check or skips a step.
+    timeout-minutes: 40
     defaults:
       run:
         working-directory: backend
