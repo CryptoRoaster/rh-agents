@@ -57,11 +57,16 @@ def box(tmp_path: Path) -> dict[str, Path]:
         f'env | sort > "{record}/env"\n'
         f'if [[ -e "{record}/sleep" ]]; then\n'
         f"  trap 'echo terminated > \"{record}/signal\"; exit 143' TERM\n"
+        f'  touch "{record}/started"\n'
         "  for _ in $(seq 1 100); do sleep 0.1; done\n"
         "fi\n"
         f'exit "$(cat "{record}/exit" 2>/dev/null || echo 0)"\n',
     )
-    executable(bin_dir / "launchctl", f'printf "%s\\n" "$*" >> "{record}/launchctl"\n')
+    executable(
+        bin_dir / "launchctl",
+        f'printf "%s\\n" "$*" >> "{record}/launchctl"\n'
+        f'[[ "$1" != print || -e "{record}/loaded" ]]\n',
+    )
     env_file = tmp_path / "observe.env"
     env_file.write_text(PROFILE)
     return {
@@ -120,7 +125,7 @@ def test_a_run_starts_only_the_scout_mode_from_the_backend(box):
     assert cwd == (box["checkout"] / "backend").resolve()
     assert "observe: start (database rh_agents_observe" in log(box)
     assert "observe: exit 0" in log(box)
-    assert not (box["state"] / "running.pid").exists()
+    assert not (box["state"] / "run.lock").exists()
 
 
 def test_the_scout_sees_the_profile_and_nothing_inherited(box):
@@ -205,6 +210,26 @@ def test_a_profile_that_could_trade_or_leave_its_database_is_refused(box, values
     assert not (box["record"] / "args").exists()
 
 
+@pytest.mark.parametrize(
+    ("values", "reason"),
+    [
+        (
+            {"EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN": "5"},
+            "OBSERVE_MODEL_BUDGET_ABOVE_CAP",
+        ),
+        (
+            {"EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_DAY": "97"},
+            "OBSERVE_MODEL_BUDGET_ABOVE_CAP",
+        ),
+        ({"EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_DAY": ""}, "OBSERVE_MODEL_BUDGET_NOT_EXPLICIT"),
+    ],
+)
+def test_an_approved_model_budget_is_explicit_and_capped(box, values, reason):
+    profile_with(box, RH_AGENTS_OBSERVE_MODEL_BUDGET_APPROVED="yes", **values)
+    assert script(box, "run-observe.sh").returncode == 78
+    assert reason in log(box)
+
+
 def test_an_approved_model_budget_allows_orbit_reviews(box):
     profile_with(
         box,
@@ -218,16 +243,18 @@ def test_an_approved_model_budget_allows_orbit_reviews(box):
     ("text", "reason"),
     [
         ("TRADING_MODE=OBSERVE\nTRADING_MODE=OBSERVE\n", "OBSERVE_ENV_KEY_REPEATED_TRADING_MODE"),
-        ("CODEX_EXECUTABLE=$(touch /tmp/x)\n", "OBSERVE_ENV_MALFORMED"),
+        ("CODEX_EXECUTABLE=$(touch MARKER)\n", "OBSERVE_ENV_MALFORMED"),
         ('TRADING_MODE="OBSERVE"\n', "OBSERVE_ENV_MALFORMED"),
         ("export TRADING_MODE=OBSERVE\n", "OBSERVE_ENV_MALFORMED"),
     ],
 )
 def test_the_env_file_is_read_never_sourced(box, text, reason):
-    box["env_file"].write_text(text + PROFILE)
+    marker = box["tmp"] / "MARKER"
+    box["env_file"].write_text(text.replace("MARKER", str(marker)) + PROFILE)
     result = script(box, "run-observe.sh")
     assert result.returncode == 78
     assert reason in log(box)
+    assert not marker.exists()
 
 
 def test_a_missing_profile_is_refused(box):
@@ -240,6 +267,18 @@ def test_a_repository_env_file_is_refused(box):
     (box["checkout"] / ".env").write_text("PAPER_RUNNER_ENABLED=true\n")
     assert script(box, "run-observe.sh").returncode == 78
     assert "OBSERVE_REPOSITORY_ENV_PRESENT" in log(box)
+
+
+def test_a_dangling_repository_env_link_is_refused(box):
+    (box["checkout"] / ".env").symlink_to(box["tmp"] / "nowhere")
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_REPOSITORY_ENV_PRESENT" in log(box)
+
+
+def test_an_untracked_module_next_to_the_backend_is_refused(box):
+    (box["checkout"] / "backend" / "src.py").write_text("raise SystemExit\n")
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
 
 
 def test_a_modified_checkout_is_refused(box):
@@ -271,42 +310,14 @@ def test_the_stop_file_skips_every_run(box):
     assert not (box["record"] / "args").exists()
 
 
-def test_a_run_in_progress_is_never_joined_by_a_second(box):
-    box["state"].mkdir()
-    (box["state"] / "running.pid").write_text(f"{os.getpid()}\n")
-    result = script(box, "run-observe.sh")
-    assert result.returncode == 0
-    assert "skipped RUN_IN_PROGRESS" in log(box)
-    assert not (box["record"] / "args").exists()
-
-
-def test_a_stale_pid_file_does_not_block_the_next_run(box):
-    box["state"].mkdir()
-    (box["state"] / "running.pid").write_text("999999\n")
-    assert script(box, "run-observe.sh").returncode == 0
-    assert (box["record"] / "args").exists()
-
-
-def test_a_terminated_wrapper_stops_the_scout_and_waits_for_it(box):
-    (box["record"] / "sleep").touch()
-    wrapper = subprocess.Popen(
-        ["/bin/bash", str(box["checkout"] / "ops" / "observe" / "run-observe.sh")],
-        env=environment(box),
-    )
-    deadline = time.monotonic() + 10
-    while not (box["record"] / "args").exists() and time.monotonic() < deadline:
-        time.sleep(0.05)
-    wrapper.send_signal(signal.SIGTERM)
-    assert wrapper.wait(timeout=20) == 143
-    assert (box["record"] / "signal").read_text().strip() == "terminated"
-    assert "observe: exit 143" in log(box)
-    assert not (box["state"] / "running.pid").exists()
-
-
-def detached_sleep(seconds: int) -> int:
-    """A process that is not ours: it is reaped by init, never left a zombie."""
+def detached_sleep(seconds: int, name: str = "run-observe.sh") -> int:
+    """A process that is not ours (reaped by init, never a zombie), named like a wrapper."""
     started = subprocess.run(
-        ["/bin/bash", "-c", f"/bin/sleep {seconds} >/dev/null 2>&1 & echo $!"],
+        [
+            "/bin/bash",
+            "-c",
+            f"(exec -a {name} /bin/sleep {seconds}) >/dev/null 2>&1 & echo $!",
+        ],
         capture_output=True,
         text=True,
         check=True,
@@ -322,6 +333,48 @@ def alive(pid: int) -> bool:
     return True
 
 
+def hold_lock(box: dict[str, Path], pid: int) -> None:
+    (box["state"] / "run.lock").mkdir(parents=True)
+    (box["state"] / "run.lock" / "pid").write_text(f"{pid}\n")
+
+
+def test_a_run_in_progress_is_never_joined_by_a_second(box):
+    pid = detached_sleep(30)
+    try:
+        hold_lock(box, pid)
+        result = script(box, "run-observe.sh")
+        assert result.returncode == 0
+        assert f"skipped RUN_IN_PROGRESS pid {pid}" in log(box)
+        assert not (box["record"] / "args").exists()
+        assert (box["state"] / "run.lock" / "pid").read_text().strip() == str(pid)
+    finally:
+        os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize("pid", [999999, os.getpid()])
+def test_a_dead_or_foreign_pid_does_not_block_the_next_run(box, pid):
+    hold_lock(box, pid)
+    assert script(box, "run-observe.sh").returncode == 0
+    assert (box["record"] / "args").exists()
+    assert not (box["state"] / "run.lock").exists()
+
+
+def test_a_terminated_wrapper_stops_the_scout_and_waits_for_it(box):
+    (box["record"] / "sleep").touch()
+    wrapper = subprocess.Popen(
+        ["/bin/bash", str(box["checkout"] / "ops" / "observe" / "run-observe.sh")],
+        env=environment(box),
+    )
+    deadline = time.monotonic() + 10
+    while not (box["record"] / "started").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    wrapper.send_signal(signal.SIGTERM)
+    assert wrapper.wait(timeout=20) == 143
+    assert (box["record"] / "signal").read_text().strip() == "terminated"
+    assert "observe: exit 143" in log(box)
+    assert not (box["state"] / "run.lock").exists()
+
+
 def test_stop_sets_the_stop_file_and_unloads(box):
     result = script(box, "stop.sh")
     assert result.returncode == 0, result.stderr
@@ -330,9 +383,8 @@ def test_stop_sets_the_stop_file_and_unloads(box):
 
 
 def test_stop_waits_for_the_run_in_progress(box):
-    box["state"].mkdir()
     pid = detached_sleep(2)
-    (box["state"] / "running.pid").write_text(f"{pid}\n")
+    hold_lock(box, pid)
     started = time.monotonic()
     result = script(box, "stop.sh")
     assert result.returncode == 0, result.stderr
@@ -342,10 +394,9 @@ def test_stop_waits_for_the_run_in_progress(box):
 
 
 def test_stop_gives_up_loudly_and_keeps_the_stop_file(box):
-    box["state"].mkdir()
     pid = detached_sleep(30)
     try:
-        (box["state"] / "running.pid").write_text(f"{pid}\n")
+        hold_lock(box, pid)
         result = script(box, "stop.sh", RH_AGENTS_OBSERVE_STOP_WAIT_SECONDS="1")
         assert result.returncode == 1
         assert "OBSERVE_STOP_TIMEOUT" in result.stderr
@@ -356,12 +407,29 @@ def test_stop_gives_up_loudly_and_keeps_the_stop_file(box):
 
 
 def test_stop_now_interrupts_the_run_in_progress(box):
-    box["state"].mkdir()
     pid = detached_sleep(30)
-    (box["state"] / "running.pid").write_text(f"{pid}\n")
+    hold_lock(box, pid)
     result = script(box, "stop.sh", "--now")
     assert result.returncode == 0, result.stderr
     assert not alive(pid)
+
+
+def test_stop_never_signals_a_foreign_process_behind_a_stale_pid(box):
+    pid = detached_sleep(30, name="unrelated")
+    try:
+        hold_lock(box, pid)
+        assert script(box, "stop.sh", "--now").returncode == 0
+        assert alive(pid)
+    finally:
+        os.kill(pid, signal.SIGKILL)
+
+
+def test_stop_fails_loudly_while_the_agent_stays_loaded(box):
+    (box["record"] / "loaded").touch()
+    result = script(box, "stop.sh")
+    assert result.returncode == 1
+    assert "OBSERVE_STOP_FAILED" in result.stderr
+    assert (box["state"] / "STOP").exists()
 
 
 # ------------------------------------------------------------ start
@@ -448,6 +516,13 @@ def test_status_is_healthy_without_trading_state(box):
     assert result.returncode == 0, result.stdout
     assert "trade_cases=0 order_intents=0 positions=0" in result.stdout
     assert "HEALTHY" in result.stdout
+
+
+def test_status_fails_closed_when_the_database_cannot_be_read(box):
+    executable(box["bin"] / "psql", "exit 2\n")
+    result = script(box, "status.sh")
+    assert result.returncode == 2
+    assert "trading invariants: UNKNOWN" in result.stdout
 
 
 def test_status_flags_any_trading_state_in_the_observation_database(box):

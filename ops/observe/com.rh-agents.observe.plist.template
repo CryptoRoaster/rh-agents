@@ -37,8 +37,9 @@
   <!-- A stop waits for the run in progress before launchd signals it. -->
   <key>ExitTimeOut</key>
   <integer>120</integer>
+  <!-- The wrapper logs to observe.log (rotated); only shell errors land here. -->
   <key>StandardOutPath</key>
-  <string>__LOG_DIR__/observe.launchd.log</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
   <string>__LOG_DIR__/observe.launchd.log</string>
 </dict>

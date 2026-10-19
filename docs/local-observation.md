@@ -36,14 +36,19 @@ every run:
   `MARKET_CHAINS=robinhood` and `REASONING_PROVIDER=codex`.
 - `DATABASE_URL` must name a local `rh_agents_observe[_suffix]` database and
   carry no password (`OBSERVE_DATABASE_NOT_ISOLATED`).
-- ORBIT reviews stay at 0 unless `RH_AGENTS_OBSERVE_MODEL_BUDGET_APPROVED=yes`
-  (`OBSERVE_MODEL_BUDGET_NOT_APPROVED`).
+- ORBIT reviews are explicit numbers and stay at 0 unless
+  `RH_AGENTS_OBSERVE_MODEL_BUDGET_APPROVED=yes`
+  (`OBSERVE_MODEL_BUDGET_NOT_APPROVED`). An approved budget is still capped at
+  4 a run and 96 a day (`OBSERVE_MODEL_BUDGET_ABOVE_CAP`).
 - The scout starts with `env -i` plus the profile. No inherited variable and no
   wrapper key reaches it. A repository `.env` is refused
   (`OBSERVE_REPOSITORY_ENV_PRESENT`), because settings would read it.
-- Only committed code runs: a tracked change, or an untracked file under `ops/`
-  or `backend/src/`, is refused (`OBSERVE_WORKTREE_MODIFIED`). `start.sh`
-  also requires a commit that is on `origin/main`.
+- Only committed code runs. Refused (`OBSERVE_WORKTREE_MODIFIED`):
+  - a tracked change;
+  - an untracked or ignored file under `ops/` or `backend/`, except the
+    virtualenv and tool caches. `python -m` puts `backend/` first on `sys.path`.
+
+  `start.sh` also requires a commit on `origin/main`.
 
 ## 2. Setup (once)
 
@@ -65,11 +70,13 @@ every run:
 4. Check the profile and the configuration without any call:
 
    ```bash
-   ops/observe/run-observe.sh --check
+   ops/observe/run-observe.sh --check       # the profile and the checkout
+   ops/observe/run-observe.sh --preflight   # the runner preflight under the profile
    ```
 
-   The preflight under the profile must show `RUN_PERMITTED` as `BLOCKED`
-   (`PAPER_RUNNER_NOT_ENABLED`) and `DATABASE_SCHEMA` as satisfied.
+   The preflight writes nothing and calls no provider. It must show
+   `RUN_PERMITTED` as `BLOCKED` (`PAPER_RUNNER_NOT_ENABLED`) and
+   `DATABASE_SCHEMA` as satisfied.
 
 Backup and restore of the runtime database are proven separately and
 read-only, with `ops/db/rehearse-migration.sh` (section 4 of
@@ -81,7 +88,7 @@ needs no copy of runtime data.
 | Action | Command |
 | --- | --- |
 | Start (needs explicit approval) | `ops/observe/start.sh --confirm` (`--dry-run` prints the agent and changes nothing) |
-| Health / status | `ops/observe/status.sh` (exit 0 healthy, 1 degraded, 2 trading state found) |
+| Health / status | `ops/observe/status.sh` (exit 0 healthy, 1 degraded, 2 trading state found or unreadable) |
 | Stop | `ops/observe/stop.sh`: sets the STOP file, waits for the run in progress (at most 600 s), then unloads the agent |
 | Emergency stop | `ops/observe/stop.sh --now`: as above, but terminates the run in progress |
 | Restart | `ops/observe/start.sh --confirm`: clears STOP; the next run continues from the database |
@@ -89,9 +96,11 @@ needs no copy of runtime data.
 
 - **Starting.** The first run begins one interval after loading
   (`RunAtLoad` is false).
-- **Overlap.** Runs never overlap. launchd does not start a job that is still
-  running, the wrapper skips while its pid file names a live run, and the scout
-  holds a PostgreSQL advisory lock.
+- **Overlap.** Runs never overlap:
+  - launchd does not start a job that is still running;
+  - the wrapper takes an atomic lock directory, and a pid left behind by a
+    crash is trusted only while it is still a `run-observe.sh`;
+  - the scout holds a PostgreSQL advisory lock.
 - **Stopping without data loss.** Every stage commits on its own. A run that is
   terminated loses only its uncommitted stage, and the next run records the
   same pools again idempotently (`ON CONFLICT DO NOTHING`, unique keys per pool
@@ -113,14 +122,14 @@ power.
 
 | Provider | Needed for | Credential | Calls in this profile | Cost |
 | --- | --- | --- | --- | --- |
-| GeckoTerminal public API v2 | discovery, refreshes, OHLCV | none | at most 5 market requests plus 6 OHLCV reads per run, each with bounded retries; at 288 runs a day ≤ 3 168 requests a day | free; public rate limit about 30 calls a minute (provider documentation, NOT VERIFIED here), far above ≤ 11 per 5 minutes |
+| GeckoTerminal public API v2 | discovery, refreshes, OHLCV | none | at most 5 logical market requests a run, hard-capped at 8 HTTP attempts with retries (`GECKOTERMINAL_MAX_HTTP_ATTEMPTS`); plus at most 6 OHLCV reads, 1 retry each; worst case 8 + 12 = 20 HTTP calls a run, 5 760 a day; expected 1 to 6 a run | free; public rate limit about 30 calls a minute (provider documentation, NOT VERIFIED here), far above ≤ 20 per 5 minutes |
 | Codex (ORBIT) | model review of watches | local Codex login | 0 (budget 0) | per call NOT VERIFIED (subscription); needs approval |
 | Anthropic | alternative ORBIT model | not in the profile | 0 | needs a key and approval |
 | TypeSafe JEV | shadow triage | not in the profile | 0 | needs approval |
 | Robinhood chain RPC, Blockscout, NodeReal, Etherscan | ATLAS, V4 pool index, funding | not in the profile | 0 | not part of this mode |
 
 **Proposed ceiling for activation:**
-- GeckoTerminal at most 3 200 requests a day, all other providers 0, cost 0.
+- GeckoTerminal at most 5 760 HTTP calls a day (worst case; the expected figure is about 300 to 1 700), all other providers 0, cost 0.
 - An ORBIT budget, if wanted, is a separate approval. The code defaults are 4 a run and 96 a day. Set them together with `RH_AGENTS_OBSERVE_MODEL_BUDGET_APPROVED=yes`.
 
 ## 6. Verification

@@ -15,9 +15,15 @@ LOG_DIR="${RH_AGENTS_OBSERVE_LOG_DIR:-$HOME/Library/Logs/rh-agents}"
 LAUNCH_AGENTS="${RH_AGENTS_LAUNCH_AGENTS:-$HOME/Library/LaunchAgents}"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 STOP_FILE="$STATE_DIR/STOP"
-PID_FILE="$STATE_DIR/running.pid"
+# A run in progress holds this directory (mkdir is atomic); its pid file names
+# the wrapper that owns it.
+LOCK_DIR="$STATE_DIR/run.lock"
+PID_FILE="$LOCK_DIR/pid"
 # The checkout's own virtualenv, as it is: never `uv run`, which would sync it.
 PYTHON="${RH_AGENTS_OBSERVE_PYTHON:-$REPO/backend/.venv/bin/python}"
+# An ORBIT budget, once approved, is still capped here (the code defaults).
+ORBIT_MAX_PER_RUN=4
+ORBIT_MAX_PER_DAY=96
 
 # Every key the profile may set. Anything else in the env file is refused, so
 # no trading gate, provider key or RPC URL can be switched on through it.
@@ -71,16 +77,23 @@ observe_check() {
     [[ "$(observe_get "$key")" == "${pair#*=}" ]] || { echo "OBSERVE_REQUIRES_${key}"; return 1; }
   done
   [[ "$(observe_get DATABASE_URL)" =~ $OBSERVE_DB_URL_RE ]] || { echo "OBSERVE_DATABASE_NOT_ISOLATED"; return 1; }
-  # A model call costs money: no ORBIT review without an approved budget.
+  # A model call costs money: no ORBIT review without an approved budget, and
+  # an approved budget is explicit and capped.
+  local per_run per_day
+  per_run="$(observe_get EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN)"
+  per_day="$(observe_get EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_DAY)"
+  [[ "$per_run" =~ ^[0-9]{1,4}$ && "$per_day" =~ ^[0-9]{1,4}$ ]] ||
+    { echo "OBSERVE_MODEL_BUDGET_NOT_EXPLICIT"; return 1; }
   if [[ "$(observe_get RH_AGENTS_OBSERVE_MODEL_BUDGET_APPROVED)" != "yes" ]]; then
-    for key in EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_DAY; do
-      [[ "$(observe_get "$key")" == "0" ]] || { echo "OBSERVE_MODEL_BUDGET_NOT_APPROVED"; return 1; }
-    done
+    ((10#$per_run == 0 && 10#$per_day == 0)) || { echo "OBSERVE_MODEL_BUDGET_NOT_APPROVED"; return 1; }
+  elif ((10#$per_run > ORBIT_MAX_PER_RUN || 10#$per_day > ORBIT_MAX_PER_DAY)); then
+    echo "OBSERVE_MODEL_BUDGET_ABOVE_CAP"
+    return 1
   fi
   # Settings read `../.env` relative to backend/: a repository .env here would
   # mix the runtime configuration into the observation profile.
-  [[ ! -e "$REPO/.env" ]] || { echo "OBSERVE_REPOSITORY_ENV_PRESENT"; return 1; }
-  [[ -x "$PYTHON" ]] || { echo "OBSERVE_PYTHON_MISSING"; return 1; }
+  [[ ! -e "$REPO/.env" && ! -L "$REPO/.env" ]] || { echo "OBSERVE_REPOSITORY_ENV_PRESENT"; return 1; }
+  [[ "$PYTHON" == /* && -x "$PYTHON" ]] || { echo "OBSERVE_PYTHON_MISSING"; return 1; }
 }
 
 # The database name of the checked profile (no credentials are ever printed).
@@ -96,10 +109,46 @@ observe_env_args() {
   done
 }
 
-# A run in progress: its pid file names a live process.
+# Only committed code runs: no tracked change, and no untracked or ignored file
+# anywhere the scout could import from (ops/ and backend/, whose directory
+# leads sys.path under `python -m`), except the virtualenv and tool caches.
+observe_code_clean() {
+  git -C "$REPO" diff --quiet HEAD -- || return 1
+  [[ -z "$(git -C "$REPO" status --porcelain --untracked-files=all --ignored -- ops backend \
+    ':(exclude)backend/.venv' ':(exclude)backend/.mypy_cache' ':(exclude)backend/.pytest_cache' \
+    ':(exclude)backend/.ruff_cache' ':(exclude)**/__pycache__/**')" ]]
+}
+
+# The wrapper that holds the run lock, if it is alive and still a wrapper: a
+# pid left behind by a crash and reused by another process is never trusted.
 observe_running_pid() {
   local pid
   [[ -f "$PID_FILE" ]] || return 1
   pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+  [[ "$(ps -o command= -p "$pid" 2>/dev/null)" == *run-observe.sh* ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+# Take the run lock for this shell. Returns 1 while another run holds it; a
+# stale lock (dead or foreign pid) is cleared once.
+observe_lock() {
+  local attempt
+  for attempt in 1 2; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      echo $$ >"$PID_FILE"
+      return 0
+    fi
+    observe_running_pid >/dev/null && return 1
+    rm -f "$PID_FILE"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  done
+  return 1
+}
+
+# Release the run lock, only if this shell owns it.
+observe_unlock() {
+  [[ "$(cat "$PID_FILE" 2>/dev/null || true)" == "$$" ]] || return 0
+  rm -f "$PID_FILE"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
 }

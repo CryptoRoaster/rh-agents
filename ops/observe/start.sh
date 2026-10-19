@@ -26,14 +26,17 @@ INTERVAL="$((10#$INTERVAL))"
 reason="$(observe_load)" || refuse "$reason"
 observe_load >/dev/null
 reason="$(observe_check)" || refuse "$reason"
-# Only committed code runs: no tracked change and no untracked file in the
-# code the scout loads (ops/ and backend/src); .venv and logs are elsewhere.
-[[ -z "$(git -C "$REPO" status --porcelain -- ops backend/src)" ]] &&
-  git -C "$REPO" diff --quiet HEAD -- || refuse OBSERVE_WORKTREE_MODIFIED
-if [[ -z "${RH_AGENTS_OBSERVE_ALLOW_UNMERGED:-}" ]] &&
-  ! git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+observe_code_clean || refuse OBSERVE_WORKTREE_MODIFIED
+if [[ -n "${RH_AGENTS_OBSERVE_ALLOW_UNMERGED:-}" ]]; then
+  echo "warning: RH_AGENTS_OBSERVE_ALLOW_UNMERGED set; the commit is not checked against origin/main" >&2
+elif ! git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
   refuse OBSERVE_COMMIT_NOT_ON_MAIN
 fi
+
+# Rendered paths must stay plain: no sed or XML metacharacter.
+for path in "$REPO" "$ENV_FILE" "$STATE_DIR" "$LOG_DIR"; do
+  [[ "$path" =~ ^/[A-Za-z0-9\ ._/@+-]+$ ]] || refuse "OBSERVE_PATH_NOT_PLAIN: $path"
+done
 
 rendered="$(sed \
   -e "s|__REPO__|$REPO|g" \
@@ -50,9 +53,11 @@ fi
 
 mkdir -p "$LAUNCH_AGENTS" "$LOG_DIR" "$STATE_DIR"
 chmod 0700 "$STATE_DIR"
-printf '%s\n' "$rendered" >"$PLIST"
-plutil -lint "$PLIST" >/dev/null
+staged="$(mktemp "$LAUNCH_AGENTS/.$LABEL.XXXXXX")"
+printf '%s\n' "$rendered" >"$staged"
+plutil -lint "$staged" >/dev/null || { rm -f "$staged"; refuse OBSERVE_PLIST_INVALID; }
+mv "$staged" "$PLIST"
 rm -f "$STOP_FILE"
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "started $LABEL (every $INTERVAL s, database $(observe_db), commit $(git -C "$REPO" rev-parse --short HEAD); logs in $LOG_DIR)"
+echo "started $LABEL (every $INTERVAL s, database $(observe_db), ORBIT reviews $(observe_get EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN)/run $(observe_get EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_DAY)/day, commit $(git -C "$REPO" rev-parse --short HEAD); logs in $LOG_DIR)"

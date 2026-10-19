@@ -39,5 +39,9 @@ if pid="$(observe_running_pid)"; then
 fi
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+  echo "OBSERVE_STOP_FAILED: $LABEL is still loaded (STOP file set, so no run starts)" >&2
+  exit 1
+fi
 rm -f "$PLIST"
 echo "stopped $LABEL (STOP file kept; data and logs kept)"

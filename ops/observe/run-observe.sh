@@ -4,6 +4,8 @@
 #
 #   ops/observe/run-observe.sh           one run (skipped while STOP exists)
 #   ops/observe/run-observe.sh --check   validate the profile, run nothing
+#   ops/observe/run-observe.sh --preflight  the runner preflight under the profile
+#                                        (writes nothing, calls no provider)
 #
 # The scout records discovered pools, watches them and reads market history;
 # it never forms a trade case, an order or a position. Everything else that
@@ -31,34 +33,42 @@ if [[ -f "$LOG" ]] && (($(wc -c <"$LOG") > MAX_BYTES)); then
   mv "$LOG" "$LOG.1"
 fi
 
-say() { echo "$(date -u +%FT%TZ) observe: $*" | tee -a "$LOG"; }
-refuse() { say "refused $1"; exit 78; }
+say() { echo "$(date -u +%FT%TZ) observe: $*" >>"$LOG"; }
+refuse() { say "refused $1"; echo "OBSERVE_REFUSED: $1" >&2; exit 78; }
 
 reason="$(observe_load)" || refuse "$reason"
 observe_load >/dev/null
 reason="$(observe_check)" || refuse "$reason"
-# Only committed code runs: no tracked change and no untracked file in the
-# code the scout loads (ops/ and backend/src); .venv and logs are elsewhere.
-[[ -z "$(git -C "$REPO" status --porcelain -- ops backend/src)" ]] &&
-  git -C "$REPO" diff --quiet HEAD -- || refuse OBSERVE_WORKTREE_MODIFIED
+observe_code_clean || refuse OBSERVE_WORKTREE_MODIFIED
 
-if [[ "${1:-}" == "--check" ]]; then
-  say "profile ok (database $(observe_db), commit $(git -C "$REPO" rev-parse --short HEAD))"
+env_args=()
+while IFS= read -r line; do env_args+=("$line"); done < <(observe_env_args)
+
+case "${1:-}" in
+  --check)
+    say "profile ok (database $(observe_db), commit $(git -C "$REPO" rev-parse --short HEAD))"
+    echo "profile ok (database $(observe_db), commit $(git -C "$REPO" rev-parse --short HEAD))"
+    exit 0
+    ;;
+  --preflight)
+    cd "$REPO/backend"
+    exec env -i "${env_args[@]}" "$PYTHON" -m src.runner.main --preflight
+    ;;
+  "") ;;
+  *) refuse OBSERVE_UNKNOWN_ARGUMENT ;;
+esac
+
+# The lock first, then STOP: a stop that sets STOP either sees this run's
+# lock or this run sees STOP.
+if ! observe_lock; then
+  say "skipped RUN_IN_PROGRESS pid $(observe_running_pid || echo UNKNOWN)"
   exit 0
 fi
-[[ $# -eq 0 ]] || refuse OBSERVE_UNKNOWN_ARGUMENT
-
+trap observe_unlock EXIT
 if [[ -e "$STOP_FILE" ]]; then
   say "skipped STOP_FILE_PRESENT"
   exit 0
 fi
-if running="$(observe_running_pid)"; then
-  say "skipped RUN_IN_PROGRESS pid $running"
-  exit 0
-fi
-
-env_args=()
-while IFS= read -r line; do env_args+=("$line"); done < <(observe_env_args)
 
 child=""
 signalled=""
@@ -69,8 +79,6 @@ stop_child() {
   [[ -n "$child" ]] && kill -TERM "$child" 2>/dev/null || true
 }
 trap stop_child TERM INT
-trap 'rm -f "$PID_FILE"' EXIT
-echo $$ >"$PID_FILE"
 
 say "start (database $(observe_db), commit $(git -C "$REPO" rev-parse --short HEAD))"
 status=0
