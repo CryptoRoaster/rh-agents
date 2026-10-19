@@ -8,8 +8,9 @@
 # observation database. Never prints a credential.
 #
 # Exit: 0 healthy; 1 degraded (not loaded while not stopped, no run within two
-# intervals, the latest run failed, or the profile is refused); 2 a trading
-# invariant is violated (a trade case, order intent or position exists).
+# intervals, the latest run failed, a lock without a live run, or the profile
+# is refused); 2 a trading invariant is violated (a trade case, order intent or
+# position exists) or cannot be read.
 # No -e: a database that cannot be read is reported, never a silent abort.
 set -uo pipefail
 
@@ -43,6 +44,7 @@ stopped=no
 [[ -e "$STOP_FILE" ]] && stopped=yes
 echo "STOP file: $stopped"
 if pid="$(observe_running_pid)"; then echo "run in progress: pid $pid"; else echo "run in progress: none"; fi
+if [[ -d "$LOCK_DIR" ]] && ! observe_running_pid >/dev/null; then degraded STALE_RUN_LOCK; fi
 [[ "$loaded" == yes || "$stopped" == yes ]] || degraded AGENT_NOT_LOADED
 
 echo "revision: $(q 'select version_num from alembic_version')"

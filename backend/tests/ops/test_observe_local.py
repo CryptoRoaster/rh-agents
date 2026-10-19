@@ -351,6 +351,13 @@ def test_a_run_in_progress_is_never_joined_by_a_second(box):
         os.kill(pid, signal.SIGKILL)
 
 
+def test_a_lock_without_a_pid_counts_as_held(box):
+    (box["state"] / "run.lock").mkdir(parents=True)
+    assert script(box, "run-observe.sh").returncode == 0
+    assert "skipped RUN_IN_PROGRESS" in log(box)
+    assert not (box["record"] / "args").exists()
+
+
 @pytest.mark.parametrize("pid", [999999, os.getpid()])
 def test_a_dead_or_foreign_pid_does_not_block_the_next_run(box, pid):
     hold_lock(box, pid)
@@ -479,6 +486,18 @@ def test_start_clears_the_stop_file_and_loads_the_agent(box):
     assert (box["tmp"] / "agents" / "com.rh-agents.observe.plist").exists()
 
 
+def test_a_rendered_path_with_a_backslash_is_refused(box):
+    result = script(
+        box,
+        "start.sh",
+        "--dry-run",
+        RH_AGENTS_OBSERVE_ALLOW_UNMERGED="1",
+        RH_AGENTS_OBSERVE_LOG_DIR=str(box["tmp"] / "a\\&b"),
+    )
+    assert result.returncode == 78
+    assert "OBSERVE_PATH_NOT_PLAIN" in result.stderr
+
+
 @pytest.mark.parametrize("interval", ["60", "299", "3601", "5m"])
 def test_the_interval_stays_within_five_minutes_and_an_hour(box, interval):
     result = script(
@@ -516,6 +535,15 @@ def test_status_is_healthy_without_trading_state(box):
     assert result.returncode == 0, result.stdout
     assert "trade_cases=0 order_intents=0 positions=0" in result.stdout
     assert "HEALTHY" in result.stdout
+
+
+def test_status_reports_a_lock_without_a_live_run(box):
+    fake_psql(box, "0 0 0")
+    (box["state"] / "run.lock").mkdir(parents=True)
+    (box["state"] / "STOP").touch()
+    result = script(box, "status.sh")
+    assert result.returncode == 1
+    assert "STALE_RUN_LOCK" in result.stdout
 
 
 def test_status_fails_closed_when_the_database_cannot_be_read(box):

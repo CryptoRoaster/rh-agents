@@ -131,7 +131,8 @@ observe_running_pid() {
 }
 
 # Take the run lock for this shell. Returns 1 while another run holds it; a
-# stale lock (dead or foreign pid) is cleared once.
+# stale lock (a dead or foreign pid) is cleared once. A lock without a pid
+# counts as held; status.sh reports one that stays.
 observe_lock() {
   local attempt
   for attempt in 1 2; do
@@ -139,6 +140,8 @@ observe_lock() {
       echo $$ >"$PID_FILE"
       return 0
     fi
+    # No pid yet: the holder is between mkdir and writing it. Held.
+    [[ -f "$PID_FILE" ]] || return 1
     observe_running_pid >/dev/null && return 1
     rm -f "$PID_FILE"
     rmdir "$LOCK_DIR" 2>/dev/null || true

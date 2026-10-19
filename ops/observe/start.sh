@@ -33,9 +33,10 @@ elif ! git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; the
   refuse OBSERVE_COMMIT_NOT_ON_MAIN
 fi
 
-# Rendered paths must stay plain: no sed or XML metacharacter.
+# Rendered paths must stay plain: no sed or XML metacharacter, no backslash.
+plain_path='^/[-A-Za-z0-9 ._/@+]+$'
 for path in "$REPO" "$ENV_FILE" "$STATE_DIR" "$LOG_DIR"; do
-  [[ "$path" =~ ^/[A-Za-z0-9\ ._/@+-]+$ ]] || refuse "OBSERVE_PATH_NOT_PLAIN: $path"
+  [[ "$path" =~ $plain_path ]] || refuse "OBSERVE_PATH_NOT_PLAIN: $path"
 done
 
 rendered="$(sed \
