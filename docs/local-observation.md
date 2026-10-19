@@ -47,12 +47,12 @@ every run:
   (`/usr/bin:/bin:/usr/sbin:/sbin`), keeping only `HOME`, `USER`, `LOGNAME`,
   `TMPDIR`, `LANG`, `TERM` and the scripts' own location and timing knobs
   (`RH_AGENTS_OBSERVE_ENV`, `_STATE_DIR`, `_LOG_DIR`, `_INTERVAL_SECONDS`,
-  `_STOP_WAIT_SECONDS`, `_ALLOW_UNMERGED`) plus the test hooks
-  `RH_AGENTS_LAUNCH_AGENTS`, `RH_AGENTS_LAUNCHCTL`, `RH_AGENTS_PLUTIL` and
-  `RH_AGENTS_PSQL`. An inherited `BASH_ENV`, exported function, `PATH`,
+  `_STOP_WAIT_SECONDS`). An inherited `BASH_ENV`, exported function, `PATH`,
   `GIT_*` or `PG*` variable therefore never reaches the checks below, and no
-  inherited variable chooses git, ps or the Python interpreter (always the
-  checkout's `backend/.venv/bin/python`).
+  inherited variable chooses a command: git and ps come from the system
+  `PATH`, launchctl and plutil are absolute, Python is always the checkout's
+  `backend/.venv/bin/python` and psql comes from the profile. There is no
+  override of the `origin/main` check.
 - Only committed code runs. Refused (`OBSERVE_WORKTREE_MODIFIED`):
   - a tracked change, also one hidden by `--assume-unchanged` or
     `--skip-worktree`;

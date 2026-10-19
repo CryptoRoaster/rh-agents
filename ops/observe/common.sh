@@ -11,9 +11,10 @@
 # function, PATH, GIT_* or PG* variable could otherwise change what the checks
 # below see. Until only these names are exported, PATH is the system one and no
 # function is defined, the calling script re-executes itself once under
-# `env -i` with just them. None of the kept knobs chooses git, ps or Python.
+# `env -i` with just them. No kept variable chooses a command: git, ps,
+# Python, launchctl, plutil and psql are fixed or come from the profile.
 OBSERVE_PATH=/usr/bin:/bin:/usr/sbin:/sbin
-OBSERVE_INHERIT_RE='^(HOME|USER|LOGNAME|TMPDIR|LANG|TERM|RH_AGENTS_OBSERVE_(ENV|STATE_DIR|LOG_DIR|INTERVAL_SECONDS|STOP_WAIT_SECONDS|ALLOW_UNMERGED)|RH_AGENTS_LAUNCH_AGENTS|RH_AGENTS_LAUNCHCTL|RH_AGENTS_PLUTIL|RH_AGENTS_PSQL)$'
+OBSERVE_INHERIT_RE='^(HOME|USER|LOGNAME|TMPDIR|LANG|TERM|RH_AGENTS_OBSERVE_(ENV|STATE_DIR|LOG_DIR|INTERVAL_SECONDS|STOP_WAIT_SECONDS))$'
 observe_keep=()
 observe_dirty=""
 [[ -z "$(declare -F)" ]] || observe_dirty=yes
@@ -36,7 +37,7 @@ LABEL="com.rh-agents.observe"
 ENV_FILE="${RH_AGENTS_OBSERVE_ENV:-$HOME/.config/rh-agents/observe.env}"
 STATE_DIR="${RH_AGENTS_OBSERVE_STATE_DIR:-$HOME/Library/Application Support/rh-agents/observe}"
 LOG_DIR="${RH_AGENTS_OBSERVE_LOG_DIR:-$HOME/Library/Logs/rh-agents}"
-LAUNCH_AGENTS="${RH_AGENTS_LAUNCH_AGENTS:-$HOME/Library/LaunchAgents}"
+LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 STOP_FILE="$STATE_DIR/STOP"
 # A run in progress holds this directory (mkdir is atomic); its pid file names
@@ -45,9 +46,10 @@ LOCK_DIR="$STATE_DIR/run.lock"
 PID_FILE="$LOCK_DIR/pid"
 # The checkout's own virtualenv, as it is: never `uv run`, which would sync it.
 PYTHON="$REPO/backend/.venv/bin/python"
-# launchd and plist tools; overridable for the tests, never part of a guarantee.
-LAUNCHCTL="${RH_AGENTS_LAUNCHCTL:-/bin/launchctl}"
-PLUTIL="${RH_AGENTS_PLUTIL:-/usr/bin/plutil}"
+# launchd and plist tools, by absolute path (the tests replace these two lines
+# in their own throwaway copy; nothing inherited can).
+LAUNCHCTL=/bin/launchctl
+PLUTIL=/usr/bin/plutil
 # An ORBIT budget, once approved, is still capped here (the code defaults).
 ORBIT_MAX_PER_RUN=4
 ORBIT_MAX_PER_DAY=96

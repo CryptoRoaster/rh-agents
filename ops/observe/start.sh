@@ -27,9 +27,7 @@ reason="$(observe_load)" || refuse "$reason"
 observe_load >/dev/null
 reason="$(observe_check)" || refuse "$reason"
 observe_code_clean || refuse OBSERVE_WORKTREE_MODIFIED
-if [[ -n "${RH_AGENTS_OBSERVE_ALLOW_UNMERGED:-}" ]]; then
-  echo "warning: RH_AGENTS_OBSERVE_ALLOW_UNMERGED set; the commit is not checked against origin/main" >&2
-elif ! git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+if ! git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
   refuse OBSERVE_COMMIT_NOT_ON_MAIN
 fi
 

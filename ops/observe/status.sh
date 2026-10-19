@@ -26,8 +26,8 @@ degraded() { echo "DEGRADED: $1"; ((health < 1)) && health=1; return 0; }
 reason="$(observe_load)" || { echo "PROFILE_REFUSED: $reason"; exit 1; }
 observe_load >/dev/null
 reason="$(observe_check)" || { echo "PROFILE_REFUSED: $reason"; exit 1; }
-# PATH is the system one here: psql comes from the profile (or the test knob).
-PSQL="${RH_AGENTS_PSQL:-$(observe_get RH_AGENTS_OBSERVE_PSQL)}"
+# PATH is the system one here: psql comes from the profile.
+PSQL="$(observe_get RH_AGENTS_OBSERVE_PSQL)"
 PSQL="${PSQL:-psql}"
 url="$(observe_get DATABASE_URL)"
 role="${url#*://}" role="${role%%@*}"

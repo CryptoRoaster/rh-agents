@@ -29,6 +29,13 @@ FILES = (
     "com.rh-agents.observe.plist.template",
 )
 PROFILE = (OBSERVE / "observe.env.example").read_text().replace("YOUR_ROLE", "observer")
+PSQL_EXAMPLE = "/opt/homebrew/opt/postgresql@17/bin/psql"
+assert PSQL_EXAMPLE in PROFILE
+
+
+def base_profile(box: dict[str, Path]) -> str:
+    """The example profile, with psql pointing at the box's stand-in."""
+    return PROFILE.replace(PSQL_EXAMPLE, str(box["bin"] / "psql"))
 
 
 def executable(path: Path, body: str) -> Path:
@@ -42,12 +49,22 @@ def box(tmp_path: Path) -> dict[str, Path]:
     checkout = tmp_path / "checkout"
     shutil.copytree(OBSERVE, checkout / "ops" / "observe")
     (checkout / "backend").mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # Only this throwaway copy uses stand-ins for launchctl and plutil; no
+    # variable can swap them in the real scripts. Never reach the real ones.
+    common = checkout / "ops" / "observe" / "common.sh"
+    text = common.read_text()
+    for real, name in (("/bin/launchctl", "LAUNCHCTL"), ("/usr/bin/plutil", "PLUTIL")):
+        assert text.count(f"{name}={real}\n") == 1
+        text = text.replace(f"{name}={real}\n", f"{name}={bin_dir / name.lower()}\n")
+    common.write_text(text)
     git = ["git", "-C", str(checkout), "-c", "user.name=t", "-c", "user.email=t@t"]
     subprocess.run([*git, "init", "-q"], check=True)
     subprocess.run([*git, "add", "."], check=True)
     subprocess.run([*git, "commit", "-qm", "observe"], check=True)
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
+    # The commit counts as merged unless a test says otherwise.
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
     record = tmp_path / "record"
     record.mkdir()
     # The checkout's own virtualenv (untracked, like the real one).
@@ -70,7 +87,7 @@ def box(tmp_path: Path) -> dict[str, Path]:
         f'[[ "$1" != print || -e "{record}/loaded" ]]\n',
     )
     env_file = tmp_path / "observe.env"
-    env_file.write_text(PROFILE)
+    env_file.write_text(PROFILE.replace(PSQL_EXAMPLE, str(bin_dir / "psql")))
     return {
         "tmp": tmp_path,
         "checkout": checkout,
@@ -90,10 +107,6 @@ def environment(box: dict[str, Path], **extra: str) -> dict[str, str]:
         "RH_AGENTS_OBSERVE_ENV": str(box["env_file"]),
         "RH_AGENTS_OBSERVE_STATE_DIR": str(box["state"]),
         "RH_AGENTS_OBSERVE_LOG_DIR": str(box["logs"]),
-        "RH_AGENTS_LAUNCHCTL": str(box["bin"] / "launchctl"),
-        "RH_AGENTS_PLUTIL": str(box["bin"] / "plutil"),
-        "RH_AGENTS_PSQL": str(box["bin"] / "psql"),
-        "RH_AGENTS_LAUNCH_AGENTS": str(box["tmp"] / "agents"),
         **extra,
     }
 
@@ -109,7 +122,7 @@ def script(box: dict[str, Path], name: str, *args: str, **extra: str):
 
 
 def profile_with(box: dict[str, Path], **values: str) -> None:
-    lines = [line for line in PROFILE.splitlines() if line.split("=", 1)[0] not in values]
+    lines = [line for line in base_profile(box).splitlines() if line.split("=", 1)[0] not in values]
     lines += [f"{key}={value}" for key, value in values.items()]
     box["env_file"].write_text("\n".join(lines) + "\n")
 
@@ -254,7 +267,7 @@ def test_an_approved_model_budget_allows_orbit_reviews(box):
 )
 def test_the_env_file_is_read_never_sourced(box, text, reason):
     marker = box["tmp"] / "MARKER"
-    box["env_file"].write_text(text.replace("MARKER", str(marker)) + PROFILE)
+    box["env_file"].write_text(text.replace("MARKER", str(marker)) + base_profile(box))
     result = script(box, "run-observe.sh")
     assert result.returncode == 78
     assert reason in log(box)
@@ -296,7 +309,7 @@ def test_an_uncommitted_file_in_the_code_is_refused(box):
     (box["checkout"] / "ops" / "observe" / "extra.sh").write_text("echo\n")
     assert script(box, "run-observe.sh").returncode == 78
     assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
-    result = script(box, "start.sh", "--confirm", RH_AGENTS_OBSERVE_ALLOW_UNMERGED="1")
+    result = script(box, "start.sh", "--confirm")
     assert result.returncode == 78
     assert "OBSERVE_WORKTREE_MODIFIED" in result.stderr
     assert not (box["record"] / "launchctl").exists()
@@ -464,7 +477,7 @@ def test_start_needs_an_explicit_mode(box):
 
 
 def test_the_rendered_agent_runs_the_wrapper_every_five_minutes(box):
-    result = script(box, "start.sh", "--dry-run", RH_AGENTS_OBSERVE_ALLOW_UNMERGED="1")
+    result = script(box, "start.sh", "--dry-run")
     assert result.returncode == 0, result.stderr
     plist = plistlib.loads(result.stdout.encode())
     checkout = box["checkout"]
@@ -477,6 +490,7 @@ def test_the_rendered_agent_runs_the_wrapper_every_five_minutes(box):
 
 
 def test_start_refuses_a_commit_that_is_not_on_main(box):
+    not_on_main(box)
     result = script(box, "start.sh", "--confirm")
     assert result.returncode == 78
     assert "OBSERVE_COMMIT_NOT_ON_MAIN" in result.stderr
@@ -485,7 +499,7 @@ def test_start_refuses_a_commit_that_is_not_on_main(box):
 
 def test_start_refuses_a_profile_that_could_trade(box):
     profile_with(box, PAPER_RUNNER_ENABLED="true")
-    result = script(box, "start.sh", "--confirm", RH_AGENTS_OBSERVE_ALLOW_UNMERGED="1")
+    result = script(box, "start.sh", "--confirm")
     assert result.returncode == 78
     assert "OBSERVE_REQUIRES_PAPER_RUNNER_ENABLED" in result.stderr
 
@@ -494,11 +508,11 @@ def test_start_clears_the_stop_file_and_loads_the_agent(box):
     box["state"].mkdir()
     (box["state"] / "STOP").touch()
     executable(box["bin"] / "plutil", "exit 0\n")
-    result = script(box, "start.sh", "--confirm", RH_AGENTS_OBSERVE_ALLOW_UNMERGED="1")
+    result = script(box, "start.sh", "--confirm")
     assert result.returncode == 0, result.stderr
     assert not (box["state"] / "STOP").exists()
     assert "bootstrap" in (box["record"] / "launchctl").read_text()
-    assert (box["tmp"] / "agents" / "com.rh-agents.observe.plist").exists()
+    assert (box["tmp"] / "Library" / "LaunchAgents" / "com.rh-agents.observe.plist").exists()
 
 
 def test_a_rendered_path_with_a_backslash_is_refused(box):
@@ -506,7 +520,6 @@ def test_a_rendered_path_with_a_backslash_is_refused(box):
         box,
         "start.sh",
         "--dry-run",
-        RH_AGENTS_OBSERVE_ALLOW_UNMERGED="1",
         RH_AGENTS_OBSERVE_LOG_DIR=str(box["tmp"] / "a\\&b"),
     )
     assert result.returncode == 78
@@ -519,7 +532,6 @@ def test_the_interval_stays_within_five_minutes_and_an_hour(box, interval):
         box,
         "start.sh",
         "--dry-run",
-        RH_AGENTS_OBSERVE_ALLOW_UNMERGED="1",
         RH_AGENTS_OBSERVE_INTERVAL_SECONDS=interval,
     )
     assert result.returncode == 78
@@ -692,3 +704,54 @@ def test_a_hidden_edit_still_counts_as_modified(box, flag):
     result = script(box, "run-observe.sh")
     assert result.returncode == 78
     assert "OBSERVE_WORKTREE_MODIFIED" in result.stderr
+
+
+# ------------------------------------------------------------ test hooks stay in tests
+
+
+def shim(box: dict[str, Path]) -> Path:
+    return executable(box["tmp"] / "shim", f'touch "{box["record"]}/shim"\n')
+
+
+def not_on_main(box: dict[str, Path]) -> None:
+    subprocess.run(
+        ["git", "-C", str(box["checkout"]), "update-ref", "-d", "refs/remotes/origin/main"],
+        capture_output=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "hook", "args"),
+    [
+        ("stop.sh", "RH_AGENTS_LAUNCHCTL", ()),
+        ("status.sh", "RH_AGENTS_LAUNCHCTL", ()),
+        ("status.sh", "RH_AGENTS_PSQL", ()),
+        ("start.sh", "RH_AGENTS_PLUTIL", ("--confirm",)),
+        ("start.sh", "RH_AGENTS_LAUNCHCTL", ("--confirm",)),
+    ],
+)
+def test_an_inherited_test_hook_never_runs_a_command(box, name, hook, args):
+    executable(box["bin"] / "plutil", "exit 0\n")
+    script(box, name, *args, **{hook: str(shim(box)), "RH_AGENTS_OBSERVE_ALLOW_UNMERGED": "1"})
+    assert not (box["record"] / "shim").exists()
+
+
+def test_an_inherited_agents_directory_is_ignored(box):
+    executable(box["bin"] / "plutil", "exit 0\n")
+    elsewhere = box["tmp"] / "elsewhere"
+    script(
+        box,
+        "start.sh",
+        "--confirm",
+        RH_AGENTS_LAUNCH_AGENTS=str(elsewhere),
+        RH_AGENTS_OBSERVE_ALLOW_UNMERGED="1",
+    )
+    assert not (elsewhere / "com.rh-agents.observe.plist").exists()
+
+
+def test_an_inherited_allow_unmerged_never_skips_the_main_check(box):
+    not_on_main(box)
+    result = script(box, "start.sh", "--confirm", RH_AGENTS_OBSERVE_ALLOW_UNMERGED="1")
+    assert result.returncode == 78
+    assert "OBSERVE_COMMIT_NOT_ON_MAIN" in result.stderr
+    assert not (box["record"] / "launchctl").exists()
