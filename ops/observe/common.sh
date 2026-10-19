@@ -8,22 +8,26 @@
 # refuses anything that could reach a BUY, the runtime database or a model.
 
 # Every script runs in a clean environment: an inherited BASH_ENV, exported
-# function, GIT_* or PG* variable could otherwise change what the checks below
-# see. Until only these names are exported and no function is defined, the
-# calling script re-executes itself once under `env -i` with just them.
-OBSERVE_INHERIT_RE='^(HOME|PATH|USER|LOGNAME|TMPDIR|LANG|TERM|RH_AGENTS_OBSERVE_[A-Z_]+|RH_AGENTS_LAUNCH_AGENTS|RH_AGENTS_PSQL)$'
+# function, PATH, GIT_* or PG* variable could otherwise change what the checks
+# below see. Until only these names are exported, PATH is the system one and no
+# function is defined, the calling script re-executes itself once under
+# `env -i` with just them. None of the kept knobs chooses git, ps or Python.
+OBSERVE_PATH=/usr/bin:/bin:/usr/sbin:/sbin
+OBSERVE_INHERIT_RE='^(HOME|USER|LOGNAME|TMPDIR|LANG|TERM|RH_AGENTS_OBSERVE_(ENV|STATE_DIR|LOG_DIR|INTERVAL_SECONDS|STOP_WAIT_SECONDS|ALLOW_UNMERGED)|RH_AGENTS_LAUNCH_AGENTS|RH_AGENTS_LAUNCHCTL|RH_AGENTS_PLUTIL|RH_AGENTS_PSQL)$'
 observe_keep=()
 observe_dirty=""
 [[ -z "$(declare -F)" ]] || observe_dirty=yes
 for observe_name in $(compgen -e); do
   if [[ "$observe_name" =~ $OBSERVE_INHERIT_RE ]]; then
     observe_keep+=("$observe_name=${!observe_name}")
+  elif [[ "$observe_name" == PATH ]]; then
+    [[ "$PATH" == "$OBSERVE_PATH" ]] || observe_dirty=yes
   elif [[ ! "$observe_name" =~ ^(PWD|OLDPWD|SHLVL|_)$ ]]; then
     observe_dirty=yes
   fi
 done
 if [[ -n "$observe_dirty" ]]; then
-  exec /usr/bin/env -i ${observe_keep[@]+"${observe_keep[@]}"} /bin/bash "$0" "$@"
+  exec /usr/bin/env -i PATH="$OBSERVE_PATH" ${observe_keep[@]+"${observe_keep[@]}"} /bin/bash "$0" "$@"
 fi
 unset observe_keep observe_dirty observe_name
 
@@ -40,7 +44,10 @@ STOP_FILE="$STATE_DIR/STOP"
 LOCK_DIR="$STATE_DIR/run.lock"
 PID_FILE="$LOCK_DIR/pid"
 # The checkout's own virtualenv, as it is: never `uv run`, which would sync it.
-PYTHON="${RH_AGENTS_OBSERVE_PYTHON:-$REPO/backend/.venv/bin/python}"
+PYTHON="$REPO/backend/.venv/bin/python"
+# launchd and plist tools; overridable for the tests, never part of a guarantee.
+LAUNCHCTL="${RH_AGENTS_LAUNCHCTL:-/bin/launchctl}"
+PLUTIL="${RH_AGENTS_PLUTIL:-/usr/bin/plutil}"
 # An ORBIT budget, once approved, is still capped here (the code defaults).
 ORBIT_MAX_PER_RUN=4
 ORBIT_MAX_PER_DAY=96
@@ -55,7 +62,7 @@ OBSERVE_KEYS=(
   EARLY_SCOUT_V4_PREFILTER_ENABLED EARLY_SCOUT_HISTORY_MAX_REQUESTS_PER_RUN
   EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN
   EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_DAY REASONING_PROVIDER CODEX_EXECUTABLE
-  RH_AGENTS_OBSERVE_MODEL_BUDGET_APPROVED
+  RH_AGENTS_OBSERVE_MODEL_BUDGET_APPROVED RH_AGENTS_OBSERVE_PSQL
 )
 
 OBSERVE_DB_URL_RE='^postgresql\+asyncpg://[a-z_][a-z0-9_-]{0,62}@(localhost|127\.0\.0\.1)(:[0-9]{1,5})?/rh_agents_observe(_[a-z0-9_]{1,40})?$'
@@ -134,6 +141,8 @@ observe_env_args() {
 # leads sys.path under `python -m`), except the virtualenv and tool caches.
 observe_code_clean() {
   git -C "$REPO" diff --quiet HEAD -- || return 1
+  # An assume-unchanged or skip-worktree file hides its edit from diff and status.
+  [[ -z "$(git -C "$REPO" ls-files -v -- ops backend | grep -v '^H ')" ]] || return 1
   [[ -z "$(git -C "$REPO" status --porcelain --untracked-files=all --ignored -- ops backend \
     ':(exclude)backend/.venv' ':(exclude)backend/.mypy_cache' ':(exclude)backend/.pytest_cache' \
     ':(exclude)backend/.ruff_cache' ':(exclude)**/__pycache__/**')" ]]
@@ -159,18 +168,24 @@ observe_running_pid() {
 # stale lock (a dead or foreign pid) is cleared once. A lock without a pid
 # counts as held; status.sh reports one that stays.
 observe_lock() {
-  local attempt
+  local attempt since staged="$STATE_DIR/pid.$$"
+  # Without its own start time this run could not be told from a reused pid.
+  since="$(observe_started $$)"
+  [[ -n "$since" ]] || return 1
   for attempt in 1 2; do
     if mkdir "$LOCK_DIR" 2>/dev/null; then
-      # Written aside and renamed, so a reader sees no pid or a whole one.
-      printf '%s\n%s\n' $$ "$(observe_started $$)" >"$LOCK_DIR/pid.new"
-      mv "$LOCK_DIR/pid.new" "$PID_FILE"
-      return 0
+      # Written aside and renamed in, so a reader sees no pid or a whole one.
+      if printf '%s\n%s\n' $$ "$since" >"$staged" && mv "$staged" "$PID_FILE"; then
+        return 0
+      fi
+      rm -f "$staged"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      return 1
     fi
     # No pid yet: the holder is between mkdir and writing it. Held.
     [[ -f "$PID_FILE" ]] || return 1
     observe_running_pid >/dev/null && return 1
-    rm -f "$PID_FILE" "$LOCK_DIR/pid.new"
+    rm -f "$PID_FILE"
     rmdir "$LOCK_DIR" 2>/dev/null || true
   done
   return 1

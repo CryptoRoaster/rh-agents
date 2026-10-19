@@ -17,7 +17,6 @@ set -uo pipefail
 # shellcheck source=common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-PSQL="${RH_AGENTS_PSQL:-psql}"
 INTERVAL="${RH_AGENTS_OBSERVE_INTERVAL_SECONDS-300}"
 [[ "$INTERVAL" =~ ^[0-9]{3,4}$ ]] || INTERVAL=300
 INTERVAL="$((10#$INTERVAL))"
@@ -27,6 +26,9 @@ degraded() { echo "DEGRADED: $1"; ((health < 1)) && health=1; return 0; }
 reason="$(observe_load)" || { echo "PROFILE_REFUSED: $reason"; exit 1; }
 observe_load >/dev/null
 reason="$(observe_check)" || { echo "PROFILE_REFUSED: $reason"; exit 1; }
+# PATH is the system one here: psql comes from the profile (or the test knob).
+PSQL="${RH_AGENTS_PSQL:-$(observe_get RH_AGENTS_OBSERVE_PSQL)}"
+PSQL="${PSQL:-psql}"
 url="$(observe_get DATABASE_URL)"
 role="${url#*://}" role="${role%%@*}"
 hostpart="${url#*@}" hostpart="${hostpart%%/*}"
@@ -38,7 +40,7 @@ q() { "$PSQL" -X -At -v ON_ERROR_STOP=1 -h "$host" -p "$port" -U "$role" -d "$db
 
 echo "profile: ok (database $db, commit $(git -C "$REPO" rev-parse --short HEAD))"
 loaded=no
-launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && loaded=yes
+"$LAUNCHCTL" print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && loaded=yes
 echo "agent loaded: $loaded"
 stopped=no
 [[ -e "$STOP_FILE" ]] && stopped=yes

@@ -50,8 +50,10 @@ def box(tmp_path: Path) -> dict[str, Path]:
     bin_dir.mkdir()
     record = tmp_path / "record"
     record.mkdir()
+    # The checkout's own virtualenv (untracked, like the real one).
+    (checkout / "backend" / ".venv" / "bin").mkdir(parents=True)
     python = executable(
-        bin_dir / "python",
+        checkout / "backend" / ".venv" / "bin" / "python",
         f'echo "$PWD" > "{record}/cwd"\n'
         f'printf "%s\\n" "$@" > "{record}/args"\n'
         f'env | sort > "{record}/env"\n'
@@ -88,7 +90,9 @@ def environment(box: dict[str, Path], **extra: str) -> dict[str, str]:
         "RH_AGENTS_OBSERVE_ENV": str(box["env_file"]),
         "RH_AGENTS_OBSERVE_STATE_DIR": str(box["state"]),
         "RH_AGENTS_OBSERVE_LOG_DIR": str(box["logs"]),
-        "RH_AGENTS_OBSERVE_PYTHON": str(box["python"]),
+        "RH_AGENTS_LAUNCHCTL": str(box["bin"] / "launchctl"),
+        "RH_AGENTS_PLUTIL": str(box["bin"] / "plutil"),
+        "RH_AGENTS_PSQL": str(box["bin"] / "psql"),
         "RH_AGENTS_LAUNCH_AGENTS": str(box["tmp"] / "agents"),
         **extra,
     }
@@ -659,3 +663,32 @@ def test_the_lock_names_the_wrapper_and_its_start_time(box):
     finally:
         wrapper.send_signal(signal.SIGTERM)
         wrapper.wait(timeout=20)
+
+
+def test_an_inherited_path_never_chooses_git(box):
+    executable(box["bin"] / "git", "exit 0\n")
+    dirty_checkout(box)
+    result = script(box, "run-observe.sh")
+    assert result.returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in result.stderr
+    assert not (box["record"] / "args").exists()
+
+
+def test_an_inherited_interpreter_never_runs(box):
+    shim = executable(box["tmp"] / "shim", f'touch "{box["record"]}/shim"\n')
+    result = script(box, "run-observe.sh", RH_AGENTS_OBSERVE_PYTHON=str(shim))
+    assert result.returncode == 0, result.stderr
+    assert (box["record"] / "args").exists()
+    assert not (box["record"] / "shim").exists()
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_a_hidden_edit_still_counts_as_modified(box, flag):
+    dirty_checkout(box)
+    subprocess.run(
+        ["git", "-C", str(box["checkout"]), "update-index", flag, "ops/observe/common.sh"],
+        check=True,
+    )
+    result = script(box, "run-observe.sh")
+    assert result.returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in result.stderr

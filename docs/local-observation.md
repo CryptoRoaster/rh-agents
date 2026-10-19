@@ -43,14 +43,19 @@ every run:
 - The scout starts with `env -i` plus the profile. No inherited variable and no
   wrapper key reaches it. A repository `.env` is refused
   (`OBSERVE_REPOSITORY_ENV_PRESENT`), because settings would read it.
-- Every script first re-executes itself under `env -i` unless only `HOME`,
-  `PATH`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `TERM` and the scripts' own
-  `RH_AGENTS_OBSERVE_*`, `RH_AGENTS_LAUNCH_AGENTS` and `RH_AGENTS_PSQL` knobs
-  are exported and no shell function is defined. An inherited `BASH_ENV`,
-  exported function, `GIT_*` or `PG*` variable therefore never reaches the
-  checks below.
+- Every script first re-executes itself under `env -i` with the system `PATH`
+  (`/usr/bin:/bin:/usr/sbin:/sbin`), keeping only `HOME`, `USER`, `LOGNAME`,
+  `TMPDIR`, `LANG`, `TERM` and the scripts' own location and timing knobs
+  (`RH_AGENTS_OBSERVE_ENV`, `_STATE_DIR`, `_LOG_DIR`, `_INTERVAL_SECONDS`,
+  `_STOP_WAIT_SECONDS`, `_ALLOW_UNMERGED`) plus the test hooks
+  `RH_AGENTS_LAUNCH_AGENTS`, `RH_AGENTS_LAUNCHCTL`, `RH_AGENTS_PLUTIL` and
+  `RH_AGENTS_PSQL`. An inherited `BASH_ENV`, exported function, `PATH`,
+  `GIT_*` or `PG*` variable therefore never reaches the checks below, and no
+  inherited variable chooses git, ps or the Python interpreter (always the
+  checkout's `backend/.venv/bin/python`).
 - Only committed code runs. Refused (`OBSERVE_WORKTREE_MODIFIED`):
-  - a tracked change;
+  - a tracked change, also one hidden by `--assume-unchanged` or
+    `--skip-worktree`;
   - an untracked or ignored file under `ops/` or `backend/`, except the
     virtualenv and tool caches. `python -m` puts `backend/` first on `sys.path`.
 
@@ -72,7 +77,8 @@ every run:
    ```
 
 3. Copy `ops/observe/observe.env.example` to `~/.config/rh-agents/observe.env`
-   (mode 0600) and replace `YOUR_ROLE`.
+   (mode 0600), replace `YOUR_ROLE` and set `RH_AGENTS_OBSERVE_PSQL` to the
+   local `psql` (status.sh runs with the system `PATH` only).
 4. Check the profile and the configuration without any call:
 
    ```bash

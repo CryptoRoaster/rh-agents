@@ -56,9 +56,9 @@ mkdir -p "$LAUNCH_AGENTS" "$LOG_DIR" "$STATE_DIR"
 chmod 0700 "$STATE_DIR"
 staged="$(mktemp "$LAUNCH_AGENTS/.$LABEL.XXXXXX")"
 printf '%s\n' "$rendered" >"$staged"
-plutil -lint "$staged" >/dev/null || { rm -f "$staged"; refuse OBSERVE_PLIST_INVALID; }
+"$PLUTIL" -lint "$staged" >/dev/null || { rm -f "$staged"; refuse OBSERVE_PLIST_INVALID; }
 mv "$staged" "$PLIST"
 rm -f "$STOP_FILE"
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+"$LAUNCHCTL" bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+"$LAUNCHCTL" bootstrap "gui/$(id -u)" "$PLIST"
 echo "started $LABEL (every $INTERVAL s, database $(observe_db), ORBIT reviews $(observe_get EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN)/run $(observe_get EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_DAY)/day, commit $(git -C "$REPO" rev-parse --short HEAD); logs in $LOG_DIR)"
