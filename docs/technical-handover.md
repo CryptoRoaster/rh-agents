@@ -29,7 +29,7 @@ closed. The ten invariants are in `AGENTS.md` and `ARCHITECTURE.md`.
 | Risk | `backend/src/risk` (`engine.py`, `authorization.py`) | SENTINEL: hard limits, `APPROVED`/`LIMITED`/`REJECTED`, UNKNOWN fails closed |
 | Orchestration | `orchestration/commander`, `casefill`, `riskrequest`, `sizing`, `strategy`, `entryhalt`, `jobruns` | COMMANDER, kill switch and durable system pause, entry-only halt (0023), job-run evidence (0024) |
 | Exits | `orchestration/exitpolicy`, `orchestration/paperexit` | auto and early exit policies, pre-exit refresh, one budget and one order per sweep, per-position isolation (#115), idempotent paper SELL by request key |
-| Execution and ledger | `backend/src/execution/paper.py`, `backend/src/ledger` | paper executor (refuses a BUY without established LP control, refuses non-early BUYs in early-only mode), fills, cost basis, PnL |
+| Execution and ledger | `backend/src/execution/paper.py`, `backend/src/orchestration/paper.py`, `backend/src/ledger` | paper executor (refuses a BUY without established LP control); `PaperTradingService` (with case fill and risk request) refuses non-early BUYs in early-only mode; fills, cost basis, PnL |
 | Markets | `backend/src/markets` | GeckoTerminal, KyberSwap quotes, observation recording, decimal precision |
 | Runner | `backend/src/runner` | `python -m src.runner.main` with `--preflight`, `--exits-once`, `--entries-once`; `src.runner.control --halt-entries` |
 | Scout | `backend/src/scout`, `ops/scout` | early discovery, watches, ORBIT budget, shadow runs; launchd today |
@@ -77,7 +77,7 @@ All settings come from the root `.env` (never printed, never committed;
 | PAPER run | `PAPER_RUNNER_ENABLED`, `PAPER_EARLY_ONLY`, `PAPER_ENTRY_REQUIRES_EXIT_JOB`, `PAPER_EXIT_*` (liveness 180 s, run ≤ 60 s, attempts per run 5) |
 | Early entry | `EARLY_SCOUT_ENABLED`, `ATLAS_FUNDING_GRAPH_ENABLED`, `PRE_VECTOR_EARLY_ENTRY_ENABLED`, `EARLY_PAPER_EXIT_ENABLED` |
 | LP control | `ATLAS_V4_POOL_CONTROL_ENABLED`, `ATLAS_V4_POOL_INDEX_ENABLED` |
-| Discovery | `EARLY_SCOUT_MAX_DISCOVERY_POOLS`, `..._MAX_NEW_WATCHES_PER_RUN`, `..._DISCOVERY_PAGE2_*`, `..._V4_PREFILTER_ENABLED`, `..._MAX_ORBIT_REVIEWS_PER_RUN/_PER_DAY` |
+| Discovery | `EARLY_SCOUT_MAX_DISCOVERY_POOLS`, `..._MAX_NEW_WATCHES_PER_RUN`, `..._DISCOVERY_PAGE2_ENABLED`, `..._MAX_DISCOVERY_PAGE2_PER_DAY`, `..._V4_PREFILTER_ENABLED`, `..._MAX_ORBIT_REVIEWS_PER_RUN/_PER_DAY` |
 | Stops | `COMMANDER_KILL_SWITCH`; durable pause and entry halt live in the database |
 | Supervisor | Telegram and heartbeat secrets as systemd credentials only, never in the tick's environment |
 
@@ -97,7 +97,7 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy
 PostgreSQL is required for locking, concurrency and migration tests; SQLite
 never substitutes for them. The frontend: `npm ci`, `npm run typecheck`,
 `npm run lint`, `npm run build`. CI runs backend and frontend on every PR
-(backend job budget 25 minutes; runner timeouts have needed a rerun).
+(backend job bound 40 minutes; runner timeouts have needed a rerun).
 
 Key acceptance suites:
 

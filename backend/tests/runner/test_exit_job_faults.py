@@ -68,10 +68,13 @@ async def test_an_unreadable_database_is_a_technical_failure_of_the_exit_job(ris
 
     summary = await BoundedPaperRun(stack, mode=RunMode.EXITS_ONLY).execute()
 
-    assert "DATABASE_UNAVAILABLE" in summary.errors
-    assert summary.exit_ready is not True
+    # A technical failure, not evidence that exits work -- and no job record
+    # could be written either, so the entry gate sees no fresh ready run.
+    assert summary.errors == ("DATABASE_UNAVAILABLE", "JOB_RUN_UNRECORDED")
+    assert summary.exit_ready is False
+    assert summary.exit_ready_reason == "EXIT_JOB_TECHNICAL_FAILURE"
+    # The chain was never read, so nothing was sold: a sale needs that read.
     assert reads.calls == 0
-    assert len(await exit_rows(sessions)) == 0
 
 
 async def test_a_database_error_in_one_sale_costs_that_position_only(risk_db, now):
