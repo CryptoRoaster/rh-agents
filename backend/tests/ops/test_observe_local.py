@@ -333,9 +333,20 @@ def alive(pid: int) -> bool:
     return True
 
 
-def hold_lock(box: dict[str, Path], pid: int) -> None:
+def started(pid: int) -> str:
+    return subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(pid)],
+        env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    ).stdout.strip("\n")
+
+
+def hold_lock(box: dict[str, Path], pid: int, since: str | None = None) -> None:
+    """A lock as the wrapper writes it: its pid and that process's start time."""
     (box["state"] / "run.lock").mkdir(parents=True)
-    (box["state"] / "run.lock" / "pid").write_text(f"{pid}\n")
+    since = started(pid) if since is None else since
+    (box["state"] / "run.lock" / "pid").write_text(f"{pid}\n{since}\n")
 
 
 def test_a_run_in_progress_is_never_joined_by_a_second(box):
@@ -346,7 +357,7 @@ def test_a_run_in_progress_is_never_joined_by_a_second(box):
         assert result.returncode == 0
         assert f"skipped RUN_IN_PROGRESS pid {pid}" in log(box)
         assert not (box["record"] / "args").exists()
-        assert (box["state"] / "run.lock" / "pid").read_text().strip() == str(pid)
+        assert (box["state"] / "run.lock" / "pid").read_text().split("\n")[0] == str(pid)
     finally:
         os.kill(pid, signal.SIGKILL)
 
@@ -575,3 +586,76 @@ def test_no_secret_is_committed():
         text = (OBSERVE / name).read_text().lower()
         for marker in ("sk-ant", "api_key=", "apikey", "password=", "secret="):
             assert marker not in text, (name, marker)
+
+
+# ------------------------------------------------------------ inherited shell state
+
+
+def dirty_checkout(box: dict[str, Path]) -> None:
+    (box["checkout"] / "ops" / "observe" / "common.sh").write_text(
+        (box["checkout"] / "ops" / "observe" / "common.sh").read_text() + "\n# modified\n"
+    )
+
+
+def test_an_inherited_bash_env_never_reaches_the_checks(box):
+    hook = box["tmp"] / "hook.sh"
+    hook.write_text(f'env() {{ touch "{box["record"]}/hijacked"; command env "$@"; }}\n')
+    result = script(box, "run-observe.sh", BASH_ENV=str(hook))
+    assert result.returncode == 0, result.stderr
+    assert (box["record"] / "args").exists()
+    assert not (box["record"] / "hijacked").exists()
+
+
+def test_an_exported_function_never_replaces_a_command(box):
+    dirty_checkout(box)
+    result = script(box, "run-observe.sh", **{"BASH_FUNC_git%%": "() { return 0; }"})
+    assert result.returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in result.stderr
+    assert not (box["record"] / "args").exists()
+
+
+def test_an_inherited_git_dir_never_vouches_for_a_modified_checkout(box):
+    clean = box["tmp"] / "clean"
+    shutil.copytree(box["checkout"], clean)
+    dirty_checkout(box)
+    result = script(box, "run-observe.sh", GIT_DIR=str(clean / ".git"), GIT_WORK_TREE=str(clean))
+    assert result.returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in result.stderr
+    assert not (box["record"] / "args").exists()
+
+
+@pytest.mark.parametrize("record", ["{pid}\n", "{pid}\nThu Jan  1 00:00:00 1970\n"])
+def test_a_reused_pid_is_never_trusted_by_its_name_alone(box, record):
+    """A wrapper-named process behind a pid without its own start time is foreign."""
+    pid = detached_sleep(30)
+    try:
+        (box["state"] / "run.lock").mkdir(parents=True)
+        (box["state"] / "run.lock" / "pid").write_text(record.format(pid=pid))
+        assert script(box, "stop.sh", "--now").returncode == 0
+        assert alive(pid)
+        (box["state"] / "STOP").unlink()
+        assert script(box, "run-observe.sh").returncode == 0
+        assert (box["record"] / "args").exists()
+        assert alive(pid)
+    finally:
+        if alive(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_the_lock_names_the_wrapper_and_its_start_time(box):
+    (box["record"] / "sleep").touch()
+    wrapper = subprocess.Popen(
+        ["/bin/bash", str(box["checkout"] / "ops" / "observe" / "run-observe.sh")],
+        env=environment(box),
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not (box["record"] / "started").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        pid, since = (box["state"] / "run.lock" / "pid").read_text().split("\n")[:2]
+        assert int(pid) == wrapper.pid
+        assert since == started(wrapper.pid)
+        assert script(box, "status.sh").stdout.count(f"run in progress: pid {pid}") == 1
+    finally:
+        wrapper.send_signal(signal.SIGTERM)
+        wrapper.wait(timeout=20)

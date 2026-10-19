@@ -7,6 +7,26 @@
 # observe_load reads the env file through an allowlist and observe_check
 # refuses anything that could reach a BUY, the runtime database or a model.
 
+# Every script runs in a clean environment: an inherited BASH_ENV, exported
+# function, GIT_* or PG* variable could otherwise change what the checks below
+# see. Until only these names are exported and no function is defined, the
+# calling script re-executes itself once under `env -i` with just them.
+OBSERVE_INHERIT_RE='^(HOME|PATH|USER|LOGNAME|TMPDIR|LANG|TERM|RH_AGENTS_OBSERVE_[A-Z_]+|RH_AGENTS_LAUNCH_AGENTS|RH_AGENTS_PSQL)$'
+observe_keep=()
+observe_dirty=""
+[[ -z "$(declare -F)" ]] || observe_dirty=yes
+for observe_name in $(compgen -e); do
+  if [[ "$observe_name" =~ $OBSERVE_INHERIT_RE ]]; then
+    observe_keep+=("$observe_name=${!observe_name}")
+  elif [[ ! "$observe_name" =~ ^(PWD|OLDPWD|SHLVL|_)$ ]]; then
+    observe_dirty=yes
+  fi
+done
+if [[ -n "$observe_dirty" ]]; then
+  exec /usr/bin/env -i ${observe_keep[@]+"${observe_keep[@]}"} /bin/bash "$0" "$@"
+fi
+unset observe_keep observe_dirty observe_name
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LABEL="com.rh-agents.observe"
 ENV_FILE="${RH_AGENTS_OBSERVE_ENV:-$HOME/.config/rh-agents/observe.env}"
@@ -119,13 +139,18 @@ observe_code_clean() {
     ':(exclude)backend/.ruff_cache' ':(exclude)**/__pycache__/**')" ]]
 }
 
-# The wrapper that holds the run lock, if it is alive and still a wrapper: a
-# pid left behind by a crash and reused by another process is never trusted.
+# The start time of a process, as ps prints it (empty when it is gone).
+observe_started() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null || true; }
+
+# The wrapper that holds the run lock, if it is alive and still that wrapper:
+# the pid file names its pid and start time, so a pid left behind by a crash
+# and reused by another process is never trusted, whatever it is called.
 observe_running_pid() {
-  local pid
+  local pid started
   [[ -f "$PID_FILE" ]] || return 1
-  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+  { IFS= read -r pid && IFS= read -r started; } <"$PID_FILE" 2>/dev/null || return 1
+  [[ "$pid" =~ ^[0-9]+$ && -n "$started" ]] && kill -0 "$pid" 2>/dev/null || return 1
+  [[ "$(observe_started "$pid")" == "$started" ]] || return 1
   [[ "$(ps -o command= -p "$pid" 2>/dev/null)" == *run-observe.sh* ]] || return 1
   printf '%s\n' "$pid"
 }
@@ -137,13 +162,15 @@ observe_lock() {
   local attempt
   for attempt in 1 2; do
     if mkdir "$LOCK_DIR" 2>/dev/null; then
-      echo $$ >"$PID_FILE"
+      # Written aside and renamed, so a reader sees no pid or a whole one.
+      printf '%s\n%s\n' $$ "$(observe_started $$)" >"$LOCK_DIR/pid.new"
+      mv "$LOCK_DIR/pid.new" "$PID_FILE"
       return 0
     fi
     # No pid yet: the holder is between mkdir and writing it. Held.
     [[ -f "$PID_FILE" ]] || return 1
     observe_running_pid >/dev/null && return 1
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" "$LOCK_DIR/pid.new"
     rmdir "$LOCK_DIR" 2>/dev/null || true
   done
   return 1
@@ -151,7 +178,7 @@ observe_lock() {
 
 # Release the run lock, only if this shell owns it.
 observe_unlock() {
-  [[ "$(cat "$PID_FILE" 2>/dev/null || true)" == "$$" ]] || return 0
+  [[ "$(head -n 1 "$PID_FILE" 2>/dev/null || true)" == "$$" ]] || return 0
   rm -f "$PID_FILE"
   rmdir "$LOCK_DIR" 2>/dev/null || true
 }

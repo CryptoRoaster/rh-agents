@@ -43,6 +43,12 @@ every run:
 - The scout starts with `env -i` plus the profile. No inherited variable and no
   wrapper key reaches it. A repository `.env` is refused
   (`OBSERVE_REPOSITORY_ENV_PRESENT`), because settings would read it.
+- Every script first re-executes itself under `env -i` unless only `HOME`,
+  `PATH`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `TERM` and the scripts' own
+  `RH_AGENTS_OBSERVE_*`, `RH_AGENTS_LAUNCH_AGENTS` and `RH_AGENTS_PSQL` knobs
+  are exported and no shell function is defined. An inherited `BASH_ENV`,
+  exported function, `GIT_*` or `PG*` variable therefore never reaches the
+  checks below.
 - Only committed code runs. Refused (`OBSERVE_WORKTREE_MODIFIED`):
   - a tracked change;
   - an untracked or ignored file under `ops/` or `backend/`, except the
@@ -98,8 +104,9 @@ needs no copy of runtime data.
   (`RunAtLoad` is false).
 - **Overlap.** Runs never overlap:
   - launchd does not start a job that is still running;
-  - the wrapper takes an atomic lock directory, and a pid left behind by a
-    crash is trusted only while it is still a `run-observe.sh`;
+  - the wrapper takes an atomic lock directory and records its pid and start
+    time; a pid left behind by a crash is trusted only while the same process
+    (same pid, same start time) is still a `run-observe.sh`;
   - the scout holds a PostgreSQL advisory lock.
 - **Stopping without data loss.** Every stage commits on its own. A run that is
   terminated loses only its uncommitted stage, and the next run records the
