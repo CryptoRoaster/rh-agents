@@ -42,8 +42,8 @@ first sell can pass, unless a worst-case treatment of claimable fees is decided.
 
 ## Shortest safe path to a releasable early PAPER candidate
 
-1. **Code** (no approval beyond review): merge the open acceptance and
-   backfill-readiness PRs.
+1. **Code**: done (acceptance, backfill readiness, exit isolation #115,
+   runbook #116 merged). Next: the exit host (runbook step 8).
 2. **FeeSplitter evidence**: done offline — token fees are permissionlessly
    claimable, never creditable; a 13-read live confirmation remains. A
    decision on a worst-case treatment of claimable fees (an exact upper bound,
@@ -83,7 +83,7 @@ the scout-unload gate (`ops/scout/install.sh` still has an unconditional
 
 ## Required approvals
 
-1. Merging the open exit-isolation PR (#115); acceptance, backfill readiness and the V2/V3 architecture are merged.
+1. Code: done — exit isolation (#115), the pilot runbook and exit acceptance (#116), offline acceptance, backfill readiness and the V2/V3 architecture are merged. A host with 72-hour exit continuity (runbook step 8) is the first decision.
 2. The FeeSplitter live reads (13 reads, `docs/fee-splitter-verification.md`); the public-source work is done.
 3. Runtime deploy plus migrations 0025 and 0026.
 4. RPC budget for the index backfill (≈ 4 000 reads, ≈ 13 000 worst case) and
