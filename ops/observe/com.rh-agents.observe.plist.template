@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Local observation scout, every 300 seconds unless start.sh was given
+  RH_AGENTS_OBSERVE_INTERVAL_SECONDS (300..3600). Rendered by start.sh; never
+  edit the installed copy by hand. Scout mode only (see run-observe.sh). No
+  secrets here: the profile lives in the env file run-observe.sh reads.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.rh-agents.observe</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/ops/observe/run-observe.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__/backend</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>RH_AGENTS_OBSERVE_ENV</key>
+    <string>__ENV_FILE__</string>
+    <key>RH_AGENTS_OBSERVE_STATE_DIR</key>
+    <string>__STATE_DIR__</string>
+    <key>RH_AGENTS_OBSERVE_LOG_DIR</key>
+    <string>__LOG_DIR__</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Standard</string>
+  <!-- A stop waits for the run in progress before launchd signals it. -->
+  <key>ExitTimeOut</key>
+  <integer>120</integer>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/observe.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/observe.launchd.log</string>
+</dict>
+</plist>
