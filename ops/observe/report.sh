@@ -17,6 +17,9 @@ since="${1:-}" hours="${2:-}"
 [[ "$since" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
   { echo "usage: report.sh YYYY-MM-DDTHH:MM:SSZ 24|48|72" >&2; exit 64; }
 [[ "$hours" =~ ^(24|48|72)$ ]] || { echo "usage: report.sh YYYY-MM-DDTHH:MM:SSZ 24|48|72" >&2; exit 64; }
+# A real calendar instant, not only its shape (BSD date, as on macOS).
+[[ "$(LC_ALL=C date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$since" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)" == "$since" ]] ||
+  { echo "usage: report.sh YYYY-MM-DDTHH:MM:SSZ 24|48|72 (not a valid instant)" >&2; exit 64; }
 
 reason="$(observe_load)" || { echo "PROFILE_REFUSED: $reason"; exit 1; }
 observe_load >/dev/null
@@ -41,10 +44,13 @@ AGE="extract(epoch from first_seen_at - pool_created_at)"
 V4="(market_payload->'pool_locator'->>'kind') = 'BYTES32_POOL_ID'"
 
 echo "observation report: $since + ${hours} h (database $db, port $port, commit $(git -C "$REPO" rev-parse --short HEAD))"
-echo "server: $(q "select split_part(version(),' ',2) || ', revision ' || (select version_num from alembic_version)")"
+# The first read decides: a database that cannot be read ends the report.
+server="$(q "select split_part(version(),' ',2) || ', revision ' || (select version_num from alembic_version)")" ||
+  { echo "DATABASE_UNREADABLE"; exit 1; }
+echo "server: $server"
 echo
 echo "## scout runs"
-echo "runs | completed | failed | stopped: $(q "select count(*), count(*) filter (where status='COMPLETED'), count(*) filter (where status='FAILED'), count(*) filter (where status='STOPPED') from scout_runs where $W")"
+echo "runs | completed | failed | of those never finished (RUN_INCOMPLETE) | stopped: $(q "select count(*), count(*) filter (where status='COMPLETED'), count(*) filter (where status='FAILED'), count(*) filter (where stop='RUN_INCOMPLETE'), count(*) filter (where status='STOPPED') from scout_runs where $W")"
 echo "errors (code: runs):"
 q "select e, count(*) from scout_runs, jsonb_array_elements_text(errors) e where $W group by e order by 2 desc" | sed 's/^/  /'
 echo "longest pauses between runs (> 10 min; sleep, stop, outage):"

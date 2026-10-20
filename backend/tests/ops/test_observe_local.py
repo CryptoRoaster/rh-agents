@@ -660,6 +660,7 @@ def test_the_daily_http_ceiling_reaches_the_scout(box):
         ("2026-10-20 06:00", "24"),
         ("2026-10-20T06:00:00Z", "12"),
         ("2026-10-20T06:00:00Z';drop table x;--", "24"),
+        ("2026-13-45T06:00:00Z", "24"),
     ],
 )
 def test_the_report_takes_only_a_utc_start_and_24_48_or_72_hours(box, args):

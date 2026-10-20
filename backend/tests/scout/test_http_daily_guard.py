@@ -358,3 +358,27 @@ async def test_the_outcome_sampler_draws_from_the_same_allowance(db):
     assert len(provider.requests) == 2
     assert summary.provider_http_attempts == 2
     assert summary.outcome_requests == 0
+
+
+async def test_the_overview_shows_the_latest_finished_run_not_a_reservation(db):
+    from src.scout.policy import EARLY_SCOUT_V1
+    from src.scout.read import ScoutReadService
+    from src.scout.runs import ScoutRunRepository
+
+    _, sessions = db
+    capped = settings(early_scout_max_provider_http_attempts_per_day=20)
+    finished = await scout(
+        sessions, T0, provider=PagedNetworks(discovery_pages={1: page(1)}), settings=capped
+    )
+    # A run in progress: its reservation is the newest row.
+    from uuid import uuid4
+
+    await ScoutRunRepository(sessions).reserve(uuid4(), T0 + FIVE, "early-scout-v1", 8)
+    service = ScoutReadService(sessions, daily_budget=96, policy=EARLY_SCOUT_V1)
+    overview = await service.overview(T0 + FIVE + timedelta(seconds=30))
+    assert overview.latest_run is not None
+    assert overview.latest_run.run.id == finished.run_id
+    assert overview.latest_run.run.status == "COMPLETED"
+    # The run list stays the record: the reservation is listed as it is.
+    newest, *_ = await ScoutRunRepository(sessions).recent(1)
+    assert newest.stop == "RUN_INCOMPLETE"

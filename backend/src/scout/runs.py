@@ -155,13 +155,18 @@ class ScoutRunRepository:
             )
         return int(used or 0)
 
-    async def recent(self, limit: int, offset: int = 0) -> tuple[ScoutRun, ...]:
-        """Newest first."""
+    async def recent(
+        self, limit: int, offset: int = 0, *, finished_only: bool = False
+    ) -> tuple[ScoutRun, ...]:
+        """Newest first. `finished_only` leaves out reservations (`RUN_INCOMPLETE`):
+        a run in progress, or one that never recorded its end."""
+        statement = select(ScoutRunRow)
+        if finished_only:
+            statement = statement.where(ScoutRunRow.stop != RUN_INCOMPLETE)
         async with self.sessions() as session:
             rows = (
                 await session.scalars(
-                    select(ScoutRunRow)
-                    .order_by(ScoutRunRow.started_at.desc(), ScoutRunRow.id.desc())
+                    statement.order_by(ScoutRunRow.started_at.desc(), ScoutRunRow.id.desc())
                     .limit(limit)
                     .offset(offset)
                 )

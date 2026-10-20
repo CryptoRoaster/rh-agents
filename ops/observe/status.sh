@@ -54,10 +54,11 @@ echo "latest runs (started_at | status | stop | discovered | watches_created | p
 q "select to_char(started_at at time zone 'Europe/Berlin','YYYY-MM-DD HH24:MI:SS'), status, stop, discovered, watches_created, provider_requests, jsonb_array_length(errors) from scout_runs order by started_at desc limit 5" | sed 's/^/  /'
 age="$(q "select coalesce(extract(epoch from now() - max(completed_at))::int, -1) from scout_runs")" || age=-1
 # The run in progress has reserved its provider attempts as a RUN_INCOMPLETE
-# row; while it runs, that row is not the latest finished run.
+# row; while it runs, that one row (the newest reservation) is left out. An
+# older reservation is a run that never finished, and still counts as failed.
 skip_incomplete=false
 observe_running_pid >/dev/null && skip_incomplete=true
-latest="$(q "select coalesce((select status from scout_runs where not ($skip_incomplete and stop = 'RUN_INCOMPLETE') order by started_at desc limit 1), 'NONE')")" || latest=UNREADABLE
+latest="$(q "select coalesce((select status from scout_runs where not ($skip_incomplete and id = (select id from scout_runs where stop = 'RUN_INCOMPLETE' order by started_at desc limit 1)) order by started_at desc limit 1), 'NONE')")" || latest=UNREADABLE
 echo "seconds since last run: $age; latest status: $latest"
 if [[ "$loaded" == yes && "$stopped" == no ]]; then
   if [[ "$age" == -1 ]] || ((age > 2 * INTERVAL)); then degraded NO_RECENT_RUN; fi
