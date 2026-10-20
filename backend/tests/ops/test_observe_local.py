@@ -434,9 +434,7 @@ def test_start_accepts_finder_metadata_and_still_refuses_code(box):
 def test_the_scout_reads_no_bytecode_from_the_checkout(box):
     """A fresh, empty bytecode prefix per run: nothing in __pycache__ is ever loaded."""
     assert script(box, "run-observe.sh").returncode == 0
-    env = dict(
-        line.split("=", 1) for line in (box["record"] / "env").read_text().splitlines()
-    )
+    env = dict(line.split("=", 1) for line in (box["record"] / "env").read_text().splitlines())
     prefix = Path(env["PYTHONPYCACHEPREFIX"])
     assert env["PYTHONDONTWRITEBYTECODE"] == "1"
     assert prefix.is_relative_to(box["state"])
