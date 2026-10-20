@@ -428,6 +428,206 @@ def test_start_accepts_finder_metadata_and_still_refuses_code(box):
     assert "OBSERVE_WORKTREE_MODIFIED" in result.stderr
 
 
+# ------------------------------------------------------------ bytecode and git hooks
+
+
+def test_the_scout_reads_no_bytecode_from_the_checkout(box):
+    """A fresh, empty bytecode prefix per run: nothing in __pycache__ is ever loaded."""
+    assert script(box, "run-observe.sh").returncode == 0
+    env = dict(line.split("=", 1) for line in (box["record"] / "env").read_text().splitlines())
+    prefix = Path(env["PYTHONPYCACHEPREFIX"])
+    assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert prefix.is_relative_to(box["state"])
+    # Removed again once the run is over.
+    assert not prefix.exists()
+
+
+def test_the_preflight_reads_no_bytecode_from_the_checkout(box):
+    assert script(box, "run-observe.sh", "--preflight").returncode == 0
+    env = (box["record"] / "env").read_text()
+    assert "PYTHONPYCACHEPREFIX=" in env
+    assert "PYTHONDONTWRITEBYTECODE=1" in env
+
+
+def test_a_planted_unchecked_hash_pyc_is_ignored_under_the_prefix(tmp_path):
+    """The Python behaviour the prefix relies on, with the interpreter itself."""
+    import importlib.util
+    import py_compile
+    import sys
+
+    (tmp_path / "gen").mkdir()
+    (tmp_path / "app").mkdir()
+    (tmp_path / "gen" / "mod.py").write_text("VALUE = 'planted'\n")
+    (tmp_path / "app" / "mod.py").write_text("VALUE = 'source'\n")
+    cached = importlib.util.cache_from_source(str(tmp_path / "app" / "mod.py"))
+    py_compile.compile(
+        str(tmp_path / "gen" / "mod.py"),
+        cfile=cached,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+
+    def value(**extra: str) -> str:
+        return subprocess.run(
+            [sys.executable, "-c", "import mod; print(mod.VALUE)"],
+            cwd=tmp_path / "app",
+            env={"PATH": "/usr/bin:/bin", **extra},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    assert value() == "planted"
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    assert value(PYTHONPYCACHEPREFIX=str(fresh), PYTHONDONTWRITEBYTECODE="1") == "source"
+
+
+def test_a_configured_fsmonitor_is_never_asked(box):
+    """git status could be told by a monitor hook that nothing changed."""
+    marker = box["tmp"] / "fsmonitor-called"
+    hook = executable(box["tmp"] / "fsmonitor", f'touch "{marker}"\nexit 0\n')
+    git = ["git", "-C", str(box["checkout"])]
+    subprocess.run([*git, "config", "core.fsmonitor", str(hook)], check=True)
+    (box["checkout"] / "backend" / "evil.py").write_text("import os\n")
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+    assert not marker.exists()
+
+
+def commit_module(box, name: str = "mod.py", text: str = "VALUE = 'source'\n") -> Path:
+    """A tracked backend module, committed and merged."""
+    git = ["git", "-C", str(box["checkout"]), "-c", "user.name=t", "-c", "user.email=t@t"]
+    path = box["checkout"] / "backend" / name
+    path.write_text(text)
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "module"], check=True)
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+    return path
+
+
+def same_size_edit(path: Path) -> None:
+    """Overwrite with content of the same size and put the old mtime back."""
+    stat_before = path.stat()
+    path.write_text(path.read_text().replace("source", "evil!!"))
+    os.utime(path, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
+
+
+@pytest.mark.parametrize("setting", [("core.trustctime", "false"), ("core.checkStat", "minimal")])
+def test_a_stat_setting_never_hides_a_same_size_edit(box, setting):
+    module = commit_module(box)
+    subprocess.run(["git", "-C", str(box["checkout"]), "config", *setting], check=True)
+    same_size_edit(module)
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+
+
+def test_a_configured_work_tree_never_points_the_gate_elsewhere(box):
+    commit_module(box)
+    clean = box["tmp"] / "clean"
+    shutil.copytree(box["checkout"], clean, ignore=shutil.ignore_patterns(".git"))
+    subprocess.run(
+        ["git", "-C", str(box["checkout"]), "config", "core.worktree", str(clean)], check=True
+    )
+    (box["checkout"] / "backend" / "evil.py").write_text("import os\n")
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+
+
+def test_a_clean_filter_never_hides_an_edit_and_never_runs(box):
+    module = commit_module(box)
+    marker = box["tmp"] / "filter-ran"
+    original = box["tmp"] / "original.py"
+    original.write_text(module.read_text())
+    git = ["git", "-C", str(box["checkout"])]
+    subprocess.run(
+        [*git, "config", "filter.hide.clean", f'touch "{marker}"; cat "{original}"'], check=True
+    )
+    attributes = box["checkout"] / ".git" / "info" / "attributes"
+    attributes.parent.mkdir(parents=True, exist_ok=True)
+    attributes.write_text("*.py filter=hide\n")
+    module.write_text("import os  # changed\n")
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+
+
+def test_a_global_git_config_is_never_read(box):
+    module = commit_module(box)
+    (box["tmp"] / ".gitconfig").write_text("[core]\n\ttrustctime = false\n\tcheckStat = minimal\n")
+    same_size_edit(module)
+    assert script(box, "run-observe.sh").returncode == 78
+
+
+def test_a_tracked_file_that_is_missing_is_refused(box):
+    commit_module(box).unlink()
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+
+
+def test_the_bytecode_prefix_is_removed_without_recursive_deletion(box):
+    """Left empty by PYTHONDONTWRITEBYTECODE, so rmdir suffices; a filled one is kept."""
+    text = (box["checkout"] / "ops" / "observe" / "common.sh").read_text()
+    assert "rm -rf" not in text
+    assert script(box, "run-observe.sh").returncode == 0
+    assert not list(box["state"].glob("pycache.*"))
+
+
+def test_a_stale_bytecode_prefix_from_a_killed_run_is_cleared_when_empty(box):
+    box["state"].mkdir(parents=True, exist_ok=True)
+    stale = box["state"] / "pycache.ABC123"
+    stale.mkdir()
+    kept = box["state"] / "pycache.FULL01"
+    kept.mkdir()
+    (kept / "x").write_text("x")
+    outside = box["tmp"] / "pycache.OUT001"
+    outside.mkdir()
+    assert script(box, "run-observe.sh").returncode == 0
+    assert not stale.exists()
+    # Never emptied by force, and never anything outside the state directory.
+    assert (kept / "x").exists()
+    assert outside.exists()
+
+
+def unmerged_commit(box) -> tuple[list[str], str, str]:
+    """A new commit on the checkout that origin/main does not contain."""
+    git = ["git", "-C", str(box["checkout"]), "-c", "user.name=t", "-c", "user.email=t@t"]
+    main = subprocess.run([*git, "rev-parse", "origin/main"], capture_output=True, text=True)
+    (box["checkout"] / "backend" / "late.py").write_text("VALUE = 1\n")
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "unmerged"], check=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True)
+    return git, main.stdout.strip(), head.stdout.strip()
+
+
+def test_a_replace_ref_never_makes_an_unmerged_commit_merged(box):
+    git, main, head = unmerged_commit(box)
+    subprocess.run([*git, "replace", "--graft", main, head], check=True)
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_COMMIT_NOT_ON_MAIN" in log(box)
+
+
+def test_a_graft_never_makes_an_unmerged_commit_merged(box):
+    git, main, head = unmerged_commit(box)
+    grafts = box["checkout"] / ".git" / "info" / "grafts"
+    grafts.parent.mkdir(parents=True, exist_ok=True)
+    grafts.write_text(f"{main} {head}\n")
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_COMMIT_NOT_ON_MAIN" in log(box)
+
+
+def test_a_replaced_tree_never_vouches_for_changed_code(box):
+    module = commit_module(box)
+    git = ["git", "-C", str(box["checkout"]), "-c", "user.name=t", "-c", "user.email=t@t"]
+    module.write_text("import os  # changed\n")
+    subprocess.run([*git, "add", "."], check=True)
+    evil = subprocess.run([*git, "write-tree"], capture_output=True, text=True, check=True)
+    tree = subprocess.run(
+        [*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, check=True
+    )
+    subprocess.run([*git, "replace", tree.stdout.strip(), evil.stdout.strip()], check=True)
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+
+
 # ------------------------------------------------------------ stop and restart
 
 

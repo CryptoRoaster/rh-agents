@@ -133,17 +133,67 @@ observe_check() {
   done
 }
 
+# git on the checkout, and on nothing else: no system or global configuration,
+# the work tree pinned to the checkout (a configured `core.worktree` could
+# point it at a clean copy), and none of the settings that let status or diff
+# trust stat data or a monitor instead of looking (`core.fsmonitor`,
+# `core.untrackedCache`, `core.trustctime`, `core.checkStat`). Content is
+# checked apart, without filters (`observe_code_content`).
+# Replace refs and grafts are ignored too: either could swap the tree the
+# content check compares against, or make an unmerged commit look merged.
+observe_git() {
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null git \
+    -c advice.graftFileDeprecated=false -c core.fsmonitor=false -c core.untrackedCache=false \
+    -c core.trustctime=true -c core.checkStat=default \
+    --work-tree="$REPO" -C "$REPO" "$@"
+}
+
+# Every file HEAD tracks under ops/ and backend/ has exactly HEAD's content on
+# disk, hashed without any filter, so neither stat data, the index nor a
+# configured clean filter can vouch for it. A tracked link, a missing file or
+# any difference fails, and so does a listing git did not finish.
+observe_code_content() {
+  local entry meta path rc="" actual i=0 paths=() wanted=() tab=$'\t'
+  while IFS= read -r -d '' entry; do
+    [[ -z "$rc" ]] || return 1
+    if [[ "$entry" == RC=* ]]; then
+      rc="${entry#RC=}"
+      continue
+    fi
+    meta="${entry%%"$tab"*}" path="${entry#*"$tab"}"
+    # "<mode> blob <hash>": only regular files are tracked here.
+    [[ "$meta" =~ ^100(644|755)\ blob\ ([0-9a-f]{40})$ ]] || return 1
+    wanted+=("${BASH_REMATCH[2]}")
+    [[ -f "$REPO/$path" && ! -L "$REPO/$path" ]] || return 1
+    paths+=("$REPO/$path")
+  done < <(
+    observe_git ls-tree -r -z --full-tree HEAD -- ops backend
+    printf 'RC=%s\0' "$?"
+  )
+  [[ "$rc" == 0 && ${#paths[@]} -gt 0 ]] || return 1
+  while IFS= read -r actual; do
+    [[ $i -lt ${#wanted[@]} && "$actual" == "${wanted[$i]}" ]] || return 1
+    i=$((i + 1))
+  done < <(printf '%s\n' "${paths[@]}" | observe_git hash-object --no-filters --stdin-paths)
+  [[ $i -eq ${#wanted[@]} ]]
+}
+
 # Only merged code runs: the checkout's commit must be on origin/main.
-observe_code_merged() { git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; }
+observe_code_merged() { observe_git merge-base --is-ancestor HEAD origin/main 2>/dev/null; }
 
 # The database name of the checked profile (no credentials are ever printed).
 observe_db() { local url; url="$(observe_get DATABASE_URL)"; printf '%s\n' "${url##*/}"; }
 
 # The scout's environment: the profile and nothing inherited but HOME and a
 # fixed PATH. The wrapper's own RH_AGENTS_* keys never reach the scout.
+# Bytecode is read from, and written to, only `$OBSERVE_PYCACHE`: a fresh empty
+# directory per run (`observe_pycache`), so no .pyc planted in a __pycache__
+# of the checkout — which the clean check leaves out — is ever loaded.
 observe_env_args() {
   local key
-  printf '%s\n' "HOME=$HOME" "PATH=/usr/bin:/bin:/usr/sbin:/sbin" "LANG=en_US.UTF-8"
+  printf '%s\n' "HOME=$HOME" "PATH=/usr/bin:/bin:/usr/sbin:/sbin" "LANG=en_US.UTF-8" \
+    "PYTHONPYCACHEPREFIX=$OBSERVE_PYCACHE" "PYTHONDONTWRITEBYTECODE=1"
   for key in $OBSERVE_SEEN; do
     [[ "$key" == RH_AGENTS_* ]] || printf '%s\n' "$key=$(observe_get "$key")"
   done
@@ -163,15 +213,19 @@ observe_finder_metadata() {
 # anywhere the scout could import from (ops/ and backend/, whose directory
 # leads sys.path under `python -m`), except the virtualenv, tool caches and
 # Finder metadata (`observe_finder_metadata`), which Finder writes on its own
-# whenever the checkout is opened in it.
+# whenever the checkout is opened in it. Known gap: the virtualenv itself is
+# not checked, so a `.pth` file or a source-less `.pyc` planted in
+# `backend/.venv` would still run; only someone who can already write to the
+# checkout as this user can plant one.
 observe_code_clean() {
   local entry rc=""
-  local status=(git -C "$REPO" status --porcelain -z --untracked-files=all --ignored -- ops backend
+  local status=(observe_git status --porcelain -z --untracked-files=all --ignored -- ops backend
     ':(exclude)backend/.venv' ':(exclude)backend/.mypy_cache' ':(exclude)backend/.pytest_cache'
     ':(exclude)backend/.ruff_cache' ':(exclude)**/__pycache__/**')
-  git -C "$REPO" diff --quiet HEAD -- || return 1
+  observe_git diff --quiet HEAD -- || return 1
+  observe_code_content || return 1
   # An assume-unchanged or skip-worktree file hides its edit from diff and status.
-  [[ -z "$(git -C "$REPO" ls-files -v -- ops backend | grep -v '^H ')" ]] || return 1
+  [[ -z "$(observe_git ls-files -v -- ops backend | grep -v '^H ')" ]] || return 1
   # Read NUL-separated, so no file name can split into entries of its own,
   # and followed by git's exit status: only a listing git finished counts.
   # An entry always starts with its two status letters, never with `RC=`.
@@ -189,6 +243,32 @@ observe_code_clean() {
     printf 'RC=%s\0' "$?"
   )
   [[ "$rc" == 0 ]]
+}
+
+# One of this wrapper's bytecode prefixes: a real directory (no link) directly
+# in the absolute state directory, named as `observe_pycache` names it.
+observe_is_pycache() {
+  [[ "$STATE_DIR" == /* && "$1" == "$STATE_DIR"/pycache.* && "${1#"$STATE_DIR"/}" != */* ]] &&
+    [[ -d "$1" && ! -L "$1" ]]
+}
+
+# A fresh, empty bytecode prefix for this run, in the private state directory.
+# Empty prefixes a killed run left behind are removed first. Nothing holding a
+# file is ever removed, and nothing is deleted recursively.
+observe_pycache() {
+  local stale
+  for stale in "$STATE_DIR"/pycache.*; do
+    if observe_is_pycache "$stale"; then rmdir "$stale" 2>/dev/null || true; fi
+  done
+  OBSERVE_PYCACHE="$(mktemp -d "$STATE_DIR/pycache.XXXXXX")"
+}
+
+# Remove it again. PYTHONDONTWRITEBYTECODE keeps it empty, so rmdir suffices;
+# one that is not empty is left for inspection.
+observe_drop_pycache() {
+  if [[ -n "${OBSERVE_PYCACHE:-}" ]] && observe_is_pycache "$OBSERVE_PYCACHE"; then
+    rmdir "$OBSERVE_PYCACHE" 2>/dev/null || true
+  fi
 }
 
 # The start time of a process, as ps prints it (empty when it is gone).
