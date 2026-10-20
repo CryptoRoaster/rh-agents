@@ -133,17 +133,25 @@ observe_check() {
   done
 }
 
+# git on the checkout, with no file-system monitor or untracked cache: either
+# could tell status that nothing changed. Neither is set today; this keeps it so.
+observe_git() { git -c core.fsmonitor=false -c core.untrackedCache=false -C "$REPO" "$@"; }
+
 # Only merged code runs: the checkout's commit must be on origin/main.
-observe_code_merged() { git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; }
+observe_code_merged() { observe_git merge-base --is-ancestor HEAD origin/main 2>/dev/null; }
 
 # The database name of the checked profile (no credentials are ever printed).
 observe_db() { local url; url="$(observe_get DATABASE_URL)"; printf '%s\n' "${url##*/}"; }
 
 # The scout's environment: the profile and nothing inherited but HOME and a
 # fixed PATH. The wrapper's own RH_AGENTS_* keys never reach the scout.
+# Bytecode is read from, and written to, only `$OBSERVE_PYCACHE`: a fresh empty
+# directory per run (`observe_pycache`), so no .pyc planted in a __pycache__
+# of the checkout — which the clean check leaves out — is ever loaded.
 observe_env_args() {
   local key
-  printf '%s\n' "HOME=$HOME" "PATH=/usr/bin:/bin:/usr/sbin:/sbin" "LANG=en_US.UTF-8"
+  printf '%s\n' "HOME=$HOME" "PATH=/usr/bin:/bin:/usr/sbin:/sbin" "LANG=en_US.UTF-8" \
+    "PYTHONPYCACHEPREFIX=$OBSERVE_PYCACHE" "PYTHONDONTWRITEBYTECODE=1"
   for key in $OBSERVE_SEEN; do
     [[ "$key" == RH_AGENTS_* ]] || printf '%s\n' "$key=$(observe_get "$key")"
   done
@@ -166,12 +174,12 @@ observe_finder_metadata() {
 # whenever the checkout is opened in it.
 observe_code_clean() {
   local entry rc=""
-  local status=(git -C "$REPO" status --porcelain -z --untracked-files=all --ignored -- ops backend
+  local status=(observe_git status --porcelain -z --untracked-files=all --ignored -- ops backend
     ':(exclude)backend/.venv' ':(exclude)backend/.mypy_cache' ':(exclude)backend/.pytest_cache'
     ':(exclude)backend/.ruff_cache' ':(exclude)**/__pycache__/**')
-  git -C "$REPO" diff --quiet HEAD -- || return 1
+  observe_git diff --quiet HEAD -- || return 1
   # An assume-unchanged or skip-worktree file hides its edit from diff and status.
-  [[ -z "$(git -C "$REPO" ls-files -v -- ops backend | grep -v '^H ')" ]] || return 1
+  [[ -z "$(observe_git ls-files -v -- ops backend | grep -v '^H ')" ]] || return 1
   # Read NUL-separated, so no file name can split into entries of its own,
   # and followed by git's exit status: only a listing git finished counts.
   # An entry always starts with its two status letters, never with `RC=`.
@@ -190,6 +198,12 @@ observe_code_clean() {
   )
   [[ "$rc" == 0 ]]
 }
+
+# A fresh, empty bytecode prefix for this run, in the private state directory.
+observe_pycache() { OBSERVE_PYCACHE="$(mktemp -d "$STATE_DIR/pycache.XXXXXX")"; }
+
+# Remove it again (it stays empty: nothing is written into it).
+observe_drop_pycache() { [[ -z "${OBSERVE_PYCACHE:-}" ]] || rm -rf "$OBSERVE_PYCACHE"; }
 
 # The start time of a process, as ps prints it (empty when it is gone).
 observe_started() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null || true; }

@@ -428,6 +428,74 @@ def test_start_accepts_finder_metadata_and_still_refuses_code(box):
     assert "OBSERVE_WORKTREE_MODIFIED" in result.stderr
 
 
+# ------------------------------------------------------------ bytecode and git hooks
+
+
+def test_the_scout_reads_no_bytecode_from_the_checkout(box):
+    """A fresh, empty bytecode prefix per run: nothing in __pycache__ is ever loaded."""
+    assert script(box, "run-observe.sh").returncode == 0
+    env = dict(
+        line.split("=", 1) for line in (box["record"] / "env").read_text().splitlines()
+    )
+    prefix = Path(env["PYTHONPYCACHEPREFIX"])
+    assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert prefix.is_relative_to(box["state"])
+    # Removed again once the run is over.
+    assert not prefix.exists()
+
+
+def test_the_preflight_reads_no_bytecode_from_the_checkout(box):
+    assert script(box, "run-observe.sh", "--preflight").returncode == 0
+    env = (box["record"] / "env").read_text()
+    assert "PYTHONPYCACHEPREFIX=" in env
+    assert "PYTHONDONTWRITEBYTECODE=1" in env
+
+
+def test_a_planted_unchecked_hash_pyc_is_ignored_under_the_prefix(tmp_path):
+    """The Python behaviour the prefix relies on, with the interpreter itself."""
+    import importlib.util
+    import py_compile
+    import sys
+
+    (tmp_path / "gen").mkdir()
+    (tmp_path / "app").mkdir()
+    (tmp_path / "gen" / "mod.py").write_text("VALUE = 'planted'\n")
+    (tmp_path / "app" / "mod.py").write_text("VALUE = 'source'\n")
+    cached = importlib.util.cache_from_source(str(tmp_path / "app" / "mod.py"))
+    py_compile.compile(
+        str(tmp_path / "gen" / "mod.py"),
+        cfile=cached,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+
+    def value(**extra: str) -> str:
+        return subprocess.run(
+            [sys.executable, "-c", "import mod; print(mod.VALUE)"],
+            cwd=tmp_path / "app",
+            env={"PATH": "/usr/bin:/bin", **extra},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    assert value() == "planted"
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    assert value(PYTHONPYCACHEPREFIX=str(fresh), PYTHONDONTWRITEBYTECODE="1") == "source"
+
+
+def test_a_configured_fsmonitor_is_never_asked(box):
+    """git status could be told by a monitor hook that nothing changed."""
+    marker = box["tmp"] / "fsmonitor-called"
+    hook = executable(box["tmp"] / "fsmonitor", f'touch "{marker}"\nexit 0\n')
+    git = ["git", "-C", str(box["checkout"])]
+    subprocess.run([*git, "config", "core.fsmonitor", str(hook)], check=True)
+    (box["checkout"] / "backend" / "evil.py").write_text("import os\n")
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+    assert not marker.exists()
+
+
 # ------------------------------------------------------------ stop and restart
 
 

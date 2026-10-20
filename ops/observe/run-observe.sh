@@ -44,6 +44,8 @@ observe_code_clean || refuse OBSERVE_WORKTREE_MODIFIED
 # after loading the agent never runs unmerged code.
 observe_code_merged || refuse OBSERVE_COMMIT_NOT_ON_MAIN
 
+observe_pycache || refuse OBSERVE_PYCACHE_UNAVAILABLE
+trap observe_drop_pycache EXIT
 env_args=()
 while IFS= read -r line; do env_args+=("$line"); done < <(observe_env_args)
 
@@ -55,7 +57,9 @@ case "${1:-}" in
     ;;
   --preflight)
     cd "$REPO/backend"
-    exec env -i "${env_args[@]}" "$PYTHON" -m src.runner.main --preflight
+    status=0
+    env -i "${env_args[@]}" "$PYTHON" -m src.runner.main --preflight || status=$?
+    exit "$status"
     ;;
   "") ;;
   *) refuse OBSERVE_UNKNOWN_ARGUMENT ;;
@@ -67,7 +71,7 @@ if ! observe_lock; then
   say "skipped RUN_IN_PROGRESS pid $(observe_running_pid || echo UNKNOWN)"
   exit 0
 fi
-trap observe_unlock EXIT
+trap 'observe_unlock; observe_drop_pycache' EXIT
 if [[ -e "$STOP_FILE" ]]; then
   say "skipped STOP_FILE_PRESENT"
   exit 0
