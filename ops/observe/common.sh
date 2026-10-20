@@ -144,7 +144,7 @@ observe_check() {
 observe_git() {
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
     GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null git \
-    -c core.fsmonitor=false -c core.untrackedCache=false \
+    -c advice.graftFileDeprecated=false -c core.fsmonitor=false -c core.untrackedCache=false \
     -c core.trustctime=true -c core.checkStat=default \
     --work-tree="$REPO" -C "$REPO" "$@"
 }
