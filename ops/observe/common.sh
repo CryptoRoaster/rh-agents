@@ -139,8 +139,11 @@ observe_check() {
 # trust stat data or a monitor instead of looking (`core.fsmonitor`,
 # `core.untrackedCache`, `core.trustctime`, `core.checkStat`). Content is
 # checked apart, without filters (`observe_code_content`).
+# Replace refs and grafts are ignored too: either could swap the tree the
+# content check compares against, or make an unmerged commit look merged.
 observe_git() {
-  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git \
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null git \
     -c core.fsmonitor=false -c core.untrackedCache=false \
     -c core.trustctime=true -c core.checkStat=default \
     --work-tree="$REPO" -C "$REPO" "$@"
@@ -210,7 +213,10 @@ observe_finder_metadata() {
 # anywhere the scout could import from (ops/ and backend/, whose directory
 # leads sys.path under `python -m`), except the virtualenv, tool caches and
 # Finder metadata (`observe_finder_metadata`), which Finder writes on its own
-# whenever the checkout is opened in it.
+# whenever the checkout is opened in it. Known gap: the virtualenv itself is
+# not checked, so a `.pth` file or a source-less `.pyc` planted in
+# `backend/.venv` would still run; only someone who can already write to the
+# checkout as this user can plant one.
 observe_code_clean() {
   local entry rc=""
   local status=(observe_git status --porcelain -z --untracked-files=all --ignored -- ops backend

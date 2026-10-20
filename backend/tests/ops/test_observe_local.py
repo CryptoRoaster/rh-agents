@@ -587,6 +587,47 @@ def test_a_stale_bytecode_prefix_from_a_killed_run_is_cleared_when_empty(box):
     assert outside.exists()
 
 
+def unmerged_commit(box) -> tuple[list[str], str, str]:
+    """A new commit on the checkout that origin/main does not contain."""
+    git = ["git", "-C", str(box["checkout"]), "-c", "user.name=t", "-c", "user.email=t@t"]
+    main = subprocess.run([*git, "rev-parse", "origin/main"], capture_output=True, text=True)
+    (box["checkout"] / "backend" / "late.py").write_text("VALUE = 1\n")
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "unmerged"], check=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True)
+    return git, main.stdout.strip(), head.stdout.strip()
+
+
+def test_a_replace_ref_never_makes_an_unmerged_commit_merged(box):
+    git, main, head = unmerged_commit(box)
+    subprocess.run([*git, "replace", "--graft", main, head], check=True)
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_COMMIT_NOT_ON_MAIN" in log(box)
+
+
+def test_a_graft_never_makes_an_unmerged_commit_merged(box):
+    git, main, head = unmerged_commit(box)
+    grafts = box["checkout"] / ".git" / "info" / "grafts"
+    grafts.parent.mkdir(parents=True, exist_ok=True)
+    grafts.write_text(f"{main} {head}\n")
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_COMMIT_NOT_ON_MAIN" in log(box)
+
+
+def test_a_replaced_tree_never_vouches_for_changed_code(box):
+    module = commit_module(box)
+    git = ["git", "-C", str(box["checkout"]), "-c", "user.name=t", "-c", "user.email=t@t"]
+    module.write_text("import os  # changed\n")
+    subprocess.run([*git, "add", "."], check=True)
+    evil = subprocess.run([*git, "write-tree"], capture_output=True, text=True, check=True)
+    tree = subprocess.run(
+        [*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, check=True
+    )
+    subprocess.run([*git, "replace", tree.stdout.strip(), evil.stdout.strip()], check=True)
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+
+
 # ------------------------------------------------------------ stop and restart
 
 
