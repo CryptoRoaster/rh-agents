@@ -432,7 +432,11 @@ class ScoutReadService:
         by_status = {item.value: 0 for item in WatchStatus}
         for status, count in grouped:
             by_status[status] = int(count)
-        (latest,) = (await ScoutRunRepository(self.sessions).recent(1)) or (None,)
+        # The latest run that recorded its end: a run in progress has only its
+        # reservation, which the run list shows as it is.
+        (latest,) = (await ScoutRunRepository(self.sessions).recent(1, finished_only=True)) or (
+            None,
+        )
         return ScoutOverview(
             as_of=now,
             policy_version=self.policy.version,

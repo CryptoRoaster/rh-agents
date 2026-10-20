@@ -1,7 +1,7 @@
 """Durable scout run history: one terminal row per scout execution."""
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, date, datetime, time, timedelta
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -65,6 +65,10 @@ COUNTERS = (
 )
 
 
+# A run reserved its provider attempts and has not recorded its end (yet).
+RUN_INCOMPLETE = "RUN_INCOMPLETE"
+
+
 def run_status(summary: ScoutSummary) -> str:
     """COMPLETED, STOPPED (a durable stop) or FAILED (a technical fault)."""
     if summary.errors:
@@ -100,7 +104,8 @@ class ScoutRunRepository:
         self, run_id: UUID, started: datetime, completed: datetime, summary: ScoutSummary
     ) -> None:
         async with self.sessions.begin() as session:
-            session.add(
+            # Replaces this run's reservation, if it made one.
+            await session.merge(
                 ScoutRunRow(
                     id=run_id,
                     started_at=started,
@@ -119,13 +124,49 @@ class ScoutRunRepository:
                 )
             )
 
-    async def recent(self, limit: int, offset: int = 0) -> tuple[ScoutRun, ...]:
-        """Newest first."""
+    async def reserve(
+        self, run_id: UUID, started: datetime, policy_version: str, attempts: int
+    ) -> None:
+        """This run's provider HTTP attempts, reserved and committed before any.
+
+        A terminal row as a run that never finished would leave it: FAILED,
+        `RUN_INCOMPLETE`, every counter zero but the reserved attempts. The
+        run's own `record` replaces it.
+        """
+        incomplete = ScoutSummary(
+            policy_version=policy_version,
+            started_at=started.isoformat(),
+            finished_at=started.isoformat(),
+            stop=RUN_INCOMPLETE,
+            errors=(RUN_INCOMPLETE,),
+            provider_http_attempts=attempts,
+        )
+        await self.record(run_id, started, started, incomplete)
+
+    async def http_attempts_on(self, day: date) -> int:
+        """Provider HTTP attempts the scout runs started on this UTC day recorded."""
+        start = datetime.combine(day, time(), tzinfo=UTC)
+        async with self.sessions() as session:
+            used = await session.scalar(
+                select(func.coalesce(func.sum(ScoutRunRow.provider_http_attempts), 0)).where(
+                    ScoutRunRow.started_at >= start,
+                    ScoutRunRow.started_at < start + timedelta(days=1),
+                )
+            )
+        return int(used or 0)
+
+    async def recent(
+        self, limit: int, offset: int = 0, *, finished_only: bool = False
+    ) -> tuple[ScoutRun, ...]:
+        """Newest first. `finished_only` leaves out reservations (`RUN_INCOMPLETE`):
+        a run in progress, or one that never recorded its end."""
+        statement = select(ScoutRunRow)
+        if finished_only:
+            statement = statement.where(ScoutRunRow.stop != RUN_INCOMPLETE)
         async with self.sessions() as session:
             rows = (
                 await session.scalars(
-                    select(ScoutRunRow)
-                    .order_by(ScoutRunRow.started_at.desc(), ScoutRunRow.id.desc())
+                    statement.order_by(ScoutRunRow.started_at.desc(), ScoutRunRow.id.desc())
                     .limit(limit)
                     .offset(offset)
                 )

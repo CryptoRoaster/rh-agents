@@ -195,7 +195,86 @@ Everything else is still refused. Negative tests cover each of these:
 The git status is read NUL-separated, and a failing `git status` refuses the
 run.
 
-## 7. Proposed operating profile (not activated)
+## 7. One daily ceiling on every provider HTTP attempt
+
+Discovery/refresh (at most 5 logical requests, 8 HTTP attempts a run) and the
+VECTOR OHLCV history (at most 6 requests, 8 attempts a run, its own paced
+transport) each keep their per-run budgets.
+`EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY` adds one ceiling over all of
+them for the UTC day.
+
+**How the ceiling is applied.**
+
+- The attempts recorded by the earlier runs of the day
+  (`scout_runs.provider_http_attempts`) are subtracted from it.
+- The rest is a single allowance. Every transport of the run takes from it
+  before each attempt, retries included.
+- Once it is spent, the next request fails with `REQUEST_BUDGET_EXHAUSTED`.
+  For discovery this counts as a provider failure. For history it stops the
+  run's reads without setting a backoff.
+- Page 2 also needs it to be large enough.
+- The next UTC day starts fresh at the ceiling. Unused attempts are never
+  carried over.
+
+**What the observation profile enforces.** It must set the ceiling explicitly,
+to a value from 1 to 5760, or the run is refused with
+`OBSERVE_HTTP_DAILY_BUDGET_NOT_EXPLICIT`. `status.sh` shows the day's
+attempts.
+
+**Reservation.** Before its first attempt, a run reserves its share:
+the most it can spend, which is 8 attempts per transport it may use, capped
+by what the day has left. The reservation is its own `scout_runs` row
+(`FAILED`, `RUN_INCOMPLETE`), committed first; the run's final record
+replaces it with what was actually spent. A run that is killed, cancelled
+or crashes keeps its reservation in the day's sum, so the ceiling holds
+whatever becomes of a run. `status.sh` does not report the reservation of
+the run in progress as a failed run.
+
+**Spent day.** When nothing is left at a run's start, the run makes no
+provider request at all, records `stop = PROVIDER_HTTP_DAILY_BUDGET_REACHED`
+and is otherwise a normal completed run.
+
+**Several processes.** A run reads the day's sum, reserves its share and
+records its end while holding the scout's PostgreSQL advisory lock. A
+second run that starts meanwhile gives way (`ALREADY_RUNNING`) without any
+request. A killed process releases the lock with its connection, and its
+committed reservation stays in the sum. The ceiling counts what is recorded
+in one database: runs against another database have their own count.
+
+**Scope.** Only the observation profile requires the ceiling. The runtime
+scout (`ops/scout`) and the Linux jobs keep the default 0 (no daily ceiling)
+until they are configured for it.
+
+The ceiling is not an approval to spend it.
+
+## 8. Measurement plan (24 / 48 / 72 h)
+
+`ops/observe/report.sh START HOURS` prints one report for a window. START is
+the observation start in UTC (`YYYY-MM-DDTHH:MM:SSZ`), and HOURS is 24, 48 or
+72. The report reads the observation database in a read-only transaction and
+makes no provider call. It contains:
+
+- scout runs: completed, failed and stopped; errors; pauses over 10 minutes
+  (sleep, stop, outage);
+- requests: logical requests, HTTP attempts (in total and per UTC day),
+  `/networks` pages, network cache hits and refusals, history requests, and
+  429s where they are recorded (history, page 2);
+- discovery: pools, new watches, unique base tokens, V4 against V2/V3, page-2
+  reads, polls without overlap, possible gaps and their reasons;
+- age at first discovery: known and unknown counts, median, P90, share under
+  5 and under 10 minutes for all pools, V4 and V2/V3, and early V4 candidates;
+- VECTOR history checks, sufficiency, backoffs and PROMOTABLE watches;
+- data quality: creation times after the first sighting, duplicate streams,
+  and the trading invariants.
+
+Some figures are UNKNOWN and are printed as UNKNOWN:
+
+- **Total discovery coverage** needs an independent reference.
+- **A 429 on page 1 or on a refresh** is not recorded on its own.
+- **Runs from before migration 0027** carry neither HTTP attempts nor creation
+  times. Set START after the first run on 0027.
+
+## 9. Proposed operating profile (not activated)
 
 | Item | Proposal | Reason |
 | --- | --- | --- |

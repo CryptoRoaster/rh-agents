@@ -39,7 +39,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from functools import partial
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 from sqlalchemy import text
@@ -73,7 +73,7 @@ from src.markets.geckoterminal.errors import (
 )
 from src.markets.geckoterminal.networks import CHAINS, Chain, NetworkDirectory, selected_chains
 from src.markets.geckoterminal.ohlcv import GeckoTerminalOhlcvSource
-from src.markets.geckoterminal.transport import GeckoTerminalTransport
+from src.markets.geckoterminal.transport import AttemptAllowance, GeckoTerminalTransport
 from src.markets.history import MarketHistory, MarketHistorySource, MarketHistoryUnavailable
 from src.markets.models import Availability, MarketPair, MarketSnapshot
 from src.markets.recorder import MarketRecorder, ObservationConflict, record_pair_reporting
@@ -305,6 +305,11 @@ class Tally:
     network_cache_hits: int = 0
     network_cache_rejected: int = 0
     provider_http_attempts: int = 0
+    # The daily ceiling on provider HTTP attempts, what the day had used when
+    # the run began, and the allowance every transport of this run shares.
+    provider_http_daily_budget: int = 0
+    provider_http_daily_used_before: int = 0
+    allowance: AttemptAllowance | None = None
     reviews: list[ScoutReview] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     shadow: ShadowTally = field(default_factory=ShadowTally)
@@ -334,6 +339,14 @@ class Readings:
     refresh_budget: int
     # Per pair: the reading, or None where this run already tried and failed.
     by_pair: dict[str, MarketSnapshot | None] = field(default_factory=dict)
+
+
+# The run's stop when the day's provider HTTP attempts are already spent.
+PROVIDER_HTTP_DAILY_BUDGET_REACHED = "PROVIDER_HTTP_DAILY_BUDGET_REACHED"
+
+
+class _NoProviderStage(Exception):
+    """Internal: leave the run's provider stages out, then record it as usual."""
 
 
 class EarlyScoutCycle:
@@ -411,6 +424,7 @@ class EarlyScoutCycle:
 
     async def _run(self) -> ScoutSummary:
         started = self._clock.now()
+        run_id = uuid4()
         tally = Tally()
         transport: GeckoTerminalTransport | None = None
         try:
@@ -418,8 +432,16 @@ class EarlyScoutCycle:
                 tally.bootstrapped = await self._watches.bootstrap(
                     started, self._settings.early_scout_max_bootstrap_streams
                 )
+                if not await self._daily_allowance(tally, started, run_id):
+                    # The day's provider HTTP attempts are spent: no provider
+                    # stage runs, and nothing is fetched later to make up.
+                    tally.stop = PROVIDER_HTTP_DAILY_BUDGET_REACHED
+                    raise _NoProviderStage
                 transport = GeckoTerminalTransport(
-                    self._settings, transport=self._ports.market_http, clock=self._clock
+                    self._settings,
+                    transport=self._ports.market_http,
+                    clock=self._clock,
+                    allowance=tally.allowance,
                 )
                 # Bindings validated by an earlier run, within the cache's TTL.
                 cache = NetworkBindingCache(self._sessions, self._settings)
@@ -443,6 +465,8 @@ class EarlyScoutCycle:
                 await self._shadow(tally)
                 # Outcome labels, after everything else and on their own budget.
                 await self._outcomes(tally)
+        except _NoProviderStage:
+            pass
         except SystemPauseUnavailable:
             tally.stop = "SYSTEM_STOPPED"
             tally.fail("SYSTEM_STOP_UNREADABLE")
@@ -454,7 +478,6 @@ class EarlyScoutCycle:
             if transport is not None:
                 await transport.__aexit__(None, None, None)
         summary = self._summary(started, tally, transport)
-        run_id = uuid4()
         try:
             await ScoutRunRepository(self._sessions).record(
                 run_id, started, self._clock.now(), summary
@@ -464,6 +487,39 @@ class EarlyScoutCycle:
                 update={"errors": (*summary.errors, "RUN_HISTORY_UNAVAILABLE")[:16]}
             )
         return summary.model_copy(update={"run_id": run_id})
+
+    def _run_attempt_bound(self) -> int:
+        """The most HTTP attempts one run can make: each transport's own cap, summed."""
+        settings = self._settings
+        transports = 1
+        if settings.early_scout_history_max_requests_per_run > 0:
+            transports += 1
+        if settings.outcome_sampler_enabled and settings.outcome_max_requests_per_run > 0:
+            transports += 1
+        return transports * settings.geckoterminal_max_http_attempts
+
+    async def _daily_allowance(self, tally: Tally, started: datetime, run_id: UUID) -> bool:
+        """Reserve this run's share of the day's provider HTTP attempts, before any.
+
+        The reservation is the run's own `scout_runs` row, committed before the
+        first attempt and holding the most this run may spend; the run's final
+        record replaces it with what was spent. A run that never gets that far
+        (killed, cancelled, crashed) keeps its reservation in the day's sum, so
+        the ceiling holds whatever becomes of a run. False: nothing is left.
+        """
+        ceiling = self._settings.early_scout_max_provider_http_attempts_per_day
+        if ceiling <= 0:
+            return True
+        runs = ScoutRunRepository(self._sessions)
+        used = await runs.http_attempts_on(utc_day(started))
+        tally.provider_http_daily_budget = ceiling
+        tally.provider_http_daily_used_before = used
+        share = min(max(0, ceiling - used), self._run_attempt_bound())
+        if share <= 0:
+            return False
+        await runs.reserve(run_id, started, self._policy.version, share)
+        tally.allowance = AttemptAllowance(share)
+        return True
 
     async def _freeze_candidates(self, ordered: list[MarketSnapshot], tally: Tally) -> None:
         """Every new valid stream of this discovery, in the neutral chain order.
@@ -518,7 +574,7 @@ class EarlyScoutCycle:
             update={"geckoterminal_max_requests": settings.outcome_max_requests_per_run}
         )
         transport = GeckoTerminalTransport(
-            budget, transport=self._ports.market_http, clock=self._clock
+            budget, transport=self._ports.market_http, clock=self._clock, allowance=tally.allowance
         )
         directory = NetworkDirectory(transport, budget)
         recorder = MarketRecorder(self._sessions, clock=self._clock)
@@ -1253,6 +1309,7 @@ class EarlyScoutCycle:
             clock=self._clock,
             sleep=self._ports.sleep if self._ports.sleep is not None else asyncio.sleep,
             spacing_seconds=settings.early_scout_history_request_spacing_seconds,
+            allowance=tally.allowance,
         )
         async with transport:
             try:
@@ -1401,6 +1458,8 @@ class EarlyScoutCycle:
             network_cache_rejected=tally.network_cache_rejected,
             provider_http_attempts=tally.provider_http_attempts
             + (0 if transport is None else transport.http_attempts),
+            provider_http_daily_budget=tally.provider_http_daily_budget,
+            provider_http_daily_used_before=tally.provider_http_daily_used_before,
             reviews=tuple(tally.reviews[:16]),
             model_failure_reasons=tuple(
                 ModelFailureCount(provider=provider, category=category, reason_code=code, count=n)

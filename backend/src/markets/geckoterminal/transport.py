@@ -38,6 +38,28 @@ def unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+class AttemptAllowance:
+    """HTTP attempts several transports of one run may still make, together.
+
+    Taken before every attempt, retries included; once spent, every transport
+    that shares it refuses its next attempt with `BudgetError`. Never refilled.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(0, limit)
+        self.used = 0
+
+    @property
+    def remaining(self) -> int:
+        return self.limit - self.used
+
+    def take(self) -> bool:
+        if self.used >= self.limit:
+            return False
+        self.used += 1
+        return True
+
+
 class GeckoTerminalTransport:
     def __init__(
         self,
@@ -47,6 +69,7 @@ class GeckoTerminalTransport:
         clock: Clock | None = None,
         sleep: Sleep = asyncio.sleep,
         spacing_seconds: float = 0.0,
+        allowance: AttemptAllowance | None = None,
     ) -> None:
         self._clock = clock if clock is not None else SystemClock()
         self._sleep = sleep
@@ -60,6 +83,8 @@ class GeckoTerminalTransport:
         self._timeout = settings.geckoterminal_total_timeout_seconds
         self._max_requests = settings.geckoterminal_max_requests
         self._max_attempts = settings.geckoterminal_max_http_attempts
+        # Shared with the run's other transports when a daily ceiling is set.
+        self._allowance = allowance
         self.logical_requests = 0
         self.http_attempts = 0
         # 429 answers seen, retried or not: a run that met one asks for no
@@ -100,7 +125,8 @@ class GeckoTerminalTransport:
     @property
     def attempts_remaining(self) -> int:
         """HTTP attempts this transport may still make, retries included."""
-        return max(0, self._max_attempts - self.http_attempts)
+        own = max(0, self._max_attempts - self.http_attempts)
+        return own if self._allowance is None else min(own, self._allowance.remaining)
 
     def retry_delay(self, header: str | None, attempt: int) -> int:
         fallback = min(self._delay * (1 << attempt), self._delay_cap)
@@ -120,6 +146,9 @@ class GeckoTerminalTransport:
     async def get(self, path: str, params: dict[str, str | int]) -> object:
         if self.logical_requests >= self._max_requests:
             raise BudgetError()
+        if self._allowance is not None and self._allowance.remaining <= 0:
+            # Spent before this request: it is not made, and not counted as made.
+            raise BudgetError()
         if self._spacing > 0 and self.logical_requests > 0:
             await self._sleep(self._spacing)
         self.logical_requests += 1
@@ -132,6 +161,8 @@ class GeckoTerminalTransport:
     async def _get(self, path: str, params: dict[str, str | int]) -> object:
         for attempt in range(self._retries + 1):
             if self.http_attempts >= self._max_attempts:
+                raise BudgetError()
+            if self._allowance is not None and not self._allowance.take():
                 raise BudgetError()
             self.http_attempts += 1
             delay = self.retry_delay(None, attempt)
@@ -175,5 +206,8 @@ class GeckoTerminalTransport:
                 raise UnavailableError() from None
             if attempt == self._retries:
                 raise failure from None
+            if self.attempts_remaining <= 0:
+                # No attempt left to retry with: no point waiting for one.
+                raise BudgetError() from None
             await self._sleep(delay)
         raise AssertionError("Bounded retries exhausted")

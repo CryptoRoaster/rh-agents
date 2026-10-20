@@ -20,6 +20,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[3]
 OBSERVE = REPO / "ops" / "observe"
 FILES = (
+    "report.sh",
     "common.sh",
     "run-observe.sh",
     "start.sh",
@@ -626,6 +627,53 @@ def test_a_replaced_tree_never_vouches_for_changed_code(box):
     subprocess.run([*git, "replace", tree.stdout.strip(), evil.stdout.strip()], check=True)
     assert script(box, "run-observe.sh").returncode == 78
     assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "5761", "-1", "1e3", "09999"])
+def test_the_daily_http_ceiling_is_required_and_bounded(box, value):
+    lines = [
+        line
+        for line in base_profile(box).splitlines()
+        if not line.startswith("EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY=")
+    ]
+    if value is not None:
+        lines.append(f"EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY={value}")
+    box["env_file"].write_text("\n".join(lines) + "\n")
+    result = script(box, "run-observe.sh")
+    assert result.returncode == 78
+    assert "OBSERVE_HTTP_DAILY_BUDGET_NOT_EXPLICIT" in log(box) or "MALFORMED" in log(box)
+    assert not (box["record"] / "args").exists()
+
+
+def test_the_daily_http_ceiling_reaches_the_scout(box):
+    profile_with(box, EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY="3000")
+    assert script(box, "run-observe.sh").returncode == 0
+    env = (box["record"] / "env").read_text()
+    assert "EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY=3000" in env
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        (),
+        ("2026-10-20T06:00:00Z",),
+        ("2026-10-20 06:00", "24"),
+        ("2026-10-20T06:00:00Z", "12"),
+        ("2026-10-20T06:00:00Z';drop table x;--", "24"),
+        ("2026-13-45T06:00:00Z", "24"),
+    ],
+)
+def test_the_report_takes_only_a_utc_start_and_24_48_or_72_hours(box, args):
+    result = script(box, "report.sh", *args)
+    assert result.returncode == 64
+    assert "usage" in result.stderr
+
+
+def test_the_report_reads_in_a_read_only_transaction():
+    text = (OBSERVE / "report.sh").read_text()
+    assert "default_transaction_read_only=on" in text
+    for verb in ("insert ", "update ", "delete ", "drop ", "alter ", "truncate "):
+        assert verb not in text.lower()
 
 
 # ------------------------------------------------------------ stop and restart
