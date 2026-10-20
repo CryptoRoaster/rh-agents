@@ -20,6 +20,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[3]
 OBSERVE = REPO / "ops" / "observe"
 FILES = (
+    "report.sh",
     "common.sh",
     "run-observe.sh",
     "start.sh",
@@ -649,6 +650,29 @@ def test_the_daily_http_ceiling_reaches_the_scout(box):
     assert script(box, "run-observe.sh").returncode == 0
     env = (box["record"] / "env").read_text()
     assert "EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY=3000" in env
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        (),
+        ("2026-10-20T06:00:00Z",),
+        ("2026-10-20 06:00", "24"),
+        ("2026-10-20T06:00:00Z", "12"),
+        ("2026-10-20T06:00:00Z';drop table x;--", "24"),
+    ],
+)
+def test_the_report_takes_only_a_utc_start_and_24_48_or_72_hours(box, args):
+    result = script(box, "report.sh", *args)
+    assert result.returncode == 64
+    assert "usage" in result.stderr
+
+
+def test_the_report_reads_in_a_read_only_transaction():
+    text = (OBSERVE / "report.sh").read_text()
+    assert "default_transaction_read_only=on" in text
+    for verb in ("insert ", "update ", "delete ", "drop ", "alter ", "truncate "):
+        assert verb not in text.lower()
 
 
 # ------------------------------------------------------------ stop and restart

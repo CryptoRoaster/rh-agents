@@ -65,6 +65,10 @@ COUNTERS = (
 )
 
 
+# A run reserved its provider attempts and has not recorded its end (yet).
+RUN_INCOMPLETE = "RUN_INCOMPLETE"
+
+
 def run_status(summary: ScoutSummary) -> str:
     """COMPLETED, STOPPED (a durable stop) or FAILED (a technical fault)."""
     if summary.errors:
@@ -100,7 +104,8 @@ class ScoutRunRepository:
         self, run_id: UUID, started: datetime, completed: datetime, summary: ScoutSummary
     ) -> None:
         async with self.sessions.begin() as session:
-            session.add(
+            # Replaces this run's reservation, if it made one.
+            await session.merge(
                 ScoutRunRow(
                     id=run_id,
                     started_at=started,
@@ -118,6 +123,25 @@ class ScoutRunRepository:
                     **{name: getattr(summary, name) for name in COUNTERS},
                 )
             )
+
+    async def reserve(
+        self, run_id: UUID, started: datetime, policy_version: str, attempts: int
+    ) -> None:
+        """This run's provider HTTP attempts, reserved and committed before any.
+
+        A terminal row as a run that never finished would leave it: FAILED,
+        `RUN_INCOMPLETE`, every counter zero but the reserved attempts. The
+        run's own `record` replaces it.
+        """
+        incomplete = ScoutSummary(
+            policy_version=policy_version,
+            started_at=started.isoformat(),
+            finished_at=started.isoformat(),
+            stop=RUN_INCOMPLETE,
+            errors=(RUN_INCOMPLETE,),
+            provider_http_attempts=attempts,
+        )
+        await self.record(run_id, started, started, incomplete)
 
     async def http_attempts_on(self, day: date) -> int:
         """Provider HTTP attempts the scout runs started on this UTC day recorded."""

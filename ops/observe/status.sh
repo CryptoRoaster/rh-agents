@@ -53,13 +53,17 @@ echo "revision: $(q 'select version_num from alembic_version')"
 echo "latest runs (started_at | status | stop | discovered | watches_created | provider_requests | errors):"
 q "select to_char(started_at at time zone 'Europe/Berlin','YYYY-MM-DD HH24:MI:SS'), status, stop, discovered, watches_created, provider_requests, jsonb_array_length(errors) from scout_runs order by started_at desc limit 5" | sed 's/^/  /'
 age="$(q "select coalesce(extract(epoch from now() - max(completed_at))::int, -1) from scout_runs")" || age=-1
-latest="$(q "select coalesce((select status from scout_runs order by started_at desc limit 1), 'NONE')")" || latest=UNREADABLE
+# The run in progress has reserved its provider attempts as a RUN_INCOMPLETE
+# row; while it runs, that row is not the latest finished run.
+skip_incomplete=false
+observe_running_pid >/dev/null && skip_incomplete=true
+latest="$(q "select coalesce((select status from scout_runs where not ($skip_incomplete and stop = 'RUN_INCOMPLETE') order by started_at desc limit 1), 'NONE')")" || latest=UNREADABLE
 echo "seconds since last run: $age; latest status: $latest"
 if [[ "$loaded" == yes && "$stopped" == no ]]; then
   if [[ "$age" == -1 ]] || ((age > 2 * INTERVAL)); then degraded NO_RECENT_RUN; fi
 fi
 [[ "$latest" == NONE || "$latest" == COMPLETED ]] || degraded "LATEST_RUN_$latest"
-echo "today (UTC): $(q "select count(*) || ' runs, ' || coalesce(sum(provider_requests),0) || ' provider requests, ' || coalesce(sum(provider_http_attempts),0) || ' provider HTTP attempts, ' || coalesce(sum(orbit_reviews_started),0) || ' model reviews' from scout_runs where started_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc'")"
+echo "today (UTC): $(q "select count(*) || ' runs, ' || coalesce(sum(provider_requests),0) || ' provider requests, ' || coalesce(sum(provider_http_attempts),0) || ' of $(observe_get EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY) provider HTTP attempts (reserved included), ' || coalesce(sum(orbit_reviews_started),0) || ' model reviews' from scout_runs where started_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc'")"
 echo "watches by status: $(q "select coalesce(string_agg(status || '=' || n, ', ' order by status), 'none') from (select status, count(*) n from discovery_watches where not is_fixture group by status) s")"
 echo "early candidates (PROMOTABLE): $(q "select count(*) from discovery_watches where status = 'PROMOTABLE' and not is_fixture")"
 

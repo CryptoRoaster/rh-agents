@@ -221,13 +221,53 @@ to a value from 1 to 5760, or the run is refused with
 `OBSERVE_HTTP_DAILY_BUDGET_NOT_EXPLICIT`. `status.sh` shows the day's
 attempts.
 
-**Limit.** A run that is killed before it records itself is not subtracted.
-Each such run is bounded by its per-run budgets: 8 + 8 attempts with
-outcomes off.
+**Reservation.** Before its first attempt, a run reserves its share:
+the most it can spend, which is 8 attempts per transport it may use, capped
+by what the day has left. The reservation is its own `scout_runs` row
+(`FAILED`, `RUN_INCOMPLETE`), committed first; the run's final record
+replaces it with what was actually spent. A run that is killed, cancelled
+or crashes keeps its reservation in the day's sum, so the ceiling holds
+whatever becomes of a run. `status.sh` does not report the reservation of
+the run in progress as a failed run.
+
+**Spent day.** When nothing is left at a run's start, the run makes no
+provider request at all, records `stop = PROVIDER_HTTP_DAILY_BUDGET_REACHED`
+and is otherwise a normal completed run.
+
+**Scope.** Only the observation profile requires the ceiling. The runtime
+scout (`ops/scout`) and the Linux jobs keep the default 0 (no daily ceiling)
+until they are configured for it.
 
 The ceiling is not an approval to spend it.
 
-## 8. Proposed operating profile (not activated)
+## 8. Measurement plan (24 / 48 / 72 h)
+
+`ops/observe/report.sh START HOURS` prints one report for a window. START is
+the observation start in UTC (`YYYY-MM-DDTHH:MM:SSZ`), and HOURS is 24, 48 or
+72. The report reads the observation database in a read-only transaction and
+makes no provider call. It contains:
+
+- scout runs: completed, failed and stopped; errors; pauses over 10 minutes
+  (sleep, stop, outage);
+- requests: logical requests, HTTP attempts (in total and per UTC day),
+  `/networks` pages, network cache hits and refusals, history requests, and
+  429s where they are recorded (history, page 2);
+- discovery: pools, new watches, unique base tokens, V4 against V2/V3, page-2
+  reads, polls without overlap, possible gaps and their reasons;
+- age at first discovery: known and unknown counts, median, P90, share under
+  5 and under 10 minutes for all pools, V4 and V2/V3, and early V4 candidates;
+- VECTOR history checks, sufficiency, backoffs and PROMOTABLE watches;
+- data quality: creation times after the first sighting, duplicate streams,
+  and the trading invariants.
+
+Some figures are UNKNOWN and are printed as UNKNOWN:
+
+- **Total discovery coverage** needs an independent reference.
+- **A 429 on page 1 or on a refresh** is not recorded on its own.
+- **Runs from before migration 0027** carry neither HTTP attempts nor creation
+  times. Set START after the first run on 0027.
+
+## 9. Proposed operating profile (not activated)
 
 | Item | Proposal | Reason |
 | --- | --- | --- |

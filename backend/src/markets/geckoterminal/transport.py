@@ -206,5 +206,8 @@ class GeckoTerminalTransport:
                 raise UnavailableError() from None
             if attempt == self._retries:
                 raise failure from None
+            if self.attempts_remaining <= 0:
+                # No attempt left to retry with: no point waiting for one.
+                raise BudgetError() from None
             await self._sleep(delay)
         raise AssertionError("Bounded retries exhausted")

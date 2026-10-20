@@ -228,3 +228,133 @@ def test_the_daily_ceiling_is_bounded():
         scout_settings(early_scout_max_provider_http_attempts_per_day=5761)
     with pytest.raises(ValidationError):
         scout_settings(early_scout_max_provider_http_attempts_per_day=-1)
+
+
+# ------------------------------------------------------------ reservation before the first attempt
+
+
+class Dies(Exception):
+    pass
+
+
+class DyingProvider(PagedNetworks):
+    """Answers the directory, then the process 'dies' on the new-pool read."""
+
+    def handle(self, request):
+        if request.url.path.endswith("new_pools"):
+            raise Dies()
+        return super().handle(request)
+
+
+async def test_a_run_that_dies_after_its_attempts_still_counts_against_the_day(db):
+    from sqlalchemy import select
+
+    from src.data.tables import ScoutRunRow
+
+    _, sessions = db
+    capped = settings(early_scout_max_provider_http_attempts_per_day=20)
+    with pytest.raises(Dies):
+        await scout(
+            sessions, T0, provider=DyingProvider(discovery_pages={1: page(1)}), settings=capped
+        )
+    async with sessions() as session:
+        (row,) = (await session.scalars(select(ScoutRunRow))).all()
+    # The whole share it reserved before its first attempt: one transport's cap.
+    assert (row.status, row.stop, row.provider_http_attempts) == ("FAILED", "RUN_INCOMPLETE", 8)
+    after = PagedNetworks(discovery_pages={1: page(1)})
+    summary = await scout(sessions, T0 + FIVE, provider=after, settings=capped)
+    assert summary.provider_http_daily_used_before == 8
+
+
+async def test_a_finished_run_replaces_its_reservation_with_what_it_spent(db):
+    from sqlalchemy import select
+
+    from src.data.tables import ScoutRunRow
+
+    _, sessions = db
+    capped = settings(early_scout_max_provider_http_attempts_per_day=20)
+    summary = await scout(
+        sessions, T0, provider=PagedNetworks(discovery_pages={1: page(1)}), settings=capped
+    )
+    async with sessions() as session:
+        (row,) = (await session.scalars(select(ScoutRunRow))).all()
+    assert row.id == summary.run_id
+    assert (row.status, row.stop, row.provider_http_attempts) == ("COMPLETED", "COMPLETED", 4)
+
+
+async def test_the_reservation_bounds_what_the_run_may_spend(db):
+    _, sessions = db
+    # History on: two transports, sixteen attempts at most, and the day has 30.
+    capped = settings(
+        early_scout_max_provider_http_attempts_per_day=30,
+        early_scout_history_max_requests_per_run=6,
+    )
+    summary = await scout(
+        sessions,
+        T0,
+        provider=PagedNetworks(discovery_pages={1: page(1)}),
+        settings=capped,
+        history=False,
+    )
+    assert summary.provider_http_attempts == 4
+
+
+async def test_a_spent_day_runs_no_provider_stage_and_says_so(db):
+    _, sessions = db
+    capped = settings(early_scout_max_provider_http_attempts_per_day=4)
+    await scout(sessions, T0, provider=PagedNetworks(discovery_pages={1: page(1)}), settings=capped)
+    provider = PagedNetworks(discovery_pages={1: page(1)})
+    summary = await scout(sessions, T0 + FIVE, provider=provider, settings=capped)
+    assert provider.requests == []
+    assert summary.stop == "PROVIDER_HTTP_DAILY_BUDGET_REACHED"
+    assert summary.errors == ()
+    assert summary.provider_failures == 0
+
+
+async def test_no_wait_for_a_retry_the_allowance_cannot_pay():
+    waits: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "30"})
+
+    transport = GeckoTerminalTransport(
+        scout_settings(geckoterminal_retries=2),
+        transport=httpx.MockTransport(handle),
+        sleep=sleep,
+        allowance=AttemptAllowance(1),
+    )
+    async with transport:
+        with pytest.raises(BudgetError):
+            await transport.get("a", {})
+    assert waits == []
+
+
+async def test_the_outcome_sampler_draws_from_the_same_allowance(db):
+    from tests.runner.provider import MarketProvider
+    from tests.scout.test_outcomes import OutcomeHistory, discovered
+
+    _, sessions = db
+    await discovered(sessions, limit=5, pools=6)
+    at = T0 + timedelta(hours=73)
+    sampler = {
+        "outcome_sampler_enabled": True,
+        "early_scout_history_max_requests_per_run": 0,
+    }
+    # Discovery of this run takes two attempts (directory, page 1); the day has
+    # exactly those two left, so the sampler's liquidity reads get nothing.
+    provider = MarketProvider()
+    history = OutcomeHistory()
+    history.now = at
+    summary = await scout(
+        sessions,
+        at,
+        provider=provider,
+        history=history,
+        settings=scout_settings(**sampler, early_scout_max_provider_http_attempts_per_day=2),
+    )
+    assert len(provider.requests) == 2
+    assert summary.provider_http_attempts == 2
+    assert summary.outcome_requests == 0
