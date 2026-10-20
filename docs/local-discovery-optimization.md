@@ -234,6 +234,13 @@ the run in progress as a failed run.
 provider request at all, records `stop = PROVIDER_HTTP_DAILY_BUDGET_REACHED`
 and is otherwise a normal completed run.
 
+**Several processes.** A run reads the day's sum, reserves its share and
+records its end while holding the scout's PostgreSQL advisory lock. A
+second run that starts meanwhile gives way (`ALREADY_RUNNING`) without any
+request. A killed process releases the lock with its connection, and its
+committed reservation stays in the sum. The ceiling counts what is recorded
+in one database: runs against another database have their own count.
+
 **Scope.** Only the observation profile requires the ceiling. The runtime
 scout (`ops/scout`) and the Linux jobs keep the default 0 (no daily ceiling)
 until they are configured for it.

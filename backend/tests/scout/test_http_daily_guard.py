@@ -382,3 +382,45 @@ async def test_the_overview_shows_the_latest_finished_run_not_a_reservation(db):
     # The run list stays the record: the reservation is listed as it is.
     newest, *_ = await ScoutRunRepository(sessions).recent(1)
     assert newest.stop == "RUN_INCOMPLETE"
+
+
+# ------------------------------------------------------------ several processes at once
+
+
+@pytest.mark.skipif(
+    not __import__("os").environ.get("TEST_DATABASE_URL"),
+    reason="PostgreSQL advisory locks need a real server",
+)
+async def test_concurrent_runs_never_exceed_the_day(db):
+    """Two scout runs started together: one runs, the other gives way unspent."""
+    import asyncio
+
+    _, sessions = db
+    started = asyncio.Event()
+
+    class Slow(PagedNetworks):
+        async def handle_async(self, request):
+            started.set()
+            await asyncio.sleep(0.3)
+            return super().handle(request)
+
+        def transport(self):
+            return httpx.MockTransport(self.handle_async)
+
+    capped = settings(early_scout_max_provider_http_attempts_per_day=5)
+    first, second = Slow(discovery_pages={1: page(1)}), Slow(discovery_pages={1: page(1)})
+
+    async def later():
+        await started.wait()
+        return await scout(sessions, T0, provider=second, settings=capped)
+
+    one, two = await asyncio.gather(scout(sessions, T0, provider=first, settings=capped), later())
+    assert two.stop == "ALREADY_RUNNING"
+    assert second.requests == []
+    assert one.provider_http_attempts == 4
+    third = PagedNetworks(discovery_pages={1: page(1)})
+    after = await scout(sessions, T0 + FIVE, provider=third, settings=capped)
+    # One attempt left of five: the directory scan stops after its first page.
+    assert after.provider_http_daily_used_before == 4
+    assert after.provider_http_attempts == 1
+    assert len(third.requests) == 1
