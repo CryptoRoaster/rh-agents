@@ -58,6 +58,10 @@ COUNTERS = (
     "discovery_no_overlap_polls",
     "discovery_page2_requests",
     "discovery_possible_gaps",
+    "network_requests",
+    "network_cache_hits",
+    "network_cache_rejected",
+    "provider_http_attempts",
 )
 
 
@@ -83,6 +87,7 @@ def _run(row: ScoutRunRow) -> ScoutRun:
         model_failure_reasons=tuple(
             ModelFailureCount.model_validate(item) for item in row.model_failure_reasons or ()
         ),
+        discovery_gap_reasons=tuple(row.discovery_gap_reasons or ()),
         **{name: getattr(row, name) for name in COUNTERS},
     )
 
@@ -108,6 +113,7 @@ class ScoutRunRepository:
                     model_failure_reasons=[
                         item.model_dump() for item in summary.model_failure_reasons
                     ],
+                    discovery_gap_reasons=list(summary.discovery_gap_reasons),
                     created_at=completed,
                     **{name: getattr(summary, name) for name in COUNTERS},
                 )

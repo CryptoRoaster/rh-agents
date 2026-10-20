@@ -62,12 +62,35 @@ class VerifiedNetworkRegistry:
 
     def __init__(self) -> None:
         self._verified: dict[str, str] = {}
+        self._validated: set[str] = set()
 
     def verified(self, chain: str) -> str | None:
         return self._verified.get(chain)
 
     def record(self, chain: str, network_id: str) -> None:
         self._verified[chain] = network_id
+        self._validated.add(chain)
+
+    def seed(self, chain: str, network_id: str) -> None:
+        """A binding an earlier run validated, as its owner vouches for it.
+
+        Answered like a recorded one, but not reported by `validated`: it was
+        not validated here.
+        """
+        self._verified[chain] = network_id
+
+    def seeded(self, chain: str) -> bool:
+        """Answered from an earlier run's binding, not validated by this one."""
+        return chain in self._verified and chain not in self._validated
+
+    def drop(self, chain: str) -> None:
+        """Forget a binding the provider refused: the next resolution validates."""
+        self._verified.pop(chain, None)
+        self._validated.discard(chain)
+
+    def validated(self) -> dict[str, str]:
+        """The bindings validated against the provider by this registry's run."""
+        return {chain: self._verified[chain] for chain in sorted(self._validated)}
 
     def __len__(self) -> int:
         return len(self._verified)
@@ -103,26 +126,37 @@ class NetworkDirectory:
         # registry. Counts only.
         self.resolved_by_provider = 0
         self.resolved_from_cache = 0
+        # Chains answered from the registry without a request, by name, and
+        # `/networks` requests the transport made for this directory, answered
+        # or not.
+        self.cached_chains: set[str] = set()
+        self.pages_requested = 0
+
+    @property
+    def registry(self) -> VerifiedNetworkRegistry | None:
+        return self._registry
 
     async def resolve(self, chain: Chain) -> str:
         if CHAINS.get(chain.name) != chain:
             raise ConfigurationError()
         network_id = self._configured[chain.name]
         if self._registry is not None and self._registry.verified(chain.name) == network_id:
-            # Validated earlier in this run, against this same configured id.
+            # Validated earlier in this run, against this same configured id,
+            # or by an earlier run whose binding the registry was seeded with.
             self.resolved_from_cache += 1
+            if self._registry.seeded(chain.name):
+                self.cached_chains.add(chain.name)
             return network_id
         while network_id not in self._entries and not self._finished:
             if self._page > self._max_pages:
                 # A bounded scan is not proof that a network does not exist.
                 raise BudgetError()
-            response = validate(
-                NetworksResponse,
-                await self._transport.get(
-                    "networks",
-                    {"page": self._page},
-                ),
-            )
+            before = self._transport.logical_requests
+            try:
+                payload = await self._transport.get("networks", {"page": self._page})
+            finally:
+                self.pages_requested += self._transport.logical_requests - before
+            response = validate(NetworksResponse, payload)
             for entry in response.data:
                 previous = self._entries.get(entry.id)
                 if previous is not None and previous != entry:

@@ -151,6 +151,9 @@ power.
 - GeckoTerminal at most 5 760 HTTP calls a day (worst case; the expected figure is about 300 to 1 700), all other providers 0, cost 0.
 - An ORBIT budget, if wanted, is a separate approval. The code defaults are 4 a run and 96 a day. Set them together with `RH_AGENTS_OBSERVE_MODEL_BUDGET_APPROVED=yes`.
 
+Request optimisation, page 2, coverage and the proposed continuous profile:
+`docs/local-discovery-optimization.md`.
+
 ## 6. Verification
 
 `backend/tests/ops/test_observe_local.py` covers:

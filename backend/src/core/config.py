@@ -431,6 +431,14 @@ class Settings(BaseSettings):
     # (~57 a day); 72 is a quarter of the 288 daily polls. Exhausted means no
     # page 2 and the poll recorded as a possible gap — never a wider read.
     early_scout_max_discovery_page2_per_day: int = Field(default=72, ge=0, le=288)
+    # How long a validated GeckoTerminal network binding (chain -> network id,
+    # checked against the paginated `/networks` directory, the configured id and
+    # the chain's platform) is reused by later scout runs. Robinhood is listed on
+    # directory page 3, so validating it costs three of the run's requests; the
+    # stored binding costs none. Only that exact binding is reused: another
+    # configured id, platform or provider, an entry from the future or one older
+    # than this is validated again. 0, the default, keeps no binding.
+    early_scout_network_cache_ttl_seconds: int = Field(default=0, ge=0, le=86400)
     # The V4 prefilter. Only a 32-byte V4 pool id can reach LP_CONTROL=PASS; a
     # 20-byte pool address (V2/V3-style) is UNSUPPORTED, so it can never be
     # bought (issue #92). On, such a pool is still discovered, recorded and

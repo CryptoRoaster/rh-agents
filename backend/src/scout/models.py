@@ -181,6 +181,13 @@ class ScoutSummary(Immutable):
     discovery_page2_requests: int = Field(default=0, ge=0)
     discovery_possible_gaps: int = Field(default=0, ge=0)
     discovery_gap_reasons: tuple[Code, ...] = Field(default=(), max_length=16)
+    # Provider request accounting: `/networks` pages read, chains answered from
+    # the stored network binding, stored bindings refused, and every HTTP
+    # attempt of the run on any transport, retries included.
+    network_requests: int = Field(default=0, ge=0)
+    network_cache_hits: int = Field(default=0, ge=0)
+    network_cache_rejected: int = Field(default=0, ge=0)
+    provider_http_attempts: int = Field(default=0, ge=0)
     reviews: tuple[ScoutReview, ...] = Field(default=(), max_length=16)
     # Every model failure of this run, counted by provider, category and code.
     model_failure_reasons: tuple[ModelFailureCount, ...] = Field(default=(), max_length=32)
@@ -265,6 +272,11 @@ class ScoutRun(Immutable):
     discovery_no_overlap_polls: int = 0
     discovery_page2_requests: int = 0
     discovery_possible_gaps: int = 0
+    discovery_gap_reasons: tuple[str, ...] = ()
+    network_requests: int = 0
+    network_cache_hits: int = 0
+    network_cache_rejected: int = 0
+    provider_http_attempts: int = 0
     model_failure_reasons: tuple[ModelFailureCount, ...] = ()
 
     @property

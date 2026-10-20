@@ -63,7 +63,8 @@ OBSERVE_KEYS=(
   DATABASE_URL TRADING_MODE PAPER_RUNNER_ENABLED EARLY_SCOUT_ENABLED
   MARKET_PROVIDER MARKET_CHAINS GECKOTERMINAL_MAX_REQUESTS
   EARLY_SCOUT_MAX_DISCOVERY_POOLS EARLY_SCOUT_DISCOVERY_PAGE2_ENABLED
-  EARLY_SCOUT_MAX_DISCOVERY_PAGE2_PER_DAY EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN
+  EARLY_SCOUT_MAX_DISCOVERY_PAGE2_PER_DAY EARLY_SCOUT_NETWORK_CACHE_TTL_SECONDS
+  EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN
   EARLY_SCOUT_V4_PREFILTER_ENABLED EARLY_SCOUT_HISTORY_MAX_REQUESTS_PER_RUN
   EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN
   EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_DAY REASONING_PROVIDER CODEX_EXECUTABLE
@@ -148,16 +149,46 @@ observe_env_args() {
   done
 }
 
+# Finder metadata, and nothing that only carries its name: a regular file (no
+# link, no directory) called exactly `.DS_Store` that starts with Finder's
+# buddy-allocator header. Python imports no such file. Argument: a path
+# relative to the checkout.
+observe_finder_metadata() {
+  local path="$REPO/$1"
+  [[ "${1##*/}" == .DS_Store && -f "$path" && ! -L "$path" ]] || return 1
+  [[ "$(LC_ALL=C head -c 8 "$path" | od -An -tx1 | tr -d ' \n')" == 0000000142756431 ]]
+}
+
 # Only committed code runs: no tracked change, and no untracked or ignored file
 # anywhere the scout could import from (ops/ and backend/, whose directory
-# leads sys.path under `python -m`), except the virtualenv and tool caches.
+# leads sys.path under `python -m`), except the virtualenv, tool caches and
+# Finder metadata (`observe_finder_metadata`), which Finder writes on its own
+# whenever the checkout is opened in it.
 observe_code_clean() {
+  local entry rc=""
+  local status=(git -C "$REPO" status --porcelain -z --untracked-files=all --ignored -- ops backend
+    ':(exclude)backend/.venv' ':(exclude)backend/.mypy_cache' ':(exclude)backend/.pytest_cache'
+    ':(exclude)backend/.ruff_cache' ':(exclude)**/__pycache__/**')
   git -C "$REPO" diff --quiet HEAD -- || return 1
   # An assume-unchanged or skip-worktree file hides its edit from diff and status.
   [[ -z "$(git -C "$REPO" ls-files -v -- ops backend | grep -v '^H ')" ]] || return 1
-  [[ -z "$(git -C "$REPO" status --porcelain --untracked-files=all --ignored -- ops backend \
-    ':(exclude)backend/.venv' ':(exclude)backend/.mypy_cache' ':(exclude)backend/.pytest_cache' \
-    ':(exclude)backend/.ruff_cache' ':(exclude)**/__pycache__/**')" ]]
+  # Read NUL-separated, so no file name can split into entries of its own,
+  # and followed by git's exit status: only a listing git finished counts.
+  # An entry always starts with its two status letters, never with `RC=`.
+  while IFS= read -r -d '' entry; do
+    [[ -z "$rc" ]] || return 1
+    if [[ "$entry" == RC=* ]]; then
+      rc="${entry#RC=}"
+      continue
+    fi
+    # Untracked or ignored, and Finder's: anything else is a change.
+    [[ "${entry:0:3}" == '?? ' || "${entry:0:3}" == '!! ' ]] || return 1
+    observe_finder_metadata "${entry:3}" || return 1
+  done < <(
+    "${status[@]}"
+    printf 'RC=%s\0' "$?"
+  )
+  [[ "$rc" == 0 ]]
 }
 
 # The start time of a process, as ps prints it (empty when it is gone).

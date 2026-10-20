@@ -38,6 +38,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from uuid import uuid4
 
 import httpx
@@ -64,7 +65,12 @@ from src.core.config import Settings
 from src.data.database import connect
 from src.fast_reasoning.provider import FastAssessmentProvider
 from src.markets.geckoterminal.adapter import MAX_POOLS_PER_REQUEST, GeckoTerminalAdapter
-from src.markets.geckoterminal.errors import IdentityError, ProviderError
+from src.markets.geckoterminal.errors import (
+    ClientError,
+    ContractError,
+    IdentityError,
+    ProviderError,
+)
 from src.markets.geckoterminal.networks import CHAINS, Chain, NetworkDirectory, selected_chains
 from src.markets.geckoterminal.ohlcv import GeckoTerminalOhlcvSource
 from src.markets.geckoterminal.transport import GeckoTerminalTransport
@@ -85,6 +91,7 @@ from src.scout.discovery import (
     PAGE2_DISABLED,
     PAGE2_FAILED_PREFIX,
     PAGE2_NO_OVERLAP,
+    PAGE2_RATE_LIMITED,
     PAGE2_RUN_BUDGET,
     PAGE_TRUNCATED,
     DiscoveryReference,
@@ -106,6 +113,7 @@ from src.scout.models import (
     ScoutSummary,
     WatchAssessment,
 )
+from src.scout.network_cache import NetworkBindingCache
 from src.scout.outcomes import (
     SAMPLE_AGGREGATE,
     SAMPLE_STEP,
@@ -290,6 +298,13 @@ class Tally:
     discovery_page2_requests: int = 0
     discovery_possible_gaps: int = 0
     discovery_gap_reasons: list[str] = field(default_factory=list)
+    # Provider request accounting: `/networks` pages read, chains answered from
+    # the stored binding, stored bindings refused, and the HTTP attempts of the
+    # run's other transports (history, outcomes); the main one is added last.
+    network_requests: int = 0
+    network_cache_hits: int = 0
+    network_cache_rejected: int = 0
+    provider_http_attempts: int = 0
     reviews: list[ScoutReview] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     shadow: ShadowTally = field(default_factory=ShadowTally)
@@ -406,10 +421,23 @@ class EarlyScoutCycle:
                 transport = GeckoTerminalTransport(
                     self._settings, transport=self._ports.market_http, clock=self._clock
                 )
-                directory = NetworkDirectory(transport, self._settings)
+                # Bindings validated by an earlier run, within the cache's TTL.
+                cache = NetworkBindingCache(self._sessions, self._settings)
+                loaded = await cache.load(selected_chains(self._settings), started)
+                tally.network_cache_rejected = loaded.rejected
+                directory = NetworkDirectory(transport, self._settings, registry=loaded.registry)
                 recorder = MarketRecorder(self._sessions, clock=self._clock)
-                fresh = await self._discover(transport, directory, recorder, tally, started)
-                await self._scheduled(transport, directory, recorder, fresh, tally)
+                try:
+                    fresh = await self._discover(
+                        transport, directory, recorder, tally, started, cache
+                    )
+                    await self._scheduled(transport, directory, recorder, fresh, tally)
+                finally:
+                    tally.network_requests += directory.pages_requested
+                    tally.network_cache_hits = len(directory.cached_chains)
+                # Dated from the run's start, before any validation in it: the
+                # TTL never runs longer than from the validation itself.
+                await cache.store(loaded.registry, started)
                 # Last, after every review and check: shadow work cannot change
                 # what the run already decided, nor delay it.
                 await self._shadow(tally)
@@ -568,6 +596,8 @@ class EarlyScoutCycle:
             tally.outcomes.failure(error.code.upper())
         finally:
             tally.outcomes.requests = transport.logical_requests
+            tally.provider_http_attempts += transport.http_attempts
+            tally.network_requests += directory.pages_requested
             await transport.__aexit__(None, None, None)
 
     async def _permitted(self, tally: Tally) -> bool:
@@ -591,6 +621,7 @@ class EarlyScoutCycle:
         recorder: MarketRecorder,
         tally: Tally,
         started: datetime,
+        cache: NetworkBindingCache,
     ) -> dict[str, MarketSnapshot]:
         """One new-pool read per chain. Returns what this run recorded, by pair.
 
@@ -604,8 +635,14 @@ class EarlyScoutCycle:
         A saturated page 1 — full, and sharing no pool with anything recorded
         before the run — is a possible gap; page 2 may then be read once
         (`_page_two`). Its pools are discovery data exactly like page 1's.
+
+        A chain answered from the stored network binding whose new-pool read the
+        provider then refuses as a client or contract error drops that binding:
+        the next run validates the chain again.
         """
         recorded: dict[str, MarketSnapshot] = {}
+        # The provider's stated pool creation time, by pair id (None: UNKNOWN).
+        created: dict[str, datetime | None] = {}
         by_chain: list[list[MarketSnapshot]] = []
         bounded = self._settings.model_copy(
             update={"geckoterminal_pools_per_chain": self._settings.early_scout_max_discovery_pools}
@@ -620,9 +657,11 @@ class EarlyScoutCycle:
                 tally.rejections[error.code.upper()] = (
                     tally.rejections.get(error.code.upper(), 0) + 1
                 )
+                await self._refuted(chain, directory, cache, error)
                 continue
             finally:
                 self._count(adapter, tally)
+            created.update(adapter.created_at)
             tally.valid_markets += len(pairs)
             batch: list[MarketSnapshot] = []
             for pair in pairs:
@@ -635,10 +674,20 @@ class EarlyScoutCycle:
             # chain, and one refresh request per chain. Page 2 never takes it.
             reserve = (len(chains) - index - 1) + len(chains)
             for snapshot in await self._page_two(
-                chain, adapter, pairs, transport, recorder, tally, started, reserve
+                chain,
+                adapter,
+                pairs,
+                transport,
+                recorder,
+                tally,
+                started,
+                reserve,
+                partial(self._refuted, chain, directory, cache),
             ):
                 recorded[snapshot.pair.pair_id] = snapshot
                 batch.append(snapshot)
+            for pair_id, stated in adapter.created_at.items():
+                created.setdefault(pair_id, stated)
             by_chain.append(batch)
         ordered = round_robin(by_chain)
         # The JEV-0 candidate set is fixed here, from discovery alone and before
@@ -659,6 +708,7 @@ class EarlyScoutCycle:
                 now=now,
                 allow_create=tally.watches_created < limit
                 and snapshot.pair.pair_id not in declined,
+                pool_created_at=created.get(snapshot.pair.pair_id),
             )
             if result is SyncResult.CREATED:
                 tally.watches_created += 1
@@ -670,6 +720,16 @@ class EarlyScoutCycle:
                 ):
                     tally.watches_declined += 1
         return recorded
+
+    @staticmethod
+    async def _refuted(
+        chain: Chain, directory: NetworkDirectory, cache: NetworkBindingCache, error: ProviderError
+    ) -> None:
+        """A client or contract error on a chain answered from a stored binding drops it."""
+        if chain.name in directory.cached_chains and isinstance(error, ClientError | ContractError):
+            registry = directory.registry
+            if registry is not None:
+                await cache.forget(chain, registry)
 
     @staticmethod
     def _count(adapter: GeckoTerminalAdapter, tally: Tally) -> None:
@@ -692,6 +752,7 @@ class EarlyScoutCycle:
         tally: Tally,
         started: datetime,
         reserve: int,
+        refuted: Callable[[ProviderError], Awaitable[None]],
     ) -> list[MarketSnapshot]:
         """Page 2 of new pools, once, and only on proven saturation of page 1.
 
@@ -726,7 +787,11 @@ class EarlyScoutCycle:
         if used >= settings.early_scout_max_discovery_page2_per_day:
             tally.gap(PAGE2_DAILY_BUDGET)
             return []
-        if transport.remaining < 1 + reserve:
+        if transport.rate_limited:
+            # Even a 429 a retry got past: the provider asked this run to slow down.
+            tally.gap(PAGE2_RATE_LIMITED)
+            return []
+        if transport.remaining < 1 + reserve or transport.attempts_remaining < 1 + reserve:
             tally.gap(PAGE2_RUN_BUDGET)
             return []
         tally.discovery_page2_requests += 1
@@ -735,6 +800,7 @@ class EarlyScoutCycle:
         except ProviderError as error:
             tally.provider_failures += 1
             tally.gap(PAGE2_FAILED_PREFIX + error.code.upper())
+            await refuted(error)
             return []
         finally:
             self._count(adapter, tally)
@@ -1195,6 +1261,7 @@ class EarlyScoutCycle:
                         break
             finally:
                 tally.history_provider_requests = transport.logical_requests
+                tally.provider_http_attempts += transport.http_attempts
 
     async def _check_history(
         self,
@@ -1329,6 +1396,11 @@ class EarlyScoutCycle:
             discovery_page2_requests=tally.discovery_page2_requests,
             discovery_possible_gaps=tally.discovery_possible_gaps,
             discovery_gap_reasons=tuple(tally.discovery_gap_reasons[:16]),
+            network_requests=tally.network_requests,
+            network_cache_hits=tally.network_cache_hits,
+            network_cache_rejected=tally.network_cache_rejected,
+            provider_http_attempts=tally.provider_http_attempts
+            + (0 if transport is None else transport.http_attempts),
             reviews=tuple(tally.reviews[:16]),
             model_failure_reasons=tuple(
                 ModelFailureCount(provider=provider, category=category, reason_code=code, count=n)

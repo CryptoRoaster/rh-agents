@@ -497,13 +497,19 @@ class WatchRepository:
     # ----------------------------------------------------------------- writes
 
     async def sync(
-        self, snapshot: MarketSnapshot, *, now: datetime, allow_create: bool
+        self,
+        snapshot: MarketSnapshot,
+        *,
+        now: datetime,
+        allow_create: bool,
+        pool_created_at: datetime | None = None,
     ) -> SyncResult:
         """Attach one recorded observation to the watch of its market.
 
         `first_seen_at` is written once, from the observation's own source
         instant, and never moved. `last_seen_at` and the latest snapshot only
-        ever move forward.
+        ever move forward. `pool_created_at` is the provider's stated creation
+        time: written once, and later only into a NULL, never moved.
         """
         identity = snapshot.pair.market_identity
         key = self._stream(identity)
@@ -512,7 +518,9 @@ class WatchRepository:
             if row is None:
                 if not allow_create:
                     return SyncResult.SKIPPED
-                if await self._insert(session, snapshot, now, "WATCH_OPENED"):
+                if await self._insert(
+                    session, snapshot, now, "WATCH_OPENED", pool_created_at=pool_created_at
+                ):
                     return SyncResult.CREATED
                 # Somebody else created it between the read and the insert.
                 row = await session.scalar(select(DiscoveryWatchRow).where(*key).with_for_update())
@@ -521,6 +529,14 @@ class WatchRepository:
             stored = MarketIdentity.model_validate(row.market_payload)
             if not _same_market(stored, identity):
                 return SyncResult.CONFLICT
+            if (
+                row.pool_created_at is None
+                and pool_created_at is not None
+                and pool_created_at <= aware(row.first_seen_at)
+            ):
+                # Never after this system first saw the pool: that would be no
+                # creation time.
+                row.pool_created_at = pool_created_at
             if snapshot.observed_at <= aware(row.last_seen_at):
                 return SyncResult.UNCHANGED
             row.market_payload = identity.model_dump(mode="json")
@@ -599,6 +615,7 @@ class WatchRepository:
         reason: str,
         *,
         first_seen_at: datetime | None = None,
+        pool_created_at: datetime | None = None,
     ) -> bool:
         identity = snapshot.pair.market_identity
         first = first_seen_at if first_seen_at is not None else snapshot.observed_at
@@ -613,6 +630,7 @@ class WatchRepository:
             is_fixture=identity.is_fixture,
             market_payload=identity.model_dump(mode="json"),
             first_seen_at=first,
+            pool_created_at=pool_created_at,
             last_seen_at=snapshot.observed_at,
             latest_snapshot_id=snapshot.id,
             created_at=now,
