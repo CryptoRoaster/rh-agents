@@ -387,6 +387,32 @@ def test_anything_but_finder_metadata_under_that_name_is_refused(box, make):
     assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
 
 
+@pytest.mark.parametrize("failing", ["1", "2"])
+def test_a_failing_git_status_never_passes_the_code_check(box, failing):
+    """Whichever `git status` call fails, the check fails: no listing is no proof."""
+    (box["checkout"] / "backend" / "evil.py").write_text("import os\n")
+    common = box["checkout"] / "ops" / "observe" / "common.sh"
+    probe = (
+        f'source "{common}"\n'
+        "calls=0\n"
+        "git() {\n"
+        '  if [[ " $* " == *" status "* ]]; then\n'
+        "    calls=$((calls + 1))\n"
+        f"    [[ $calls != {failing} ]] || return 128\n"
+        "  fi\n"
+        '  command git "$@"\n'
+        "}\n"
+        "observe_code_clean && echo CLEAN || echo REFUSED\n"
+    )
+    result = subprocess.run(
+        ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "/bin/bash", "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.stdout.strip().splitlines()[-1] == "REFUSED", result.stderr
+
+
 def test_a_tracked_file_replaced_by_finder_bytes_is_still_modified(box):
     target = box["checkout"] / "ops" / "observe" / "observe.env.example"
     target.write_bytes(FINDER_MAGIC)

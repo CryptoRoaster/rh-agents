@@ -79,6 +79,15 @@ class VerifiedNetworkRegistry:
         """
         self._verified[chain] = network_id
 
+    def seeded(self, chain: str) -> bool:
+        """Answered from an earlier run's binding, not validated by this one."""
+        return chain in self._verified and chain not in self._validated
+
+    def drop(self, chain: str) -> None:
+        """Forget a binding the provider refused: the next resolution validates."""
+        self._verified.pop(chain, None)
+        self._validated.discard(chain)
+
     def validated(self) -> dict[str, str]:
         """The bindings validated against the provider by this registry's run."""
         return {chain: self._verified[chain] for chain in sorted(self._validated)}
@@ -123,14 +132,20 @@ class NetworkDirectory:
         self.cached_chains: set[str] = set()
         self.pages_requested = 0
 
+    @property
+    def registry(self) -> VerifiedNetworkRegistry | None:
+        return self._registry
+
     async def resolve(self, chain: Chain) -> str:
         if CHAINS.get(chain.name) != chain:
             raise ConfigurationError()
         network_id = self._configured[chain.name]
         if self._registry is not None and self._registry.verified(chain.name) == network_id:
-            # Validated earlier in this run, against this same configured id.
+            # Validated earlier in this run, against this same configured id,
+            # or by an earlier run whose binding the registry was seeded with.
             self.resolved_from_cache += 1
-            self.cached_chains.add(chain.name)
+            if self._registry.seeded(chain.name):
+                self.cached_chains.add(chain.name)
             return network_id
         while network_id not in self._entries and not self._finished:
             if self._page > self._max_pages:

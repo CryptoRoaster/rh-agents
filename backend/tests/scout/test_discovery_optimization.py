@@ -245,6 +245,46 @@ async def test_a_cached_binding_the_provider_no_longer_answers_is_dropped(db):
     assert again.network_pages == [1, 2, 3]
 
 
+async def test_a_binding_validated_in_this_run_is_no_cache_hit(db):
+    """Page 2 resolving what page 1 validated a moment ago is not the cache at work."""
+    _, sessions = db
+    await scout(
+        sessions, T0, provider=PagedNetworks(discovery_pages={1: page(1)}), settings=settings()
+    )
+    provider = PagedNetworks(discovery_pages={1: page(41), 2: page(21)})
+    summary = await scout(
+        sessions, T0 + FIVE, provider=provider, settings=cached(geckoterminal_max_requests=10)
+    )
+    assert provider.network_pages == [1, 2, 3]
+    assert provider.discovery_page_numbers == [1, 2]
+    assert summary.network_cache_hits == 0
+
+
+async def test_a_cached_binding_refused_on_page_two_is_dropped(db):
+    _, sessions = db
+    await seed(sessions, page(1))
+    provider = PagedNetworks(discovery_pages={1: page(41)}, page_status={2: 404})
+    summary = await scout(sessions, T0 + FIVE, provider=provider, settings=cached())
+    assert provider.discovery_page_numbers == [1, 2]
+    assert summary.discovery_gap_reasons == ("DISCOVERY_PAGE2_PROVIDER_CLIENT_ERROR",)
+    assert await bindings(sessions) == []
+
+
+async def test_a_dropped_binding_is_never_used_again_in_the_same_run():
+    from src.markets.geckoterminal.networks import CHAINS, VerifiedNetworkRegistry
+
+    registry = VerifiedNetworkRegistry()
+    registry.seed("robinhood", NETWORK_ID)
+    assert registry.seeded("robinhood")
+    registry.drop("robinhood")
+    assert registry.verified("robinhood") is None
+    assert not registry.seeded("robinhood")
+    registry.record("robinhood", NETWORK_ID)
+    assert not registry.seeded("robinhood")
+    assert registry.validated() == {"robinhood": NETWORK_ID}
+    assert CHAINS["robinhood"].platform == "robinhood"
+
+
 async def test_a_process_restart_reuses_the_binding_and_creates_no_watch_twice(db):
     """Two separate cycles, as two processes would run them: the database is the state."""
     _, sessions = db
@@ -395,15 +435,20 @@ async def test_the_provider_pool_creation_time_is_kept_and_a_missing_one_stays_u
         created(v3(6), "2026-10-20T05:59:00"),  # no zone: not a point in time
         created(v3(7), "2026-10-20T06:00:01Z"),  # after the fetch: impossible
         created(v3(8), 1760939820),
+        # Out of range once in UTC, and long before any chain: never a creation time.
+        created(v3(9), "0001-01-01T00:00:00+14:00"),
+        created(v3(10), "2009-01-03T18:15:05Z"),
     ]
     summary = await scout(
         sessions, T0, provider=PagedNetworks(discovery_pages={1: pools}), settings=cached()
     )
-    assert summary.watches_created == 8
+    assert summary.watches_created == 10
+    assert summary.errors == ()
     stored = await ages(sessions)
     assert stored["0x" + f"{1:064x}"] == datetime(2026, 10, 20, 5, 57, 30, tzinfo=UTC)
     assert stored["0x" + f"{2:040x}"] == datetime(2026, 10, 20, 5, 51, tzinfo=UTC)
-    for index in (3, 4, 5, 6, 7, 8):
+    assert all(value is None or value.utcoffset() == timedelta(0) for value in stored.values())
+    for index in (3, 4, 5, 6, 7, 8, 9, 10):
         assert stored["0x" + f"{index:040x}"] is None
 
 

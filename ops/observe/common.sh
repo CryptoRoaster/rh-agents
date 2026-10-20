@@ -165,20 +165,30 @@ observe_finder_metadata() {
 # Finder metadata (`observe_finder_metadata`), which Finder writes on its own
 # whenever the checkout is opened in it.
 observe_code_clean() {
-  local entry
+  local entry rc=""
   local status=(git -C "$REPO" status --porcelain -z --untracked-files=all --ignored -- ops backend
     ':(exclude)backend/.venv' ':(exclude)backend/.mypy_cache' ':(exclude)backend/.pytest_cache'
     ':(exclude)backend/.ruff_cache' ':(exclude)**/__pycache__/**')
   git -C "$REPO" diff --quiet HEAD -- || return 1
   # An assume-unchanged or skip-worktree file hides its edit from diff and status.
   [[ -z "$(git -C "$REPO" ls-files -v -- ops backend | grep -v '^H ')" ]] || return 1
-  # Read NUL-separated, so no file name can split into entries of its own.
-  "${status[@]}" >/dev/null || return 1
+  # Read NUL-separated, so no file name can split into entries of its own,
+  # and followed by git's exit status: only a listing git finished counts.
+  # An entry always starts with its two status letters, never with `RC=`.
   while IFS= read -r -d '' entry; do
+    [[ -z "$rc" ]] || return 1
+    if [[ "$entry" == RC=* ]]; then
+      rc="${entry#RC=}"
+      continue
+    fi
     # Untracked or ignored, and Finder's: anything else is a change.
     [[ "${entry:0:3}" == '?? ' || "${entry:0:3}" == '!! ' ]] || return 1
     observe_finder_metadata "${entry:3}" || return 1
-  done < <("${status[@]}")
+  done < <(
+    "${status[@]}"
+    printf 'RC=%s\0' "$?"
+  )
+  [[ "$rc" == 0 ]]
 }
 
 # The start time of a process, as ps prints it (empty when it is gone).

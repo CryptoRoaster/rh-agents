@@ -64,6 +64,13 @@ and the chain is not read (fail-closed).
 error or contract error on `new_pools` (for example a 404) deletes the
 binding, so the next run validates the chain again.
 
+**Base URL.** The provider base URL is not part of the key. The observation
+profile cannot set `GECKOTERMINAL_BASE_URL` (it is not on the allowlist), so
+the stored binding always comes from the public API.
+
+**Dating.** `verified_at` is the run's start, before the validation, so the
+TTL never runs longer than from the validation itself.
+
 **Request count.** With the cache, a run makes:
 
 | Read | Requests |

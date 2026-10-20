@@ -109,8 +109,9 @@ class NetworkBindingCache:
                     )
                 )
 
-    async def forget(self, chain: Chain) -> None:
-        """Drop a binding the provider no longer answers for."""
+    async def forget(self, chain: Chain, registry: VerifiedNetworkRegistry) -> None:
+        """Drop a binding the provider no longer answers for, here and stored."""
+        registry.drop(chain.name)
         async with self.sessions.begin() as session:
             await session.execute(
                 delete(ProviderNetworkBindingRow).where(

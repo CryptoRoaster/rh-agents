@@ -38,6 +38,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from uuid import uuid4
 
 import httpx
@@ -434,7 +435,9 @@ class EarlyScoutCycle:
                 finally:
                     tally.network_requests += directory.pages_requested
                     tally.network_cache_hits = len(directory.cached_chains)
-                await cache.store(loaded.registry, self._clock.now())
+                # Dated from the run's start, before any validation in it: the
+                # TTL never runs longer than from the validation itself.
+                await cache.store(loaded.registry, started)
                 # Last, after every review and check: shadow work cannot change
                 # what the run already decided, nor delay it.
                 await self._shadow(tally)
@@ -654,10 +657,7 @@ class EarlyScoutCycle:
                 tally.rejections[error.code.upper()] = (
                     tally.rejections.get(error.code.upper(), 0) + 1
                 )
-                if chain.name in directory.cached_chains and isinstance(
-                    error, ClientError | ContractError
-                ):
-                    await cache.forget(chain)
+                await self._refuted(chain, directory, cache, error)
                 continue
             finally:
                 self._count(adapter, tally)
@@ -674,7 +674,15 @@ class EarlyScoutCycle:
             # chain, and one refresh request per chain. Page 2 never takes it.
             reserve = (len(chains) - index - 1) + len(chains)
             for snapshot in await self._page_two(
-                chain, adapter, pairs, transport, recorder, tally, started, reserve
+                chain,
+                adapter,
+                pairs,
+                transport,
+                recorder,
+                tally,
+                started,
+                reserve,
+                partial(self._refuted, chain, directory, cache),
             ):
                 recorded[snapshot.pair.pair_id] = snapshot
                 batch.append(snapshot)
@@ -714,6 +722,16 @@ class EarlyScoutCycle:
         return recorded
 
     @staticmethod
+    async def _refuted(
+        chain: Chain, directory: NetworkDirectory, cache: NetworkBindingCache, error: ProviderError
+    ) -> None:
+        """A client or contract error on a chain answered from a stored binding drops it."""
+        if chain.name in directory.cached_chains and isinstance(error, ClientError | ContractError):
+            registry = directory.registry
+            if registry is not None:
+                await cache.forget(chain, registry)
+
+    @staticmethod
     def _count(adapter: GeckoTerminalAdapter, tally: Tally) -> None:
         """Add one page's discovered pools and rejections to the run's tally."""
         tally.discovered += adapter.discovered
@@ -734,6 +752,7 @@ class EarlyScoutCycle:
         tally: Tally,
         started: datetime,
         reserve: int,
+        refuted: Callable[[ProviderError], Awaitable[None]],
     ) -> list[MarketSnapshot]:
         """Page 2 of new pools, once, and only on proven saturation of page 1.
 
@@ -781,6 +800,7 @@ class EarlyScoutCycle:
         except ProviderError as error:
             tally.provider_failures += 1
             tally.gap(PAGE2_FAILED_PREFIX + error.code.upper())
+            await refuted(error)
             return []
         finally:
             self._count(adapter, tally)

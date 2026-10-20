@@ -5,7 +5,7 @@ they are local validation rules, not invented provider measurements.
 """
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -22,6 +22,9 @@ from src.markets.models import Amount
 # A calendar date and a time of day, as ISO 8601 writes them: a bare number,
 # which pydantic would read as Unix seconds, is not a stated creation time.
 ISO_INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+# No pool on any chain this system reads was created before this instant; an
+# earlier stated time is no creation time (and may not even fit a database).
+EARLIEST_POOL = datetime(2015, 1, 1, tzinfo=UTC)
 
 Text = Annotated[str, Field(strict=True, min_length=1, max_length=200)]
 Address = Annotated[str, Field(strict=True, pattern=r"^0x[0-9a-fA-F]{40}$")]
@@ -112,7 +115,12 @@ class PoolAttributes(Provenance):
             return None
         if not isinstance(parsed, datetime) or parsed.utcoffset() is None:
             return None
-        return parsed
+        try:
+            # Stored and compared in UTC; a stated offset may push it out of range.
+            instant = parsed.astimezone(UTC)
+        except (OverflowError, ValueError):
+            return None
+        return instant if instant >= EARLIEST_POOL else None
 
 
 class Pool(Provenance):
