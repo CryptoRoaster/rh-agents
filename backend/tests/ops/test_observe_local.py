@@ -315,6 +315,93 @@ def test_an_uncommitted_file_in_the_code_is_refused(box):
     assert not (box["record"] / "launchctl").exists()
 
 
+# Finder's buddy-allocator header: the first eight bytes of every .DS_Store.
+FINDER_MAGIC = b"\x00\x00\x00\x01Bud1"
+
+
+def finder_file(path: Path, body: bytes = FINDER_MAGIC + b"\x00" * 4088) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    return path
+
+
+@pytest.mark.parametrize("where", ["backend", "backend/src", "ops/observe"])
+def test_finder_metadata_in_the_code_does_not_block_a_run(box, where):
+    finder_file(box["checkout"] / where / ".DS_Store")
+    assert script(box, "run-observe.sh").returncode == 0
+    assert "OBSERVE_WORKTREE_MODIFIED" not in log(box)
+
+
+def test_finder_metadata_that_git_ignores_does_not_block_a_run(box):
+    git = ["git", "-C", str(box["checkout"]), "-c", "user.name=t", "-c", "user.email=t@t"]
+    (box["checkout"] / ".gitignore").write_text(".DS_Store\n")
+    subprocess.run([*git, "add", ".gitignore"], check=True)
+    subprocess.run([*git, "commit", "-qm", "ignore"], check=True)
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+    finder_file(box["checkout"] / "backend" / ".DS_Store")
+    assert script(box, "run-observe.sh").returncode == 0
+
+
+def test_an_ignored_directory_under_finder_name_is_refused(box):
+    git = ["git", "-C", str(box["checkout"]), "-c", "user.name=t", "-c", "user.email=t@t"]
+    (box["checkout"] / ".gitignore").write_text(".DS_Store\n")
+    subprocess.run([*git, "add", ".gitignore"], check=True)
+    subprocess.run([*git, "commit", "-qm", "ignore"], check=True)
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+    finder_file(box["checkout"] / "backend" / ".DS_Store" / "evil.py", FINDER_MAGIC)
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+
+
+def test_a_finder_file_still_leaves_a_real_module_refused(box):
+    finder_file(box["checkout"] / "backend" / ".DS_Store")
+    (box["checkout"] / "backend" / "sitecustomize.py").write_text("raise SystemExit\n")
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        # Code under Finder's name: not Finder's format.
+        lambda root: (root / "backend" / ".DS_Store").write_text("import os\n"),
+        # Empty: Finder never writes one.
+        lambda root: (root / "backend" / ".DS_Store").write_bytes(b""),
+        # Finder's header, but a Python name.
+        lambda root: finder_file(root / "backend" / ".DS_Store.py"),
+        lambda root: finder_file(root / "backend" / "x.DS_Store"),
+        # A directory of that name hides whatever it holds.
+        lambda root: finder_file(root / "backend" / ".DS_Store" / "evil.py", b"import os\n"),
+        # A link points anywhere.
+        lambda root: (root / "backend" / ".DS_Store").symlink_to(
+            root / "ops" / "observe" / "common.sh"
+        ),
+        # A .pth file under Finder's header is still code to site.
+        lambda root: finder_file(root / "backend" / "finder.pth"),
+    ],
+    ids=["code", "empty", "py-suffix", "other-name", "directory", "symlink", "pth"],
+)
+def test_anything_but_finder_metadata_under_that_name_is_refused(box, make):
+    make(box["checkout"])
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+
+
+def test_a_tracked_file_replaced_by_finder_bytes_is_still_modified(box):
+    target = box["checkout"] / "ops" / "observe" / "observe.env.example"
+    target.write_bytes(FINDER_MAGIC)
+    assert script(box, "run-observe.sh").returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
+
+
+def test_start_accepts_finder_metadata_and_still_refuses_code(box):
+    finder_file(box["checkout"] / "backend" / ".DS_Store")
+    (box["checkout"] / "ops" / "observe" / "extra.sh").write_text("echo\n")
+    result = script(box, "start.sh", "--confirm")
+    assert result.returncode == 78
+    assert "OBSERVE_WORKTREE_MODIFIED" in result.stderr
+
+
 # ------------------------------------------------------------ stop and restart
 
 

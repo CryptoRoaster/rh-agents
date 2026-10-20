@@ -227,6 +227,10 @@ class GeckoTerminalAdapter:
         # any limit or validation: a page shorter than a full one is the end of
         # the list, so nothing can lie beyond it.
         self.returned = 0
+        # The provider's pool creation time for each pair of the last page, by
+        # pair id; None where it stated none usable (UNKNOWN). A time after the
+        # fetch completed cannot be a creation time and is UNKNOWN too.
+        self.created_at: dict[str, datetime | None] = {}
 
     async def discover(self, *, page: int = 1) -> tuple[MarketPair, ...]:
         """One page of new pools, page 1 unless told otherwise; one request."""
@@ -235,6 +239,7 @@ class GeckoTerminalAdapter:
         self._snapshots = {}
         self.discovered = self.failed = self.returned = 0
         self.rejections = {}
+        self.created_at = {}
         network_id = await self._directory.resolve(self.chain)
         payload = await self._transport.get(
             f"networks/{network_id}/new_pools",
@@ -274,6 +279,10 @@ class GeckoTerminalAdapter:
                 raise IdentityError()
             pool_addresses.add(snapshot.pair.pair_id)
             snapshots[snapshot.pair.market_identity] = snapshot
+            stated = pool.attributes.pool_created_at
+            self.created_at[snapshot.pair.pair_id] = (
+                stated if stated is not None and stated <= at else None
+            )
         self._snapshots = snapshots
         return tuple(item.pair for item in snapshots.values())
 

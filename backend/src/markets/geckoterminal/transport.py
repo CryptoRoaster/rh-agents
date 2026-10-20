@@ -62,6 +62,9 @@ class GeckoTerminalTransport:
         self._max_attempts = settings.geckoterminal_max_http_attempts
         self.logical_requests = 0
         self.http_attempts = 0
+        # 429 answers seen, retried or not: a run that met one asks for no
+        # optional page afterwards.
+        self.rate_limited = 0
         self._slots = asyncio.Semaphore(settings.geckoterminal_max_concurrency)
         self._client = httpx.AsyncClient(
             base_url=settings.geckoterminal_base_url + "/",
@@ -93,6 +96,11 @@ class GeckoTerminalTransport:
     def remaining(self) -> int:
         """Logical requests this transport may still make."""
         return max(0, self._max_requests - self.logical_requests)
+
+    @property
+    def attempts_remaining(self) -> int:
+        """HTTP attempts this transport may still make, retries included."""
+        return max(0, self._max_attempts - self.http_attempts)
 
     def retry_delay(self, header: str | None, attempt: int) -> int:
         fallback = min(self._delay * (1 << attempt), self._delay_cap)
@@ -134,6 +142,7 @@ class GeckoTerminalTransport:
                     if status in (401, 403):
                         raise AuthenticationError()
                     if status == 429:
+                        self.rate_limited += 1
                         failure = RateLimitError()
                     elif status in (500, 502, 503, 504):
                         failure = UnavailableError()

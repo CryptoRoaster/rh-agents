@@ -902,6 +902,10 @@ class DiscoveryWatchRow(Base):
     # the market by this and nothing else.
     market_payload: Mapped[dict[str, Any]] = mapped_column(JSON().with_variant(JSONB, "postgresql"))
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # When the provider says the pool was created (migration 0027), as it stated
+    # it in the discovery answer. NULL is UNKNOWN: never estimated, never taken
+    # from `first_seen_at`. Written once; a later answer only fills a NULL.
+    pool_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     latest_snapshot_id: Mapped[UUID] = mapped_column(Uuid)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -1071,12 +1075,42 @@ class ScoutRunRow(Base):
     discovery_no_overlap_polls: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     discovery_page2_requests: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     discovery_possible_gaps: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    # Provider request accounting (migration 0027): `/networks` directory pages
+    # read, chains answered from the stored network binding instead, bindings
+    # found and refused, every HTTP attempt of the run on any of its transports
+    # (retries included), and why each possible gap stayed open.
+    network_requests: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    network_cache_hits: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    network_cache_rejected: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    provider_http_attempts: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    discovery_gap_reasons: Mapped[list[str]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), server_default=text("'[]'")
+    )
     # Model failures by provider, category and reason code: a list of
     # {"provider", "category", "reason_code", "count"}. Codes only.
     model_failure_reasons: Mapped[list[dict[str, Any]]] = mapped_column(
         JSON().with_variant(JSONB, "postgresql"), server_default=text("'[]'")
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ProviderNetworkBindingRow(Base):
+    """A provider network id the scout validated for one chain, and when.
+
+    Written only after `NetworkDirectory` validated the binding the usual way:
+    the paginated `/networks` answer, the configured id and the chain's
+    platform. Read back only for that same provider, chain, configured id and
+    platform, and only within `early_scout_network_cache_ttl_seconds` of
+    `verified_at`; anything else is scanned for again. A binding the provider
+    later refuses is deleted.
+    """
+
+    __tablename__ = "provider_network_bindings"
+    provider: Mapped[str] = mapped_column(String(40), primary_key=True)
+    chain: Mapped[str] = mapped_column(String(60), primary_key=True)
+    network_id: Mapped[str] = mapped_column(String(200))
+    platform: Mapped[str] = mapped_column(String(200))
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class ScoutOrbitReservationRow(Base):
