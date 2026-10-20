@@ -73,7 +73,7 @@ from src.markets.geckoterminal.errors import (
 )
 from src.markets.geckoterminal.networks import CHAINS, Chain, NetworkDirectory, selected_chains
 from src.markets.geckoterminal.ohlcv import GeckoTerminalOhlcvSource
-from src.markets.geckoterminal.transport import GeckoTerminalTransport
+from src.markets.geckoterminal.transport import AttemptAllowance, GeckoTerminalTransport
 from src.markets.history import MarketHistory, MarketHistorySource, MarketHistoryUnavailable
 from src.markets.models import Availability, MarketPair, MarketSnapshot
 from src.markets.recorder import MarketRecorder, ObservationConflict, record_pair_reporting
@@ -305,6 +305,11 @@ class Tally:
     network_cache_hits: int = 0
     network_cache_rejected: int = 0
     provider_http_attempts: int = 0
+    # The daily ceiling on provider HTTP attempts, what the day had used when
+    # the run began, and the allowance every transport of this run shares.
+    provider_http_daily_budget: int = 0
+    provider_http_daily_used_before: int = 0
+    allowance: AttemptAllowance | None = None
     reviews: list[ScoutReview] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     shadow: ShadowTally = field(default_factory=ShadowTally)
@@ -418,8 +423,12 @@ class EarlyScoutCycle:
                 tally.bootstrapped = await self._watches.bootstrap(
                     started, self._settings.early_scout_max_bootstrap_streams
                 )
+                await self._daily_allowance(tally, started)
                 transport = GeckoTerminalTransport(
-                    self._settings, transport=self._ports.market_http, clock=self._clock
+                    self._settings,
+                    transport=self._ports.market_http,
+                    clock=self._clock,
+                    allowance=tally.allowance,
                 )
                 # Bindings validated by an earlier run, within the cache's TTL.
                 cache = NetworkBindingCache(self._sessions, self._settings)
@@ -464,6 +473,16 @@ class EarlyScoutCycle:
                 update={"errors": (*summary.errors, "RUN_HISTORY_UNAVAILABLE")[:16]}
             )
         return summary.model_copy(update={"run_id": run_id})
+
+    async def _daily_allowance(self, tally: Tally, started: datetime) -> None:
+        """The day's remaining provider HTTP attempts, shared by this run's transports."""
+        ceiling = self._settings.early_scout_max_provider_http_attempts_per_day
+        if ceiling <= 0:
+            return
+        used = await ScoutRunRepository(self._sessions).http_attempts_on(utc_day(started))
+        tally.provider_http_daily_budget = ceiling
+        tally.provider_http_daily_used_before = used
+        tally.allowance = AttemptAllowance(ceiling - used)
 
     async def _freeze_candidates(self, ordered: list[MarketSnapshot], tally: Tally) -> None:
         """Every new valid stream of this discovery, in the neutral chain order.
@@ -518,7 +537,7 @@ class EarlyScoutCycle:
             update={"geckoterminal_max_requests": settings.outcome_max_requests_per_run}
         )
         transport = GeckoTerminalTransport(
-            budget, transport=self._ports.market_http, clock=self._clock
+            budget, transport=self._ports.market_http, clock=self._clock, allowance=tally.allowance
         )
         directory = NetworkDirectory(transport, budget)
         recorder = MarketRecorder(self._sessions, clock=self._clock)
@@ -1253,6 +1272,7 @@ class EarlyScoutCycle:
             clock=self._clock,
             sleep=self._ports.sleep if self._ports.sleep is not None else asyncio.sleep,
             spacing_seconds=settings.early_scout_history_request_spacing_seconds,
+            allowance=tally.allowance,
         )
         async with transport:
             try:
@@ -1401,6 +1421,8 @@ class EarlyScoutCycle:
             network_cache_rejected=tally.network_cache_rejected,
             provider_http_attempts=tally.provider_http_attempts
             + (0 if transport is None else transport.http_attempts),
+            provider_http_daily_budget=tally.provider_http_daily_budget,
+            provider_http_daily_used_before=tally.provider_http_daily_used_before,
             reviews=tuple(tally.reviews[:16]),
             model_failure_reasons=tuple(
                 ModelFailureCount(provider=provider, category=category, reason_code=code, count=n)

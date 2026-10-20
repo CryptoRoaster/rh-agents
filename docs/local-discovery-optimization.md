@@ -195,7 +195,39 @@ Everything else is still refused. Negative tests cover each of these:
 The git status is read NUL-separated, and a failing `git status` refuses the
 run.
 
-## 7. Proposed operating profile (not activated)
+## 7. One daily ceiling on every provider HTTP attempt
+
+Discovery/refresh (at most 5 logical requests, 8 HTTP attempts a run) and the
+VECTOR OHLCV history (at most 6 requests, 8 attempts a run, its own paced
+transport) each keep their per-run budgets.
+`EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY` adds one ceiling over all of
+them for the UTC day.
+
+**How the ceiling is applied.**
+
+- The attempts recorded by the earlier runs of the day
+  (`scout_runs.provider_http_attempts`) are subtracted from it.
+- The rest is a single allowance. Every transport of the run takes from it
+  before each attempt, retries included.
+- Once it is spent, the next request fails with `REQUEST_BUDGET_EXHAUSTED`.
+  For discovery this counts as a provider failure. For history it stops the
+  run's reads without setting a backoff.
+- Page 2 also needs it to be large enough.
+- The next UTC day starts fresh at the ceiling. Unused attempts are never
+  carried over.
+
+**What the observation profile enforces.** It must set the ceiling explicitly,
+to a value from 1 to 5760, or the run is refused with
+`OBSERVE_HTTP_DAILY_BUDGET_NOT_EXPLICIT`. `status.sh` shows the day's
+attempts.
+
+**Limit.** A run that is killed before it records itself is not subtracted.
+Each such run is bounded by its per-run budgets: 8 + 8 attempts with
+outcomes off.
+
+The ceiling is not an approval to spend it.
+
+## 8. Proposed operating profile (not activated)
 
 | Item | Proposal | Reason |
 | --- | --- | --- |

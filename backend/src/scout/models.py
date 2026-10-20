@@ -188,6 +188,10 @@ class ScoutSummary(Immutable):
     network_cache_hits: int = Field(default=0, ge=0)
     network_cache_rejected: int = Field(default=0, ge=0)
     provider_http_attempts: int = Field(default=0, ge=0)
+    # The daily ceiling on those attempts (0: none) and what earlier runs of
+    # the UTC day had recorded against it when this run started.
+    provider_http_daily_budget: int = Field(default=0, ge=0)
+    provider_http_daily_used_before: int = Field(default=0, ge=0)
     reviews: tuple[ScoutReview, ...] = Field(default=(), max_length=16)
     # Every model failure of this run, counted by provider, category and code.
     model_failure_reasons: tuple[ModelFailureCount, ...] = Field(default=(), max_length=32)

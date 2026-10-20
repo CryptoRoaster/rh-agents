@@ -1,7 +1,7 @@
 """Durable scout run history: one terminal row per scout execution."""
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, date, datetime, time, timedelta
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -118,6 +118,18 @@ class ScoutRunRepository:
                     **{name: getattr(summary, name) for name in COUNTERS},
                 )
             )
+
+    async def http_attempts_on(self, day: date) -> int:
+        """Provider HTTP attempts the scout runs started on this UTC day recorded."""
+        start = datetime.combine(day, time(), tzinfo=UTC)
+        async with self.sessions() as session:
+            used = await session.scalar(
+                select(func.coalesce(func.sum(ScoutRunRow.provider_http_attempts), 0)).where(
+                    ScoutRunRow.started_at >= start,
+                    ScoutRunRow.started_at < start + timedelta(days=1),
+                )
+            )
+        return int(used or 0)
 
     async def recent(self, limit: int, offset: int = 0) -> tuple[ScoutRun, ...]:
         """Newest first."""

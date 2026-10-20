@@ -64,6 +64,7 @@ OBSERVE_KEYS=(
   MARKET_PROVIDER MARKET_CHAINS GECKOTERMINAL_MAX_REQUESTS
   EARLY_SCOUT_MAX_DISCOVERY_POOLS EARLY_SCOUT_DISCOVERY_PAGE2_ENABLED
   EARLY_SCOUT_MAX_DISCOVERY_PAGE2_PER_DAY EARLY_SCOUT_NETWORK_CACHE_TTL_SECONDS
+  EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY
   EARLY_SCOUT_MAX_NEW_WATCHES_PER_RUN
   EARLY_SCOUT_V4_PREFILTER_ENABLED EARLY_SCOUT_HISTORY_MAX_REQUESTS_PER_RUN
   EARLY_SCOUT_MAX_REFRESH_MARKETS_PER_RUN EARLY_SCOUT_MAX_ORBIT_REVIEWS_PER_RUN
@@ -110,6 +111,11 @@ observe_check() {
     [[ "$(observe_get "$key")" == "${pair#*=}" ]] || { echo "OBSERVE_REQUIRES_${key}"; return 1; }
   done
   [[ "$(observe_get DATABASE_URL)" =~ $OBSERVE_DB_URL_RE ]] || { echo "OBSERVE_DATABASE_NOT_ISOLATED"; return 1; }
+  # Every provider HTTP attempt of a day sits under one explicit ceiling.
+  local http_day
+  http_day="$(observe_get EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY)"
+  [[ "$http_day" =~ ^[0-9]{1,4}$ ]] && ((10#$http_day >= 1 && 10#$http_day <= 5760)) ||
+    { echo "OBSERVE_HTTP_DAILY_BUDGET_NOT_EXPLICIT"; return 1; }
   # A model call costs money: no ORBIT review without an approved budget, and
   # an approved budget is explicit and capped.
   local per_run per_day

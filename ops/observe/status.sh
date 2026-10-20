@@ -59,7 +59,7 @@ if [[ "$loaded" == yes && "$stopped" == no ]]; then
   if [[ "$age" == -1 ]] || ((age > 2 * INTERVAL)); then degraded NO_RECENT_RUN; fi
 fi
 [[ "$latest" == NONE || "$latest" == COMPLETED ]] || degraded "LATEST_RUN_$latest"
-echo "today (UTC): $(q "select count(*) || ' runs, ' || coalesce(sum(provider_requests),0) || ' provider requests, ' || coalesce(sum(orbit_reviews_started),0) || ' model reviews' from scout_runs where started_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc'")"
+echo "today (UTC): $(q "select count(*) || ' runs, ' || coalesce(sum(provider_requests),0) || ' provider requests, ' || coalesce(sum(provider_http_attempts),0) || ' provider HTTP attempts, ' || coalesce(sum(orbit_reviews_started),0) || ' model reviews' from scout_runs where started_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc'")"
 echo "watches by status: $(q "select coalesce(string_agg(status || '=' || n, ', ' order by status), 'none') from (select status, count(*) n from discovery_watches where not is_fixture group by status) s")"
 echo "early candidates (PROMOTABLE): $(q "select count(*) from discovery_watches where status = 'PROMOTABLE' and not is_fixture")"
 

@@ -439,6 +439,14 @@ class Settings(BaseSettings):
     # configured id, platform or provider, an entry from the future or one older
     # than this is validated again. 0, the default, keeps no binding.
     early_scout_network_cache_ttl_seconds: int = Field(default=0, ge=0, le=86400)
+    # One ceiling on every GeckoTerminal HTTP attempt the scout makes in a UTC
+    # day — discovery, refresh, VECTOR history and outcomes, retries included.
+    # The attempts earlier runs of the day recorded are subtracted; the rest is
+    # shared by all of the run's transports and taken before each attempt.
+    # Spent means no attempt until the next UTC day, and no catch-up then.
+    # 0, the default, sets no daily ceiling (the per-run budgets still hold).
+    # 5760 is twenty attempts a run at a five-minute cadence.
+    early_scout_max_provider_http_attempts_per_day: int = Field(default=0, ge=0, le=5760)
     # The V4 prefilter. Only a 32-byte V4 pool id can reach LP_CONTROL=PASS; a
     # 20-byte pool address (V2/V3-style) is UNSUPPORTED, so it can never be
     # bought (issue #92). On, such a pool is still discovered, recorded and

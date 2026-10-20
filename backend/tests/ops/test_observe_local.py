@@ -628,6 +628,29 @@ def test_a_replaced_tree_never_vouches_for_changed_code(box):
     assert "OBSERVE_WORKTREE_MODIFIED" in log(box)
 
 
+@pytest.mark.parametrize("value", [None, "", "0", "5761", "-1", "1e3", "09999"])
+def test_the_daily_http_ceiling_is_required_and_bounded(box, value):
+    lines = [
+        line
+        for line in base_profile(box).splitlines()
+        if not line.startswith("EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY=")
+    ]
+    if value is not None:
+        lines.append(f"EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY={value}")
+    box["env_file"].write_text("\n".join(lines) + "\n")
+    result = script(box, "run-observe.sh")
+    assert result.returncode == 78
+    assert "OBSERVE_HTTP_DAILY_BUDGET_NOT_EXPLICIT" in log(box) or "MALFORMED" in log(box)
+    assert not (box["record"] / "args").exists()
+
+
+def test_the_daily_http_ceiling_reaches_the_scout(box):
+    profile_with(box, EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY="3000")
+    assert script(box, "run-observe.sh").returncode == 0
+    env = (box["record"] / "env").read_text()
+    assert "EARLY_SCOUT_MAX_PROVIDER_HTTP_ATTEMPTS_PER_DAY=3000" in env
+
+
 # ------------------------------------------------------------ stop and restart
 
 
