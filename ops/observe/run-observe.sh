@@ -51,8 +51,8 @@ while IFS= read -r line; do env_args+=("$line"); done < <(observe_env_args)
 
 case "${1:-}" in
   --check)
-    say "profile ok (database $(observe_db), commit $(git -C "$REPO" rev-parse --short HEAD))"
-    echo "profile ok (database $(observe_db), commit $(git -C "$REPO" rev-parse --short HEAD))"
+    say "profile ok (database $(observe_db), commit $(observe_git rev-parse --short HEAD))"
+    echo "profile ok (database $(observe_db), commit $(observe_git rev-parse --short HEAD))"
     exit 0
     ;;
   --preflight)
@@ -87,7 +87,7 @@ stop_child() {
 }
 trap stop_child TERM INT
 
-say "start (database $(observe_db), commit $(git -C "$REPO" rev-parse --short HEAD))"
+say "start (database $(observe_db), commit $(observe_git rev-parse --short HEAD))"
 status=0
 cd "$REPO/backend"
 env -i "${env_args[@]}" "$PYTHON" -m src.runner.main --scout-once >>"$LOG" 2>&1 &
