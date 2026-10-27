@@ -212,14 +212,24 @@ def evaluate(
         elif liquidity is not None:
             with localcontext() as arithmetic:
                 arithmetic.prec = EXACT_PRECISION
-                # A purchase is priced by a ceiling, up to one ledger unit
-                # above the recorded price. The floor is judged at that price,
-                # where the FDV can only come out larger; the ceiling at the
-                # lowest price it can stand for, where the FDV can only come
-                # out smaller. Each errs toward refusal.
+                # The price may be a ceiling and the liquidity a floor of what
+                # was recorded, each by under one ledger unit, so the figures
+                # bound the true ratio rather than state it. The floor is met
+                # only if the lowest ratio they allow meets it; the ceiling
+                # only if the highest does. Exactly 100 % passes only on exact
+                # figures; where rounding leaves it open, it is refused as
+                # undecidable rather than guessed.
                 fdv = supply * market.price_usd
-                if liquidity > supply * (market.price_usd - LEDGER_UNIT):
+                lowest_price = (
+                    market.price_usd if market.price_exact else (market.price_usd - LEDGER_UNIT)
+                )
+                highest_liquidity = (
+                    liquidity if market.liquidity.liquidity_exact else (liquidity + LEDGER_UNIT)
+                )
+                if liquidity > fdv:
                     reasons.append("LIQUIDITY_FDV_RATIO_UNVERIFIED")
+                elif highest_liquidity > supply * lowest_price:
+                    reasons.append("LIQUIDITY_FDV_RATIO_UNDECIDABLE")
                 elif liquidity < limits.min_liquidity_fdv_ratio * fdv:
                     reasons.append("LIQUIDITY_FDV_RATIO_LIMIT")
                 fdv_ratio = (liquidity / fdv).quantize(RATIO_QUANTUM, rounding=ROUND_DOWN)

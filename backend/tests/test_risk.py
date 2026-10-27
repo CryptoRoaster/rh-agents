@@ -465,9 +465,9 @@ def test_a_buy_records_its_liquidity_fdv_ratio(intent, market, context, now):
         ("10000000", RiskOutcome.REJECT, ("LIQUIDITY_FDV_RATIO_LIMIT",)),
         # FDV 1,000,100: the pool is worth just under the whole token.
         ("10001", RiskOutcome.APPROVE, ("WITHIN_LIMITS",)),
-        # FDV 1,000,000 at the ledger price: exactly 100 % there, but above it
-        # at the lowest price that rounded-up ledger price can stand for.
-        ("10000", RiskOutcome.REJECT, ("LIQUIDITY_FDV_RATIO_UNVERIFIED",)),
+        # FDV 1,000,000 at the ledger price: exactly 100 % there. Neither figure
+        # is marked exact, so the true ratio may lie just above it.
+        ("10000", RiskOutcome.REJECT, ("LIQUIDITY_FDV_RATIO_UNDECIDABLE",)),
         # The pool would be worth more than every token there is.
         ("9999", RiskOutcome.REJECT, ("LIQUIDITY_FDV_RATIO_UNVERIFIED",)),
         ("1", RiskOutcome.REJECT, ("LIQUIDITY_FDV_RATIO_UNVERIFIED",)),
@@ -630,7 +630,7 @@ def test_a_rounded_up_micro_price_cannot_hide_a_ratio_above_one(intent, market, 
     raw = str(6 * 10**23 * 10**9)
     micro = _priced(market, "0.000000000000000002", raw, 9)
     risk = evaluate(intent, micro, context, RiskLimits(), now=now)
-    assert "LIQUIDITY_FDV_RATIO_UNVERIFIED" in risk.reason_codes
+    assert "LIQUIDITY_FDV_RATIO_UNDECIDABLE" in risk.reason_codes
     assert risk.metrics.liquidity_fdv_ratio == Decimal("0.833333333333333333")
 
 
@@ -639,9 +639,132 @@ def test_a_price_of_one_ledger_unit_proves_no_ceiling(intent, market, context, n
     raw = str(10**30 * 10**9)
     micro = _priced(market, "0.000000000000000001", raw, 9)
     risk = evaluate(intent, micro, context, RiskLimits(), now=now)
-    assert "LIQUIDITY_FDV_RATIO_UNVERIFIED" in risk.reason_codes
+    assert "LIQUIDITY_FDV_RATIO_UNDECIDABLE" in risk.reason_codes
 
 
 def test_contract_decimals_are_strict(market):
     with pytest.raises(ValidationError):
         market.token.model_validate({**market.token.model_dump(), "total_supply_decimals": True})
+
+
+def _exact(market, price=True, liquidity=True):
+    """Mark the price and liquidity as the recorded figures, or as rounded ones."""
+    return market.model_copy(
+        update={
+            "price_exact": price,
+            "liquidity": market.liquidity.model_copy(update={"liquidity_exact": liquidity}),
+        }
+    )
+
+
+# Supply in raw units at the fixture's 9 decimals, against 1,000,000 of pool
+# liquidity at a price of 100: each FDV is supply x 100.
+@pytest.mark.parametrize(
+    "raw,codes",
+    [
+        # 9.99990000099 %: below the floor however it was rounded.
+        ("100001000000000", ("LIQUIDITY_FDV_RATIO_LIMIT",)),
+        # Exactly 10 %.
+        ("100000000000000", ("WITHIN_LIMITS",)),
+        # Exactly 100 %.
+        ("10000000000000", ("WITHIN_LIMITS",)),
+        # 100.0001 %: FDV 999,999.
+        ("9999990000000", ("LIQUIDITY_FDV_RATIO_UNVERIFIED",)),
+    ],
+)
+def test_the_boundaries_on_exact_figures(intent, market, context, now, raw, codes):
+    exact = _exact(_supply_raw(market, raw))
+    risk = evaluate(intent, exact, context, RiskLimits(), now=now)
+    assert risk.reason_codes == codes
+
+
+def _supply_raw(market, raw):
+    return market.model_copy(
+        update={"token": market.token.model_copy(update={"total_supply_raw": raw})}
+    )
+
+
+@pytest.mark.parametrize("price,liquidity", [(False, True), (True, False), (None, None)])
+def test_exactly_one_hundred_percent_on_rounded_figures_is_undecidable(
+    intent, market, context, now, price, liquidity
+):
+    """A rounded price or a floored pool may hide a ratio above one: refused, not guessed."""
+    rounded = _exact(_supply_raw(market, "10000000000000"), price, liquidity)
+    risk = evaluate(intent, rounded, context, RiskLimits(), now=now)
+    assert risk.outcome == RiskOutcome.REJECT
+    assert risk.reason_codes == ("LIQUIDITY_FDV_RATIO_UNDECIDABLE",)
+    assert risk.metrics.liquidity_fdv_ratio == Decimal("1")
+
+
+def test_exactly_ten_percent_passes_on_rounded_figures(intent, market, context, now):
+    """Rounding only ever understates the ratio, so a floor met is met."""
+    rounded = _exact(_supply_raw(market, "100000000000000"), False, False)
+    assert evaluate(intent, rounded, context, RiskLimits(), now=now).reason_codes == (
+        "WITHIN_LIMITS",
+    )
+
+
+def test_a_ratio_in_bounds_lifts_no_other_blocker(intent, market, context, now):
+    """Passing the ratio leaves every other refusal exactly where it was."""
+    held = _exact(_concentrated(market))
+    risk = evaluate(intent, held, context, RiskLimits(), now=now)
+    assert risk.outcome == RiskOutcome.REJECT
+    assert risk.reason_codes == ("HOLDERS_FAIL", "HOLDER_CONCENTRATION_LIMIT")
+
+
+@pytest.mark.parametrize("value", [1, "true", "yes"])
+def test_exactness_flags_are_strict(market, value):
+    with pytest.raises(ValidationError):
+        type(market).model_validate({**market.model_dump(), "price_exact": value})
+    with pytest.raises(ValidationError):
+        type(market.liquidity).model_validate(
+            {**market.liquidity.model_dump(), "liquidity_exact": value}
+        )
+
+
+def test_a_snapshot_without_exactness_keeps_its_shape(market):
+    dumped = market.model_dump(mode="json")
+    assert "price_exact" not in dumped
+    assert "liquidity_exact" not in dumped["liquidity"]
+
+
+def test_a_sale_is_not_held_to_exactness(intent, market, context, now):
+    sell, holding = _holding(intent, context)
+    rounded = _exact(_supply_raw(market, "1"), False, False)
+    assert evaluate(sell, rounded, holding, RiskLimits(), now=now).outcome == (RiskOutcome.APPROVE)
+
+
+def test_stale_supply_evidence_is_refused_whatever_its_ratio(intent, market, context, now):
+    """Supply travels with the holder evidence, and ages with it."""
+    aged = _exact(market).model_copy(
+        update={
+            "holders": market.holders.model_copy(update={"created_at": now - timedelta(minutes=1)})
+        }
+    )
+    risk = evaluate(intent, aged, context, RiskLimits(), now=now)
+    assert risk.outcome == RiskOutcome.REJECT
+    assert "STALE_OR_FUTURE_SAFETY_DATA" in risk.reason_codes
+
+
+@pytest.mark.parametrize(
+    "later,outcome",
+    [
+        # The pool has since grown into proportion with the token.
+        ("10001", RiskOutcome.APPROVE),
+        # It has not.
+        ("10000000", RiskOutcome.REJECT),
+    ],
+)
+def test_an_earlier_refusal_neither_carries_over_nor_is_reused(
+    intent, market, context, now, later, outcome
+):
+    """SENTINEL holds no memory: each verdict is the figures in front of it.
+
+    Whether a refused market may be asked again at all is COMMANDER's intake
+    rule (`RISK_REJECTED_FOR_MARKET`), not this one.
+    """
+    first = evaluate(intent, _supply(market, "1"), context, RiskLimits(), now=now)
+    assert first.reason_codes == ("LIQUIDITY_FDV_RATIO_UNVERIFIED",)
+    again = evaluate(intent, _supply(market, later), context, RiskLimits(), now=now)
+    assert again.outcome == outcome
+    assert again.id != first.id

@@ -55,6 +55,12 @@ def test_a_purchase_carries_the_contract_supply(now) -> None:
     assert token.decimals == 18
 
 
+def test_a_purchase_says_whether_its_price_and_pool_were_rounded(now) -> None:
+    market = view(now, Side.BUY)
+    assert isinstance(market.price_exact, bool)
+    assert isinstance(market.liquidity.liquidity_exact, bool)
+
+
 def test_a_sale_keeps_its_shape(now) -> None:
     market = view(now, Side.SELL)
     assert market.token.total_supply_raw is None
@@ -62,6 +68,10 @@ def test_a_sale_keeps_its_shape(now) -> None:
     dumped = market.model_dump(mode="json")["token"]
     assert "total_supply_raw" not in dumped
     assert "total_supply_decimals" not in dumped
+    assert market.price_exact is None
+    assert market.liquidity.liquidity_exact is None
+    assert "price_exact" not in market.model_dump(mode="json")
+    assert "liquidity_exact" not in market.model_dump(mode="json")["liquidity"]
 
 
 def test_holder_evidence_without_contract_decimals_replays_unchanged(now) -> None:

@@ -118,6 +118,17 @@ class LiquiditySnapshot(Record):
     liquidity_usd: Amount | None = None
     routing: SafetyStatus = SafetyStatus.UNKNOWN
     estimated_slippage_bps: Amount | None = None
+    # Whether `liquidity_usd` is the recorded reading itself, or that reading
+    # floored to the ledger's scale. Only a purchase carries it; absent, the
+    # figure may sit up to one ledger unit below the reading.
+    liquidity_exact: bool | None = Field(default=None, strict=True)
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        emitted: dict[str, Any] = handler(self)
+        if emitted.get("liquidity_exact") is None:
+            emitted.pop("liquidity_exact", None)
+        return emitted
 
 
 class HolderSnapshot(Record):
@@ -186,6 +197,10 @@ class MarketSnapshot(Record):
     # Absent from every snapshot recorded before issue #92 and from every sale's:
     # absent reads as UNKNOWN, which no BUY passes.
     lp_control: LpControlSnapshot | None = None
+    # Whether `price_usd` is the recorded price itself, or that price rounded
+    # to the ledger's scale. Only a purchase carries it; absent, the price may
+    # sit up to one ledger unit away from the recording.
+    price_exact: bool | None = Field(default=None, strict=True)
 
     def fingerprint(self) -> str:
         return sha256(self.model_dump_json().encode()).hexdigest()
@@ -205,8 +220,9 @@ class MarketSnapshot(Record):
         # A snapshot without LP-control evidence keeps the shape, and so the
         # fingerprint, it was recorded and approved with.
         emitted: dict[str, Any] = handler(self)
-        if emitted.get("lp_control") is None:
-            emitted.pop("lp_control", None)
+        for key in ("lp_control", "price_exact"):
+            if emitted.get(key) is None:
+                emitted.pop(key, None)
         return emitted
 
 
