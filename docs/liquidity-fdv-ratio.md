@@ -101,12 +101,66 @@ SENTINEL keeps no memory: every verdict is computed from the figures in front
 of it, and no earlier approval or refusal is reused.
 
 The case still ends `RISK_REJECTED`, as after every SENTINEL rejection, and
-COMMANDER intake then bars the market (`RISK_REJECTED_FOR_MARKET`). That bar is
-the existing rule for all rejections and is not specific to this gate, so a
-market refused only by this gate is today not asked again even if its ratio
-later comes into bounds. A bounded, explicit re-check with fresh evidence and
-no inherited authorization is specified in issue #124. Until then the bar
-stands.
+COMMANDER intake then bars the market (`RISK_REJECTED_FOR_MARKET`); the scout
+skips it too. That bar is unchanged. A market refused only by this gate can be
+asked about again through one explicit call,
+`LiquidityFdvRecheckService.open_recheck(predecessor_case_id)`
+(`src/orchestration/recheck`, issue #124). Nothing calls it on a schedule, and
+it opens a case, never a purchase.
+
+`LIQ_FDV_RECHECK_V1`:
+
+| Rule | Value |
+|---|---|
+| Predecessor | `RISK_REJECTED`; its latest binding (highest `case_revision`) carries the case's own `risk_input_digest`, outcome `REJECT` (not `PAUSE_SYSTEM`) |
+| Eligible codes | a non-empty subset of `LIQUIDITY_FDV_RATIO_LIMIT`, `LIQUIDITY_FDV_RATIO_UNVERIFIED`, `LIQUIDITY_FDV_RATIO_UNDECIDABLE`, `FDV_UNKNOWN`. Any other code, `FDV_DECIMALS_MISMATCH` included, keeps the market barred |
+| Market history | the predecessor is its newest case, no case is live, none was executed, and every other rejection in it was gate-only too |
+| Window | from 30 minutes to 24 hours after the rejecting decision's `evaluated_at` |
+| Per rejected case | one successor. A second call returns the same case (`replayed`), never a new one |
+| Per market | at most 2 successors over its whole history, however each ended. A successor refused on gate codes alone is itself eligible, with its own window, so a market gets at most three SENTINEL verdicts |
+| Operational bars | the chain is one intake opens cases on, the market is not a fixture, and under `PAPER_EARLY_ONLY` only an early predecessor is re-checked |
+| Stops | kill switch, PAPER mode, configured pause, durable pause, entry halt: as for any entry |
+| Successor | a new case through `open_trade_case_in_session`, in the workflow's starting state, under the predecessor's workflow and strategy, living one hour. Its `originating_discovery_reference` is the predecessor's case id |
+
+The successor inherits nothing: no evidence, binding, risk request or
+approval. ORBIT, ATLAS, PULSE, ANCHOR and SENTINEL run again on evidence
+gathered after the call, and every BUY gate applies in full; a ratio still out
+of band is rejected again. A successor that lapses or is cancelled ends the
+history; nothing re-checks it.
+
+For an early market this is a second early case for the same pool, the one
+exception to "one early attempt per market". It is not a re-entry: no cycle
+completed, and the early age bound and caps still apply.
+
+**No migration.** The successor's open key is
+`rh-agents:liq-fdv-recheck:<predecessor id>` and its case id is derived from
+that key, so the unique open key already enforces one successor per rejected
+case; the per-market cap counts those keys; the account lock serialises
+callers. Its first event, `LIQ_FDV_RECHECK_OPENED`, records the policy
+version, the predecessor, the binding and the codes it was eligible on. The
+predecessor's case, bindings, risk request and events are never written.
+
+## Calibration
+
+Whether 10 % is the right floor can only be read from figures that were
+observed together. `uv run python -m src.evaluation.liquidity_fdv --database
+NAME --port PORT` reads a local database read-only and prints JSON:
+
+- every ATLAS contract read (`total_supply_raw`, `total_supply_decimals`, its
+  block) paired with the nearest market observation of the same pair within
+  30 seconds (at most ten minutes), judged by `liquidity_fdv_verdict`, the
+  same function SENTINEL calls, after the same BUY rounding;
+- everything else under the reason it is UNKNOWN (`SUPPLY_EVIDENCE_MISSING`,
+  `EVIDENCE_NOT_COMPARABLE`, `MARKET_OBSERVATION_MISSING`, `PRICE_UNKNOWN`,
+  `LIQUIDITY_UNKNOWN`, `FDV_UNKNOWN`, ...), never with a ratio;
+- a ratio spread only from 30 measured ratios on;
+- pool age at first sight from `discovery_watches.pool_created_at`, UNKNOWN
+  where it is absent.
+
+No provider, RPC or model is called, and a provider's market cap or FDV is
+never read. As of 2026-10-27 no local database holds an ATLAS contract read
+for a Robinhood market, so every market reads `SUPPLY_EVIDENCE_MISSING`: the
+supply and contract decimals come only from ATLAS inside a PAPER case.
 
 ## SELL
 

@@ -39,14 +39,63 @@ def total_supply(market: MarketSnapshot) -> Decimal | None:
     Whether the contract's decimals agree with the provider's is the caller's
     question (`FDV_DECIMALS_MISMATCH`).
     """
-    raw = market.token.total_supply_raw
-    decimals = market.token.total_supply_decimals
+    return scaled_supply(market.token.total_supply_raw, market.token.total_supply_decimals)
+
+
+def scaled_supply(raw: str | None, decimals: int | None) -> Decimal | None:
+    """A raw contract supply in whole tokens, or unknown. See `total_supply`."""
     if raw is None or decimals is None or int(raw) == 0:
         return None
     with localcontext() as arithmetic:
         # A 78-digit supply survives scaling only above the default precision.
         arithmetic.prec = EXACT_PRECISION
         return Decimal(int(raw)).scaleb(-decimals)
+
+
+def liquidity_fdv_verdict(
+    *,
+    supply: Decimal | None,
+    supply_decimals: int | None,
+    provider_decimals: int | None,
+    price_usd: Decimal,
+    price_exact: bool | None,
+    liquidity: Decimal | None,
+    liquidity_exact: bool | None,
+    min_ratio: Decimal,
+) -> tuple[str | None, Decimal | None]:
+    """The liquidity/FDV reason code a purchase gets, if any, and the ratio.
+
+    The one place the gate's arithmetic lives, so SENTINEL and any offline
+    reading of recorded figures cannot disagree. Unknown liquidity yields no
+    code here (`LIQUIDITY_UNKNOWN` is SENTINEL's own) and no ratio.
+    """
+    if supply is None:
+        return "FDV_UNKNOWN", None
+    if supply_decimals != provider_decimals:
+        # The contract and the provider disagree on the token's scale, so
+        # the price and the supply are not in the same unit.
+        return "FDV_DECIMALS_MISMATCH", None
+    if liquidity is None:
+        return None, None
+    with localcontext() as arithmetic:
+        arithmetic.prec = EXACT_PRECISION
+        # The price may be a ceiling and the liquidity a floor of what was
+        # recorded, each by under one ledger unit, so the figures bound the
+        # true ratio rather than state it. The floor is met only if the lowest
+        # ratio they allow meets it; the ceiling only if the highest does.
+        # Exactly 100 % passes only on exact figures; where rounding leaves it
+        # open, it is refused as undecidable rather than guessed.
+        fdv = supply * price_usd
+        lowest_price = price_usd if price_exact else (price_usd - LEDGER_UNIT)
+        highest_liquidity = liquidity if liquidity_exact else (liquidity + LEDGER_UNIT)
+        code: str | None = None
+        if liquidity > fdv:
+            code = "LIQUIDITY_FDV_RATIO_UNVERIFIED"
+        elif highest_liquidity > supply * lowest_price:
+            code = "LIQUIDITY_FDV_RATIO_UNDECIDABLE"
+        elif liquidity < min_ratio * fdv:
+            code = "LIQUIDITY_FDV_RATIO_LIMIT"
+        return code, (liquidity / fdv).quantize(RATIO_QUANTUM, rounding=ROUND_DOWN)
 
 
 def lp_control_refusal(market: MarketSnapshot) -> str | None:
@@ -202,37 +251,18 @@ def evaluate(
     # against the token, and it is not bought on.
     fdv_ratio: Decimal | None = None
     if buying:
-        supply = total_supply(market)
-        if supply is None:
-            reasons.append("FDV_UNKNOWN")
-        elif market.token.total_supply_decimals != market.token.decimals:
-            # The contract and the provider disagree on the token's scale, so
-            # the price and the supply are not in the same unit.
-            reasons.append("FDV_DECIMALS_MISMATCH")
-        elif liquidity is not None:
-            with localcontext() as arithmetic:
-                arithmetic.prec = EXACT_PRECISION
-                # The price may be a ceiling and the liquidity a floor of what
-                # was recorded, each by under one ledger unit, so the figures
-                # bound the true ratio rather than state it. The floor is met
-                # only if the lowest ratio they allow meets it; the ceiling
-                # only if the highest does. Exactly 100 % passes only on exact
-                # figures; where rounding leaves it open, it is refused as
-                # undecidable rather than guessed.
-                fdv = supply * market.price_usd
-                lowest_price = (
-                    market.price_usd if market.price_exact else (market.price_usd - LEDGER_UNIT)
-                )
-                highest_liquidity = (
-                    liquidity if market.liquidity.liquidity_exact else (liquidity + LEDGER_UNIT)
-                )
-                if liquidity > fdv:
-                    reasons.append("LIQUIDITY_FDV_RATIO_UNVERIFIED")
-                elif highest_liquidity > supply * lowest_price:
-                    reasons.append("LIQUIDITY_FDV_RATIO_UNDECIDABLE")
-                elif liquidity < limits.min_liquidity_fdv_ratio * fdv:
-                    reasons.append("LIQUIDITY_FDV_RATIO_LIMIT")
-                fdv_ratio = (liquidity / fdv).quantize(RATIO_QUANTUM, rounding=ROUND_DOWN)
+        fdv_code, fdv_ratio = liquidity_fdv_verdict(
+            supply=total_supply(market),
+            supply_decimals=market.token.total_supply_decimals,
+            provider_decimals=market.token.decimals,
+            price_usd=market.price_usd,
+            price_exact=market.price_exact,
+            liquidity=liquidity,
+            liquidity_exact=market.liquidity.liquidity_exact,
+            min_ratio=limits.min_liquidity_fdv_ratio,
+        )
+        if fdv_code is not None:
+            reasons.append(fdv_code)
     if slippage is None:
         reasons.append("SLIPPAGE_UNKNOWN")
     elif slippage > permitted_slippage or slippage >= BPS:
