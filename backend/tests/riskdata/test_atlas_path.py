@@ -53,6 +53,8 @@ async def test_the_real_path_stores_the_measured_holder_distribution(worker_db, 
     assert holders.top_one_fraction == expected.top1_share
     assert holders.measurement == "TOP_TEN_OVER_TOTAL_SUPPLY"
     assert holders.total_supply_raw == str(TOTAL_SUPPLY)
+    # The supply's scale from the same contract read, not the provider's.
+    assert holders.total_supply_decimals == 18
 
 
 async def test_the_stored_metrics_carry_their_own_provenance(worker_db, now, trace):

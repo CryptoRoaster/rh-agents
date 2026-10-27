@@ -385,4 +385,5 @@ def test_risk_contracts_are_untouched_by_this_phase():
         "daily_loss_usd",
         "liquidity_usd",
         "estimated_slippage_bps",
+        "liquidity_fdv_ratio",
     }

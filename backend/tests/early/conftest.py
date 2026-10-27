@@ -31,9 +31,24 @@ from tests.vector.conftest import StubHistory
 CREATION_SOURCE = "evm-rpc:eth_getBlockByNumber"
 
 
-def early_onchain(now, *, created_ago: timedelta | None = timedelta(hours=2), fresh=True):
-    """ATLAS evidence carrying the chain-side creation timestamp, or none at all."""
+def early_onchain(
+    now,
+    *,
+    created_ago: timedelta | None = timedelta(hours=2),
+    fresh=True,
+    supply: str | None = None,
+):
+    """ATLAS evidence carrying the chain-side creation timestamp, or none at all.
+
+    `supply` replaces the contract supply the holder figures were divided by,
+    for a market whose pool must stand in proportion to its FDV.
+    """
     base: OnchainPayload = fresh_onchain(now) if fresh else onchain_payload(now)
+    if supply is not None:
+        assert base.intelligence is not None and base.intelligence.holders is not None
+        holders = base.intelligence.holders.model_copy(update={"total_supply_raw": supply})
+        intelligence = base.intelligence.model_copy(update={"holders": holders})
+        base = base.model_copy(update={"intelligence": intelligence})
     if created_ago is None:
         return base
     intelligence = base.intelligence

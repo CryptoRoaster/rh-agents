@@ -1168,6 +1168,11 @@ def market_view(
             # code present, supply known, no unreviewed proxy admin. Whether a
             # route exists is a different question and travels on `routing`.
             tradable=SAFETY_STATUS[payload.contract_integrity],
+            # The contract-read supply the holder figures were divided by, for
+            # a purchase's fully diluted value. A sale is not judged on it and
+            # keeps the shape it always had.
+            total_supply_raw=holders.total_supply_raw if side is Side.BUY else None,
+            total_supply_decimals=holders.total_supply_decimals if side is Side.BUY else None,
         ),
         liquidity=LiquiditySnapshot(
             id=identity("liquidity"),

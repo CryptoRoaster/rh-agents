@@ -81,7 +81,15 @@ def market(now, trace):
         observed_at=now,
         price_usd=Decimal("100"),
         token=TokenSnapshot(
-            **meta, asset_id="paper:DEMO", symbol="DEMO", decimals=9, tradable=SafetyStatus.PASS
+            **meta,
+            asset_id="paper:DEMO",
+            symbol="DEMO",
+            decimals=9,
+            tradable=SafetyStatus.PASS,
+            # 50,000 DEMO at 100 USD: an FDV of 5,000,000 against 1,000,000 of
+            # pool liquidity, a liquidity/FDV ratio of 0.2.
+            total_supply_raw="50000000000000",
+            total_supply_decimals=9,
         ),
         liquidity=LiquiditySnapshot(
             **meta,

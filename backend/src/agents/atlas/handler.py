@@ -125,7 +125,9 @@ def domain_verdicts(decision: AtlasSafetyDecision) -> dict[AtlasDomain, str]:
     return verdicts
 
 
-def holder_distribution(facts: HolderFacts) -> HolderDistributionFacts | None:
+def holder_distribution(
+    facts: HolderFacts, contract_decimals: int | None = None
+) -> HolderDistributionFacts | None:
     """Carry the measured distribution onto the evidence, or record nothing.
 
     Only an available measurement travels. A verdict, a failure code or a
@@ -153,6 +155,9 @@ def holder_distribution(facts: HolderFacts) -> HolderDistributionFacts | None:
         "total_supply_raw": (
             None if facts.total_supply_raw is None else str(facts.total_supply_raw)
         ),
+        # The scale of that supply, from the same contract read. Never the
+        # provider's decimals: a purchase's FDV is judged on this pair alone.
+        "total_supply_decimals": None if facts.total_supply_raw is None else contract_decimals,
         "top_one_fraction": facts.top1_share,
         "top_five_fraction": facts.top5_share,
         "top_ten_fraction": facts.top10_share,
@@ -505,7 +510,12 @@ def onchain_payload(
             # absence says "this run looked and found nothing", which is
             # a different fact from a row written before the block
             # existed — and the two must not serialise alike.
-            holders=holder_distribution(snapshot.holders),
+            holders=holder_distribution(
+                snapshot.holders,
+                snapshot.contract.decimals
+                if snapshot.contract.status == Availability.AVAILABLE
+                else None,
+            ),
             pool_control=pool_control_summary(
                 snapshot.pool_control, snapshot.holders.top10_share, snapshot.chain
             ),

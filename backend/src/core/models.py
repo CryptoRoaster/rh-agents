@@ -20,6 +20,7 @@ Amount = Annotated[Decimal, Field(ge=0, allow_inf_nan=False, max_digits=38, deci
 Positive = Annotated[Decimal, Field(gt=0, allow_inf_nan=False, max_digits=38, decimal_places=18)]
 SignedAmount = Annotated[Decimal, Field(allow_inf_nan=False, max_digits=38, decimal_places=18)]
 Fraction = Annotated[Decimal, Field(ge=0, le=1, allow_inf_nan=False)]
+RawAmount = Annotated[str, Field(pattern=r"^[0-9]{1,78}$")]
 Identifier = Annotated[str, Field(min_length=1, max_length=200)]
 
 
@@ -91,6 +92,25 @@ class TokenSnapshot(Record):
     symbol: Identifier
     decimals: int = Field(ge=0, le=36)
     tradable: SafetyStatus = SafetyStatus.UNKNOWN
+    # The on-chain total supply in raw units, as text: a uint256 does not come
+    # back unharmed from every JSON reader as a number. A purchase is judged on
+    # the fully diluted value it gives; absent, as on every snapshot recorded
+    # before it and on every sale's, that value is unknown and no BUY passes.
+    total_supply_raw: RawAmount | None = None
+    # That supply's scale as the contract itself reports it, read with it.
+    # `decimals` above is what the market provider recorded; the FDV is only
+    # established when both agree, so neither can silently rescale it.
+    total_supply_decimals: int | None = Field(default=None, strict=True, ge=0, le=36)
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        # A snapshot without a supply keeps the shape, and so the fingerprint,
+        # it was recorded and approved with.
+        emitted: dict[str, Any] = handler(self)
+        for key in ("total_supply_raw", "total_supply_decimals"):
+            if emitted.get(key) is None:
+                emitted.pop(key, None)
+        return emitted
 
 
 class LiquiditySnapshot(Record):
@@ -253,6 +273,11 @@ class RiskLimits(Contract):
     max_slippage_bps: Amount = Field(default=Decimal("100"), le=10000)
     daily_loss_limit_usd: Positive = Decimal("500")
     min_liquidity_usd: Positive = Decimal("100000")
+    # Pool liquidity over the fully diluted value a purchase must reach. A
+    # floor, never a switch: zero would turn the bar off.
+    min_liquidity_fdv_ratio: Annotated[Decimal, Field(gt=0, le=1, allow_inf_nan=False)] = Decimal(
+        "0.10"
+    )
     max_top_ten_holder_fraction: Fraction = Decimal("0.35")
     max_snapshot_age_seconds: int = Field(default=30, gt=0)
     approval_ttl_seconds: int = Field(default=5, gt=0)
@@ -273,6 +298,19 @@ class RiskMetrics(Contract):
     daily_loss_usd: Amount | None
     liquidity_usd: Amount | None
     estimated_slippage_bps: Amount | None
+    # A purchase's pool liquidity over its fully diluted value, floored to 18
+    # places. Absent wherever it was not judged: a sale, an unknown FDV or
+    # liquidity, and every decision recorded before it existed.
+    liquidity_fdv_ratio: (
+        Annotated[Decimal, Field(ge=0, allow_inf_nan=False, decimal_places=18)] | None
+    ) = None
+
+    @model_serializer(mode="wrap")
+    def _historical_shape(self, handler: Any) -> dict[str, Any]:
+        emitted: dict[str, Any] = handler(self)
+        if emitted.get("liquidity_fdv_ratio") is None:
+            emitted.pop("liquidity_fdv_ratio", None)
+        return emitted
 
 
 class RiskDecision(Record):

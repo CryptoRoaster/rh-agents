@@ -18,7 +18,7 @@ from src.core.models import (
     TradeIntent,
     TradingMode,
 )
-from src.core.numbers import quantize
+from src.core.numbers import LEDGER_UNIT, quantize
 
 BPS = Decimal("10000")
 # The order safety checks report in, unchanged from when they were one mapping.
@@ -26,6 +26,27 @@ ORDER = {"TOKEN": 0, "ROUTING": 1, "HOLDERS": 2, "ACCOUNTING": 3}
 # The reason a BUY refused at the daily loss limit carries, and the one its
 # caller turns into the automatic entry halt.
 DAILY_LOSS_LIMIT = "DAILY_LOSS_LIMIT"
+RATIO_QUANTUM = Decimal("0.000000000000000001")
+# Enough digits that a 78-digit supply times a ledger price is exact.
+EXACT_PRECISION = 160
+
+
+def total_supply(market: MarketSnapshot) -> Decimal | None:
+    """The token's on-chain total supply in whole tokens, or unknown.
+
+    Supply and decimals are ATLAS's contract read, never a provider's market
+    cap; a zero supply values nothing and is as unknown as a missing one.
+    Whether the contract's decimals agree with the provider's is the caller's
+    question (`FDV_DECIMALS_MISMATCH`).
+    """
+    raw = market.token.total_supply_raw
+    decimals = market.token.total_supply_decimals
+    if raw is None or decimals is None or int(raw) == 0:
+        return None
+    with localcontext() as arithmetic:
+        # A 78-digit supply survives scaling only above the default precision.
+        arithmetic.prec = EXACT_PRECISION
+        return Decimal(int(raw)).scaleb(-decimals)
 
 
 def lp_control_refusal(market: MarketSnapshot) -> str | None:
@@ -172,6 +193,36 @@ def evaluate(
     elif (liquidity < limits.min_liquidity_usd) if buying else (liquidity <= 0):
         # A sale needs a pool that exists, not one deep enough to enter.
         reasons.append("INSUFFICIENT_LIQUIDITY")
+    # How deep the pool is against what the whole token is valued at: a pool
+    # thin for its valuation cannot absorb an exit, however large it is in
+    # dollars. An entry bar, so a purchase alone is judged on it. Liquidity
+    # counts both sides of the pool, so above the FDV it is either a launch
+    # whose pool still holds nearly the whole supply or wrong data. Neither
+    # can be told apart here: the evidence is unverified, not a finding
+    # against the token, and it is not bought on.
+    fdv_ratio: Decimal | None = None
+    if buying:
+        supply = total_supply(market)
+        if supply is None:
+            reasons.append("FDV_UNKNOWN")
+        elif market.token.total_supply_decimals != market.token.decimals:
+            # The contract and the provider disagree on the token's scale, so
+            # the price and the supply are not in the same unit.
+            reasons.append("FDV_DECIMALS_MISMATCH")
+        elif liquidity is not None:
+            with localcontext() as arithmetic:
+                arithmetic.prec = EXACT_PRECISION
+                # A purchase is priced by a ceiling, up to one ledger unit
+                # above the recorded price. The floor is judged at that price,
+                # where the FDV can only come out larger; the ceiling at the
+                # lowest price it can stand for, where the FDV can only come
+                # out smaller. Each errs toward refusal.
+                fdv = supply * market.price_usd
+                if liquidity > supply * (market.price_usd - LEDGER_UNIT):
+                    reasons.append("LIQUIDITY_FDV_RATIO_UNVERIFIED")
+                elif liquidity < limits.min_liquidity_fdv_ratio * fdv:
+                    reasons.append("LIQUIDITY_FDV_RATIO_LIMIT")
+                fdv_ratio = (liquidity / fdv).quantize(RATIO_QUANTUM, rounding=ROUND_DOWN)
     if slippage is None:
         reasons.append("SLIPPAGE_UNKNOWN")
     elif slippage > permitted_slippage or slippage >= BPS:
@@ -247,6 +298,7 @@ def evaluate(
             daily_loss_usd=context.daily_loss_usd,
             liquidity_usd=liquidity,
             estimated_slippage_bps=slippage,
+            liquidity_fdv_ratio=fdv_ratio,
         ),
         evaluated_at=now,
         expires_at=now + timedelta(seconds=limits.approval_ttl_seconds),

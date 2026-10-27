@@ -40,13 +40,25 @@ async def _execution_detail(now, capacity):
     return detail.model_copy(update={"largest_tested_acceptable_notional_usd": capacity})
 
 
+# 50,000 tokens at 1.25: an FDV of 62,500, which a 10,000 pool is 16 % of.
+SMALL_SUPPLY = str(50_000 * 10**18)
+
+
 async def early_ready(
-    service, sessions, now, trace, *, key="early", capacity=Decimal(10), identity=None
+    service,
+    sessions,
+    now,
+    trace,
+    *,
+    key="early",
+    capacity=Decimal(10),
+    identity=None,
+    supply: str | None = None,
 ):
     """An early case carried by the real producers and workflow to READY_FOR_RISK."""
     cases = service.cases
     trade_case = await open_early_case(cases, sessions, now, trace, key=key, identity=identity)
-    await record_early_onchain(cases, trade_case, now)
+    await record_early_onchain(cases, trade_case, now, supply=supply)
     history = young_history(now, identity=identity)
     result, setup = await early_setup(cases, trade_case, service.markets, now, history)
     assert setup is not None, result
@@ -91,7 +103,7 @@ async def test_an_early_case_at_ten_thousand_liquidity_is_approved_for_ten_dolla
 ):
     _, sessions = risk_db
     service = _service(sessions, now, liquidity="10000")
-    trade_case = await early_ready(service, sessions, now, trace)
+    trade_case = await early_ready(service, sessions, now, trace, supply=SMALL_SUPPLY)
 
     result = await service.request_risk_evaluation(trade_case.id, request_key="early-approve")
 
@@ -222,7 +234,7 @@ async def test_a_cap_never_engages_the_kill_switch(risk_db, now, trace, monkeypa
 async def test_an_early_fill_is_ten_dollars_and_counts_in_the_early_book(risk_db, now, trace):
     _, sessions = risk_db
     service = _service(sessions, now, liquidity="10000")
-    trade_case = await early_ready(service, sessions, now, trace)
+    trade_case = await early_ready(service, sessions, now, trace, supply=SMALL_SUPPLY)
     approval = await service.request_risk_evaluation(trade_case.id, request_key="early-fill")
     assert approval.outcome is RiskOutcome.APPROVE
 
