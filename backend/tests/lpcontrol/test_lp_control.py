@@ -33,6 +33,8 @@ from tests.anchor.conftest import evidence_envelope
 from tests.atlas.v4.scenarios import CREATOR_HOOK, build, locked_only_launch, revenue_like
 from tests.riskdata.conftest import (
     BASE_ASSET,
+    LIQUIDITY,
+    PRICE,
     anchor_payload,
     configured_costs,
     onchain_payload,
@@ -214,8 +216,8 @@ async def test_the_executor_fills_a_sale_without_lp_control(intent, market, cont
 # --------------------------------------------------------------- market view
 
 
-def recorded(now, *, pool_id: str | None = None):
-    snapshot = recorded_snapshot(now, age=timedelta(seconds=5))
+def recorded(now, *, pool_id: str | None = None, liquidity: Decimal = LIQUIDITY):
+    snapshot = recorded_snapshot(now, age=timedelta(seconds=5), liquidity=liquidity)
     if pool_id is None:
         return snapshot
     locator = PoolLocator(kind=PoolLocatorKind.BYTES32_POOL_ID, value=pool_id, venue="uniswap-v4")
@@ -224,7 +226,13 @@ def recorded(now, *, pool_id: str | None = None):
 
 
 def sentinel(now, intent, context, payload: OnchainPayload, *, pool_id: str | None):
-    snapshot = recorded(now, pool_id=pool_id)
+    # A pool of a fifth of the evidence's own FDV, so SENTINEL's liquidity/FDV
+    # bar holds whichever supply the payload carries: the V4 scenarios' billion
+    # tokens or the risk-data fixture's million.
+    holders = None if payload.intelligence is None else payload.intelligence.holders
+    supply = None if holders is None else holders.total_supply_raw
+    liquidity = LIQUIDITY if supply is None else Decimal(supply) / 10**18 * PRICE / 5
+    snapshot = recorded(now, pool_id=pool_id, liquidity=liquidity)
     price = reference_price(snapshot)
     metadata = base_asset_metadata(snapshot)
     assert price is not None and metadata is not None

@@ -1155,6 +1155,8 @@ def market_view(
         asset_id=base_asset_id,
         observed_at=price_at,
         price_usd=price_usd,
+        # The same for the price: a ceiling can hide an FDV below the pool.
+        price_exact=price_usd == recorded_price if side is Side.BUY else None,
         token=TokenSnapshot(
             id=identity("token"),
             created_at=base_asset.source_observed_at,
@@ -1168,6 +1170,11 @@ def market_view(
             # code present, supply known, no unreviewed proxy admin. Whether a
             # route exists is a different question and travels on `routing`.
             tradable=SAFETY_STATUS[payload.contract_integrity],
+            # The contract-read supply the holder figures were divided by, for
+            # a purchase's fully diluted value. A sale is not judged on it and
+            # keeps the shape it always had.
+            total_supply_raw=holders.total_supply_raw if side is Side.BUY else None,
+            total_supply_decimals=holders.total_supply_decimals if side is Side.BUY else None,
         ),
         liquidity=LiquiditySnapshot(
             id=identity("liquidity"),
@@ -1177,6 +1184,13 @@ def market_view(
             correlation_id=correlation_id,
             asset_id=base_asset_id,
             liquidity_usd=liquidity_usd,
+            # For a purchase's liquidity/FDV ceiling: a floored reading can
+            # hide a pool worth more than the token. A sale keeps its shape.
+            liquidity_exact=(
+                liquidity_usd == liquidity.value_usd
+                if side is Side.BUY and liquidity_usd is not None
+                else None
+            ),
             routing=routing,
             # A configured simulation assumption, never a measured fill cost and
             # never ANCHOR's execution deviation.

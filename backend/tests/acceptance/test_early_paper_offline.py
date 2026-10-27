@@ -137,7 +137,9 @@ async def atlas(
 def recorded(
     now, pool_id: str, *, manager: str | None = None, kind=PoolLocatorKind.BYTES32_POOL_ID
 ):
-    snapshot = recorded_snapshot(now, age=timedelta(seconds=5))
+    # The young token's 1,000,000,000 supply at 1.25 is an FDV of 1.25bn; a
+    # pool of a fifth of that is deep enough for SENTINEL's liquidity/FDV bar.
+    snapshot = recorded_snapshot(now, age=timedelta(seconds=5), liquidity=Decimal("250000000"))
     locator = PoolLocator(
         kind=kind,
         value=pool_id,

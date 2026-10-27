@@ -296,3 +296,13 @@ async def test_the_rpc_source_turns_a_failure_into_unread_not_zero():
     client, _ = rpc_answering("0x")
     source = RpcTokenContractSource(client=client, config=None)  # type: ignore[arg-type]
     assert await source.balance_of(TOKEN, ZERO_ADDRESS, SNAPSHOT_BLOCK) is None
+
+
+async def test_the_supply_travels_with_the_contracts_own_decimals(now):
+    """The scale read with the supply, or none: never filled in from elsewhere."""
+    contracts = Contracts(now, balance=0)
+    holders = await measured(now, contracts, provider(now))
+    assert holder_distribution(holders, 18).total_supply_decimals == 18
+    unknown = holder_distribution(holders, None)
+    assert unknown.total_supply_decimals is None
+    assert "total_supply_decimals" not in unknown.model_dump(mode="json")

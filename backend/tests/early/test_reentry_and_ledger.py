@@ -9,7 +9,7 @@ from src.data.tables import TradeCaseRow
 from src.orchestration.reentry.models import ReentryRefusal
 from src.orchestration.strategy.early import PRE_VECTOR_EARLY_ENTRY_V1, early_ledger
 from tests.casefill.conftest import build_fill_service
-from tests.early.test_sentinel import _service, early_ready
+from tests.early.test_sentinel import SMALL_SUPPLY, _service, early_ready
 from tests.paperexit.conftest import build_exit_service, market_feed, position_of
 from tests.reentry.conftest import build_reentry_service, closed_cycle
 
@@ -45,7 +45,7 @@ async def test_a_closed_normal_cycle_is_still_re_entered(risk_db, now, trace):
 async def test_an_early_loss_is_counted_once_it_is_realised(risk_db, now, trace):
     _, sessions = risk_db
     service = _service(sessions, now, liquidity="10000")
-    trade_case = await early_ready(service, sessions, now, trace)
+    trade_case = await early_ready(service, sessions, now, trace, supply=SMALL_SUPPLY)
     approval = await service.request_risk_evaluation(trade_case.id, request_key="early-loss")
     assert approval.outcome is RiskOutcome.APPROVE
     fill = await build_fill_service(sessions, now, feed=service.markets).execute_case_fill(

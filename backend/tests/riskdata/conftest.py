@@ -243,6 +243,7 @@ def holder_block(
         snapshot_block=1_000_000,
         holder_count=holder_count,
         total_supply_raw=TOTAL_SUPPLY,
+        total_supply_decimals=18,
         top_one_fraction=Decimal("0.08"),
         top_ten_fraction=top_ten,
         provider_excluded_addresses=excluded,

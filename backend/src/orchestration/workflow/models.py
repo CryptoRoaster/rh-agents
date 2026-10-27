@@ -246,6 +246,8 @@ class OnchainAdvisoryFinding(Immutable):
 HOLDER_FACTS_KEY = "holders"
 # The same, for holder evidence written before exclusions could be reconciled.
 RECONCILED_EXCLUSIONS_KEY = "reconciled_exclusions"
+# The same, for holder evidence written before the contract's decimals were.
+TOTAL_SUPPLY_DECIMALS_KEY = "total_supply_decimals"
 # How a provider-side exclusion may be reconciled: the standard ERC-20
 # `balanceOf` of that address, read over our own RPC at exactly the block the
 # provider's holder state belongs to. Nothing else resolves an exclusion.
@@ -321,6 +323,12 @@ class HolderDistributionFacts(Immutable):
     # The denominator actually divided by, as text: a uint256 supply exceeds what
     # a JSON number can carry back unharmed in every reader.
     total_supply_raw: Annotated[str, Field(pattern=r"^[0-9]{1,78}$")] | None = None
+    # The contract's own `decimals()`, read at the block that supply was read
+    # at. The decimals a market provider recorded are not a reading of the
+    # contract, and a supply scaled by them is not one either. Absent on
+    # evidence written before it was carried, and omitted when unknown so those
+    # rows replay with the bytes and fingerprints they were stored with.
+    total_supply_decimals: int | None = Field(default=None, strict=True, ge=0, le=36)
     top_one_fraction: Share | None = None
     top_five_fraction: Share | None = None
     top_ten_fraction: Share | None = None
@@ -348,6 +356,8 @@ class HolderDistributionFacts(Immutable):
     @model_serializer(mode="wrap")
     def _historical_reconciliation_shape(self, handler: Any) -> dict[str, Any]:
         emitted: dict[str, Any] = handler(self)
+        if emitted.get(TOTAL_SUPPLY_DECIMALS_KEY) is None:
+            emitted.pop(TOTAL_SUPPLY_DECIMALS_KEY, None)
         if self._reconciled_exclusions_key_present:
             return emitted
         return {key: value for key, value in emitted.items() if key != RECONCILED_EXCLUSIONS_KEY}
